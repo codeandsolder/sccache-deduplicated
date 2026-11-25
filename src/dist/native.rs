@@ -47,6 +47,7 @@ pub(super) struct ScheduleRequest {
     pub ticket: Ticket,
     pub spec: ExecutionSpec,
     pub receiver: crate::build_runtime::wire::ClientDeliveryRates,
+    pub selected: std::collections::BTreeSet<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -554,6 +555,16 @@ impl NativeCacheClient {
     /// # Errors
     /// Returns an error for an invalid or expired action.
     pub fn schedule(&self, ticket: Ticket, spec: ExecutionSpec) -> Result<ScheduleReply> {
+        let selected = spec.outputs.keys().cloned().collect();
+        self.schedule_selected(ticket, spec, selected)
+    }
+
+    fn schedule_selected(
+        &self,
+        ticket: Ticket,
+        spec: ExecutionSpec,
+        selected: std::collections::BTreeSet<String>,
+    ) -> Result<ScheduleReply> {
         let receiver = crate::build_runtime::wire::ClientDeliveryRates {
             scheduler: self.path_rates().download,
             #[cfg(all(target_os = "linux", feature = "native-store"))]
@@ -567,6 +578,7 @@ impl NativeCacheClient {
                 ticket,
                 spec,
                 receiver,
+                selected,
             },
         )
     }

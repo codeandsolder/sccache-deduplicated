@@ -1174,6 +1174,15 @@ impl Scheduler {
             let transfer_plan = native_inputs.as_ref().map(|inputs| {
                 NativeTransferPlan::new(network, &servers, Some(&packages), Some(inputs))
                     .with_receiver(native.and_then(|assignment| assignment.receiver.as_ref()))
+                    .with_remote_fraction(
+                        native
+                            .and_then(|assignment| {
+                                let (requester, _) = assignment.receiver.as_ref()?;
+                                let profile = assignment.delivery_profile?;
+                                Some(cost_book.delivery_fraction(*requester, profile, assigned_at))
+                            })
+                            .unwrap_or(1_000_000),
+                    )
             });
             let res = {
                 let mut healthy = Vec::new();
@@ -1456,6 +1465,15 @@ impl SchedulerIncoming for Scheduler {
         event: dist::NativeLifecycleEvent<'_>,
     ) {
         let now = Instant::now();
+        // Delivery receipts outlive the worker's job record. The session
+        // authenticated the original requester and validated the exact closure.
+        if let dist::NativeLifecycleEvent::Delivered(receipt) = event {
+            self.cost_book
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observe_delivery(receipt, now);
+            return;
+        }
         // Same lock order as assignment and heartbeat processing. The
         // scheduler-epoch job ID ties the receipt to the current worker
         // incarnation even if the address is reused after a restart.
@@ -1476,6 +1494,7 @@ impl SchedulerIncoming for Scheduler {
         }
         use sccache::build_runtime::wire::NativeJobPhase;
         match event {
+            dist::NativeLifecycleEvent::Delivered(_) => (),
             dist::NativeLifecycleEvent::InputsStaged => {
                 detail.inputs_staged_at.get_or_insert(now);
                 server.native_milestone(job, NativeJobPhase::Ready, now);
@@ -2763,6 +2782,7 @@ mod scheduler_tests {
             input_blobs,
             estimated_result_bytes: None,
             receiver: None,
+            delivery_profile: None,
             spec: ExecutionSpec {
                 platform,
                 root: ExecutionRoot {

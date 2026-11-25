@@ -623,38 +623,50 @@ fn dispatch(
                 ticket,
                 spec,
                 receiver,
+                selected,
             } = metadata(request, limit)?;
             ensure!(receiver.valid(), "invalid client delivery telemetry");
             let requester_id = request.id();
             let request = spec.action_request()?;
+            let selection = crate::build_runtime::wire::DeliverySelection::new(&spec, selected)?;
+            let profile = selection.profile;
             encode(
-                &sessions.schedule(ticket, &request, requester_id, |inputs, trees| {
-                    let blobs = inputs
-                        .iter()
-                        .map(|(&id, &size)| BlobRef { id, size })
-                        .collect::<Vec<_>>();
-                    let mut packages =
-                        sessions
-                            .store()
-                            .package_catalog(&blobs)
-                            .unwrap_or_else(|error| {
-                                warn!("Native package placement catalog unavailable: {error:#}");
-                                crate::build_runtime::PackageCatalog::default()
-                            });
-                    packages.restrict_to_trees(trees);
-                    let snapshot = network.snapshot();
-                    allocate(
-                        crate::dist::NativeAssignment {
-                            ticket,
-                            spec,
-                            input_blobs: inputs,
-                            estimated_result_bytes: None,
-                            receiver: Some((requester_id, receiver)),
-                        },
-                        &snapshot,
-                        std::sync::Arc::new(packages),
-                    )
-                })?,
+                &sessions.schedule(
+                    ticket,
+                    &request,
+                    requester_id,
+                    selection,
+                    |inputs, trees| {
+                        let blobs = inputs
+                            .iter()
+                            .map(|(&id, &size)| BlobRef { id, size })
+                            .collect::<Vec<_>>();
+                        let mut packages =
+                            sessions
+                                .store()
+                                .package_catalog(&blobs)
+                                .unwrap_or_else(|error| {
+                                    warn!(
+                                        "Native package placement catalog unavailable: {error:#}"
+                                    );
+                                    crate::build_runtime::PackageCatalog::default()
+                                });
+                        packages.restrict_to_trees(trees);
+                        let snapshot = network.snapshot();
+                        allocate(
+                            crate::dist::NativeAssignment {
+                                ticket,
+                                spec,
+                                input_blobs: inputs,
+                                estimated_result_bytes: None,
+                                receiver: Some((requester_id, receiver)),
+                                delivery_profile: Some(profile),
+                            },
+                            &snapshot,
+                            std::sync::Arc::new(packages),
+                        )
+                    },
+                )?,
                 limit,
             )
         }
@@ -669,13 +681,18 @@ fn dispatch(
             {
                 match sessions.record_client_delivery(ticket, request.id(), delivery) {
                     Ok(Some(receipt)) => {
+                        observe_result(
+                            receipt.worker,
+                            crate::dist::JobId(receipt.job),
+                            crate::dist::NativeLifecycleEvent::Delivered(receipt),
+                        );
                         trace!(target: "native_placement_replay", "{}", serde_json::json!({
                             "kind": "delivered", "job": receipt.job, "worker": receipt.worker,
                             "requester": receipt.requester,
                             "actual_client_completion_seconds": receipt.elapsed.as_secs_f64(),
                             "staging_nanoseconds": receipt.observation.staging_nanoseconds,
                             "selected_bytes": receipt.observation.selected_bytes,
-                        "direct_bytes": receipt.observation.direct_bytes,
+                            "direct_bytes": receipt.observation.direct_bytes,
                             "scheduler_bytes": receipt.observation.scheduler_bytes,
                             "unique_blobs": receipt.observation.unique_blobs,
                         }))

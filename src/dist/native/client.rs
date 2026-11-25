@@ -191,6 +191,7 @@ pub(super) struct Pin<'a> {
     client: &'a NativeCacheClient,
     pub(super) ticket: Ticket,
     assigned: bool,
+    selected: BTreeSet<String>,
     delivery: Option<ClientDeliveryObservation>,
 }
 
@@ -318,7 +319,8 @@ impl NativeCacheClient {
     ) -> Result<NativeBuildResult> {
         let mut inputs = LocalInputs::new(spec, inputs)?;
         let destinations = verify_destinations(spec, destinations)?;
-        match self.acquire_action(spec, &mut inputs, policy, local)? {
+        let selected = destinations.keys().cloned().collect();
+        match self.acquire_action(spec, &mut inputs, policy, local, &selected)? {
             Outcome::Ready {
                 mut delivery,
                 source,
@@ -326,7 +328,6 @@ impl NativeCacheClient {
             } => {
                 inputs.progress(NativeProgress::Phase(Phase::RestoreOutputs))?;
                 validate_manifest(spec, &manifest, policy.max_result_bytes)?;
-                let selected = destinations.keys().cloned().collect();
                 let declared = manifest.selected_blobs(&selected)?;
                 let staged =
                     delivery.with_download(policy.renewal_interval, &declared, |download| {
@@ -355,6 +356,7 @@ impl NativeCacheClient {
         inputs: &mut impl InputProvider,
         policy: &NativeBuildPolicy,
         local: Option<&LocalExecutor>,
+        selected: &BTreeSet<String>,
     ) -> Result<Outcome<'_>> {
         validate_policy(policy)?;
         let request = spec.action_request()?;
@@ -373,6 +375,7 @@ impl NativeCacheClient {
                         client: self,
                         ticket,
                         assigned: false,
+                        selected: selected.clone(),
                         delivery: None,
                     };
                     return Ok(Outcome::Ready {
@@ -412,6 +415,7 @@ impl NativeCacheClient {
                         client: self,
                         ticket,
                         assigned: false,
+                        selected: selected.clone(),
                         delivery: None,
                     };
                     return self.run_admitted(pin, spec, inputs, policy, start, local);
@@ -422,7 +426,7 @@ impl NativeCacheClient {
 
     fn schedule_with_retry(
         &self,
-        ticket: Ticket,
+        pin: &Pin<'_>,
         spec: &ExecutionSpec,
         start: Instant,
         timeout: Duration,
@@ -431,7 +435,7 @@ impl NativeCacheClient {
         loop {
             let remaining = timeout.saturating_sub(start.elapsed());
             ensure!(!remaining.is_zero(), "native allocation deadline exceeded");
-            match self.schedule(ticket, spec.clone()) {
+            match self.schedule_selected(pin.ticket, spec.clone(), pin.selected.clone()) {
                 Ok(reply) => return Ok(reply),
                 Err(error) if retryable_transport_error(&error) => {
                     debug!("retrying native allocation: {error:#}");
@@ -456,7 +460,7 @@ impl NativeCacheClient {
             return self.run_local(pin, spec, inputs, policy, start, local);
         }
         inputs.progress(NativeProgress::Phase(Phase::AllocateWorker))?;
-        let reply = self.schedule_with_retry(pin.ticket, spec, start, policy.timeout)?;
+        let reply = self.schedule_with_retry(&pin, spec, start, policy.timeout)?;
         let allocation = match reply {
             ScheduleReply::Assigned(allocation) => allocation,
             ScheduleReply::Unavailable { message } => {

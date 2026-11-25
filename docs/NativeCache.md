@@ -1075,7 +1075,7 @@ result limit. Publication pins its local result, then atomically charges only
 additional unique bytes into the grace pool; if actual capacity is exhausted,
 it waits outside the compiler slot with cancellation and lease checks. Existing
 grace leases never expire early. New forecast admission pauses while exact
-publishers are waiting. The persistent history format is version 5.
+publishers are waiting. The persistent history format is version 6.
 
 The opt-in `native_placement_replay` trace target logs JSON assignment records
 with job ID, hashed command family, selected worker, all eligible workers'
@@ -1095,7 +1095,14 @@ logical content bytes split by successful direct or scheduler source. The
 selected unique result closure includes diagnostics; its difference from
 received unique bytes measures local reuse, and its difference from the full
 manifest measures omitted outputs. Source plans are restricted to the selected
-closure in both direct and namespace clients. Local
+closure in both direct and namespace clients. The allocation carries the selected output names,
+and the receipt is validated against their exact committed unique closure.
+The scheduler learns the selected and remotely delivered fractions of full
+result size per authenticated receiver, command family, and selection.
+Four observations replace the full-result prior; recent reuse estimates
+expire after one hour and are checkpointed with the service history.
+Only the client-side forecast is scaled; publication remains independent.
+The overlap with missing scheduler content is estimated proportionally. Local
 installation after the broker's Done frame is outside this measurement. The
 replay separately evaluates end-to-end delivery forecasts using these receipts;
 missing receipts are not interpreted as zero-duration delivery. Join by job ID within

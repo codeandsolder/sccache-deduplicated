@@ -21,9 +21,9 @@ use crate::{
     PackageImportLimits, PackageTransferCost, ResultLease, ResultManifest, StagedBlob, TreeId,
     TreeLease, TreeManifest, UploadReservation, VerifiedPackage,
     wire::{
-        ActionRequest, BeginResult, ClientDeliveryObservation, InputDemand, InputPoll,
-        NativeAdmission, NativeStatus, Publisher, ScheduleReply, Ticket, TreeOffer, TreeRead,
-        WorkerAllocation,
+        ActionRequest, BeginResult, ClientDeliveryObservation, DeliverySelection, InputDemand,
+        InputPoll, NativeAdmission, NativeStatus, Publisher, ScheduleReply, Ticket, TreeOffer,
+        TreeRead, WorkerAllocation,
     },
 };
 
@@ -397,6 +397,7 @@ struct DelegatedAllocation {
     declaration: [u8; 32],
     worker: WorkerAllocation,
     requester: crate::PeerId,
+    selection: DeliverySelection,
     allocation_started: Instant,
     delivery_reported: bool,
 }
@@ -408,6 +409,8 @@ pub struct DeliveryReceipt {
     pub worker: crate::PeerId,
     pub job: u64,
     pub requester: crate::PeerId,
+    pub profile: ContentId,
+    pub result_bytes: u64,
     pub elapsed: Duration,
     pub observation: ClientDeliveryObservation,
 }
@@ -833,6 +836,7 @@ impl NativeSessions {
         ticket: Ticket,
         request: &ActionRequest,
         requester: crate::PeerId,
+        selection: DeliverySelection,
         allocate: impl FnOnce(
             BTreeMap<ContentId, u64>,
             Vec<&BTreeMap<ContentId, u64>>,
@@ -849,7 +853,9 @@ impl NativeSessions {
         // origin. Replay survives execution, publication and failure.
         if let Some(allocation) = &state.allocation {
             ensure!(
-                allocation.declaration == declaration && allocation.requester == requester,
+                allocation.declaration == declaration
+                    && allocation.requester == requester
+                    && allocation.selection == selection,
                 "allocation declaration differs from admission"
             );
             return Ok(ScheduleReply::Assigned(allocation.worker.clone()));
@@ -868,6 +874,14 @@ impl NativeSessions {
         ensure!(
             publisher == Publisher::Client && action.upload.is_none(),
             "native action already has a publisher"
+        );
+        ensure!(
+            selection
+                .outputs
+                .iter()
+                .all(|name| request.required_outputs.contains_key(name)
+                    || request.optional_outputs.contains_key(name)),
+            "undeclared selected output"
         );
         let mut blobs = BTreeMap::new();
         for tree in action.inputs.values() {
@@ -899,6 +913,7 @@ impl NativeSessions {
                 declaration,
                 worker: allocation.clone(),
                 requester,
+                selection,
                 allocation_started,
                 delivery_reported: false,
             });
@@ -1945,6 +1960,21 @@ impl NativeSessions {
         let Phase::Ready(Ready::Result(lease)) = &state.phase else {
             bail!("native delivery is not committed");
         };
+        let Some(allocation) = state.allocation.as_ref() else {
+            return Ok(None);
+        };
+        ensure!(
+            requester == allocation.requester,
+            "native delivery requester differs from allocation"
+        );
+        let selected = lease
+            .manifest()
+            .selected_blobs(&allocation.selection.outputs)?;
+        let selected_size = selected
+            .values()
+            .copied()
+            .try_fold(0_u64, u64::checked_add)
+            .context("selected size overflow")?;
         let declared = lease.manifest().blobs()?;
         let size = declared
             .values()
@@ -1957,18 +1987,14 @@ impl NativeSessions {
             .context("delivery size overflow")?;
         ensure!(
             bytes <= observation.selected_bytes
-                && observation.selected_bytes <= size
-                && observation.unique_blobs <= u64::try_from(declared.len())?
+                && observation.selected_bytes == selected_size
+                && observation.unique_blobs <= u64::try_from(selected.len())?
                 && (observation.unique_blobs != 0 || bytes == 0),
             "delivery exceeds result manifest"
         );
         let Some(allocation) = state.allocation.as_mut() else {
             return Ok(None);
         };
-        ensure!(
-            requester == allocation.requester,
-            "native delivery requester differs from allocation"
-        );
         if allocation.delivery_reported {
             return Ok(None);
         }
@@ -1983,6 +2009,8 @@ impl NativeSessions {
             worker: allocation.worker.peer,
             job: allocation.worker.job,
             requester,
+            profile: allocation.selection.profile,
+            result_bytes: size,
             elapsed,
             observation,
         };

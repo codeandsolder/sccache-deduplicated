@@ -78,6 +78,7 @@ pub(super) struct NativeTransferPlan<'a> {
     path_rates: BTreeMap<Peer, CachePathRates>,
     direct_inputs: BTreeMap<Peer, DirectInputs>,
     receiver: Option<&'a (ServerId, ClientDeliveryRates)>,
+    remote_fraction: u64,
 }
 
 const fn directional_rate(rates: CachePathRates, direction: Direction) -> Option<CachePathRate> {
@@ -302,6 +303,7 @@ impl<'a> NativeTransferPlan<'a> {
             path_rates,
             direct_inputs,
             receiver: None,
+            remote_fraction: 1_000_000,
         }
     }
 
@@ -310,6 +312,11 @@ impl<'a> NativeTransferPlan<'a> {
         receiver: Option<&'a (ServerId, ClientDeliveryRates)>,
     ) -> Self {
         self.receiver = receiver;
+        self
+    }
+
+    pub(super) const fn with_remote_fraction(mut self, fraction: u64) -> Self {
+        self.remote_fraction = fraction;
         self
     }
 
@@ -330,7 +337,13 @@ impl<'a> NativeTransferPlan<'a> {
             || self.send.rate(client, 16 << 20),
             |rate| rate.bytes_per_second,
         );
-        let full = u128::from(cost.result_bytes);
+        // Selection and local reuse affect only client delivery, never the
+        // scheduler's independently required durable publication. The exact
+        // future overlap with scheduler misses is unknown: scale proportionally.
+        let remote =
+            |bytes| (u128::from(bytes) * u128::from(self.remote_fraction)).div_ceil(1_000_000);
+        let full = remote(cost.result_bytes);
+        let missing = remote(cost.output_bytes).min(full);
         let scheduler_wire = self.send.wire_bytes(client, full);
         let scheduler_seconds = transfer_seconds(scheduler_wire, wire_rate);
         let direct_rate = match worker.principal() {
@@ -348,7 +361,6 @@ impl<'a> NativeTransferPlan<'a> {
             if direct_seconds <= scheduler_seconds {
                 return (publication.max(direct_seconds), 0.0);
             }
-            let missing = u128::from(cost.output_bytes).min(full);
             let cached = full - missing;
             let (cached_seconds, externality) =
                 self.client_scheduler_completion(client, negotiation_at, cached, wire_rate);
@@ -357,7 +369,6 @@ impl<'a> NativeTransferPlan<'a> {
         }
         // The exact future manifest is not known. Verified resident bytes
         // can be staged early; absent bytes become available at commit.
-        let missing = u128::from(cost.output_bytes).min(full);
         let (cached, first_delay) =
             self.client_scheduler_completion(client, negotiation_at, full - missing, wire_rate);
         let ready = publication.max(cached);
@@ -801,6 +812,15 @@ mod tests {
         assert_eq!(
             plan.client_completion(worker(1), 0.0, 0.0, cost),
             (1.0, 0.0)
+        );
+        assert_eq!(
+            plan.client_completion(worker(1), 0.0, 5.0, missing),
+            (5.0, 0.0)
+        );
+        let plan = plan.with_remote_fraction(250_000);
+        assert_eq!(
+            plan.client_completion(worker(1), 0.0, 0.0, cost),
+            (0.25, 0.0)
         );
         assert_eq!(
             plan.client_completion(worker(1), 0.0, 5.0, missing),

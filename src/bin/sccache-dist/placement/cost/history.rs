@@ -24,6 +24,7 @@ pub(crate) struct WorkerScope {
 pub(crate) struct CostBook {
     pub(super) workers: BTreeMap<WorkerScope, ActionCosts>,
     pub(super) revision: u64,
+    pub(super) receivers: super::receiver::DeliveryHistory,
 }
 
 fn median(mut values: Vec<u64>) -> Option<u64> {

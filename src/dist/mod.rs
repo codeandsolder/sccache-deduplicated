@@ -969,6 +969,8 @@ pub struct NativeAssignment {
     /// Scheduler-local authenticated requester and advisory delivery telemetry.
     #[serde(skip)]
     pub receiver: Option<(ServerId, crate::build_runtime::wire::ClientDeliveryRates)>,
+    #[serde(skip)]
+    pub delivery_profile: Option<crate::build_runtime::ContentId>,
 }
 
 /// One scheduler assignment routed through the common capacity accounting.
@@ -1122,6 +1124,7 @@ pub struct NativePlacement {
 /// the corresponding session operation has succeeded.
 #[cfg(feature = "dist-server")]
 pub enum NativeLifecycleEvent<'a> {
+    Delivered(crate::build_runtime::DeliveryReceipt),
     InputsStaged,
     Negotiated,
     Committed {

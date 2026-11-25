@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 const LIMIT: u64 = 16 << 20;
 const INTERVAL: Duration = Duration::from_secs(60);
 
@@ -70,11 +70,21 @@ struct SavedWorker {
 }
 
 #[derive(Serialize, Deserialize)]
+struct SavedDelivery {
+    key: super::receiver::Key,
+    selected: u64,
+    remote: u64,
+    count: u64,
+    age_millis: u64,
+}
+
+#[derive(Serialize, Deserialize)]
 struct Snapshot {
     version: u32,
     listener: SocketAddr,
     saved_at_millis: u64,
     workers: Vec<SavedWorker>,
+    deliveries: Vec<SavedDelivery>,
 }
 
 fn unix_millis() -> Result<u64> {
@@ -123,6 +133,21 @@ impl Snapshot {
             listener,
             saved_at_millis: wall,
             workers,
+            deliveries: book
+                .receivers
+                .samples
+                .iter()
+                .filter_map(|(&key, sample)| {
+                    let age = now.saturating_duration_since(sample.seen);
+                    (age < super::receiver::TTL).then(|| SavedDelivery {
+                        key,
+                        selected: sample.selected,
+                        remote: sample.remote,
+                        count: sample.count,
+                        age_millis: u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -195,6 +220,31 @@ impl Snapshot {
                         )
                         .is_none(),
                     "duplicate worker history"
+                );
+            }
+        }
+        ensure!(
+            self.deliveries.len() <= super::receiver::LIMIT,
+            "too many receiver histories"
+        );
+        for saved in self.deliveries {
+            let age = Duration::from_millis(elapsed.saturating_add(saved.age_millis));
+            if age >= super::receiver::TTL {
+                continue;
+            }
+            let Some(seen) = now.checked_sub(age) else {
+                continue;
+            };
+            let sample = super::receiver::Sample {
+                selected: saved.selected,
+                remote: saved.remote,
+                count: saved.count,
+                seen,
+            };
+            if sample.valid() {
+                ensure!(
+                    book.receivers.samples.insert(saved.key, sample).is_none(),
+                    "duplicate receiver history in checkpoint"
                 );
             }
         }
@@ -325,6 +375,25 @@ mod tests {
                 now,
             );
         }
+        let profile = ContentId::of(b"final-only");
+        let receipt = sccache::build_runtime::DeliveryReceipt {
+            worker: scope.peer,
+            job: 1,
+            requester: scope.peer,
+            profile,
+            result_bytes: 1000,
+            elapsed: Duration::from_secs(1),
+            observation: sccache::build_runtime::wire::ClientDeliveryObservation {
+                selected_bytes: 500,
+                direct_bytes: 100,
+                scheduler_bytes: 0,
+                unique_blobs: 1,
+                staging_nanoseconds: 0,
+            },
+        };
+        for _ in 0..4 {
+            book.observe_delivery(receipt, now);
+        }
         save(&path, &Snapshot::capture(&book, listener, now, wall))?;
         let restored = load(
             &path,
@@ -343,6 +412,10 @@ mod tests {
             restored.predict(scope, class, &placement, now + Duration::from_secs(60));
         assert_eq!(restored_cost.output_bytes, 100);
         assert_eq!(restored_cost.result_bytes, 752);
+        assert_eq!(
+            restored.delivery_fraction(scope.peer, profile, now + Duration::from_secs(60)),
+            100_000
+        );
         assert_eq!(
             restored
                 .predict(scope, class, &placement, now + Duration::from_secs(60))

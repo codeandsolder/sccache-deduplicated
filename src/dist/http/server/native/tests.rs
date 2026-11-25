@@ -195,6 +195,7 @@ fn with_native_service(
                         },
                         observe_result: &|server, job, event| {
                             let result = match event {
+                                crate::dist::NativeLifecycleEvent::Delivered(_) => return,
                                 crate::dist::NativeLifecycleEvent::InputsStaged => {
                                     Observation::Staged
                                 }

@@ -167,7 +167,7 @@ fn serve_inner(
         stream,
         limit: policy.max_metadata_bytes,
     };
-    match client.acquire_action(&spec, &mut inputs, &build_policy, local)? {
+    match client.acquire_action(&spec, &mut inputs, &build_policy, local, &selected)? {
         Outcome::Failed { source, failure } => {
             send(
                 stream,

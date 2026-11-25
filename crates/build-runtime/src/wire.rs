@@ -326,6 +326,31 @@ impl ClientDeliveryRates {
     }
 }
 
+/// Scheduler-derived delivery profile, distinct from the action identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliverySelection {
+    pub profile: ContentId,
+    pub outputs: BTreeSet<String>,
+}
+
+impl DeliverySelection {
+    /// The command-family hash and exact selected names form a stable profile.
+    ///
+    /// # Errors
+    /// Returns an error for undeclared output names or encoding failure.
+    pub fn new(spec: &crate::ExecutionSpec, outputs: BTreeSet<String>) -> Result<Self> {
+        ensure!(
+            outputs.iter().all(|name| spec.outputs.contains_key(name)),
+            "undeclared selected output"
+        );
+        let profile = ContentId(typed_digest(
+            b"sccache-delivery-profile-v1\0",
+            &(spec.placement_class()?, &outputs),
+        )?);
+        Ok(Self { profile, outputs })
+    }
+}
+
 /// Successfully staged unique content, split by the actual delivery source.
 /// Counts exclude failed attempts and repeated reads of the same content.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

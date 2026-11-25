@@ -72,6 +72,13 @@ fn empty_root() -> TreeManifest {
     }
 }
 
+fn selection() -> DeliverySelection {
+    DeliverySelection {
+        profile: ContentId::of(b"test command family"),
+        outputs: BTreeSet::from(["obj".into()]),
+    }
+}
+
 fn request() -> Result<ActionRequest> {
     let root = empty_root();
     let id = root.id()?;
@@ -291,23 +298,45 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     };
     let expected = ScheduleReply::Assigned(allocation);
     assert_eq!(
-        service.schedule(ticket, &request()?, test_peer(9), |_, _| Ok(
+        service.schedule(ticket, &request()?, test_peer(9), selection(), |_, _| Ok(
             expected.clone()
         ))?,
         expected
     );
     assert_eq!(
-        service.schedule(ticket, &request()?, test_peer(9), |_, _| bail!(
-            "duplicate allocation"
-        ))?,
+        service.schedule(
+            ticket,
+            &request()?,
+            test_peer(9),
+            selection(),
+            |_, _| bail!("duplicate allocation")
+        )?,
         expected
     );
     assert!(service.renew(ticket, Publisher::Client).is_err());
     assert!(
         service
-            .schedule(ticket, &request()?, test_peer(8), |_, _| bail!(
-                "wrong requester"
-            ))
+            .schedule(
+                ticket,
+                &request()?,
+                test_peer(9),
+                DeliverySelection {
+                    outputs: BTreeSet::new(),
+                    ..selection()
+                },
+                |_, _| bail!("selection changed")
+            )
+            .is_err()
+    );
+    assert!(
+        service
+            .schedule(
+                ticket,
+                &request()?,
+                test_peer(8),
+                selection(),
+                |_, _| bail!("wrong requester")
+            )
             .is_err()
     );
     assert!(
@@ -321,7 +350,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
         .insert("other".into(), crate::OutputKind::File);
     assert!(
         service
-            .schedule(ticket, &changed, test_peer(9), |_, _| bail!(
+            .schedule(ticket, &changed, test_peer(9), selection(), |_, _| bail!(
                 "wrong declaration"
             ))
             .is_err()
@@ -360,9 +389,13 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     service.renew(ticket, Publisher::Client)?;
 
     assert_eq!(
-        service.schedule(ticket, &request()?, test_peer(9), |_, _| bail!(
-            "duplicate assignment"
-        ))?,
+        service.schedule(
+            ticket,
+            &request()?,
+            test_peer(9),
+            selection(),
+            |_, _| bail!("duplicate assignment")
+        )?,
         expected
     );
     assert_eq!(missing.len(), 1);
@@ -398,6 +431,19 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
             )
             .is_err()
     );
+    assert!(
+        service
+            .record_client_delivery(
+                ticket,
+                test_peer(9),
+                ClientDeliveryObservation {
+                    selected_bytes: 5,
+                    direct_bytes: 5,
+                    ..delivered
+                }
+            )
+            .is_err()
+    );
     let receipt = service
         .record_client_delivery(ticket, test_peer(9), delivered)?
         .context("missing receipt")?;
@@ -418,14 +464,18 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
 
     // A worker can finish while the original schedule response is lost.
     assert_eq!(
-        service.schedule(ticket, &request()?, test_peer(9), |_, _| bail!(
-            "duplicate assignment after commit"
-        ))?,
+        service.schedule(
+            ticket,
+            &request()?,
+            test_peer(9),
+            selection(),
+            |_, _| bail!("duplicate assignment after commit")
+        )?,
         expected
     );
     assert!(
         service
-            .schedule(ticket, &changed, test_peer(9), |_, _| bail!(
+            .schedule(ticket, &changed, test_peer(9), selection(), |_, _| bail!(
                 "wrong declaration after commit"
             ))
             .is_err()
@@ -446,7 +496,9 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
         bail!("expected second compilation");
     };
     assert_eq!(
-        service.schedule(ticket, &failed, test_peer(9), |_, _| Ok(expected.clone()))?,
+        service.schedule(ticket, &failed, test_peer(9), selection(), |_, _| Ok(
+            expected.clone()
+        ))?,
         expected
     );
     // The same bytes are already durable from the previous action. A
@@ -473,7 +525,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     assert_eq!(bytes, b"object");
     service.fail(ticket, publisher)?;
     assert_eq!(
-        service.schedule(ticket, &failed, test_peer(9), |_, _| bail!(
+        service.schedule(ticket, &failed, test_peer(9), selection(), |_, _| bail!(
             "duplicate assignment after failure"
         ))?,
         expected
@@ -531,7 +583,7 @@ fn delegation_blocks_early_worker_verification_until_assignment_returns() -> Res
                 done.send(service.verify_execution(ticket, publisher, action))?;
                 Ok(())
             });
-            let reply = service.schedule(ticket, action, test_peer(9), |_, _| {
+            let reply = service.schedule(ticket, action, test_peer(9), selection(), |_, _| {
                 start.send(())?;
                 attempt_rx.recv_timeout(Duration::from_secs(5))?;
                 // The action mutex is still held while assignment returns.

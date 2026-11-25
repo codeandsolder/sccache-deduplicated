@@ -15,6 +15,7 @@ pub use network::{
     SharedCapacity, TransferDemand, transfer_seconds,
 };
 mod package;
+mod placement_class;
 pub use installation::{InstallationManifest, InstallationRecipe, InstalledComponent};
 pub use package::{
     ArchiveLength, PackageArchive, PackageCatalog, PackageCompression, PackageDeliveryLimits,
