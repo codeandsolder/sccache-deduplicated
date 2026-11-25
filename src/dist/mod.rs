@@ -47,6 +47,8 @@ pub mod execution_queue;
 pub mod http;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 pub mod native;
+#[cfg(all(target_os = "linux", feature = "dist-server"))]
+pub mod rooted_fs;
 #[cfg(test)]
 mod test;
 

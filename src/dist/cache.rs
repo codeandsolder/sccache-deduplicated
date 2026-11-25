@@ -1218,7 +1218,8 @@ impl StagedToolchainArchive {
         toolchain: Toolchain,
         max_size: u64,
     ) -> Result<Self> {
-        use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
+        use crate::dist::rooted_fs::{self, Symlinks};
+        use nix::fcntl::OFlag;
         use std::os::fd::AsRawFd;
 
         if !source_root.is_absolute() {
@@ -1228,10 +1229,12 @@ impl StagedToolchainArchive {
         // directories. NONBLOCK avoids waiting on a malicious FIFO.
         let root = std::fs::File::open("/")?;
         let path = source_root.join(make_lru_key_path(&toolchain.archive_id));
-        let how = OpenHow::new()
-            .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)
-            .resolve(ResolveFlag::RESOLVE_IN_ROOT | ResolveFlag::RESOLVE_NO_SYMLINKS);
-        let source = std::fs::File::from(openat2(&root, &path, how)?);
+        let source = std::fs::File::from(rooted_fs::open(
+            &root,
+            &path,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+            Symlinks::Deny,
+        )?);
         let meta = source.metadata()?;
         if !meta.is_file() || meta.len() > max_size {
             return Err(anyhow!(

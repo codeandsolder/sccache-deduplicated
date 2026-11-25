@@ -18,10 +18,11 @@ use anyhow::{Context, Error, Result, anyhow, bail};
 use fs_err as fs;
 use libmount::Overlay;
 use nix::errno::Errno;
-use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
+use nix::fcntl::OFlag;
 use nix::sys::stat::{Mode, mkdirat};
 use sccache::compression::ZstdFrame;
 use sccache::compression::deflate::unpack_gzip;
+use sccache::dist::rooted_fs::{self, Symlinks};
 use sccache::dist::{
     BuildResult, BuilderIncoming, CompileCommand, InputsReader, JobId, OutputRequest,
     ProcessOutput, TcCache, Toolchain,
@@ -56,10 +57,12 @@ impl RootedBuildFs {
         // RESOLVE_IN_ROOT interprets absolute paths and absolute symlinks
         // relative to the build root. NO_MAGICLINKS also forbids procfs-like
         // special links that are not ordinary filesystem symlinks.
-        let how = OpenHow::new()
-            .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
-            .resolve(ResolveFlag::RESOLVE_IN_ROOT | ResolveFlag::RESOLVE_NO_MAGICLINKS);
-        openat2(&self.root, path, how).map_err(Into::into)
+        rooted_fs::open(
+            &self.root,
+            path,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Symlinks::WithinRoot,
+        )
     }
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
@@ -106,10 +109,12 @@ impl RootedBuildFs {
     }
 
     fn open_output(&self, path: &Path) -> io::Result<std::fs::File> {
-        let how = OpenHow::new()
-            .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)
-            .resolve(ResolveFlag::RESOLVE_IN_ROOT | ResolveFlag::RESOLVE_NO_MAGICLINKS);
-        let fd = openat2(&self.root, path, how)?;
+        let fd = rooted_fs::open(
+            &self.root,
+            path,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+            Symlinks::WithinRoot,
+        )?;
         let file = std::fs::File::from(fd);
         if !file.metadata()?.is_file() {
             return Err(io::Error::new(
