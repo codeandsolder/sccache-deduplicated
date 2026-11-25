@@ -24,7 +24,7 @@ fn validate_purpose(ca: &X509Ref, leaf: &X509Ref, purpose: X509PurposeId) -> Res
 
 /// Verify the persisted identity and issuer independently of certificate
 /// lifetime. Only renewal recovery uses this without the full TLS checks.
-pub(super) fn verify_leaf_identity(
+pub fn verify_leaf_identity(
     identity: &Identity,
     certificate: &X509Ref,
     ca: &X509Ref,
