@@ -242,6 +242,19 @@ fn run(final_only: bool, args: Vec<OsString>) -> Result<i32> {
     {
         // The launcher owns the mount and one connection-owned retention
         // lease. It is not a compiler or another cache daemon.
+        // Each active FUSE inode has a backing descriptor. Match the
+        // inherited hard limit, rather than the shell's small soft limit.
+        // SAFETY: rlimit is initialized by getrlimit before being read.
+        unsafe {
+            let mut limit = std::mem::zeroed::<libc::rlimit>();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == -1 {
+                return Err(std::io::Error::last_os_error()).context("query descriptor limit");
+            }
+            limit.rlim_cur = limit.rlim_max;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == -1 {
+                return Err(std::io::Error::last_os_error()).context("raise descriptor limit");
+            }
+        }
         let mut scratch = ScratchLease::create(&scratch_base()?)?;
         let mount = scratch.path.join("intermediates");
         let backing = scratch.path.join("namespace");

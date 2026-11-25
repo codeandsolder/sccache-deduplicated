@@ -119,6 +119,15 @@ impl IntermediateFs {
     }
 }
 impl Filesystem for IntermediateFs {
+    fn init(&mut self, _: &Request, config: &mut fuser::KernelConfig) -> io::Result<()> {
+        // Without atomic truncation the kernel opens a file for writing
+        // before truncating it, forcing unnecessary copy-on-write reads.
+        config
+            .add_capabilities(fuser::InitFlags::FUSE_ATOMIC_O_TRUNC)
+            .map_err(|_| io::Error::other("kernel lacks atomic truncating open"))?;
+        Ok(())
+    }
+
     fn lookup(&self, _: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         reply_entry(reply, self.lookup_attr(parent, name));
     }

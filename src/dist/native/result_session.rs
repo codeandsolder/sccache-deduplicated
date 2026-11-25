@@ -82,9 +82,19 @@ impl NativeResultSession {
 
 impl Drop for NativeResultSession {
     fn drop(&mut self) {
-        drop(self.renewals.take());
-        if let Err(error) = self.client.close_retention(self.group) {
-            log::debug!("intermediate lease close: {error:#}");
+        let renewals = self.renewals.take();
+        let client = self.client.clone();
+        let group = self.group;
+        let cleanup = move || {
+            drop(renewals);
+            if let Err(error) = client.close_retention(group) {
+                log::debug!("intermediate lease close: {error:#}");
+            }
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(cleanup);
+        } else {
+            cleanup();
         }
     }
 }

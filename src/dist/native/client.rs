@@ -266,15 +266,18 @@ impl Delivery<'_> {
     ) -> Result<()> {
         match self {
             Self::Scheduler(pin, publication) => {
-                if let Some(pending) = publication.take() {
-                    pin.client.with_renewal(pin.ticket, interval, |check| {
-                        check()?;
-                        pending.confirm(pin)
-                    })?;
-                }
-                session.retain(pin.ticket, manifest)
+                pin.client.with_renewal(pin.ticket, interval, |check| {
+                    check()?;
+                    if let Some(pending) = publication.take() {
+                        pending.confirm(pin)?;
+                    }
+                    session.retain(pin.ticket, manifest)
+                })
             }
-            Self::Local(_, pin) => session.retain(pin.ticket, manifest),
+            Self::Local(_, pin) => pin.client.with_renewal(pin.ticket, interval, |check| {
+                check()?;
+                session.retain(pin.ticket, manifest)
+            }),
         }
     }
 

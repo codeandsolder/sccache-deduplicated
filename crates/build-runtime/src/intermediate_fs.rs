@@ -15,10 +15,7 @@ use std::{
     io::{self, Read, Seek, SeekFrom},
     os::{
         fd::AsRawFd,
-        unix::{
-            ffi::OsStrExt,
-            fs::{FileExt, MetadataExt, PermissionsExt},
-        },
+        unix::fs::{FileExt, MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
@@ -225,7 +222,7 @@ impl Namespace {
         }
     }
 }
-type Spool = Arc<Mutex<Option<Arc<File>>>>;
+type Spool = Arc<Mutex<Option<tempfile::TempPath>>>;
 struct IntermediateFs {
     session: Ticket,
     content: Arc<dyn IntermediateContent>,
@@ -275,10 +272,10 @@ impl IntermediateFs {
         };
         let mut file = lock(&slot)?;
         if let Some(file) = file.as_ref() {
-            return Ok(Arc::clone(file));
+            return Ok(Arc::new(File::open(file)?));
         }
-        let mut staged = tempfile::tempfile_in(&self.scratch)?;
-        self.content.fetch(reference, &mut staged)?;
+        let mut staged = tempfile::NamedTempFile::new_in(&self.scratch)?;
+        self.content.fetch(reference, staged.as_file_mut())?;
         ensure!(
             staged.metadata()?.len() == reference.blob.size,
             "intermediate length mismatch"
@@ -297,9 +294,9 @@ impl IntermediateFs {
             hasher.finalize().as_bytes() == &reference.blob.id.0,
             "intermediate digest mismatch"
         );
-        let staged = Arc::new(staged);
-        *file = Some(Arc::clone(&staged));
-        Ok(staged)
+        let reader = Arc::new(staged.reopen()?);
+        *file = Some(staged.into_temp_path());
+        Ok(reader)
     }
     // Caller holds the inode mutation lock. A write-open detaches before
     // returning to the kernel, so pending mmap writes cannot advertise a
@@ -308,7 +305,7 @@ impl IntermediateFs {
         let Some(reference) = node.reference()? else {
             return Ok(());
         };
-        let mut destination = node.open(OFlags::WRONLY)?;
+        let destination = node.open(OFlags::WRONLY)?;
         if discard {
             destination.set_len(0)?;
         } else {
@@ -361,6 +358,7 @@ impl IntermediateFs {
                 && node.reference()?.is_none(),
             "reference publication requires a fresh empty file"
         );
+        let destination = node.open(OFlags::WRONLY)?;
         // Marker first. A failed length update cannot expose zero-filled
         // bytes, and the staging inode is never published on failure.
         rfs::setxattr(
@@ -369,7 +367,7 @@ impl IntermediateFs {
             &reference.encode(),
             rfs::XattrFlags::CREATE,
         )?;
-        if let Err(error) = node.open(OFlags::WRONLY)?.set_len(reference.blob.size) {
+        if let Err(error) = destination.set_len(reference.blob.size) {
             let _ = rfs::removexattr(node.path(), INTERNAL);
             return Err(error.into());
         }
@@ -496,3 +494,6 @@ pub fn attach_intermediate(file: &File, reference: IntermediateReference) -> Res
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

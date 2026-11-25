@@ -700,6 +700,7 @@ where
             rewrite_includes_only,
             storage,
             cache_control,
+            ..
         } = context;
         let start_of_compilation = std::time::SystemTime::now();
         let mut parsed_args = self.parsed_args.clone();
