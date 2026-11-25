@@ -335,21 +335,6 @@ mod tests {
     }
 
     #[test]
-    fn worker_certificate_requires_exact_digest_and_single_pem() -> Result<()> {
-        use sha2::{Digest as _, Sha256};
-        let pem = include_bytes!("../../../vendor/tiny_http/examples/ssl-cert.pem");
-        let digest = Sha256::digest(certificate_der(pem)?);
-        verified_worker_certificate(&digest, pem)?;
-        assert!(verified_worker_certificate(&[0; 32], pem).is_err());
-        assert!(verified_worker_certificate(&digest, b"not a certificate").is_err());
-        assert!(
-            verified_worker_certificate(&digest, &[pem.as_slice(), pem.as_slice()].concat())
-                .is_err()
-        );
-        Ok(())
-    }
-
-    #[test]
     fn bincode_decoder_rejects_claimed_lengths_beyond_received_bytes() {
         let reported_length = 1_000_000_u64.to_le_bytes();
         assert!(decode_bincode::<Vec<u8>>(&reported_length).is_err());

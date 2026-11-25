@@ -222,6 +222,25 @@ impl Listener {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.socket.local_addr()?)
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_until(self, stop: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            tokio::select! {
+                result = self.run_async() => result,
+                _ = stop => Ok(()),
+            }
+        })
+    }
+
     pub(super) fn run(self) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
