@@ -50,7 +50,7 @@ pub fn open_peer(
     config: PeerConfig,
     scheduler: &reqwest::Url,
     role: Role,
-    enrollment_token: impl FnOnce() -> Result<String>,
+    enrollment_token: impl Fn() -> Result<String> + Send + Sync + 'static,
 ) -> Result<Arc<PeerCredentials>> {
     let address = sccache_cluster_identity::endpoint(scheduler)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -98,7 +98,14 @@ impl BlockingRoutes {
     }
 
     pub fn for_peer(peer: Arc<PeerCredentials>) -> Self {
-        Self::new(move || peer.current())
+        Self::new(move || {
+            let current = peer.current()?;
+            anyhow::ensure!(
+                !current.renewal_due(Duration::ZERO)?,
+                "cluster credential expired"
+            );
+            Ok(current)
+        })
     }
 
     fn probe(&self, peer: PeerId, role: Role, probe: Probe) {

@@ -4,7 +4,7 @@ use sccache_cluster_identity::{ClusterHttpClient, PeerCredentials, Role, TlsCred
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use super::{
@@ -47,7 +47,11 @@ impl WorkerRoutes {
             Ok(credentials) => credentials,
             Err(error) => {
                 warn!("Cluster credential renewal will be retried: {error:#}");
-                self.peer.current()?
+                let current = self.peer.current()?;
+                if current.renewal_due(Duration::ZERO)? {
+                    return Err(error);
+                }
+                current
             }
         };
         let mut paths = self

@@ -376,6 +376,65 @@ mod tests {
         })
     }
 
+    fn expired_leaf(ca: &ClusterCa, identity: Identity) -> Result<TlsCredentials> {
+        use openssl::{asn1::Asn1Time, hash::MessageDigest};
+        let mut builder = ca.leaf_builder(&identity.request()?, Role::Worker, 7)?;
+        builder.set_not_before(Asn1Time::from_unix(1)?.as_ref())?;
+        builder.set_not_after(Asn1Time::from_unix(2)?.as_ref())?;
+        builder.sign(&ca.key, MessageDigest::sha256())?;
+        Ok(TlsCredentials {
+            identity,
+            certificate: builder.build(),
+            ca: ca.certificate().clone(),
+            role: Role::Worker,
+        })
+    }
+
+    #[tokio::test]
+    async fn expired_running_peer_reenrolls_once_and_revocation_still_wins() -> Result<()> {
+        use crate::{PeerConfig, PeerCredentials, open_identity, publish_trust_anchor};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let directory = tempfile::tempdir()?;
+        let server = server(directory.path(), false).await?;
+        let anchor = directory.path().join("anchor.pem");
+        publish_trust_anchor(&server.ca, &anchor)?;
+        let config = PeerConfig {
+            directory: directory.path().join("member"),
+            ca_certificate: anchor,
+            scheduler_id: server.id,
+        };
+        let ca = ClusterCa::open(&directory.path().join("ca.pem"))?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let token_calls = Arc::clone(&calls);
+        let peer = PeerCredentials::open(config.clone(), server.address, Role::Worker, move || {
+            token_calls.fetch_add(1, Ordering::Relaxed);
+            Ok("worker-token".into())
+        })
+        .await?;
+        let member_id = peer.current()?.id()?;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        peer.install_test_credential(expired_leaf(&ca, open_identity(&config)?)?)?;
+        let (first, second) = tokio::join!(peer.refresh(), peer.refresh());
+        let (first, second) = (first?, second?);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.id()?, member_id);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let reloaded = TlsCredentials::load(
+            open_identity(&config)?,
+            &config.directory.join("leaf.der"),
+            server.ca.clone(),
+            Role::Worker,
+        )?;
+        assert_eq!(first.certificate.to_der()?, reloaded.certificate.to_der()?);
+        peer.install_test_credential(expired_leaf(&ca, open_identity(&config)?)?)?;
+        server.enrollment.authority().registry().revoke(member_id)?;
+        assert!(peer.refresh().await.is_err());
+        assert!(peer.refresh().await.is_err()); // retry delay, not another enrollment
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert!(peer.current()?.renewal_due(std::time::Duration::ZERO)?);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn data_listener_requires_mutual_tls() -> Result<()> {
         let directory = tempfile::tempdir()?;

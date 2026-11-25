@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     path::Path,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -15,6 +15,7 @@ use super::{EnrollmentClient, Identity, PeerId, Role, TlsCredentials};
 use sccache_peer_identity::PeerConfig;
 
 const RENEWAL_WINDOW: Duration = Duration::from_hours(24);
+const RENEWAL_RETRY: Duration = Duration::from_secs(5);
 
 /// Persistent member identity and current certificate. The scheduler is
 /// authenticated before any enrollment credential is transmitted.
@@ -24,6 +25,9 @@ pub struct PeerCredentials {
     scheduler: SocketAddr,
     role: Role,
     current: Mutex<Arc<TlsCredentials>>,
+    // Serialize renewal/enrollment across all worker and client transport paths.
+    renewal: tokio::sync::Mutex<Option<Instant>>,
+    enrollment_token: Box<dyn Fn() -> Result<String> + Send + Sync>,
 }
 
 /// Open the member key before requesting a key-bound enrollment token.
@@ -55,7 +59,7 @@ impl PeerCredentials {
         config: PeerConfig,
         scheduler: SocketAddr,
         role: Role,
-        enrollment_token: impl FnOnce() -> Result<String>,
+        enrollment_token: impl Fn() -> Result<String> + Send + Sync + 'static,
     ) -> Result<Self> {
         ensure!(
             role != Role::Scheduler,
@@ -97,6 +101,8 @@ impl PeerCredentials {
             scheduler,
             role,
             current: Mutex::new(Arc::new(credential)),
+            renewal: tokio::sync::Mutex::new(None),
+            enrollment_token: Box::new(enrollment_token),
         })
     }
 
@@ -111,7 +117,8 @@ impl PeerCredentials {
             .map_err(|_| anyhow::anyhow!("cluster credentials poisoned"))
     }
 
-    /// Renew a near-expiry leaf, preserving the local identity and role.
+    /// Renew a near-expiry leaf, or re-enroll an expired leaf under the same key.
+    /// Concurrent transport paths share the renewal operation.
     ///
     /// # Errors
     /// Returns an error if renewal or durable publication fails.
@@ -120,28 +127,77 @@ impl PeerCredentials {
         if !current.renewal_due(RENEWAL_WINDOW)? {
             return Ok(current);
         }
-        let client = EnrollmentClient::new(
-            &self.ca,
-            self.config.scheduler_id,
-            self.scheduler,
-            Some(&current),
-        )?;
-        let renewed = Arc::new(
-            client
-                .renew(open_identity(&self.config)?, self.role)
-                .await?,
-        );
+        // Another path may already be renewing this exact identity.
+        let mut retry_at = self.renewal.lock().await;
+        let current = self.current()?;
+        if !current.renewal_due(RENEWAL_WINDOW)? {
+            return Ok(current);
+        }
+        if retry_at.is_some_and(|retry| retry > Instant::now()) {
+            ensure!(
+                !current.renewal_due(Duration::ZERO)?,
+                "expired cluster credential awaiting enrollment retry"
+            );
+            return Ok(current);
+        }
+        let renewed = match self.renew(&current).await {
+            Ok(renewed) => renewed,
+            Err(error) => {
+                *retry_at = Some(Instant::now() + RENEWAL_RETRY);
+                return Err(error);
+            }
+        };
+        *retry_at = None;
         let mut active = self
             .current
             .lock()
             .map_err(|_| anyhow::anyhow!("cluster credentials poisoned"))?;
-        if Arc::ptr_eq(&current, &active) {
-            renewed.persist(&self.config.directory.join("leaf.der"))?;
-            *active = renewed;
-        }
-        let credential = Arc::clone(&active);
+        *active = Arc::clone(&renewed);
         drop(active);
-        Ok(credential)
+        drop(retry_at);
+        Ok(renewed)
+    }
+
+    async fn renew(&self, current: &TlsCredentials) -> Result<Arc<TlsCredentials>> {
+        let identity = open_identity(&self.config)?;
+        ensure!(
+            identity.id()? == current.id()?,
+            "persisted identity changed during daemon lifetime"
+        );
+        let expired = current.renewal_due(Duration::ZERO)?;
+        let client = EnrollmentClient::new(
+            &self.ca,
+            self.config.scheduler_id,
+            self.scheduler,
+            (!expired).then_some(current),
+        )?;
+        let renewed = Arc::new(if expired {
+            // A daemon may be offline for longer than the leaf lifetime.
+            // Bootstrap authorization is rechecked by the same registry,
+            // and revoked keys cannot re-enroll.
+            let token = (self.enrollment_token)()?;
+            client.enroll(identity, self.role, &token).await?
+        } else {
+            client.renew(identity, self.role).await?
+        });
+        renewed.persist(&self.config.directory.join("leaf.der"))?;
+        Ok(renewed)
+    }
+
+    #[cfg(test)]
+    pub fn install_test_credential(&self, credential: TlsCredentials) -> Result<()> {
+        // A signed but already expired certificate simulates a prolonged
+        // daemon outage without changing the system clock.
+        ensure!(
+            credential.id()? == self.current()?.id()?,
+            "wrong test identity"
+        );
+        credential.persist(&self.config.directory.join("leaf.der"))?;
+        *self
+            .current
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cluster credentials poisoned"))? = Arc::new(credential);
+        Ok(())
     }
 
     /// Scheduler identity as provisioned out of band.

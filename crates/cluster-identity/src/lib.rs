@@ -185,6 +185,17 @@ impl ClusterCa {
     /// # Errors
     /// Rejects invalid proof of possession, unsupported keys or certificate failures.
     pub fn issue(&self, request: &X509Req, role: Role, days: u32) -> Result<X509> {
+        let mut builder = self.leaf_builder(request, role, days)?;
+        builder.sign(&self.key, MessageDigest::sha256())?;
+        let certificate = builder.build();
+        ensure!(
+            certificate.not_after() <= self.certificate.not_after(),
+            "leaf outlives cluster CA"
+        );
+        Ok(certificate)
+    }
+
+    fn leaf_builder(&self, request: &X509Req, role: Role, days: u32) -> Result<X509Builder> {
         let key = request.public_key()?;
         validate_request_key(&key)?;
         ensure!(request.verify(&key)?, "invalid CSR signature");
@@ -205,13 +216,7 @@ impl ClusterCa {
             .dns(&tls_name)
             .build(&builder.x509v3_context(Some(&self.certificate), None))?;
         builder.append_extension(san)?;
-        builder.sign(&self.key, MessageDigest::sha256())?;
-        let certificate = builder.build();
-        ensure!(
-            certificate.not_after() <= self.certificate.not_after(),
-            "leaf outlives cluster CA"
-        );
-        Ok(certificate)
+        Ok(builder)
     }
 }
 

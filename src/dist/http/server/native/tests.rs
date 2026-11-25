@@ -79,13 +79,14 @@ fn make_client(endpoint: &TestEndpoint, token: &str) -> Result<NativeCacheClient
         "client-token" => &endpoint.client,
         "worker-token" => &endpoint.worker,
         _ => {
+            let token = token.to_owned();
             return NativeCacheClient::new(
                 &endpoint.url,
                 crate::dist::cluster::open_peer(
                     endpoint.rejected_config.clone(),
                     &endpoint.url,
                     Role::Client,
-                    || Ok(token.to_owned()),
+                    move || Ok(token.clone()),
                 )?,
                 Duration::from_secs(10),
                 1024 * 1024,

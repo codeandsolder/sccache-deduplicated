@@ -229,7 +229,7 @@ fn package_client(client_config: &Path) -> Result<sccache::dist::native::NativeC
             .context("scheduler endpoint required")?
             .to_url(),
         sccache_cluster_identity::Role::Client,
-        || Ok(token),
+        move || Ok(token.clone()),
     )?;
     NativeCacheClient::new(
         &native.endpoint.to_url(),
@@ -581,7 +581,7 @@ fn cluster_status(client_config: &Path) -> Result<i32> {
             .context("scheduler endpoint required")?
             .to_url(),
         Role::Client,
-        || Ok(token),
+        move || Ok(token.clone()),
     )?;
     let routes = dist::cluster::BlockingRoutes::for_peer(std::sync::Arc::clone(&peer));
     let (http, base) = routes.endpoint(
@@ -708,23 +708,23 @@ fn start_scheduler(config: scheduler_config::Config) -> Result<i32> {
 
 fn worker_bootstrap_token(
     server_id: ServerId,
-    scheduler_auth: server_config::SchedulerAuth,
+    scheduler_auth: &server_config::SchedulerAuth,
 ) -> Result<String> {
     Ok(match scheduler_auth {
         server_config::SchedulerAuth::Insecure => {
             warn!("Server starting with DANGEROUSLY_INSECURE scheduler authentication");
             create_server_token(server_id, INSECURE_DIST_SERVER_TOKEN)
         }
-        server_config::SchedulerAuth::Token { token } => create_server_token(server_id, &token),
+        server_config::SchedulerAuth::Token { token } => create_server_token(server_id, token),
         server_config::SchedulerAuth::JwtToken { token } => {
-            let token_server_id: ServerId = dangerous_insecure_extract_jwt_server_token(&token)
+            let token_server_id: ServerId = dangerous_insecure_extract_jwt_server_token(token)
                 .context("Could not decode scheduler auth jwt")?;
             if token_server_id != server_id {
                 bail!(
                     "JWT server id ({token_server_id:?}) did not match configured server id ({server_id:?})"
                 )
             }
-            token
+            token.clone()
         }
     })
 }
@@ -799,7 +799,7 @@ fn start_worker(config: server_config::Config) -> Result<i32> {
         cluster,
         &scheduler_url.to_url(),
         sccache_cluster_identity::Role::Worker,
-        || worker_bootstrap_token(server_id, scheduler_auth),
+        move || worker_bootstrap_token(server_id, &scheduler_auth),
     )?;
     #[cfg(target_os = "linux")]
     let native_worker = native_worker

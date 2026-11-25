@@ -505,12 +505,13 @@ impl DistClientContainer {
                     .context("distributed cluster trust configuration required")
             );
             let address = try_or_retry_later!(sccache_cluster_identity::endpoint(&url));
+            let auth = config.auth.clone();
             let peer = try_or_retry_later!(
                 sccache_cluster_identity::PeerCredentials::open(
                     cluster,
                     address,
                     sccache_cluster_identity::Role::Client,
-                    || Self::enrollment_token(&config.auth),
+                    move || Self::enrollment_token(&auth),
                 )
                 .await
             );

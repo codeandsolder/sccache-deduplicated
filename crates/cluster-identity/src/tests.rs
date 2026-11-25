@@ -369,6 +369,10 @@ fn established_cluster_cannot_recreate_lost_registry() -> Result<()> {
 
 #[tokio::test]
 async fn valid_persisted_member_does_not_need_bootstrap_token_or_scheduler() -> Result<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     let directory = tempfile::tempdir()?;
     let ca = ClusterCa::open(&directory.path().join("ca-key.pem"))?;
     let anchor = directory.path().join("ca.pem");
@@ -388,15 +392,16 @@ async fn valid_persisted_member_does_not_need_bootstrap_token_or_scheduler() -> 
     .await?;
     assert_eq!(peer.current()?.id()?, expected);
     fs::write(&leaf, b"corrupt")?;
-    let called = std::cell::Cell::new(false);
+    let called = Arc::new(AtomicBool::new(false));
+    let callback_called = Arc::clone(&called);
     assert!(
-        PeerCredentials::open(config, "127.0.0.1:1".parse()?, Role::Client, || {
-            called.set(true);
+        PeerCredentials::open(config, "127.0.0.1:1".parse()?, Role::Client, move || {
+            callback_called.store(true, Ordering::Relaxed);
             anyhow::bail!("must not enroll on corruption")
         })
         .await
         .is_err()
     );
-    assert!(!called.get());
+    assert!(!called.load(Ordering::Relaxed));
     Ok(())
 }

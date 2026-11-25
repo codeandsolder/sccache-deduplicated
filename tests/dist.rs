@@ -907,7 +907,7 @@ fn failing_server_process() -> Result<()> {
             serde_json::from_str(&env::var(harness::CUSTOM_SERVER_CLUSTER_ENV)?)?,
             &reqwest::Url::parse(&scheduler_url)?,
             sccache_cluster_identity::Role::Worker,
-            || Ok(token),
+            move || Ok(token.clone()),
         )?,
         None,
         FailingServer,

@@ -223,11 +223,12 @@ impl NativeCompilerClient {
             .scheduler
             .as_ref()
             .context("native client scheduler endpoint required")?;
+        let auth = auth.clone();
         let peer = crate::dist::cluster::open_peer(
             cluster,
             &scheduler.to_url(),
             sccache_cluster_identity::Role::Client,
-            || DistClientContainer::enrollment_token(auth),
+            move || DistClientContainer::enrollment_token(&auth),
         )?;
         let client = NativeCacheClient::new(
             &config.endpoint.to_url(),
