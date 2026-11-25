@@ -47,6 +47,7 @@ pub struct Worker {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeWorker {
+    pub cache_analytics: Option<sccache_build::analytics::CacheSiteSummary>,
     pub reservations: usize,
     pub capacity: u32,
     pub compiler_active: u32,
@@ -168,9 +169,12 @@ pub struct NativeService {
     pub recovery: Option<RecoveryQueue>,
 }
 
+pub use sccache_build::analytics::CacheAnalyticsSample as AnalyticsObservation;
+
 /// Independent, periodically collected CAS and network observations.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NativeTelemetry {
+    pub analytics: Option<AnalyticsObservation>,
     pub sampled_at: u64,
     pub cache: Option<Cache>,
     pub cache_error: Option<String>,

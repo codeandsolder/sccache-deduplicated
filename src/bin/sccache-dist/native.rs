@@ -82,11 +82,12 @@ impl NativeWorker {
             )
             .as_bytes(),
         );
-        let (placement, timing) = PlacementCache::open(
+        let (mut placement, timing) = PlacementCache::open(
             config.directory.join("worker-timing.json"),
             scope,
             config.package_transfer,
         );
+        placement.analytics = Some(store.analytics_sampler()?);
         let package_transfer = PackageTransportTracker::new(timing)?;
         let _ = store.can_clone_into(&config.scratch)?;
         let client = NativeCacheClient::new(
@@ -224,6 +225,8 @@ struct PlacementCache {
     last_saved: WorkerTiming,
     checkpoint: Instant,
     inventory: Option<(Instant, Option<BlobResidency>)>,
+    analytics: Option<sccache::build_runtime::CacheAnalyticsSampler>,
+    latest_analytics: Option<sccache::build_runtime::analytics::CacheSiteSummary>,
 }
 
 fn unix_seconds() -> u64 {
@@ -270,6 +273,8 @@ impl PlacementCache {
                 last_saved: timing,
                 checkpoint: Instant::now(),
                 inventory: None,
+                analytics: None,
+                latest_analytics: None,
             },
             timing,
         )
@@ -302,7 +307,15 @@ impl PlacementCache {
                 }
             }
         }
+        if let Some(sample) = self
+            .analytics
+            .as_ref()
+            .and_then(sccache::build_runtime::CacheAnalyticsSampler::poll)
+        {
+            self.latest_analytics = Some(sample.site_summary());
+        }
         NativePlacement {
+            cache_analytics: self.latest_analytics.clone(),
             package_limits: None,
             residency: self
                 .inventory

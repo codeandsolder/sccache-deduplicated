@@ -1286,6 +1286,10 @@ mod server {
                 let handler = Arc::clone(&handler);
                 let (sender, receiver) = std::sync::mpsc::sync_channel(1);
                 handler.install_dashboard_waker(sender)?;
+                let analytics = dashboard_native
+                    .as_ref()
+                    .map(|(sessions, _)| sessions.store().analytics_sampler())
+                    .transpose()?;
                 sccache_dashboard::server::spawn(
                     config.bind_address,
                     &config.assets,
@@ -1293,9 +1297,12 @@ mod server {
                     config.metrics_ingress_host.as_deref(),
                     move || handler.handle_dashboard_snapshot(),
                     move || {
-                        dashboard_native
-                            .as_ref()
-                            .map(|(sessions, network)| dashboard::snapshot(sessions, network))
+                        dashboard_native.as_ref().map(|(sessions, network)| {
+                            let mut snapshot = dashboard::snapshot(sessions, network);
+                            snapshot.analytics =
+                                analytics.as_ref().and_then(|receiver| receiver.poll());
+                            snapshot
+                        })
                     },
                     receiver,
                 )?;

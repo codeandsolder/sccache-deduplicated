@@ -34,6 +34,8 @@ struct PanelDefinition {
     title: String,
     unit: String,
     queries: Vec<QueryDefinition>,
+    #[serde(default)]
+    requires_client: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -457,6 +459,10 @@ async fn read_panel(
         series: Vec::new(),
         error: None,
     };
+    if definition.requires_client && view.client.is_empty() {
+        panel.error = Some("Select a client to inspect its cache distributions".into());
+        return panel;
+    }
     if source.ingress_host.is_none()
         && definition
             .queries
@@ -683,7 +689,7 @@ mod tests {
     #[test]
     fn manifest_is_complete_and_client_cannot_inject_promql() -> Result<()> {
         let panels: Vec<PanelDefinition> = serde_json::from_str(include_str!("../panels.json"))?;
-        assert_eq!(panels.len(), 33);
+        assert_eq!(panels.len(), 42);
         let view = MetricsView {
             client: "host.*\"} or vector(1) #".into(),
             ..Default::default()

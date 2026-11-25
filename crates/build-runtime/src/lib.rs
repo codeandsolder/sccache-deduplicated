@@ -6,6 +6,7 @@
 
 #![deny(rust_2018_idioms)]
 
+pub mod analytics;
 mod identity;
 mod installation;
 mod network;
@@ -59,15 +60,15 @@ mod store;
 pub use coordinator::{Admission, BuildCoordinator, CompilePermit};
 #[cfg(all(unix, feature = "store"))]
 pub use store::{
-    CacheStats, ComponentAudit, Eviction, GarbageCollected, NativeIndexAudit, NativeStore,
-    PackageArchiveLease, PackageDecoder, PackageImportLimits, PackagePolicy, PackageSlot,
-    Published, ResultLease, SchemaInventory, SpaceReport, SpaceStatus, StageBudget, StagedBlob,
-    TreeLease, UploadReservation, VerifiedPackage, decode_package_process,
+    CacheAnalyticsSampler, CacheStats, ComponentAudit, Eviction, GarbageCollected,
+    NativeIndexAudit, NativeStore, PackageArchiveLease, PackageDecoder, PackageImportLimits,
+    PackagePolicy, PackageSlot, Published, ResultLease, SchemaInventory, SpaceReport, SpaceStatus,
+    StageBudget, StagedBlob, TreeLease, UploadReservation, VerifiedPackage, decode_package_process,
 };
 
 #[cfg(all(target_os = "linux", feature = "store"))]
 mod execution;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "mapping"))]
 pub mod sandbox;
 #[cfg(all(target_os = "linux", feature = "store"))]
 pub use execution::{CapturedExecution, ExecutionPolicy, execute};

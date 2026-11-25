@@ -259,6 +259,14 @@ impl LruDiskCache {
             .saturating_add(self.pending_size.load(Ordering::Relaxed))
     }
 
+    /// Snapshot indexed paths without changing LRU order.
+    pub fn analytics_entries(&self) -> Vec<(PathBuf, u64)> {
+        self.lru
+            .iter()
+            .map(|(path, size)| (self.root.join(path), *size))
+            .collect()
+    }
+
     /// Return the count of entries in the cache.
     #[must_use = "the entry count is returned without modifying the cache"]
     pub fn len(&self) -> usize {

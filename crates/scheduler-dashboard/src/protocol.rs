@@ -92,7 +92,13 @@ pub fn apply_event(state: &mut DashboardData, event: NativeEvent) -> bool {
                 .sort_unstable_by(|a, b| (a.assigned_at_ms, &a.id).cmp(&(b.assigned_at_ms, &b.id)));
         }
     }
-    if let Some(telemetry) = patch.telemetry {
+    if let Some(mut telemetry) = patch.telemetry {
+        if telemetry.analytics.is_none() {
+            telemetry.analytics = state
+                .telemetry
+                .as_mut()
+                .and_then(|previous| previous.analytics.take());
+        }
         state.telemetry = Some(telemetry);
     }
     true

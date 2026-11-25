@@ -4364,6 +4364,7 @@ dependencies = [
  "leptos_meta",
  "log",
  "reqwest",
+ "sccache-build",
  "send_wrapper",
  "serde",
  "serde_json",

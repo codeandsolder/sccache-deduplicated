@@ -71,6 +71,7 @@ fn worker(id: ServerId, details: &ServerDetails, scheduler: &Scheduler, draining
                 remaining = remaining.saturating_add(progress.remaining_input_bytes);
             }
             NativeWorker {
+                cache_analytics: placement.cache_analytics.clone(),
                 reservations: queue.jobs.len(),
                 capacity: queue.capacity,
                 compiler_active: queue.compiler_active,
