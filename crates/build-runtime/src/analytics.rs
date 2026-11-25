@@ -151,6 +151,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cold_bytes_and_unknown_usage_are_distinct() {
+        let mut report = CacheDistribution::default();
+        report.record(10, None, 1, Some(3), Some(86400));
+        report.record(20, None, 1, Some(1), Some(604801));
+        report.record(30, None, 1, Some(0), Some(7776001));
+        report.record(40, None, 1, None, None);
+        assert_eq!(report.frequency[0].upper, None);
+        assert_eq!(report.frequency[0].weight.logical_bytes, 40);
+        let sample = CacheAnalyticsSample {
+            sampled_at: 42,
+            report: Some(report),
+            error: None,
+            maximum_bytes: Some(1000),
+        };
+        let bytes = bincode::serialize(&sample).unwrap();
+        let restored: CacheAnalyticsSample = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(restored, sample);
+        let summary = restored.site_summary();
+        assert_eq!(summary.older_than_seven_days, 50);
+        assert_eq!(summary.older_than_thirty_days, 30);
+        assert_eq!(summary.older_than_ninety_days, 30);
+        assert_eq!(summary.unknown_age_bytes, 40);
+    }
+
+    #[test]
     fn histogram_weights_are_additive_and_unknown_is_distinct() {
         let mut report = CacheDistribution::default();
         report.record(10, Some((5, 8)), 3, Some(4), Some(100));

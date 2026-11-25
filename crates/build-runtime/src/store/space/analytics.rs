@@ -154,6 +154,15 @@ mod tests {
         assert_eq!(report.total.touches, 3);
         assert_eq!(report.total.byte_touches, 12);
         assert_eq!(report.total.measured_objects, 1);
+        assert_eq!(
+            report.eviction.pinned_roots + report.eviction.zero_logical_roots,
+            2
+        );
+        assert!(report.eviction.logical.is_empty());
+        drop(_lease);
+        let report = store.cache_distribution()?;
+        assert_eq!(report.eviction.pinned_roots, 0);
+        assert_eq!(report.eviction.zero_logical_roots, 2);
         Ok(())
     }
 }
