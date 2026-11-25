@@ -42,7 +42,7 @@ jq -n --arg dir "$root/cache" --argjson uid "$uid" --argjson gid "$gid" \
 chmod 600 "$root/server.json" "$root/distribution.json"
 env -i PATH=/usr/bin:/bin HOME="$root/root-private" SCCACHE_CONF="$root/server.json" \
     SCCACHE_SERVER_UDS="$root/service.sock" SCCACHE_START_SERVER=1 SCCACHE_NO_DAEMON=1 \
-    SCCACHE_IDLE_TIMEOUT=0 SCCACHE_LOG=info "$root/sccache" >"$root/server.log" 2>&1 &
+    SCCACHE_IDLE_TIMEOUT=0 SCCACHE_LOG=info,sccache::server::shared::digests=debug "$root/sccache" >"$root/server.log" 2>&1 &
 server_pid=$!
 
 client() {
@@ -258,8 +258,32 @@ unshare --mount --propagation private -- bash -eu -c '
 [[ $(stat -c '%u:%g' "$root/alternate/visible.o") == "$uid:$gid" ]]
 nm "$root/alternate/visible.o" | rg -q 'namespace_visible$'
 
+# A normal rootful container has a distinct PID namespace and procfs.
+# Check the compiler's own namespace rather than only the output path.
+install -d -o "$uid" -g "$gid" -m 700 "$root/user-private/pid-compiler"
+cat > "$root/user-private/pid-compiler/gcc" <<'CHECK'
+#!/bin/sh
+set -eu
+test "$(readlink /proc/self/ns/pid)" = "$(cat expected-pidns)"
+exec /usr/bin/gcc "$@"
+CHECK
+chmod 755 "$root/user-private/pid-compiler/gcc"
+# shellcheck disable=SC2016
+unshare --mount --pid --fork --mount-proc --propagation private -- bash -eu -c '
+    cd "$1/user-private"
+    printf "%s\n" "$(readlink /proc/self/ns/pid)" > expected-pidns
+    chown "$2:$3" expected-pidns
+    exec setpriv --reuid "$2" --regid "$3" --groups "$3" -- \
+        env -i PATH=/usr/bin:/bin HOME="$1/user-private" SCCACHE_CONF="$1/client.toml" \
+        SCCACHE_SERVER_UDS="$1/service.sock" SCCACHE_NO_AUTO_START_SERVER=1 \
+        "$1/sccache" "$1/user-private/pid-compiler/gcc" -c probe.c -o pid.o
+' _ "$root" "$uid" "$gid"
+[[ $(stat -c '%u:%g' "$root/user-private/pid.o") == "$uid:$gid" ]]
+nm "$root/user-private/pid.o" | rg -q 'shared_value$'
+
 if [[ -n $dist ]]; then
     stats | jq -e '[.stats.dist_compiles[]] | add > 0' >/dev/null
+    rg -q 'shared toolchain memo: reused [1-9][0-9]* files' "$root/server.log"
 fi
 client --stop-server
 wait "$server_pid"

@@ -5,12 +5,17 @@ use super::{frame, peer, read_sync_frame};
 use crate::build_runtime::{
     BlobRef, ContentId, DescriptorDigestProvider, DescriptorMemo, hash_descriptor,
 };
-use anyhow::{Context, Result};
+use anyhow::{Result, ensure};
+use rustix::net::{
+    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
+};
 use std::{
     fs::File,
-    io::{self, Read, Write},
+    io::{IoSlice, IoSliceMut, Write},
+    mem::MaybeUninit,
     os::{
-        fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+        fd::AsFd,
         unix::{fs::MetadataExt, net::UnixStream},
     },
     sync::{Arc, Mutex},
@@ -19,6 +24,7 @@ use std::{
 pub(super) fn scope(peer: &peer::Peer) -> Result<ContentId> {
     let mount = peer.mount.metadata()?;
     let root = peer.root.metadata()?;
+    let pid = peer.pid_namespace.metadata()?;
     let credentials = &peer.credentials;
     Ok(ContentId::of(&bincode::serialize(&(
         credentials.uid,
@@ -28,18 +34,62 @@ pub(super) fn scope(peer: &peer::Peer) -> Result<ContentId> {
         mount.ino(),
         root.dev(),
         root.ino(),
+        pid.dev(),
+        pid.ino(),
     ))?))
 }
 
-pub(super) fn pidfd(pid: libc::pid_t) -> Result<OwnedFd> {
-    // SAFETY: the parent owns the newly spawned child's PID until wait, and
-    // pidfd_open returns a new owned descriptor for that process.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error()).context("open private executor pidfd");
+fn send_descriptor(stream: &UnixStream, file: &File) -> Result<()> {
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    let descriptors = [file.as_fd()];
+    ensure!(
+        control.push(SendAncillaryMessage::ScmRights(&descriptors)),
+        "descriptor control buffer full"
+    );
+    ensure!(
+        sendmsg(
+            stream,
+            &[IoSlice::new(b"M")],
+            &mut control,
+            SendFlags::NOSIGNAL
+        )? == 1,
+        "incomplete descriptor message"
+    );
+    Ok(())
+}
+
+fn receive_descriptor(stream: &UnixStream) -> Result<Option<File>> {
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    let mut marker = [0];
+    let msg = recvmsg(
+        stream,
+        &mut [IoSliceMut::new(&mut marker)],
+        &mut control,
+        RecvFlags::CMSG_CLOEXEC,
+    )?;
+    let mut files = Vec::new();
+    for message in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(descriptors) = message {
+            files.extend(descriptors.map(File::from));
+        } else {
+            anyhow::bail!("unexpected descriptor control message");
+        }
     }
-    // SAFETY: the successful syscall returned an owned file descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(libc::c_int::try_from(fd)?) })
+    ensure!(
+        !msg.flags.contains(ReturnFlags::CTRUNC),
+        "truncated descriptor message"
+    );
+    if msg.bytes == 0 {
+        ensure!(files.is_empty(), "unexpected descriptor on EOF");
+        return Ok(None);
+    }
+    ensure!(
+        marker == *b"M" && files.len() == 1,
+        "invalid descriptor message"
+    );
+    Ok(files.pop())
 }
 
 type Reply<T> = std::result::Result<T, String>;
@@ -49,28 +99,13 @@ fn reply<T: serde::Serialize>(stream: &mut UnixStream, result: Result<T>) -> Res
     Ok(())
 }
 
-pub(super) fn serve(
-    mut stream: UnixStream,
-    pidfd: &OwnedFd,
-    scope: ContentId,
-    memo: &DescriptorMemo,
-) -> Result<()> {
+pub(super) fn serve(mut stream: UnixStream, scope: ContentId, memo: &DescriptorMemo) -> Result<()> {
     let mut hits = 0_u64;
     let mut bytes = 0_u64;
-    loop {
-        let mut request = [0_u8; 4];
-        if stream.read(&mut request[..1])? == 0 {
-            break;
-        }
-        stream.read_exact(&mut request[1..])?;
-        let probe = (|| {
-            let file = File::from(peer::duplicate_fd(
-                pidfd.as_fd(),
-                i32::from_be_bytes(request),
-            )?);
-            let (probe, value) = memo.probe(scope, &file)?;
-            Ok::<_, anyhow::Error>((file, probe, value))
-        })();
+    while let Some(file) = receive_descriptor(&stream)? {
+        let probe = memo
+            .probe(scope, &file)
+            .map(|(probe, value)| (file, probe, value));
         match probe {
             Ok((file, probe, value)) => {
                 reply(&mut stream, Ok(value))?;
@@ -82,7 +117,7 @@ pub(super) fn serve(
                     // executor hashes that same open file under its own UID.
                     let publication: Option<BlobRef> = read_sync_frame(&mut stream)?;
                     let result =
-                        publication.map_or(Ok(()), |blob| memo.remember(probe, &file, blob));
+                        publication.map_or(Ok(()), |blob| memo.remember(&probe, &file, blob));
                     reply(&mut stream, result)?;
                 }
             }
@@ -103,7 +138,7 @@ pub(super) fn provider(stream: UnixStream) -> DescriptorDigestProvider {
             return hash_descriptor(file);
         };
         let lookup = (|| {
-            stream.write_all(&file.as_raw_fd().to_be_bytes())?;
+            send_descriptor(stream, file)?;
             read_sync_frame::<Reply<Option<BlobRef>>>(stream)
         })();
         match lookup {
@@ -137,4 +172,31 @@ pub(super) fn provider(stream: UnixStream) -> DescriptorDigestProvider {
         }
         digest
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_transfer_preserves_identity_and_closes_on_exec() -> Result<()> {
+        let (sender, receiver) = UnixStream::pair()?;
+        let file = tempfile::tempfile()?;
+        send_descriptor(&sender, &file)?;
+        let received = receive_descriptor(&receiver)?.expect("descriptor missing");
+        assert_eq!(received.metadata()?.ino(), file.metadata()?.ino());
+        assert_eq!(received.metadata()?.dev(), file.metadata()?.dev());
+        assert!(rustix::io::fcntl_getfd(&received)?.contains(rustix::io::FdFlags::CLOEXEC));
+        drop(sender);
+        assert!(receive_descriptor(&receiver)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn descriptor_transfer_rejects_missing_ancillary_data() -> Result<()> {
+        let (mut sender, receiver) = UnixStream::pair()?;
+        sender.write_all(b"M")?;
+        assert!(receive_descriptor(&receiver).is_err());
+        Ok(())
+    }
 }

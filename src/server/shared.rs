@@ -31,6 +31,7 @@ const BROKER_FD: libc::c_int = 3;
 const MOUNT_FD: libc::c_int = 4;
 const ROOT_FD: libc::c_int = 5;
 const STDIN_FD: libc::c_int = 6;
+const PIDNS_FD: libc::c_int = 8;
 #[cfg(feature = "dist-client")]
 const DIGEST_FD: libc::c_int = 7;
 
@@ -41,6 +42,7 @@ struct Credentials {
     groups: Vec<u32>,
     umask: u32,
     join_mount: bool,
+    join_pid: bool,
     parent_pid: u32,
 }
 
@@ -289,6 +291,7 @@ impl SharedExecutor {
             (duplicate_high(peer.mount.as_fd())?, MOUNT_FD),
             (duplicate_high(peer.root.as_fd())?, ROOT_FD),
             (duplicate_high(peer.stdin.as_fd())?, STDIN_FD),
+            (duplicate_high(peer.pid_namespace.as_fd())?, PIDNS_FD),
             #[cfg(feature = "dist-client")]
             (duplicate_high(digest_helper.as_fd())?, DIGEST_FD),
         ];
@@ -322,10 +325,9 @@ impl SharedExecutor {
         #[cfg(feature = "dist-client")]
         let digest_task = {
             drop(digest_helper);
-            let pidfd = digests::pidfd(pid)?;
             let scope = digests::scope(&peer)?;
             let memo = Arc::clone(&self.digest_memo);
-            tokio::task::spawn_blocking(move || digests::serve(digest_broker, &pidfd, scope, &memo))
+            tokio::task::spawn_blocking(move || digests::serve(digest_broker, scope, &memo))
         };
         broker.set_nonblocking(true)?;
         let broker = tokio::net::UnixStream::from_std(broker)?;

@@ -1,7 +1,8 @@
 //! The single-threaded trusted entry point drops privileges before decoding
 //! the user's compile request or running any compiler-related code.
 use super::{
-    BROKER_FD, Credentials, ExecutorEvent, Job, MOUNT_FD, ROOT_FD, STDIN_FD, frame, read_sync_frame,
+    BROKER_FD, Credentials, ExecutorEvent, Job, MOUNT_FD, PIDNS_FD, ROOT_FD, STDIN_FD, frame,
+    read_sync_frame,
 };
 use crate::cache::IpcStorage;
 use crate::client::{ServerConnection, connection_task};
@@ -12,7 +13,7 @@ use crate::protocol::{CompileFinished, CompileIdentity, CompileResponse, Request
 use crate::server::{SccacheService, WaitUntilZero, activity};
 use anyhow::{Context, Result, bail, ensure};
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::sync::Arc;
@@ -34,7 +35,75 @@ fn inherited(fd: RawFd) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn assume(credentials: &Credentials, mount: &OwnedFd, root: &OwnedFd) -> Result<()> {
+fn open_pidfd(pid: libc::pid_t) -> Result<OwnedFd> {
+    // SAFETY: pid identifies the current process or its verified parent.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error()).context("open supervisor pidfd");
+    }
+    // SAFETY: pidfd_open returned a new owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(libc::c_int::try_from(fd)?) })
+}
+
+// The private launcher is still single-threaded. setns(CLONE_NEWPID)
+// changes only the namespace of subsequently created children.
+fn enter_pid_namespace(credentials: &Credentials, namespace: &OwnedFd) -> Result<OwnedFd> {
+    let daemon_pid = i32::try_from(credentials.parent_pid)?;
+    // SAFETY: only process-local queries and parent-death signal setup.
+    unsafe {
+        checked(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0))?;
+        ensure!(libc::getppid() == daemon_pid, "shared daemon disappeared");
+    }
+    if !credentials.join_pid {
+        return open_pidfd(daemon_pid);
+    }
+    // SAFETY: this is the current process, prior to fork.
+    let supervisor = open_pidfd(unsafe { libc::getpid() })?;
+    // SAFETY: a verified peer PID namespace, before any threads or runtime.
+    let child = unsafe {
+        checked(libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWPID))
+            .context("enter requester PID namespace")?;
+        libc::fork()
+    };
+    if child < 0 {
+        return Err(io::Error::last_os_error()).context("fork namespace executor");
+    }
+    if child > 0 {
+        supervise_child(child);
+    }
+    Ok(supervisor)
+}
+
+fn supervise_child(child: libc::pid_t) -> ! {
+    // SAFETY: the single-threaded supervisor owns this child. Close every
+    // inherited pipe/socket copy so only the executor can hold them open.
+    // No Rust destructors or stdio operations run in this supervisor.
+    unsafe {
+        if libc::syscall(libc::SYS_close_range, 0_u32, u32::MAX, 0_u32) < 0 {
+            libc::_exit(1);
+        }
+        let mut status = 0;
+        loop {
+            if libc::waitpid(child, &raw mut status, 0) == child {
+                libc::_exit(if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    128 + libc::WTERMSIG(status)
+                });
+            }
+            if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                libc::_exit(1);
+            }
+        }
+    }
+}
+
+fn assume(
+    credentials: &Credentials,
+    mount: &OwnedFd,
+    root: &OwnedFd,
+    supervisor: &OwnedFd,
+) -> Result<()> {
     // SAFETY: this entry point executes before constructing runtimes or
     // spawning threads. Both namespace descriptors come from the authenticated
     // peer, opened by the root daemon, not from user-controlled pathname data.
@@ -85,8 +154,8 @@ fn assume(credentials: &Credentials, mount: &OwnedFd, root: &OwnedFd) -> Result<
         // Credential changes clear PDEATHSIG; arm it after dropping them.
         checked(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0))?;
         ensure!(
-            libc::getppid() == i32::try_from(credentials.parent_pid)?,
-            "shared daemon disappeared"
+            super::peer::alive(supervisor.as_fd())?,
+            "shared executor supervisor disappeared"
         );
     }
     Ok(())
@@ -181,12 +250,16 @@ pub(super) fn run() -> Result<()> {
     let broker = inherited(BROKER_FD)?;
     let mount = inherited(MOUNT_FD)?;
     let root = inherited(ROOT_FD)?;
+    let pid_namespace = inherited(PIDNS_FD)?;
     let stdin = inherited(STDIN_FD)?;
     #[cfg(feature = "dist-client")]
     let digest = inherited(super::DIGEST_FD)?;
     let mut input = io::stdin().lock();
     let credentials: Credentials = read_sync_frame(&mut input)?;
-    assume(&credentials, &mount, &root)?;
+    let supervisor = enter_pid_namespace(&credentials, &pid_namespace)?;
+    drop(pid_namespace);
+    assume(&credentials, &mount, &root, &supervisor)?;
+    drop(supervisor);
     crate::util::initialize_shared_umask(credentials.umask)?;
     drop(mount);
     drop(root);

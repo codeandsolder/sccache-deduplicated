@@ -11,6 +11,7 @@ use tokio::net::UnixStream;
 pub struct Peer {
     pub(super) credentials: Credentials,
     pub(super) mount: File,
+    pub(super) pid_namespace: File,
     pub(super) root: File,
     pub(super) stdin: OwnedFd,
     pub(super) pidfd: OwnedFd,
@@ -87,7 +88,7 @@ pub(super) fn alive(pidfd: BorrowedFd<'_>) -> io::Result<bool> {
     }
 }
 
-pub(super) fn duplicate_fd(pidfd: BorrowedFd<'_>, fd: libc::c_int) -> io::Result<OwnedFd> {
+fn duplicate_fd(pidfd: BorrowedFd<'_>, fd: libc::c_int) -> io::Result<OwnedFd> {
     // SAFETY: pidfd identifies a live process, and successful pidfd_getfd
     // returns a new owned CLOEXEC descriptor for the specified open file.
     let result = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
@@ -155,6 +156,9 @@ impl Peer {
         let mount = File::open(proc.join("ns/mnt"))?;
         let own_mount = File::open("/proc/self/ns/mnt")?;
         let join_mount = !same_identity(&mount, &own_mount)?;
+        let pid_namespace = File::open(proc.join("ns/pid"))?;
+        let own_pid_namespace = File::open("/proc/self/ns/pid")?;
+        let join_pid = !same_identity(&pid_namespace, &own_pid_namespace)?;
         let root = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
@@ -165,6 +169,7 @@ impl Peer {
             groups: peer_groups(socket.as_fd())?,
             umask: read_umask(&proc)?,
             join_mount,
+            join_pid,
             parent_pid: std::process::id(),
         };
         let stdin = stdin_fd(pidfd.as_fd())?;
@@ -177,6 +182,7 @@ impl Peer {
         Ok(Self {
             credentials,
             mount,
+            pid_namespace,
             root,
             stdin,
             pidfd,

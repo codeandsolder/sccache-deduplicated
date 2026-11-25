@@ -203,8 +203,9 @@ struct DescriptorEntries {
     order: VecDeque<DescriptorKey>,
 }
 
-/// A bounded memo shared by trusted credential-isolated executors. Scope is
-/// supplied by their supervisor, not by the executor. It includes credentials
+/// A bounded memo shared by trusted credential-isolated executors.
+///
+/// Scope is supplied by their supervisor, not by the executor. It includes credentials
 /// and filesystem view identity. The memo never reads a file or opens a path.
 pub struct DescriptorMemo {
     capacity: NonZeroUsize,
@@ -262,7 +263,7 @@ impl DescriptorMemo {
     /// credentials. Reject changed descriptors and conflicting publications.
     /// # Errors
     /// Returns an error for changed versions, wrong size or conflicting digests.
-    pub fn remember(&self, probe: DescriptorProbe, file: &File, blob: BlobRef) -> Result<()> {
+    pub fn remember(&self, probe: &DescriptorProbe, file: &File, blob: BlobRef) -> Result<()> {
         unchanged(&probe.version, &regular_version(file)?)?;
         anyhow::ensure!(
             blob.size == u64::try_from(probe.version.st_size)?,
@@ -291,6 +292,7 @@ impl DescriptorMemo {
         }
         entries.values.insert(probe.key, Some(blob));
         entries.order.push_back(probe.key);
+        drop(entries);
         Ok(())
     }
 }
@@ -323,24 +325,24 @@ mod tests {
         let (fresh, _) = open_source(&path)?;
         let (probe, hit) = memo.probe(scope, &fresh)?;
         assert!(hit.is_none());
-        memo.remember(probe, &fresh, hash_descriptor(&fresh)?)?;
+        memo.remember(&probe, &fresh, hash_descriptor(&fresh)?)?;
         std::thread::sleep(std::time::Duration::from_secs(3));
         let (file, _) = open_source(&path)?;
         let (probe, hit) = memo.probe(scope, &file)?;
         assert!(hit.is_none(), "fresh versions never seed later hits");
         let expected = hash_descriptor(&file)?;
-        memo.remember(probe, &file, expected)?;
+        memo.remember(&probe, &file, expected)?;
         let (second, _) = open_source(&path)?;
         assert_eq!(memo.probe(scope, &second)?.1, Some(expected));
         assert!(memo.probe(unrelated, &second)?.1.is_none());
         let (other, _) = open_source(&other)?;
         let (probe, hit) = memo.probe(scope, &other)?;
         assert!(hit.is_none());
-        memo.remember(probe, &other, hash_descriptor(&other)?)?;
+        memo.remember(&probe, &other, hash_descriptor(&other)?)?;
         assert!(memo.probe(scope, &second)?.1.is_none());
         let (probe, _) = memo.probe(scope, &second)?;
         fs::write(&path, b"modified")?;
-        assert!(memo.remember(probe, &second, expected).is_err());
+        assert!(memo.remember(&probe, &second, expected).is_err());
         assert!(memo.probe(scope, &second)?.1.is_none());
         Ok(())
     }
