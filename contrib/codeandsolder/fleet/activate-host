@@ -363,9 +363,19 @@ case "$phase" in
     cp "$bundle/build.txt" "$bundle/SHA256SUMS" "$state/"
     echo "committed $role $sha"
     ;;
+  open-clients)
+    # All hosts must have committed before the operator opens this barrier.
+    # Keep the updater-specific guard during full production acceptance.
+    [[ $(cat "$state/source_sha") == "$sha" && $(cat "$state/dist_protocol") == 5 ]]
+    [[ $(cat "$rollback/smoke-ok") == "$sha" ]]
+    assert_updaters_paused
+    assert_bundle
+    rm -f "$drain" "$client_guard"
+    echo "clients admitted; automatic updates still held on $role"
+    ;;
   resume-updates)
     [[ $(cat "$state/source_sha") == "$sha" && $(cat "$state/dist_protocol") == 5 ]]
-    rm -f "$drain"
+    [[ -f "$guard" && ! -e "$drain" && ! -e "$client_guard" ]]
     resume_updaters
     if systemctl is-enabled --quiet sccache-release-update.timer; then systemctl start sccache-release-update.timer; fi
     ;;

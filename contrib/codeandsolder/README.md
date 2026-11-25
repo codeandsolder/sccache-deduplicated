@@ -166,6 +166,96 @@ Build provisioning is separate from the root updater: no automatic root
 compilation and no extra cache daemons.
 
 
+## Protocol 3 → 5 / epoch 4 → 6 cutover
+
+This is a coordinated migration, not an ordinary release update. Keep automatic
+updates held throughout preparation, and finish the runtime and browser gates
+on the exact release revision before changing services.
+
+### Prepare without interrupting the fleet
+
+1. Publish the validated `main` revision using the release workflow above.
+   Record the full SHA, immutable release tag, published `build.txt` and release
+   publication timestamp. Check that the revision declares protocol 5 and epoch
+   6. Build that exact clean revision locally on each host using the managed
+   daemon. Use `--scheduler-dashboard` on Asus and the ordinary native bundle
+   elsewhere. Install the resulting files into the trusted SHA directory as
+   described in the host-native policy. Do not overwrite a previous generation.
+2. On Asus, create the private scheduler directory as root, and initialize the
+   identity using the newly staged scheduler binary, as the service account:
+
+   ```sh
+   sudo install -d -o sccache-scheduler -g sccache-scheduler -m 0700 /var/lib/sccache-cluster/scheduler
+   sudo -u sccache-scheduler /var/lib/sccache-native-bundles/RELEASE_SHA/sccache-dist cluster-init --directory /var/lib/sccache-cluster/scheduler
+   ```
+
+   Replace `RELEASE_SHA` with the exact full revision. Save the printed peer ID
+   and distribute only `ca.pem` via an independently authenticated provisioning
+   channel. If worker enrollment uses JWTs, provision the worker keys and new
+   key-bound JWTs first; old address-bound tokens cannot authenticate new peer
+   IDs. Preserve and back up the CA key, scheduler key and enrollment registry
+   together. Do not reset established identities.
+3. Verify the active worker/client bootstrap auth policy and Tailscale endpoint
+   reachability. The existing control listener remains on the configured address;
+   the native data and worker listeners can advertise authenticated LAN routes.
+   Never broaden access to the enrollment endpoint when using an insecure
+   bootstrap policy. Check cache capacity, native filesystem support, kernel
+   shared-daemon support and the actual host service accounts.
+4. From the release checkout, run `sudo contrib/codeandsolder/fleet/prepare-host
+   ROLE CA_PEM SCHEDULER_ID` on each host (`acer`, `asus`, `cold-storage`, `wsl`).
+   Preparation produces a private stage and records checksums of the original
+   configurations without replacing the live files. Install the authenticated
+   release metadata as `published-build.txt` and its publication timestamp as
+   `published-at.txt` in `/var/lib/sccache-managed-rollout/epoch6-20261125`.
+   Never use locally generated metadata as the published release authority.
+
+### Activate using fleet-wide barriers
+
+Run each phase on **every participating host** before advancing to the next
+phase. The following is the command for one host, with the phase and full SHA
+substituted; do not run a whole loop on a single host independently.
+
+```sh
+sudo /var/lib/sccache-managed-rollout/epoch6-20261125/activate-host PHASE RELEASE_SHA
+```
+
+| Phase | Fleet-wide acceptance before advancing |
+| --- | --- |
+| `verify` | All staged checksums, installed protocol and native bundles match. |
+| `snapshot` | Rollback files captured; automatic updaters and Asus watchdog quiesced. |
+| `stop-clients` | All ordinary compiler entrypoints gated and client services stopped. |
+| `stop-dist` | Old workers, scheduler and loopback proxy stopped. |
+| `install` | New binaries, identity configuration, shared daemon and dashboard assets installed everywhere. |
+| `start-scheduler` | Asus native mTLS status and exact served WASM verified. Other hosts no-op. |
+| `start-worker` | Previously active workers running matching binaries. Cold-storage's intentionally disabled worker stays stopped. |
+| `provision-rust` | Host toolchain catalogs synchronized over authenticated native CAS. |
+| `start-clients` | Root-owned shared service and socket readiness verified. |
+| `smoke` | Real native remote C compile, cross-UID cache hit, output identity and fresh metrics verified. |
+| `commit` | Active executable hashes, selected dashboard and release metadata recorded. |
+| `open-clients` | Only after **all** hosts have committed; reopen ordinary compilation while retaining the automatic updater guard. |
+| `resume-updates` | Only after fleet acceptance below succeeds; restore timers and remove the updater guard. |
+
+Before releasing the hold, check scheduler workers and capabilities, real
+Rust/Clippy/C/C++ builds and BoringSSL/container workloads through the shared
+daemon, direct and scheduler fallback result delivery, and the dashboard via
+its loopback endpoint (SSH forwarding if accessing remotely). Confirm direct
+route measurements rather than assuming advertised addresses are usable.
+After the coordinated change, measure throughput, cache reuse, transfer bytes
+and failure recovery under actual load.
+
+### Rollback
+
+If any activation or smoke phase fails, stop advancing. For hosts that have
+successfully captured their rollback snapshots, run the following phases with
+the same fleet-wide barriers: `rollback-stop`, `rollback-restore`,
+`rollback-start-scheduler`, `rollback-start-worker`, `rollback-start-clients`.
+Restore all old binaries and configurations before starting any old transport.
+The previous dashboard link, updater state and Asus watchdog are restored from
+the snapshots. Verify the original protocol, endpoints and active executable
+hashes. Keep new CA/key/registry state private for a subsequent attempt; do not
+remove it as a side effect of rolling back the executable. Preserve snapshots
+and both native bundle generations until acceptance is complete.
+
 ## Full native-cache acceptance
 
 `test-native-cache-reuse` is an operator regression test for the actual native

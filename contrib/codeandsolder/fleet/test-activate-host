@@ -162,6 +162,18 @@ cmp /usr/local/libexec/sccache-bin/sccache "$bundle/sccache"
 cmp /usr/local/bin/sccache-dist "$bundle/sccache-dist"
 [[ $(cat /usr/local/libexec/sccache-release-update) == "new updater" ]]
 [[ $(cat /usr/local/bin/cargo) == "new cargo" ]]
+# Admission must not reopen on a merely installed release.
+if ./activate-host open-clients "$sha"; then exit 1; fi
+[[ -f "$stage/updaters-paused" && -f /etc/systemd/system/sccache-fleet-rollout-drain ]]
+# Simulate the successful smoke and commit receipts; the real daemon smoke
+# requires the complete fleet and is deliberately outside this fixture.
+printf '%s\n' "$sha" > "$stage/rollback/smoke-ok"
+printf '%s\n' "$sha" > /var/lib/sccache-autoupdate/source_sha
+printf '5\n' > /var/lib/sccache-autoupdate/dist_protocol
+./activate-host open-clients "$sha"
+[[ -f "$stage/updaters-paused" && ! -e /etc/systemd/system/sccache-fleet-rollout-drain && ! -e /dev/shm/sccache-maintenance-drain ]]
+! systemctl is-active --quiet random-utils-update.timer
+! systemctl is-active --quiet sccache-release-update.timer
 # A partially committed rollout may already have disabled the watchdog.
 systemctl disable sccache-dist-worker-watchdog.timer
 ./activate-host rollback-stop "$sha"
