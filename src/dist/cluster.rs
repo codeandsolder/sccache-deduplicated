@@ -104,12 +104,10 @@ impl BlockingRoutes {
                 ConnectionPath::from_response(response.headers(), response.extensions()),
             ))
         })();
-        let (elapsed, path) = result
-            .ok()
-            .filter(|(success, _)| *success)
-            .map_or((None, ConnectionPath::default()), |(_, path)| {
-                (Some(start.elapsed()), path)
-            });
+        let (elapsed, path) = result.ok().filter(|(success, _)| *success).map_or_else(
+            || (None, ConnectionPath::default()),
+            |(_, path)| (Some(start.elapsed()), path),
+        );
         self.book.observe_path(peer, role, address, elapsed, path);
         drop(probe);
     }

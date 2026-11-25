@@ -38,12 +38,14 @@ pub struct Route {
 }
 
 impl Route {
+    #[must_use = "the route preserves kernel routing and fallback semantics"]
     pub const fn unbound(address: SocketAddr) -> Self {
         Self {
             address,
             source: None,
         }
     }
+    #[must_use = "the binding identifies the selected source interface"]
     pub fn binding(self) -> Option<(IpAddr, Option<String>)> {
         self.source.map(|ip| (ip, interface::binding(ip)))
     }
@@ -164,7 +166,7 @@ fn updated_rate(
     now: Instant,
 ) -> Rate {
     let previous = previous.filter(|rate| {
-        rate.expires > now && rate.path == connection.reported && rate.local == connection.local
+        rate.expires > now && (rate.path, rate.local) == (connection.reported, connection.local)
     });
     if let Some(prior) = previous
         && prior.quality == interface::Quality::Clean
