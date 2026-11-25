@@ -10,7 +10,10 @@ if (( $# > 2 )); then
 fi
 bindgen="${1:-wasm-bindgen}"
 stylance="${2:-stylance}"
-target_dir="$(cargo +"$rust_toolchain" metadata --locked --no-deps --format-version 1 | jq -r .target_directory)"
+# The release toolchain can differ from the caller's CI toolchain. Clear
+# explicit compiler overrides, not the managed rustc wrapper or cache.
+release_cargo=(env -u RUSTC -u RUSTDOC cargo +"$rust_toolchain")
+target_dir="$("${release_cargo[@]}" metadata --locked --no-deps --format-version 1 | jq -r .target_directory)"
 output_dir="$target_dir/scheduler-dashboard/pkg"
 locked_version() {
     awk -v package="$1" '$0 == "name = \"" package "\"" {getline; gsub(/"/,"",$3); print $3; exit}' Cargo.lock
@@ -25,7 +28,7 @@ if [[ -z "$css_version" ]] || ! command -v "$stylance" >/dev/null || [[ "$("$sty
     printf 'Install the matching stylesheet tool: cargo install stylance-cli --version %s --locked\n' "$css_version" >&2
     exit 1
 fi
-cargo +"$rust_toolchain" build --locked -p sccache-dashboard --no-default-features --features hydrate --release --target wasm32-unknown-unknown
+"${release_cargo[@]}" build --locked -p sccache-dashboard --no-default-features --features hydrate --release --target wasm32-unknown-unknown
 mkdir -p "$(dirname "$output_dir")"
 stage="$(mktemp -d "$(dirname "$output_dir")/pkg.XXXXXXXX")"
 trap 'rm -rf "$stage"' EXIT

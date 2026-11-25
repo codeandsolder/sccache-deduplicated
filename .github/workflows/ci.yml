@@ -327,10 +327,11 @@ jobs:
         env -u RUSTFLAGS cargo check --locked -p sccache-dashboard --no-default-features --features hydrate --target wasm32-unknown-unknown
         source contrib/codeandsolder/release-protocol.env
         rustup toolchain install "$rust_toolchain" --profile minimal --target wasm32-unknown-unknown
-        scripts/install-scheduler-dashboard-tools.sh target/dashboard-tools
-        env -u RUSTFLAGS scripts/build-scheduler-dashboard.sh target/dashboard-tools/wasm-bindgen target/dashboard-tools/stylance
+        target_dir="$(cargo metadata --locked --no-deps --format-version 1 | jq -r .target_directory)"
+        scripts/install-scheduler-dashboard-tools.sh "$target_dir/dashboard-tools"
+        env -u RUSTFLAGS scripts/build-scheduler-dashboard.sh "$target_dir/dashboard-tools/wasm-bindgen" "$target_dir/dashboard-tools/stylance"
         cargo build --locked --target x86_64-unknown-linux-gnu --no-default-features --features=scheduler-dashboard --bin sccache-dist
-        scripts/test-scheduler-dashboard-browser.sh target/x86_64-unknown-linux-gnu/debug/sccache-dist target/scheduler-dashboard/pkg
+        scripts/test-scheduler-dashboard-browser.sh "$target_dir/x86_64-unknown-linux-gnu/debug/sccache-dist" "$target_dir/scheduler-dashboard/pkg"
         # Reuse the already-initialized mandatory sccache for the standalone
         # destination-profile tests. Strict compiler lints run in rust-skills2.
         cargo test --locked --manifest-path tools/cpu-target-profile/Cargo.toml
