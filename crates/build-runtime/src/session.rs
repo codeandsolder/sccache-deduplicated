@@ -1248,6 +1248,41 @@ impl NativeSessions {
         })
     }
 
+    /// Authorize a bounded batch of exact result blobs before issuing peer
+    /// source grants. A ready durable result is the authority, not residency.
+    ///
+    /// # Errors
+    /// Returns an error for an expired ticket, uncommitted result or undeclared content.
+    pub fn result_sources(
+        &self,
+        ticket: Ticket,
+        blobs: &[BlobRef],
+    ) -> Result<Option<crate::PeerId>> {
+        ensure!(
+            !blobs.is_empty() && blobs.len() <= crate::wire::MAX_SOURCE_BATCH,
+            "invalid result source batch"
+        );
+        let session = self.get(ticket)?;
+        let mut state = Self::lock(&session)?;
+        self.authorize_reader(&mut state, Publisher::Client)?;
+        let Phase::Ready(Ready::Result(lease)) = &state.phase else {
+            bail!("native result not committed");
+        };
+        let declared = lease.manifest().blobs()?;
+        ensure!(
+            blobs
+                .iter()
+                .all(|blob| declared.get(&blob.id) == Some(&blob.size)),
+            "undeclared result source"
+        );
+        let producer = state
+            .allocation
+            .as_ref()
+            .map(|allocation| allocation.worker.peer);
+        drop(state);
+        Ok(producer)
+    }
+
     /// Open declared content for transport. Generated raw ZFS files are
     /// temporarily encoded for efficient wire transfer; original package
     /// archives are returned byte-for-byte.

@@ -26,6 +26,8 @@ use crate::dist::{
 };
 
 mod package;
+#[cfg(all(target_os = "linux", feature = "dist-client"))]
+mod result_delivery;
 mod upload;
 pub use package::{
     PackageAcquisition, PackageLocator, map_packages, validate_upstream_base,
@@ -58,6 +60,12 @@ pub(super) struct CommitRequest {
 pub(super) struct DownloadRequest {
     pub ticket: Ticket,
     pub id: ContentId,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct ResultSourceRequest {
+    pub ticket: Ticket,
+    pub blobs: Vec<BlobRef>,
 }
 
 #[derive(Serialize, Deserialize)]

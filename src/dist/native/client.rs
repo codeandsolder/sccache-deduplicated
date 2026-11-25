@@ -216,15 +216,19 @@ impl Delivery<'_> {
     pub(super) fn with_download<T>(
         &self,
         renewal_interval: Duration,
+        declared: &BTreeMap<crate::build_runtime::ContentId, u64>,
         operation: impl FnOnce(&mut BlobDownload<'_>) -> Result<T>,
     ) -> Result<T> {
         match self {
             Self::Scheduler(pin) => {
                 pin.client
                     .with_renewal(pin.ticket, renewal_interval, |check| {
+                        let mut delivery = super::result_delivery::ResultDelivery::new(
+                            pin.client, pin.ticket, declared,
+                        );
                         let result = operation(&mut |blob, output| {
                             check()?;
-                            pin.client.download(pin.ticket, blob, output)
+                            delivery.download(blob, output)
                         })?;
                         check()?;
                         Ok(result)
@@ -239,8 +243,8 @@ impl Delivery<'_> {
 
 impl NativeCacheClient {
     /// Admit an exact native action, supply only absent inputs, and execute
-    /// in the configured exact sandbox when needed. Remote results are read
-    /// from the scheduler; local results use captured descriptors directly.
+    /// in the configured exact sandbox when needed. Remote results use the
+    /// fastest authorized source; local results use captured descriptors directly.
     /// No result is repackaged into the legacy cache.
     ///
     /// # Errors
@@ -263,15 +267,19 @@ impl NativeCacheClient {
                 manifest,
             } => {
                 inputs.progress(NativeProgress::Phase(Phase::RestoreOutputs))?;
-                let staged = delivery.with_download(policy.renewal_interval, |download| {
-                    fetch_result(
-                        spec,
-                        &manifest,
-                        &destinations,
-                        policy.max_result_bytes,
-                        download,
-                    )
-                })?;
+                let staged = delivery.with_download(
+                    policy.renewal_interval,
+                    &manifest.blobs()?,
+                    |download| {
+                        fetch_result(
+                            spec,
+                            &manifest,
+                            &destinations,
+                            policy.max_result_bytes,
+                            download,
+                        )
+                    },
+                )?;
                 let output = staged.install()?;
                 Ok(NativeBuildResult { source, output })
             }

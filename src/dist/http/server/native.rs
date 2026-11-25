@@ -24,12 +24,13 @@ use crate::{
         NativeContentPending, NativeInputRejected, NativeServiceBusy, NativeSessions, NativeStore,
         NetworkMeter, PackageIdentity, PackageImportLimits, PackageSource, Peer, StagedBlob,
         TreeId, TreeManifest, VerifiedPackage,
-        wire::{Publisher, ScheduleReply, UploadHeader},
+        wire::{BlobRecipient, BlobSource, Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
     dist::native::{
         CommitRequest, DownloadRequest, ExecutionRequest, InputPrefetchRequest, ManifestRequest,
-        OpenTreeRequest, PackageAcquisition, PackageLocator, PackagePlanRequest, codec,
+        OpenTreeRequest, PackageAcquisition, PackageLocator, PackagePlanRequest,
+        ResultSourceRequest, codec,
     },
 };
 
@@ -42,6 +43,11 @@ pub(super) type Allocator = dyn Fn(
     ) -> Result<ScheduleReply>
     + Send
     + Sync;
+
+pub(super) type SourcePlanner<'a> = dyn Fn(BlobRef, BlobRecipient, Option<crate::dist::ServerId>) -> Result<Vec<BlobSource>>
+    + Send
+    + Sync
+    + 'a;
 
 pub(super) type ResultObserver<'a> = dyn Fn(crate::dist::ServerId, crate::dist::JobId, crate::dist::NativeLifecycleEvent<'_>)
     + Send
@@ -113,6 +119,11 @@ impl PackageService {
     }
 }
 
+pub(super) struct PublicationCallbacks<S, O> {
+    pub source_plan: S,
+    pub observe_result: O,
+}
+
 pub(super) fn spawn(
     config: &NativeCacheConfig,
     allocate: impl Fn(
@@ -132,17 +143,24 @@ pub(super) fn spawn(
     + Send
     + Sync
     + 'static,
-    observe_result: impl Fn(
-        crate::dist::ServerId,
-        crate::dist::JobId,
-        crate::dist::NativeLifecycleEvent<'_>,
-    ) + Send
-    + Sync
-    + 'static,
+    publication: PublicationCallbacks<
+        impl Fn(BlobRef, BlobRecipient, Option<crate::dist::ServerId>) -> Result<Vec<BlobSource>>
+        + Send
+        + Sync
+        + 'static,
+        impl Fn(crate::dist::ServerId, crate::dist::JobId, crate::dist::NativeLifecycleEvent<'_>)
+        + Send
+        + Sync
+        + 'static,
+    >,
     tls: Arc<ClusterListener>,
     enrollment: Arc<SchedulerEnrollment>,
     network: Arc<NetworkMeter>,
 ) -> Result<std::net::SocketAddr> {
+    let PublicationCallbacks {
+        source_plan,
+        observe_result,
+    } = publication;
     let socket = super::cluster_http::bind_data_socket(config.public_addr, config.bind_address)?;
     let bound = socket.local_addr()?;
     let limits = config.session_limits()?;
@@ -223,6 +241,7 @@ pub(super) fn spawn(
                     sessions: &sessions,
                     packages: packages.as_ref(),
                     network: &network,
+                    source_plan: &source_plan,
                     observe_result: &observe_result,
                 },
                 &allocate,
@@ -354,6 +373,7 @@ struct NativeServices<'a> {
     sessions: &'a NativeSessions,
     packages: Option<&'a PackageService>,
     network: &'a NetworkMeter,
+    source_plan: &'a SourcePlanner<'a>,
     observe_result: &'a ResultObserver<'a>,
 }
 
@@ -431,6 +451,7 @@ fn dispatch(
         packages,
         network,
         observe_result,
+        source_plan,
     } = services;
     let peer = match publisher {
         Publisher::Client => Peer::Client(request.id()),
@@ -609,6 +630,16 @@ fn dispatch(
         "close" => {
             sessions.close(metadata(request, limit)?, publisher)?;
             encode(&(), limit)
+        }
+        "result_sources" if publisher == Publisher::Client => {
+            let ResultSourceRequest { ticket, blobs } = metadata(request, limit)?;
+            let producer = sessions.result_sources(ticket, &blobs)?;
+            let recipient = BlobRecipient::Client(request.id());
+            let sources = blobs
+                .into_iter()
+                .map(|blob| Ok((blob, source_plan(blob, recipient, producer)?)))
+                .collect::<Result<Vec<_>>>()?;
+            encode(&sources, limit)
         }
         "download" => {
             let DownloadRequest { ticket, id } = metadata(request, limit)?;

@@ -182,6 +182,7 @@ fn with_native_service(
                         sessions: &sessions,
                         packages: None,
                         network: &network,
+                        source_plan: &|_, _, _| Ok(Vec::new()),
                         observe_result: &|server, job, event| {
                             let result = match event {
                                 crate::dist::NativeLifecycleEvent::InputsStaged => {
@@ -357,6 +358,7 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
             worker_client.begin(ticket, output.clone())?.missing,
             vec![blob]
         );
+        assert!(sessions.result_sources(ticket, &[blob]).is_err());
         assert!(
             worker_client
                 .commit(ticket, Duration::from_secs(300), None)
@@ -385,6 +387,39 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         worker_client.upload(ticket, blob, Cursor::new(bytes.clone()))?;
         let retention = Duration::from_millis(299_123);
         assert_eq!(worker_client.commit(ticket, retention, None)?, output);
+        assert_eq!(sessions.result_sources(ticket, &[blob])?, Some(owner));
+        assert!(
+            sessions
+                .result_sources(
+                    ticket,
+                    &[BlobRef {
+                        size: blob.size + 1,
+                        ..blob
+                    }]
+                )
+                .is_err()
+        );
+        assert!(sessions.result_sources(ticket, &[]).is_err());
+        let (http, base) = url.raw(&url.client)?;
+        let source_request = |blobs: Vec<BlobRef>| -> Result<reqwest::blocking::Response> {
+            Ok(http
+                .post(base.join("/api/v5/native/client/result_sources")?)
+                .header("Content-Type", "application/octet-stream")
+                .body(codec().serialize(&ResultSourceRequest { ticket, blobs })?)
+                .send()?)
+        };
+        assert_eq!(
+            source_request(vec![blob])?.status(),
+            reqwest::StatusCode::OK
+        );
+        assert!(
+            !source_request(vec![BlobRef {
+                size: blob.size + 1,
+                ..blob
+            }])?
+            .status()
+            .is_success()
+        );
         assert_eq!(
             *observations.lock().unwrap(),
             vec![

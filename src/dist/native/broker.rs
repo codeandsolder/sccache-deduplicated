@@ -177,7 +177,7 @@ fn serve_inner(
         } => {
             validate_manifest(&spec, &manifest, policy.max_result_bytes)?;
             let blobs = manifest.blobs()?;
-            delivery.with_download(build_policy.renewal_interval, |download| {
+            delivery.with_download(build_policy.renewal_interval, &blobs, |download| {
                 send(
                     stream,
                     &Event::Ready { source, manifest },

@@ -839,6 +839,7 @@ mod server {
     struct BlobJwt {
         exp: u64,
         blob: BlobRef,
+        recipient: crate::build_runtime::wire::BlobRecipient,
     }
 
     static BLOB_JWT_VALIDATION: LazyLock<jwt::Validation> = LazyLock::new(|| {
@@ -887,7 +888,11 @@ mod server {
                 })
         }
 
-        fn generate_blob_token(&self, blob: BlobRef) -> Result<String> {
+        fn generate_blob_token(
+            &self,
+            blob: BlobRef,
+            recipient: crate::build_runtime::wire::BlobRecipient,
+        ) -> Result<String> {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs();
@@ -896,15 +901,27 @@ mod server {
                 .context("peer capability deadline overflow")?;
             Ok(jwt::encode(
                 &JWT_HEADER,
-                &BlobJwt { exp, blob },
+                &BlobJwt {
+                    exp,
+                    blob,
+                    recipient,
+                },
                 &self.encoding_key,
             )?)
         }
 
-        fn verify_blob_token(&self, blob: BlobRef, token: &str) -> Result<()> {
+        fn verify_blob_token(
+            &self,
+            blob: BlobRef,
+            recipient: crate::build_runtime::wire::BlobRecipient,
+            token: &str,
+        ) -> Result<()> {
             let claims =
                 jwt::decode::<BlobJwt>(token, &self.decoding_key, &BLOB_JWT_VALIDATION)?.claims;
-            anyhow::ensure!(claims.blob == blob, "mismatched peer blob capability");
+            anyhow::ensure!(
+                claims.blob == blob && claims.recipient == recipient,
+                "mismatched peer blob capability"
+            );
             Ok(())
         }
     }
@@ -916,11 +933,13 @@ mod server {
             id: ContentId::of(b"data"),
             size: 4,
         };
-        let token = authorizer.generate_blob_token(blob)?;
-        authorizer.verify_blob_token(blob, &token)?;
+        use crate::build_runtime::wire::BlobRecipient;
+        let recipient = BlobRecipient::Client(ServerId::from_digest([4; 32]));
+        let token = authorizer.generate_blob_token(blob, recipient)?;
+        authorizer.verify_blob_token(blob, recipient, &token)?;
         assert!(
             authorizer
-                .verify_blob_token(BlobRef { size: 5, ..blob }, &token)
+                .verify_blob_token(BlobRef { size: 5, ..blob }, recipient, &token)
                 .is_err()
         );
         assert!(
@@ -930,6 +949,21 @@ mod server {
                         id: ContentId::of(b"else"),
                         ..blob
                     },
+                    recipient,
+                    &token
+                )
+                .is_err()
+        );
+        assert!(
+            authorizer
+                .verify_blob_token(blob, BlobRecipient::Scheduler, &token)
+                .is_err()
+        );
+        assert!(
+            authorizer
+                .verify_blob_token(
+                    blob,
+                    BlobRecipient::Client(ServerId::from_digest([5; 32])),
                     &token
                 )
                 .is_err()
@@ -938,15 +972,23 @@ mod server {
         assert!(authorizer.verify_token(job, &token).is_err());
         assert!(
             authorizer
-                .verify_blob_token(blob, &authorizer.generate_token(job)?)
+                .verify_blob_token(blob, recipient, &authorizer.generate_token(job)?)
                 .is_err()
         );
         let expired = jwt::encode(
             &JWT_HEADER,
-            &BlobJwt { exp: 1, blob },
+            &BlobJwt {
+                exp: 1,
+                blob,
+                recipient,
+            },
             &authorizer.encoding_key,
         )?;
-        assert!(authorizer.verify_blob_token(blob, &expired).is_err());
+        assert!(
+            authorizer
+                .verify_blob_token(blob, recipient, &expired)
+                .is_err()
+        );
         Ok(())
     }
 
@@ -1110,6 +1152,8 @@ mod server {
                 let allocation_routes = Arc::clone(&requester);
                 let peer_handler = Arc::clone(&handler);
                 let result_handler = Arc::clone(&handler);
+                let source_handler = Arc::clone(&handler);
+                let source_routes = Arc::clone(&requester);
                 let peer_routes = Arc::clone(&requester);
                 let network = Arc::new(crate::build_runtime::NetworkMeter::default());
                 let peer_network = Arc::clone(&network);
@@ -1138,7 +1182,12 @@ mod server {
                         }
                     },
                     move |blob, requester, store, deadline| {
-                        for source in peer_handler.native_blob_sources(blob, requester)? {
+                        for source in peer_handler.native_blob_sources(
+                            blob,
+                            requester,
+                            crate::build_runtime::wire::BlobRecipient::Scheduler,
+                            None,
+                        )? {
                             if std::time::Instant::now() >= deadline {
                                 break;
                             }
@@ -1161,8 +1210,25 @@ mod server {
                         }
                         Ok(None)
                     },
-                    move |server, job, event| {
-                        result_handler.observe_native_lifecycle(server, job, event)
+                    native::PublicationCallbacks {
+                        source_plan: move |blob, recipient, producer| {
+                            let sources = source_handler
+                                .native_blob_sources(blob, None, recipient, producer)?;
+                            Ok(sources
+                                .into_iter()
+                                .filter_map(|source| {
+                                    let routes = source_routes.addresses(source.server).ok()?;
+                                    Some(crate::build_runtime::wire::BlobSource {
+                                        peer: source.server,
+                                        routes,
+                                        token: source.token,
+                                    })
+                                })
+                                .collect())
+                        },
+                        observe_result: move |server, job, event| {
+                            result_handler.observe_native_lifecycle(server, job, event)
+                        },
                     },
                     native_tls.context("missing native data TLS listener")?,
                     Arc::clone(&enrollment),
@@ -1634,12 +1700,17 @@ mod server {
                                 prepare_response(request, &res)
                             },
                             (POST) (/api/v3/distserver/native_blob) => {
-                                if request.role() == Role::Client { return make_401("peer_role_required"); }
+                                use crate::build_runtime::wire::BlobRecipient;
+                                let recipient = match request.role() {
+                                    Role::Scheduler => BlobRecipient::Scheduler,
+                                    Role::Client => BlobRecipient::Client(request.id()),
+                                    Role::Worker => BlobRecipient::Worker(request.id()),
+                                };
                                 let blob: BlobRef = try_or_400_log!(req_id, native::metadata(request, 40));
                                 let Some(token) = bearer_http_auth(request) else {
                                     return rouille::Response::text("invalid peer capability").with_status_code(401);
                                 };
-                                if job_authorizer.verify_blob_token(blob, token).is_err() {
+                                if job_authorizer.verify_blob_token(blob, recipient, token).is_err() {
                                     return rouille::Response::text("invalid peer capability").with_status_code(401);
                                 }
                                 let file = try_or_500_log!(req_id, handler.handle_native_blob(blob));

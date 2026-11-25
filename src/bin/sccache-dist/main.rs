@@ -1572,6 +1572,8 @@ impl SchedulerIncoming for Scheduler {
         &self,
         blob: sccache::build_runtime::BlobRef,
         requester: Option<ServerId>,
+        recipient: sccache::build_runtime::wire::BlobRecipient,
+        producer: Option<ServerId>,
     ) -> Result<Vec<dist::NativeBlobSource>> {
         let servers = self
             .servers
@@ -1595,23 +1597,28 @@ impl SchedulerIncoming for Scheduler {
                             .as_ref()
                             .is_some_and(|job| job.inputs.get(&blob.id) == Some(&blob.size))
                 });
-                let locality =
-                    if pinned || details.recent_residency.retained(blob.id, blob.size, now) {
-                        3_u8
-                    } else if details.recent_residency.contains(blob.id, blob.size, now) {
-                        2_u8
-                    } else {
-                        u8::from(
-                            placement
-                                .residency
-                                .as_ref()
-                                .is_some_and(|residency| residency.may_contain(blob.id)),
-                        )
-                    };
+                let locality = if producer == Some(*id) {
+                    4_u8
+                } else if pinned || details.recent_residency.retained(blob.id, blob.size, now) {
+                    3_u8
+                } else if details.recent_residency.contains(blob.id, blob.size, now) {
+                    2_u8
+                } else {
+                    u8::from(
+                        placement
+                            .residency
+                            .as_ref()
+                            .is_some_and(|residency| residency.may_contain(blob.id)),
+                    )
+                };
                 (Some(*id) != requester
                     && details.last_seen.elapsed() < Duration::from_secs(20)
                     && details.last_error.is_none()
-                    && (requester.is_none() || locality > 0))
+                    && (matches!(
+                        recipient,
+                        sccache::build_runtime::wire::BlobRecipient::Scheduler
+                    ) && requester.is_none()
+                        || locality > 0))
                     .then_some((id, details, locality))
             })
             .collect::<Vec<_>>();
@@ -1621,12 +1628,23 @@ impl SchedulerIncoming for Scheduler {
                 .then_with(|| right.last_seen.cmp(&left.last_seen))
                 .then_with(|| a.cmp(b))
         });
+        let limit = if matches!(
+            recipient,
+            sccache::build_runtime::wire::BlobRecipient::Scheduler
+        ) {
+            usize::MAX
+        } else {
+            sccache::build_runtime::wire::MAX_BLOB_SOURCES
+        };
         candidates
             .into_iter()
+            .take(limit)
             .map(|(&server, details, _)| {
                 Ok(dist::NativeBlobSource {
                     server,
-                    token: details.job_authorizer.generate_blob_token(blob)?,
+                    token: details
+                        .job_authorizer
+                        .generate_blob_token(blob, recipient)?,
                 })
             })
             .collect()
@@ -2524,13 +2542,18 @@ mod scheduler_tests {
             Ok(())
         }
 
-        fn generate_blob_token(&self, _blob: sccache::build_runtime::BlobRef) -> Result<String> {
+        fn generate_blob_token(
+            &self,
+            _blob: sccache::build_runtime::BlobRef,
+            _recipient: sccache::build_runtime::wire::BlobRecipient,
+        ) -> Result<String> {
             Ok(String::new())
         }
 
         fn verify_blob_token(
             &self,
             _blob: sccache::build_runtime::BlobRef,
+            _recipient: sccache::build_runtime::wire::BlobRecipient,
             _token: &str,
         ) -> Result<()> {
             Ok(())
@@ -2669,12 +2692,37 @@ mod scheduler_tests {
                 },
             )?;
         }
-        let sources = scheduler.native_blob_sources(blob, Some(requester))?;
+        let sources = scheduler.native_blob_sources(
+            blob,
+            Some(requester),
+            sccache::build_runtime::wire::BlobRecipient::Scheduler,
+            None,
+        )?;
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].server, peer);
-        let recovery = scheduler.native_blob_sources(blob, None)?;
+        let recovery = scheduler.native_blob_sources(
+            blob,
+            None,
+            sccache::build_runtime::wire::BlobRecipient::Scheduler,
+            None,
+        )?;
         assert_eq!(recovery.len(), 3);
         assert_eq!(recovery[2].server, empty);
+        let direct = scheduler.native_blob_sources(
+            blob,
+            None,
+            sccache::build_runtime::wire::BlobRecipient::Client(ServerId::from_digest([4; 32])),
+            Some(empty),
+        )?;
+        assert_eq!(direct[0].server, empty);
+        assert_eq!(direct.len(), 3);
+        let direct = scheduler.native_blob_sources(
+            blob,
+            None,
+            sccache::build_runtime::wire::BlobRecipient::Client(ServerId::from_digest([4; 32])),
+            None,
+        )?;
+        assert_eq!(direct.len(), 2);
         for server in [requester, peer, empty] {
             assert_no_assigned_jobs(&scheduler, &server);
         }
@@ -2759,12 +2807,40 @@ mod scheduler_tests {
             bail!("worker unavailable");
         };
         let id = job_alloc.job_id;
-        assert!(scheduler.native_blob_sources(blob, Some(peer))?.is_empty());
+        assert!(
+            scheduler
+                .native_blob_sources(
+                    blob,
+                    Some(peer),
+                    sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None
+                )?
+                .is_empty()
+        );
         scheduler.observe_native_lifecycle(peer, id, dist::NativeLifecycleEvent::InputsStaged);
-        assert!(scheduler.native_blob_sources(blob, Some(peer))?.is_empty());
+        assert!(
+            scheduler
+                .native_blob_sources(
+                    blob,
+                    Some(peer),
+                    sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None
+                )?
+                .is_empty()
+        );
         scheduler.observe_native_lifecycle(worker, id, dist::NativeLifecycleEvent::InputsStaged);
         heartbeat(&[id])?;
-        assert_eq!(scheduler.native_blob_sources(blob, Some(peer))?.len(), 1);
+        assert_eq!(
+            scheduler
+                .native_blob_sources(
+                    blob,
+                    Some(peer),
+                    sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None
+                )?
+                .len(),
+            1
+        );
         {
             let servers = scheduler.servers.lock().unwrap();
             let queue = &servers[&worker]
@@ -2778,7 +2854,17 @@ mod scheduler_tests {
             assert_eq!(servers[&worker].compiler_demand(), 1);
         }
         scheduler.handle_update_job_state(id, worker, JobState::Complete)?;
-        assert_eq!(scheduler.native_blob_sources(blob, Some(peer))?.len(), 1);
+        assert_eq!(
+            scheduler
+                .native_blob_sources(
+                    blob,
+                    Some(peer),
+                    sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None
+                )?
+                .len(),
+            1
+        );
         assert_eq!(
             scheduler.servers.lock().unwrap()[&worker].compiler_demand(),
             0
@@ -2979,12 +3065,35 @@ mod scheduler_tests {
         };
         register(other, 1_000_000_000)?;
         scheduler.observe_native_lifecycle(producer, job, committed());
-        assert!(scheduler.native_blob_sources(blob, Some(other))?.is_empty());
+        assert!(
+            scheduler
+                .native_blob_sources(
+                    blob,
+                    Some(other),
+                    sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None
+                )?
+                .is_empty()
+        );
         scheduler.observe_native_lifecycle(producer, job, dist::NativeLifecycleEvent::Negotiated);
         scheduler.observe_native_lifecycle(other, job, committed());
-        assert!(scheduler.native_blob_sources(blob, Some(other))?.is_empty());
+        assert!(
+            scheduler
+                .native_blob_sources(
+                    blob,
+                    Some(other),
+                    sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None
+                )?
+                .is_empty()
+        );
         scheduler.observe_native_lifecycle(producer, job, committed());
-        let sources = scheduler.native_blob_sources(blob, Some(other))?;
+        let sources = scheduler.native_blob_sources(
+            blob,
+            Some(other),
+            sccache::build_runtime::wire::BlobRecipient::Scheduler,
+            None,
+        )?;
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].server, producer);
         scheduler.handle_update_job_state(job, producer, JobState::Complete)?;
@@ -3003,7 +3112,16 @@ mod scheduler_tests {
         register(producer, 2_000_000_000)?;
         scheduler.observe_native_lifecycle(producer, job, dist::NativeLifecycleEvent::Negotiated);
         scheduler.observe_native_lifecycle(producer, job, committed());
-        assert!(scheduler.native_blob_sources(blob, Some(other))?.is_empty());
+        assert!(
+            scheduler
+                .native_blob_sources(
+                    blob,
+                    Some(other),
+                    sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None
+                )?
+                .is_empty()
+        );
         let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
             &AcceptAssign,
             native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
@@ -3608,13 +3726,18 @@ mod scheduler_tests {
             Ok(())
         }
 
-        fn generate_blob_token(&self, _blob: sccache::build_runtime::BlobRef) -> Result<String> {
+        fn generate_blob_token(
+            &self,
+            _blob: sccache::build_runtime::BlobRef,
+            _recipient: sccache::build_runtime::wire::BlobRecipient,
+        ) -> Result<String> {
             bail!("synthetic authorization failure")
         }
 
         fn verify_blob_token(
             &self,
             _blob: sccache::build_runtime::BlobRef,
+            _recipient: sccache::build_runtime::wire::BlobRecipient,
             _token: &str,
         ) -> Result<()> {
             Ok(())

@@ -218,9 +218,7 @@ impl RouteSet {
     ) -> Self {
         let candidates = candidates
             .into_iter()
-            .filter(|&address| {
-                address != primary && Self::eligible(address) && !address.ip().is_loopback()
-            })
+            .filter(|&address| address != primary && Self::eligible(address))
             .collect::<std::collections::BTreeSet<_>>();
         let mut ipv4 = candidates
             .iter()

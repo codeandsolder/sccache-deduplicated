@@ -161,6 +161,35 @@ pub struct BeginResult {
     pub missing: Vec<BlobRef>,
 }
 
+/// Authorization for an exact peer-to-peer content transfer. Scheduler
+/// recovery and member delivery use the same transport but distinct grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlobRecipient {
+    Scheduler,
+    Client(crate::PeerId),
+    Worker(crate::PeerId),
+}
+
+/// A source for one exact content identity. The grant is never logged.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobSource {
+    pub peer: crate::PeerId,
+    pub routes: sccache_peer_identity::RouteSet,
+    pub token: String,
+}
+
+impl std::fmt::Debug for BlobSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobSource")
+            .field("peer", &self.peer)
+            .field("routes", &self.routes)
+            .finish_non_exhaustive()
+    }
+}
+
+pub const MAX_SOURCE_BATCH: usize = 32;
+pub const MAX_BLOB_SOURCES: usize = 4;
+
 /// Fixed header of an upload. Physical bytes follow in the declared encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadHeader {
@@ -349,7 +378,7 @@ pub enum NativeRunRequest {
     Acknowledge,
 }
 
-/// Successful output bytes are retrieved from the scheduler. Failed
+/// Successful output bytes are available under the result lease. Failed
 /// compilations retain replayable diagnostics until acknowledgement or expiry,
 /// without creating a cache hit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

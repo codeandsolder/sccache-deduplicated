@@ -105,7 +105,7 @@ impl RouteBook {
     /// Reserve only stale candidates, preventing parallel requests from
     /// generating duplicate probe batches.
     pub fn reserve(&self, peer: PeerId, role: Role, routes: &RouteSet) -> Vec<Probe> {
-        if routes.alternatives.is_empty() || !routes.valid() {
+        if !routes.valid() {
             return Vec::new();
         }
         let now = Instant::now();
@@ -292,6 +292,43 @@ impl RouteBook {
         routes: &RouteSet,
         transfer: Option<Transfer>,
     ) -> Vec<SocketAddr> {
+        let explore = transfer.is_some_and(|transfer| transfer.bytes() >= MIN_SAMPLE_BYTES)
+            && self
+                .transfers
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(16);
+        let mut result = self
+            .ranked(peer, role, routes, transfer, explore)
+            .into_iter()
+            .map(|(_, _, _, address)| address)
+            .collect::<Vec<_>>();
+        if !result.contains(&routes.primary) {
+            result.push(routes.primary);
+        }
+        result
+    }
+
+    /// Compare alternative sources without consuming an exploration slot.
+    pub fn estimated_cost(
+        &self,
+        peer: PeerId,
+        role: Role,
+        routes: &RouteSet,
+        transfer: Transfer,
+    ) -> Option<u128> {
+        self.ranked(peer, role, routes, Some(transfer), false)
+            .first()
+            .map(|(_, cost, _, _)| *cost)
+    }
+
+    fn ranked(
+        &self,
+        peer: PeerId,
+        role: Role,
+        routes: &RouteSet,
+        transfer: Option<Transfer>,
+        explore: bool,
+    ) -> Vec<(bool, u128, bool, SocketAddr)> {
         let now = Instant::now();
         let samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
         let rate = |address| {
@@ -308,11 +345,6 @@ impl RouteBook {
             })
         };
         let baseline = routes.iter().filter_map(rate).max().unwrap_or(DEFAULT_RATE);
-        let explore = transfer.is_some_and(|transfer| transfer.bytes() >= MIN_SAMPLE_BYTES)
-            && self
-                .transfers
-                .fetch_add(1, Ordering::Relaxed)
-                .is_multiple_of(16);
         let mut ranked = routes
             .iter()
             .filter_map(|address| {
@@ -327,8 +359,15 @@ impl RouteBook {
                 let known = rate(address);
                 let cost = rtt.as_nanos()
                     + transfer.map_or(0, |transfer| {
-                        (u128::from(transfer.bytes()) * 1_000_000_000)
-                            .div_ceil(u128::from(known.unwrap_or(baseline)))
+                        (u128::from(transfer.bytes()) * 1_000_000_000).div_ceil(u128::from(
+                            known.unwrap_or_else(|| {
+                                if address.ip().is_loopback() {
+                                    baseline.max(256 << 20)
+                                } else {
+                                    baseline
+                                }
+                            }),
+                        ))
                     });
                 Some((
                     !explore || known.is_some(),
@@ -345,14 +384,7 @@ impl RouteBook {
                 .then_with(|| a.2.cmp(&b.2))
                 .then_with(|| a.3.cmp(&b.3))
         });
-        let mut result = ranked
-            .into_iter()
-            .map(|(_, _, _, address)| address)
-            .collect::<Vec<_>>();
-        if !result.contains(&routes.primary) {
-            result.push(routes.primary);
-        }
-        result
+        ranked
     }
 }
 
@@ -460,9 +492,7 @@ pub fn discover(primary: SocketAddr, bind: SocketAddr) -> RouteSet {
         .into_iter()
         .flatten()
         .filter_map(|interface| {
-            if !interface.flags.contains(InterfaceFlags::IFF_UP)
-                || interface.flags.contains(InterfaceFlags::IFF_LOOPBACK)
-            {
+            if !interface.flags.contains(InterfaceFlags::IFF_UP) {
                 return None;
             }
             let address = interface.address?;

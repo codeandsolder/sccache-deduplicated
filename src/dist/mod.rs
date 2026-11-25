@@ -998,8 +998,17 @@ pub trait ServerOutgoing: Send + Sync {
 pub trait JobAuthorizer: Send {
     fn generate_token(&self, job_id: JobId) -> Result<String>;
     fn verify_token(&self, job_id: JobId, token: &str) -> Result<()>;
-    fn generate_blob_token(&self, blob: crate::build_runtime::BlobRef) -> Result<String>;
-    fn verify_blob_token(&self, blob: crate::build_runtime::BlobRef, token: &str) -> Result<()>;
+    fn generate_blob_token(
+        &self,
+        blob: crate::build_runtime::BlobRef,
+        recipient: crate::build_runtime::wire::BlobRecipient,
+    ) -> Result<String>;
+    fn verify_blob_token(
+        &self,
+        blob: crate::build_runtime::BlobRef,
+        recipient: crate::build_runtime::wire::BlobRecipient,
+        token: &str,
+    ) -> Result<()>;
 }
 
 /// A narrowly scoped peer-source capability; never log its token.
@@ -1160,6 +1169,8 @@ pub trait SchedulerIncoming: Send + Sync {
         &self,
         blob: crate::build_runtime::BlobRef,
         requester: Option<ServerId>,
+        recipient: crate::build_runtime::wire::BlobRecipient,
+        producer: Option<ServerId>,
     ) -> ExtResult<Vec<NativeBlobSource>, Error>;
     /// Record advisory producer residency for the current worker epoch.
     fn observe_native_lifecycle(

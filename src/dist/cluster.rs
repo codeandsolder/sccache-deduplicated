@@ -111,13 +111,21 @@ impl BlockingRoutes {
 
     /// Probe in parallel, without sending any application request or job token.
     pub fn select(&self, peer: PeerId, role: Role, routes: &RouteSet) -> Vec<SocketAddr> {
-        let pending = self.book.reserve(peer, role, routes);
+        self.probe_routes([(peer, role, routes)]);
+        self.book.ordered(peer, role, routes, None)
+    }
+
+    pub(super) fn probe_routes<'a>(
+        &self,
+        routes: impl IntoIterator<Item = (PeerId, Role, &'a RouteSet)>,
+    ) {
         std::thread::scope(|scope| {
-            for address in pending {
-                scope.spawn(move || self.probe(peer, role, address));
+            for (peer, role, routes) in routes {
+                for probe in self.book.reserve(peer, role, routes) {
+                    scope.spawn(move || self.probe(peer, role, probe));
+                }
             }
         });
-        self.book.ordered(peer, role, routes, None)
     }
 
     /// Refresh measurements outside the heartbeat and allocation request pools.
@@ -143,6 +151,16 @@ impl BlockingRoutes {
         transfer: Transfer,
     ) -> Vec<SocketAddr> {
         self.book.ordered(peer, role, routes, Some(transfer))
+    }
+
+    pub(super) fn estimated_cost(
+        &self,
+        peer: PeerId,
+        role: Role,
+        routes: &RouteSet,
+        transfer: Transfer,
+    ) -> Option<u128> {
+        self.book.estimated_cost(peer, role, routes, transfer)
     }
 
     pub(super) fn best_rate(
