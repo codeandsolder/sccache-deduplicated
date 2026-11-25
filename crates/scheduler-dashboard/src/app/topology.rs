@@ -7,7 +7,7 @@ use leptos::prelude::*;
 use super::rate;
 use crate::{HostRole, NetworkGraph, NetworkHost, NetworkLink, RouteEvidence, styles};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Point {
     x: i32,
     y: i32,
@@ -91,6 +91,8 @@ struct Connection {
     count: usize,
     active: bool,
     measured: bool,
+    wire_rate: Option<u64>,
+    logical_rate: Option<u64>,
 }
 
 type Pair = (String, String);
@@ -104,6 +106,8 @@ fn connections(links: &[NetworkLink]) -> BTreeMap<Pair, Connection> {
         group.count += 1;
         group.active |= link.evidence == RouteEvidence::Transferring;
         group.measured |= link.evidence != RouteEvidence::Advertised;
+        group.wire_rate = group.wire_rate.max(link.wire_bytes_per_second);
+        group.logical_rate = group.logical_rate.max(link.logical_bytes_per_second);
     }
     groups
 }
@@ -120,21 +124,7 @@ pub(super) fn Topology(graph: Memo<NetworkGraph>) -> impl IntoView {
                 .collect::<BTreeMap<_, _>>()
         })
     });
-    let roster = Memo::new(move |_| {
-        hosts.with(|hosts| {
-            hosts
-                .values()
-                .map(|host| (host.id.clone(), host.role))
-                .collect::<Vec<_>>()
-        })
-    });
-    let positions = Memo::new(move |_| roster.with(|roster| layout(roster)));
-    let pairs = Memo::new(move |_| graph.with(|graph| connections(&graph.links)));
-    let pair_keys =
-        Memo::new(move |_| pairs.with(|pairs| pairs.keys().cloned().collect::<Vec<_>>()));
-    let ids = Memo::new(move |_| {
-        roster.with(|roster| roster.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>())
-    });
+    let ids = Memo::new(move |_| hosts.with(|hosts| hosts.keys().cloned().collect::<Vec<_>>()));
     let selected_host =
         Memo::new(move |_| selected.with(|id| hosts.with(|hosts| hosts.get(id).cloned())));
     let links = Memo::new(move |_| {
@@ -167,6 +157,37 @@ pub(super) fn Topology(graph: Memo<NetworkGraph>) -> impl IntoView {
                 <button on:click=move |_| selected.set(String::new())>"Show all"</button>
                 <span class=styles::muted>{move || graph.with(|graph| format!("{} identities · {} directional paths",graph.hosts.len(),graph.links.len()))}</span>
             </div>
+            <GraphCanvas graph=graph hosts=hosts selected=selected/>
+            {move || selected_host.get().map(|host|view!{<HostDetails host=host/>})}
+            <RouteTable links=links hosts=hosts/>
+        </section>
+    }
+}
+
+type Hosts = BTreeMap<String, NetworkHost>;
+
+#[component]
+fn GraphCanvas(
+    graph: Memo<NetworkGraph>,
+    hosts: Memo<Hosts>,
+    selected: RwSignal<String>,
+) -> impl IntoView {
+    let roster = Memo::new(move |_| {
+        hosts.with(|hosts| {
+            hosts
+                .values()
+                .map(|host| (host.id.clone(), host.role))
+                .collect::<Vec<_>>()
+        })
+    });
+    let positions = Memo::new(move |_| roster.with(|roster| layout(roster)));
+    let pairs = Memo::new(move |_| graph.with(|graph| connections(&graph.links)));
+    let pair_keys =
+        Memo::new(move |_| pairs.with(|pairs| pairs.keys().cloned().collect::<Vec<_>>()));
+    let ids = Memo::new(move |_| {
+        roster.with(|roster| roster.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>())
+    });
+    view! {
             <div class=styles::topology_scroll>
                 <svg class=styles::topology_svg role="img" aria-label="Directed logical network graph" viewBox=move || format!("0 0 960 {}", positions.with(|p| p.height)) style:height=move || format!("{}px",positions.with(|p| p.height))>
                     <defs><marker id="topology-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"/></marker></defs>
@@ -180,7 +201,7 @@ pub(super) fn Topology(graph: Memo<NetworkGraph>) -> impl IntoView {
                                 opacity=move || if highlighted() {"1"} else {"0.12"}
                                 d=move || geometry.with(|points| points.map_or_else(String::new, |(a,b)| edge_path(a,b)))
                                 marker-end="url(#topology-arrow)">
-                                <title>{move || state.with(|s|format!("{} directional route(s){}",s.count,if s.active {" · transferring"} else {""}))}</title>
+                                <title>{move || state.with(|s|format!("{} directional route(s){}\nBest observed wire: {}\nBest verified logical: {}",s.count,if s.active {" · transferring"} else {""},optional_rate(s.wire_rate),optional_rate(s.logical_rate)))}</title>
                             </path>
                         }
                     }/>
@@ -202,18 +223,49 @@ pub(super) fn Topology(graph: Memo<NetworkGraph>) -> impl IntoView {
                     }/>
                 </svg>
             </div>
-            {move || selected_host.get().map(|host|view!{<HostDetails host=host/>})}
-            <h3>"Directional routes"</h3>
-            <div class=styles::tablewrap><table><thead><tr><th>"Source"</th><th>"Destination"</th><th>"Evidence"</th><th>"Wire service"</th><th>"Logical service"</th><th>"Outstanding"</th></tr></thead>
-                <tbody>{move || links.with(|links|links.iter().map(|link| {
-                    let name=|id:&str|hosts.with(|hosts|hosts.get(id).map_or_else(||short(id,16),|host|host.name.clone()));
-                    view!{<tr><td><b>{name(&link.source)}</b><small>{link.source_address.clone().unwrap_or_else(||"Unknown source".into())}</small></td>
-                    <td><b>{name(&link.target)}</b><small>{link.target_address.clone().unwrap_or_else(||"Unknown endpoint".into())}</small></td>
-                    <td>{evidence(link.evidence)}</td><td>{optional_rate(link.wire_bytes_per_second)}</td><td>{optional_rate(link.logical_bytes_per_second)}</td>
-                    <td>{link.remaining_bytes.map_or_else(||"—".into(),super::bytes)}</td></tr>}
-                }).collect_view())}</tbody>
-            </table></div>
-        </section>
+    }
+}
+
+#[component]
+fn RouteTable(links: Memo<Vec<NetworkLink>>, hosts: Memo<Hosts>) -> impl IntoView {
+    let indexed = Memo::new(move |_| {
+        links.with(|links| {
+            links
+                .iter()
+                .map(|link| (link.id.clone(), link.clone()))
+                .collect::<BTreeMap<_, _>>()
+        })
+    });
+    let keys = Memo::new(move |_| indexed.with(|links| links.keys().cloned().collect::<Vec<_>>()));
+    view! {
+        <h3>"Directional routes"</h3>
+        <div class=styles::tablewrap><table><thead><tr><th>"Source"</th><th>"Destination"</th><th>"Evidence"</th><th>"Wire service"</th><th>"Logical service"</th><th>"Outstanding"</th></tr></thead>
+            <tbody>
+                <For each=move ||keys.get() key=Clone::clone children=move |id| {
+                    let link = Memo::new(move |_| indexed.with(|links|links.get(&id).cloned()));
+                    view! { <tr>{move ||link.get().map(|link|view!{<RouteCells link=link hosts=hosts/>})}</tr> }
+                }/>
+            </tbody>
+        </table></div>
+    }
+}
+
+#[component]
+fn RouteCells(link: NetworkLink, hosts: Memo<Hosts>) -> impl IntoView {
+    let source = link.source;
+    let target = link.target;
+    let name = move |id: &str| {
+        hosts.with(|hosts| {
+            hosts
+                .get(id)
+                .map_or_else(|| short(id, 16), |host| host.name.clone())
+        })
+    };
+    view! {
+        <td><b>{move ||name(&source)}</b><small>{link.source_address.unwrap_or_else(||"Unknown source".into())}</small></td>
+        <td><b>{move ||name(&target)}</b><small>{link.target_address.unwrap_or_else(||"Unknown endpoint".into())}</small></td>
+        <td>{evidence(link.evidence)}</td><td>{optional_rate(link.wire_bytes_per_second)}</td><td>{optional_rate(link.logical_bytes_per_second)}</td>
+        <td>{link.remaining_bytes.map_or_else(||"—".into(),super::bytes)}</td>
     }
 }
 

@@ -1,8 +1,8 @@
-#![allow(
+#![expect(
     clippy::empty_enum,
     reason = "Leptos component macros generate uninhabited prop-state enums"
 )]
-#![allow(
+#![expect(
     clippy::unused_async,
     reason = "Leptos server-function macro requires an async RPC signature"
 )]
@@ -224,7 +224,7 @@ fn FleetMetrics() -> impl IntoView {
 
 // These values feed rounded human-readable labels and SVG coordinates, never
 // admission or cache accounting. The integer authoritative value stays intact.
-#[allow(
+#[expect(
     clippy::cast_precision_loss,
     reason = "approximate display coordinates and labels"
 )]
