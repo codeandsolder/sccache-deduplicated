@@ -235,6 +235,51 @@ pub(super) enum ListenerRole {
     },
 }
 
+/// Explicitly configure the address-family behavior; do not depend on
+/// the host's IPV6_V6ONLY default. An IPv4-only kernel can still serve
+/// the configured reliable IPv4 endpoint when no explicit bind is set.
+pub(super) fn bind_socket(address: SocketAddr) -> io::Result<TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    if address.is_ipv6() {
+        socket.set_only_v6(!address.ip().is_unspecified())?;
+    }
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.bind(&address.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
+}
+
+pub(super) fn bind_data_socket(
+    primary: SocketAddr,
+    explicit: Option<SocketAddr>,
+) -> Result<TcpListener> {
+    let address = explicit.unwrap_or_else(|| crate::dist::cluster::wildcard(primary));
+    match bind_socket(address) {
+        Err(error)
+            if explicit.is_none()
+                && primary.is_ipv4()
+                && address.is_ipv6()
+                && (error.kind() == io::ErrorKind::Unsupported
+                    || error.kind() == io::ErrorKind::AddrNotAvailable
+                    || error.raw_os_error() == Some(libc::EAFNOSUPPORT)
+                    || error.raw_os_error() == Some(libc::EPROTONOSUPPORT)) =>
+        {
+            bind_socket(SocketAddr::new(
+                std::net::Ipv4Addr::UNSPECIFIED.into(),
+                primary.port(),
+            ))
+            .context("bind IPv4-only distributed listener")
+        }
+        result => result.context("bind distributed HTTPS listener"),
+    }
+}
+
 /// Bind the listener before starting any dependent background services.
 pub(super) struct Listener {
     socket: TcpListener,
@@ -252,9 +297,17 @@ impl Listener {
         threads: usize,
         handler: impl Fn(&Request) -> rouille::Response + Send + Sync + 'static,
     ) -> Result<Self> {
+        Self::from_socket(bind_socket(address)?, tls, role, threads, handler)
+    }
+
+    pub(super) fn from_socket(
+        socket: TcpListener,
+        tls: Arc<ClusterListener>,
+        role: ListenerRole,
+        threads: usize,
+        handler: impl Fn(&Request) -> rouille::Response + Send + Sync + 'static,
+    ) -> Result<Self> {
         anyhow::ensure!(threads > 0, "HTTP handler pool must not be empty");
-        let socket = TcpListener::bind(address).context("bind distributed HTTPS listener")?;
-        socket.set_nonblocking(true)?;
         Ok(Self {
             socket,
             tls,
@@ -340,5 +393,36 @@ impl Listener {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod dual_stack_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr, TcpStream};
+
+    #[test]
+    fn default_data_listener_accepts_both_address_families() -> Result<()> {
+        let primary = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 0);
+        let listener = bind_data_socket(primary, None)?;
+        let bound = listener.local_addr()?;
+        let v4 = TcpStream::connect((Ipv4Addr::LOCALHOST, bound.port()))?;
+        let (accepted, _) = listener.accept()?;
+        drop((v4, accepted));
+        if bound.is_ipv6() {
+            let v6 = TcpStream::connect((Ipv6Addr::LOCALHOST, bound.port()))?;
+            let (accepted, _) = listener.accept()?;
+            drop((v6, accepted));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_ipv4_bind_is_not_widened() -> Result<()> {
+        let primary = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
+        let listener = bind_data_socket(primary, Some(primary))?;
+        assert!(listener.local_addr()?.is_ipv4());
+        assert!(listener.local_addr()?.ip().is_loopback());
+        Ok(())
     }
 }

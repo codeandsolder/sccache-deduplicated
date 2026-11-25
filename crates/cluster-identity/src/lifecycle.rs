@@ -14,7 +14,7 @@ use openssl::x509::X509;
 use super::{EnrollmentClient, Identity, PeerId, Role, TlsCredentials};
 use sccache_peer_identity::PeerConfig;
 
-const RENEWAL_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+const RENEWAL_WINDOW: Duration = Duration::from_hours(24);
 
 /// Persistent member identity and current certificate. The scheduler is
 /// authenticated before any enrollment credential is transmitted.
@@ -122,7 +122,9 @@ impl PeerCredentials {
             renewed.persist(&self.config.directory.join("leaf.der"))?;
             *active = renewed;
         }
-        Ok(Arc::clone(&active))
+        let credential = Arc::clone(&active);
+        drop(active);
+        Ok(credential)
     }
 
     /// Scheduler identity as provisioned out of band.

@@ -124,6 +124,7 @@ zstd = "0.14"
 zlib-rs-fast = { package = "zlib-rs", git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "692f6a52b19a95665be098c71e5a4f383ef0d76a", optional = true, default-features = false, features = ["std"] }
 
 # dist-server only
+socket2 = { version = "0.6", optional = true }
 nix = { version = "0.32.0", optional = true, features = [
   "mount",
   "net",
@@ -257,6 +258,7 @@ dist-client = [
 ]
 # Enables the sccache-dist binary
 dist-server = [
+  "dep:socket2",
   "dep:sccache-cluster-identity",
   "hyper",
   "http-body-util",

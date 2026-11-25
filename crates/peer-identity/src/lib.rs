@@ -154,15 +154,31 @@ impl RouteSet {
         primary: std::net::SocketAddr,
         candidates: impl IntoIterator<Item = std::net::SocketAddr>,
     ) -> Self {
-        let alternatives = candidates
+        let candidates = candidates
             .into_iter()
             .filter(|&address| {
                 address != primary && Self::eligible(address) && !address.ip().is_loopback()
             })
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .take(Self::MAX_ALTERNATIVES)
-            .collect();
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut ipv4 = candidates
+            .iter()
+            .copied()
+            .filter(std::net::SocketAddr::is_ipv4);
+        let mut ipv6 = candidates
+            .iter()
+            .copied()
+            .filter(std::net::SocketAddr::is_ipv6);
+        let mut alternatives = Vec::with_capacity(Self::MAX_ALTERNATIVES);
+        while alternatives.len() < Self::MAX_ALTERNATIVES {
+            let next = if alternatives.len().is_multiple_of(2) {
+                ipv4.next().or_else(|| ipv6.next())
+            } else {
+                ipv6.next().or_else(|| ipv4.next())
+            };
+            let Some(next) = next else { break };
+            alternatives.push(next);
+        }
+        alternatives.sort_unstable();
         Self {
             primary,
             alternatives,
@@ -179,5 +195,40 @@ impl RouteSet {
 
     pub fn iter(&self) -> impl Iterator<Item = std::net::SocketAddr> + '_ {
         std::iter::once(self.primary).chain(self.alternatives.iter().copied())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn candidate_budget_preserves_both_families() {
+        let primary = SocketAddr::new(Ipv4Addr::new(100, 64, 0, 1).into(), 10501);
+        let candidates = (1..=16)
+            .map(|last| SocketAddr::new(Ipv4Addr::new(192, 168, 0, last).into(), 10501))
+            .chain((1..=16).map(|last| {
+                SocketAddr::new(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, last).into(), 10501)
+            }));
+        let routes = RouteSet::new(primary, candidates);
+        assert!(routes.valid());
+        assert_eq!(routes.alternatives.len(), RouteSet::MAX_ALTERNATIVES);
+        assert_eq!(
+            routes
+                .alternatives
+                .iter()
+                .filter(|address| address.is_ipv4())
+                .count(),
+            4
+        );
+        assert_eq!(
+            routes
+                .alternatives
+                .iter()
+                .filter(|address| address.is_ipv6())
+                .count(),
+            4
+        );
     }
 }

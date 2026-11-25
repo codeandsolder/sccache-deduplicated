@@ -1086,10 +1086,7 @@ mod server {
                         }
                     }
                 })?;
-            let native_endpoint = native_cache
-                .as_ref()
-                .map(|config| (config.public_addr, config.listener_address()));
-            if let Some(config) = native_cache {
+            let native_endpoint = if let Some(config) = native_cache {
                 let handler = Arc::clone(&handler);
                 let requester = Arc::clone(&requester);
                 let allocation_routes = Arc::clone(&requester);
@@ -1098,7 +1095,7 @@ mod server {
                 let peer_routes = Arc::clone(&requester);
                 let network = Arc::new(crate::build_runtime::NetworkMeter::default());
                 let peer_network = Arc::clone(&network);
-                native::spawn(
+                let bound = native::spawn(
                     &config,
                     move |assignment, snapshot, packages| match handler.handle_alloc_native_job(
                         &*requester,
@@ -1153,7 +1150,10 @@ mod server {
                     Arc::clone(&enrollment),
                     network,
                 )?;
-            }
+                Some((config.public_addr, bound))
+            } else {
+                None
+            };
 
             macro_rules! check_server_auth_or_err {
                 ($request:ident) => {{
@@ -1394,7 +1394,7 @@ mod server {
 
     pub struct Server<S> {
         public_addr: SocketAddr,
-        bind_address: SocketAddr,
+        bind_address: Option<SocketAddr>,
         peer: Arc<PeerCredentials>,
         jwt_key: Vec<u8>,
         server_nonce: ServerNonce,
@@ -1419,8 +1419,7 @@ mod server {
 
             Ok(Self {
                 public_addr,
-                bind_address: bind_address
-                    .unwrap_or_else(|| crate::dist::cluster::wildcard(public_addr)),
+                bind_address,
                 peer,
                 jwt_key,
                 server_nonce,
@@ -1439,6 +1438,8 @@ mod server {
                 worker_name,
                 handler,
             } = self;
+            let socket = cluster_http::bind_data_socket(public_addr, bind_address)?;
+            let bind_address = socket.local_addr()?;
             let mut load_aware_capacity = LoadAwareCapacity::new();
             let handler = Arc::new(handler);
             let heartbeat_handler = Arc::clone(&handler);
@@ -1584,8 +1585,8 @@ mod server {
             info!("Server listening for clients on {}", bind_address);
             let request_count = atomic::AtomicUsize::new(0);
 
-            let server = Listener::bind(
-                bind_address,
+            let server = Listener::from_socket(
+                socket,
                 tls,
                 ListenerRole::Worker {
                     scheduler: scheduler_id,

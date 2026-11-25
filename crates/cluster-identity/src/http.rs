@@ -282,7 +282,13 @@ impl ClusterListener {
         H: Fn(Option<AuthenticatedPeer>, SocketAddr, Request<Incoming>) -> F + Send + Sync,
         F: Future<Output = Response<ClusterBody>> + Send,
     {
-        let address = socket.peer_addr()?;
+        let address = match socket.peer_addr()? {
+            SocketAddr::V6(address) if address.ip().to_ipv4_mapped().is_some() => SocketAddr::new(
+                std::net::IpAddr::V6(*address.ip()).to_canonical(),
+                address.port(),
+            ),
+            address => address,
+        };
         let config = self
             .config
             .read()
@@ -348,7 +354,7 @@ impl SchedulerEnrollment {
         allow_enrollment: bool,
     ) -> Response<ClusterBody>
     where
-        H: Fn(AuthenticatedPeer, Request<Incoming>) -> F,
+        H: Fn(AuthenticatedPeer, Request<Incoming>) -> F + Sync,
         F: Future<Output = Response<ClusterBody>>,
     {
         let role = match request.uri().path() {
@@ -408,7 +414,7 @@ impl SchedulerEnrollment {
         };
         let csr = match decode(request).await {
             Ok(csr) => csr,
-            Err(error) => return error,
+            Err((status, message)) => return response(status, message),
         };
         let enrollment = Arc::clone(self);
         issue_result(
@@ -428,7 +434,7 @@ impl SchedulerEnrollment {
     ) -> Response<ClusterBody> {
         let csr = match decode(request).await {
             Ok(csr) => csr,
-            Err(error) => return error,
+            Err((status, message)) => return response(status, message),
         };
         let enrollment = Arc::clone(self);
         issue_result(
@@ -442,7 +448,7 @@ impl SchedulerEnrollment {
 
 async fn decode(
     request: Request<Incoming>,
-) -> std::result::Result<EnrollmentRequest, Response<ClusterBody>> {
+) -> std::result::Result<EnrollmentRequest, (StatusCode, &'static str)> {
     if request.method() != Method::POST
         || request.uri().query().is_some()
         || request
@@ -451,42 +457,41 @@ async fn decode(
             .and_then(|value| value.to_str().ok())
             != Some("application/octet-stream")
     {
-        return Err(response(
-            StatusCode::BAD_REQUEST,
-            "invalid enrollment request",
-        ));
+        return Err((StatusCode::BAD_REQUEST, "invalid enrollment request"));
     }
     let bytes = timeout(
         CONTROL_TIMEOUT,
         Limited::new(request.into_body(), CONTROL_LIMIT).collect(),
     )
     .await
-    .map_err(|_| response(StatusCode::REQUEST_TIMEOUT, "enrollment body timed out"))?
-    .map_err(|_| response(StatusCode::BAD_REQUEST, "invalid enrollment body"))?
+    .map_err(|_| (StatusCode::REQUEST_TIMEOUT, "enrollment body timed out"))?
+    .map_err(|_| (StatusCode::BAD_REQUEST, "invalid enrollment body"))?
     .to_bytes();
     codec()
         .deserialize(&bytes)
-        .map_err(|_| response(StatusCode::BAD_REQUEST, "invalid enrollment body"))
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid enrollment body"))
 }
 
 fn issue_result(
     result: std::result::Result<Result<EnrollmentResponse>, tokio::task::JoinError>,
 ) -> Response<ClusterBody> {
     match result {
-        Ok(Ok(issued)) => match codec().serialize(&issued) {
-            Ok(bytes) => {
+        Ok(Ok(issued)) => codec().serialize(&issued).map_or_else(
+            |_| {
+                response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "certificate encoding failed",
+                )
+            },
+            |bytes| {
                 let mut reply = response(StatusCode::OK, bytes);
                 reply.headers_mut().insert(
                     hyper::header::CONTENT_TYPE,
                     hyper::header::HeaderValue::from_static("application/octet-stream"),
                 );
                 reply
-            }
-            Err(_) => response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "certificate encoding failed",
-            ),
-        },
+            },
+        ),
         Ok(Err(_)) => response(StatusCode::FORBIDDEN, "certificate request denied"),
         Err(_) => response(
             StatusCode::INTERNAL_SERVER_ERROR,

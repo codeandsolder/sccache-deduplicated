@@ -16,17 +16,19 @@ use sccache_peer_identity::RouteSet;
 
 type Current = dyn Fn() -> Result<Arc<TlsCredentials>> + Send + Sync;
 
-/// Bind to all interfaces of the configured address family (loopback-only
-/// endpoints remain loopback-only).
-pub fn wildcard(address: SocketAddr) -> SocketAddr {
+/// A default data listener is dual-stack, including when its configured
+/// reliable route is IPv4. Loopback-only endpoints remain loopback-only.
+#[cfg(feature = "dist-server")]
+#[must_use = "the returned address defines the listener bind"]
+pub const fn wildcard(address: SocketAddr) -> SocketAddr {
     if address.ip().is_loopback() {
-        return address;
+        address
+    } else {
+        SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            address.port(),
+        )
     }
-    let ip = match address.ip() {
-        std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-        std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-    };
-    SocketAddr::new(ip, address.port())
 }
 
 /// Open a persisted peer from synchronous daemon/worker initialization.

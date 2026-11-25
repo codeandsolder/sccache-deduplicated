@@ -265,7 +265,6 @@ percent = 200.0
 
 [native_cache]
 public_addr = "100.73.74.69:10602"
-bind_address = "0.0.0.0:10602"
 directory = "/var/cache/sccache-native/scheduler"
 idle_timeout_secs = 120
 max_sessions = 256

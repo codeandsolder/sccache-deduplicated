@@ -117,7 +117,9 @@ impl Registry {
                 revoked: false,
             },
         );
-        publish(&self.path, &mut records, updated)
+        let result = publish(&self.path, &mut records, updated);
+        drop(records);
+        result
     }
 
     /// Check authorization for a verified TLS principal.
@@ -161,6 +163,8 @@ impl Registry {
         let mut updated = records.clone();
         let record = updated.get_mut(&id).context("unknown enrollment key")?;
         record.revoked = true;
-        publish(&self.path, &mut records, updated)
+        let result = publish(&self.path, &mut records, updated);
+        drop(records);
+        result
     }
 }

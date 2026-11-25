@@ -147,7 +147,9 @@ pub(super) fn spawn(
     tls: Arc<ClusterListener>,
     enrollment: Arc<SchedulerEnrollment>,
     network: Arc<NetworkMeter>,
-) -> Result<()> {
+) -> Result<std::net::SocketAddr> {
+    let socket = super::cluster_http::bind_data_socket(config.public_addr, config.bind_address)?;
+    let bound = socket.local_addr()?;
     let limits = config.session_limits()?;
     let sessions = Arc::new(NativeSessions::new(
         NativeStore::open_managed(&config.directory, config.space)?,
@@ -214,8 +216,8 @@ pub(super) fn spawn(
         config.directory.join("network-timing.json"),
         config.public_addr,
     )?;
-    let server = Listener::bind(
-        config.listener_address(),
+    let server = Listener::from_socket(
+        socket,
         tls,
         ListenerRole::Scheduler(enrollment),
         config.http_threads,
@@ -233,7 +235,7 @@ pub(super) fn spawn(
             )
         },
     )?;
-    info!("Native cache listening on {}", config.listener_address());
+    info!("Native cache listening on {bound}");
     thread::Builder::new()
         .name("native-cache-maintenance".into())
         .spawn(move || {
@@ -261,7 +263,7 @@ pub(super) fn spawn(
                 error!("native cache HTTPS listener terminated: {error:#}");
             }
         })?;
-    Ok(())
+    Ok(bound)
 }
 
 const PREFIX: &str = "/api/v5/native/";

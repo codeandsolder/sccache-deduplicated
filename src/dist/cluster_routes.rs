@@ -390,7 +390,10 @@ impl<R: Read> Read for MeasuredReader<R> {
 
 /// Discover only addresses covered by the actual listener. No DNS or
 /// multicast infrastructure is required; the configured address is retained.
-#[cfg(all(feature = "dist-server", target_os = "linux"))]
+#[cfg(all(
+    feature = "dist-server",
+    any(target_os = "linux", target_os = "freebsd")
+))]
 pub fn discover(primary: SocketAddr, bind: SocketAddr) -> RouteSet {
     use nix::{ifaddrs::getifaddrs, net::if_::InterfaceFlags};
     use std::net::{IpAddr, SocketAddrV6};
@@ -423,7 +426,10 @@ pub fn discover(primary: SocketAddr, bind: SocketAddr) -> RouteSet {
     RouteSet::new(primary, candidates)
 }
 
-#[cfg(all(feature = "dist-server", not(target_os = "linux")))]
+#[cfg(all(
+    feature = "dist-server",
+    not(any(target_os = "linux", target_os = "freebsd"))
+))]
 pub fn discover(primary: SocketAddr, bind: SocketAddr) -> RouteSet {
     RouteSet::new(primary, [bind])
 }
