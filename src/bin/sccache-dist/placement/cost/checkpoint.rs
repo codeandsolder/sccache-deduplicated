@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const LIMIT: u64 = 16 << 20;
 const INTERVAL: Duration = Duration::from_secs(60);
 
@@ -155,7 +155,7 @@ impl Snapshot {
                     || sample.observations == 0
                     || !sample.cost.valid()
                     || sample.result_peak_bytes > 1 << 40
-                    || sample.cost.output_bytes > sample.result_peak_bytes
+                    || sample.cost.result_bytes > sample.result_peak_bytes
                 {
                     continue;
                 }
@@ -339,6 +339,10 @@ mod tests {
                 .execution_nanoseconds,
             123_000_000
         );
+        let restored_cost =
+            restored.predict(scope, class, &placement, now + Duration::from_secs(60));
+        assert_eq!(restored_cost.output_bytes, 100);
+        assert_eq!(restored_cost.result_bytes, 752);
         assert_eq!(
             restored
                 .predict(scope, class, &placement, now + Duration::from_secs(60))

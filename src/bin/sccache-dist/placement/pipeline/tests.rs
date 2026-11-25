@@ -241,12 +241,14 @@ fn native_pipeline_uses_each_reservations_learned_service_time() {
         phase: Default::default(),
         execution_nanoseconds: 8_000_000_000,
         output_bytes: 400,
+        result_bytes: 400,
         output_requests: 0,
     };
     let small = ActionCost {
         phase: Default::default(),
         execution_nanoseconds: 200_000_000,
         output_bytes: 0,
+        result_bytes: 0,
         output_requests: 0,
     };
     let assigned = Assignments::from([(
@@ -302,6 +304,7 @@ fn native_pipeline_charges_warm_preparation_and_publication_without_uploads() {
         },
         execution_nanoseconds: 30_000_000,
         output_bytes: 0,
+        result_bytes: 0,
         output_requests: 0,
     };
     let assigned = Assignments::from([(

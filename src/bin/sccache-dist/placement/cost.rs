@@ -93,14 +93,18 @@ fn volatile_codegen(arg: &[u8]) -> bool {
 pub(crate) struct ActionCost {
     pub phase: PhaseCost,
     pub execution_nanoseconds: u64,
+    /// Missing scheduler upload bytes.
     pub output_bytes: u64,
+    /// Full unique logical result, independent of cache residency.
+    pub result_bytes: u64,
     pub output_requests: u64,
 }
 
 impl ActionCost {
     fn valid(self) -> bool {
         (1..=3_600_000_000_000).contains(&self.execution_nanoseconds)
-            && self.output_bytes <= 1 << 40
+            && self.output_bytes <= self.result_bytes
+            && self.result_bytes <= 1 << 40
             && self.output_requests <= 1_000_000
             && self.phase.valid()
     }
@@ -112,6 +116,7 @@ impl ActionCost {
             },
             execution_nanoseconds: placement.timing.execution_estimate(),
             output_bytes: placement.timing.result.expected_bytes,
+            result_bytes: placement.timing.result.expected_bytes.max(1 << 20),
             output_requests: placement.timing.result.expected_requests,
         }
     }
@@ -196,6 +201,7 @@ impl ActionCosts {
                 sample.cost.execution_nanoseconds,
             ),
             output_bytes: blend(baseline.output_bytes, sample.cost.output_bytes),
+            result_bytes: blend(baseline.result_bytes, sample.cost.result_bytes),
             output_requests: blend(baseline.output_requests, sample.cost.output_requests),
         }
     }
@@ -215,6 +221,7 @@ impl ActionCosts {
             phase: PhaseCost::default(),
             execution_nanoseconds: observed.execution_nanoseconds,
             output_bytes: observed.upload_bytes,
+            result_bytes,
             output_requests: observed.upload_requests,
         };
         if let Some(sample) = self.entries.get_mut(&class) {
@@ -234,6 +241,7 @@ impl ActionCosts {
                     cost.execution_nanoseconds,
                 ),
                 output_bytes: smooth(sample.cost.output_bytes, cost.output_bytes),
+                result_bytes: smooth(sample.cost.result_bytes, cost.result_bytes),
                 output_requests: smooth(sample.cost.output_requests, cost.output_requests),
             };
             sample.result_peak_bytes = sample.result_peak_bytes.max(result_bytes);

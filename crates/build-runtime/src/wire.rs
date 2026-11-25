@@ -306,6 +306,26 @@ pub fn peer_download_rates_valid(rates: &[PeerDownloadRate]) -> bool {
         && rates.windows(2).all(|pair| pair[0].source < pair[1].source)
 }
 
+/// Fresh receiver-side service estimates for result delivery. The client
+/// principal is established by the scheduler's authenticated connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientDeliveryRates {
+    pub scheduler: Option<CachePathRate>,
+    pub peers: Vec<PeerDownloadRate>,
+}
+
+impl ClientDeliveryRates {
+    #[must_use = "untrusted receiver telemetry must be validated"]
+    pub fn valid(&self) -> bool {
+        CachePathRates {
+            download: self.scheduler,
+            upload: None,
+        }
+        .valid()
+            && peer_download_rates_valid(&self.peers)
+    }
+}
+
 /// Coherent snapshot of a worker's measured transfer and compiler service.
 /// Revision is monotonic within the authenticated worker incarnation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

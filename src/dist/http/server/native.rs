@@ -30,7 +30,7 @@ use crate::{
     dist::native::{
         BlobSourceRequest, CommitRequest, DownloadRequest, ExecutionRequest, InputPrefetchRequest,
         ManifestRequest, OpenTreeRequest, PackageAcquisition, PackageLocator, PackagePlanRequest,
-        StatusRequest, codec,
+        ScheduleRequest, StatusRequest, codec,
     },
 };
 
@@ -619,7 +619,13 @@ fn dispatch(
             encode(&(), limit)
         }
         "schedule" if publisher == Publisher::Client => {
-            let ExecutionRequest { ticket, spec } = metadata(request, limit)?;
+            let ScheduleRequest {
+                ticket,
+                spec,
+                receiver,
+            } = metadata(request, limit)?;
+            ensure!(receiver.valid(), "invalid client delivery telemetry");
+            let requester_id = request.id();
             let request = spec.action_request()?;
             encode(
                 &sessions.schedule(ticket, &request, |inputs, trees| {
@@ -643,6 +649,7 @@ fn dispatch(
                             spec,
                             input_blobs: inputs,
                             estimated_result_bytes: None,
+                            receiver: Some((requester_id, receiver)),
                         },
                         &snapshot,
                         std::sync::Arc::new(packages),

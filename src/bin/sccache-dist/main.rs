@@ -1173,6 +1173,7 @@ impl Scheduler {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let transfer_plan = native_inputs.as_ref().map(|inputs| {
                 NativeTransferPlan::new(network, &servers, Some(&packages), Some(inputs))
+                    .with_receiver(native.and_then(|assignment| assignment.receiver.as_ref()))
             });
             let res = {
                 let mut healthy = Vec::new();
@@ -2760,6 +2761,7 @@ mod scheduler_tests {
             ticket: Ticket([42; 32]),
             input_blobs,
             estimated_result_bytes: None,
+            receiver: None,
             spec: ExecutionSpec {
                 platform,
                 root: ExecutionRoot {

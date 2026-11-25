@@ -966,6 +966,9 @@ pub struct NativeAssignment {
     pub input_blobs: NativeInputBlobs,
     /// Scheduler's advisory logical result-size forecast, never a hard limit.
     pub estimated_result_bytes: Option<u64>,
+    /// Scheduler-local authenticated requester and advisory delivery telemetry.
+    #[serde(skip)]
+    pub receiver: Option<(ServerId, crate::build_runtime::wire::ClientDeliveryRates)>,
 }
 
 /// One scheduler assignment routed through the common capacity accounting.

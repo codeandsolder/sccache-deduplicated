@@ -46,6 +46,7 @@ fn worker(
 fn assignment(marker: u8) -> Result<NativeAssignment> {
     Ok(NativeAssignment {
         estimated_result_bytes: None,
+        receiver: None,
         ticket: Ticket([marker; 32]),
         input_blobs: BTreeMap::new(),
         spec: ExecutionSpec {

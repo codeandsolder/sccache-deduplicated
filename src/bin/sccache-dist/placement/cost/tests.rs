@@ -137,6 +137,7 @@ fn native_cost_history_shrinks_expires_and_bounds_samples() -> anyhow::Result<()
             phase: Default::default(),
             execution_nanoseconds: observation.execution_nanoseconds,
             output_bytes: 0,
+            result_bytes: 752,
             output_requests: 0,
         }
     );

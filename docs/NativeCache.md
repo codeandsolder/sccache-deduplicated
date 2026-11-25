@@ -1185,6 +1185,17 @@ scheduler shared-link contention does not automatically inflate direct
 transfer time. Per-worker aggregate staging remains serialized in the
 forecast; cross-worker direct-link contention is not yet inferred globally.
 
+Placement also distinguishes learned full unique logical result size from
+missing scheduler upload bytes. The authenticated client sends bounded fresh
+receiver-side scheduler and peer delivery rates during allocation; this
+telemetry is not forwarded to the worker or part of the action identity.
+The forecast overlaps direct delivery and publication, accounts for already
+resident scheduler output separately from missing output, and models
+scheduler fallback using its measured shared-link capacity. Before an exact
+result manifest exists, the full logical size is an advisory estimate
+(independent of selective output materialization or local reuse). Histories
+retain both sizes across scheduler restarts.
+
 The receiver compares authenticated route latency and directional effective
 goodput, using the scheduler as the durable fallback for committed results.
 An absent scheduler input can be obtained from a reachable worker without

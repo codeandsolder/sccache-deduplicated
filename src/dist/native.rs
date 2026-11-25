@@ -43,6 +43,13 @@ pub(super) struct ExecutionRequest {
 }
 
 #[derive(Serialize, Deserialize)]
+pub(super) struct ScheduleRequest {
+    pub ticket: Ticket,
+    pub spec: ExecutionSpec,
+    pub receiver: crate::build_runtime::wire::ClientDeliveryRates,
+}
+
+#[derive(Serialize, Deserialize)]
 pub(super) struct ManifestRequest {
     pub ticket: Ticket,
     pub manifest: ResultManifest,
@@ -541,7 +548,21 @@ impl NativeCacheClient {
     /// # Errors
     /// Returns an error for an invalid or expired action.
     pub fn schedule(&self, ticket: Ticket, spec: ExecutionSpec) -> Result<ScheduleReply> {
-        self.control("schedule", &ExecutionRequest { ticket, spec })
+        let receiver = crate::build_runtime::wire::ClientDeliveryRates {
+            scheduler: self.path_rates().download,
+            #[cfg(all(target_os = "linux", feature = "native-store"))]
+            peers: self.peer_download_rates(),
+            #[cfg(not(all(target_os = "linux", feature = "native-store")))]
+            peers: Vec::new(),
+        };
+        self.control(
+            "schedule",
+            &ScheduleRequest {
+                ticket,
+                spec,
+                receiver,
+            },
+        )
     }
 
     /// Observe a scheduler-dispatched worker job over its authenticated HTTPS

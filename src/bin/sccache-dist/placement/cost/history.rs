@@ -102,6 +102,7 @@ impl CostBook {
         let mut calibrated = Vec::new();
         let mut uncalibrated = Vec::new();
         let mut bytes = Vec::new();
+        let mut results = Vec::new();
         let mut requests = Vec::new();
         for (&other, history) in &self.workers {
             if other == scope || other.platform != scope.platform {
@@ -111,6 +112,7 @@ impl CostBook {
                 continue;
             };
             bytes.push(sample.cost.output_bytes);
+            results.push(sample.cost.result_bytes);
             requests.push(sample.cost.output_requests);
             if let Some(ratio) = calibration(target, history, class, now) {
                 let predicted =
@@ -136,6 +138,9 @@ impl CostBook {
             execution_nanoseconds: execution,
             output_bytes: median(bytes).map_or(baseline.output_bytes, |value| {
                 blend(baseline.output_bytes, value, 2)
+            }),
+            result_bytes: median(results).map_or(baseline.result_bytes, |value| {
+                blend(baseline.result_bytes, value, 2)
             }),
             output_requests: median(requests).map_or(baseline.output_requests, |value| {
                 blend(baseline.output_requests, value, 2)
@@ -292,6 +297,12 @@ mod tests {
         book.observe(first, class, measured, 4 << 20, now);
         book.observe(second, class, measured, 8 << 20, now);
         book.observe(second, class, measured, 1 << 20, now);
+        for _ in 0..3 {
+            book.observe(first, class, measured, 4 << 20, now);
+        }
+        let prediction = book.predict(first, class, &NativePlacement::default(), now);
+        assert_eq!(prediction.output_bytes, 0);
+        assert_eq!(prediction.result_bytes, 4 << 20);
         assert_eq!(
             book.result_reservation(first.platform, class, now),
             Some((10 << 20) + (64 << 10))

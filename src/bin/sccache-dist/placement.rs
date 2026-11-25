@@ -18,7 +18,7 @@ use sccache::{
     build_runtime::{
         Direction, DirectionSnapshot, NetworkSnapshot, PackageCatalog, Peer,
         ResultTransferEstimate, TransferDemand, transfer_seconds,
-        wire::{CachePathRate, CachePathRates},
+        wire::{CachePathRate, CachePathRates, ClientDeliveryRates},
     },
     dist::{self, ServerId},
 };
@@ -77,6 +77,7 @@ pub(super) struct NativeTransferPlan<'a> {
     receive_demands: BTreeMap<Peer, TransferDemand>,
     path_rates: BTreeMap<Peer, CachePathRates>,
     direct_inputs: BTreeMap<Peer, DirectInputs>,
+    receiver: Option<&'a (ServerId, ClientDeliveryRates)>,
 }
 
 const fn directional_rate(rates: CachePathRates, direction: Direction) -> Option<CachePathRate> {
@@ -129,7 +130,10 @@ fn marginal_completion(
     direction: Direction,
 ) -> (f64, f64) {
     let relevant = |other: Peer| {
-        other == peer || (direction == Direction::Send && other.principal() == peer.principal())
+        other == peer
+            || (direction == Direction::Send
+                && matches!(peer.principal(), Peer::Worker(_))
+                && other.principal() == peer.principal())
     };
     if network.shared.is_empty() {
         let completion = transfer_seconds(demand.bytes, demand.bytes_per_second);
@@ -297,7 +301,96 @@ impl<'a> NativeTransferPlan<'a> {
             receive_demands,
             path_rates,
             direct_inputs,
+            receiver: None,
         }
+    }
+
+    pub(super) const fn with_receiver(
+        mut self,
+        receiver: Option<&'a (ServerId, ClientDeliveryRates)>,
+    ) -> Self {
+        self.receiver = receiver;
+        self
+    }
+
+    /// Publication and receiver delivery are separate consumers. The latter
+    /// may require a full result even when the scheduler misses no blobs.
+    fn client_completion(
+        &self,
+        worker: Peer,
+        negotiation_at: f64,
+        publication: f64,
+        cost: ActionCost,
+    ) -> (f64, f64) {
+        let Some((id, rates)) = self.receiver else {
+            return (publication, 0.0);
+        };
+        let client = predicted_peer(Peer::Client(*id), rates.scheduler);
+        let wire_rate = rates.scheduler.map_or_else(
+            || self.send.rate(client, 16 << 20),
+            |rate| rate.bytes_per_second,
+        );
+        let full = u128::from(cost.result_bytes);
+        let scheduler_wire = self.send.wire_bytes(client, full);
+        let scheduler_seconds = transfer_seconds(scheduler_wire, wire_rate);
+        let direct_rate = match worker.principal() {
+            Peer::Worker(source) => rates
+                .peers
+                .binary_search_by_key(&source, |rate| rate.source)
+                .ok()
+                .map(|index| rates.peers[index].logical_bytes_per_second),
+            _ => None,
+        };
+        if let Some(rate) = direct_rate {
+            // Direct is preferred for scheduler misses; for already resident
+            // content the receiver chooses the faster observed service.
+            let direct_seconds = transfer_seconds(full, rate);
+            if direct_seconds <= scheduler_seconds {
+                return (publication.max(direct_seconds), 0.0);
+            }
+            let missing = u128::from(cost.output_bytes).min(full);
+            let cached = full - missing;
+            let (cached_seconds, externality) =
+                self.client_scheduler_completion(client, negotiation_at, cached, wire_rate);
+            let delivery = cached_seconds + transfer_seconds(missing, rate);
+            return (publication.max(delivery), externality);
+        }
+        // The exact future manifest is not known. Verified resident bytes
+        // can be staged early; absent bytes become available at commit.
+        let missing = u128::from(cost.output_bytes).min(full);
+        let (cached, first_delay) =
+            self.client_scheduler_completion(client, negotiation_at, full - missing, wire_rate);
+        let ready = publication.max(cached);
+        let (remainder, second_delay) =
+            self.client_scheduler_completion(client, negotiation_at + ready, missing, wire_rate);
+        (ready + remainder, first_delay + second_delay)
+    }
+
+    fn client_scheduler_completion(
+        &self,
+        peer: Peer,
+        start: f64,
+        logical_bytes: u128,
+        wire_rate: u64,
+    ) -> (f64, f64) {
+        if logical_bytes == 0 {
+            return (0.0, 0.0);
+        }
+        let remaining = self.send.remaining_after(&self.send_demands, start);
+        let baseline = self.send.finish_times(&remaining);
+        let active = remaining.get(&peer).map_or(0, |demand| demand.bytes);
+        let demand = TransferDemand {
+            bytes: active.saturating_add(self.send.wire_bytes(peer, logical_bytes)),
+            bytes_per_second: wire_rate,
+        };
+        marginal_completion(
+            self.send,
+            &remaining,
+            &baseline,
+            peer,
+            demand,
+            Direction::Send,
+        )
     }
 
     fn input_demand(
@@ -373,7 +466,10 @@ impl<'a> NativeTransferPlan<'a> {
         let peer = predicted_peer(peer, rate);
         let already_pending = remaining.get(&peer).map_or(0, |demand| demand.bytes);
         let demand = TransferDemand {
-            bytes: already_pending.saturating_add(u128::from(result.expected_bytes)),
+            bytes: already_pending.saturating_add(
+                self.receive
+                    .wire_bytes(peer, u128::from(result.expected_bytes)),
+            ),
             bytes_per_second: rate.map_or_else(
                 || self.receive.rate(peer, result.bytes_per_second),
                 |rate| rate.bytes_per_second,
@@ -401,6 +497,8 @@ pub(super) struct PlacementEstimate {
     pub(super) inputs_ready_at: f64,
     pub(super) ready_at: f64,
     pub(super) negotiation_at: f64,
+    publication_seconds: f64,
+    post_negotiation_seconds: f64,
     pub(super) cost: ActionCost,
 }
 
@@ -478,19 +576,23 @@ pub(super) fn native_estimate(
             .saturating_mul(result.request_nanoseconds),
     )
     .as_secs_f64();
-    let completion_seconds =
-        negotiation_at + output_network.max(output_processing) + output_overhead;
+    let publication = output_network.max(output_processing) + output_overhead;
+    let (delivery, delivery_externality) =
+        plan.client_completion(peer, negotiation_at, publication, action);
+    let completion_seconds = negotiation_at + delivery;
     PlacementEstimate {
         ready_at,
         negotiation_at,
         inputs_ready_at: adjusted.inputs_ready_at,
         completion_seconds,
+        publication_seconds: publication,
+        post_negotiation_seconds: delivery,
         missing_input_union_bytes: bytes,
         input_wire_bytes: adjusted.traffic.wire_bytes,
         direct_input_bytes: adjusted.traffic.direct_bytes,
         archive_bytes: adjusted.traffic.archive_bytes,
         cost: action,
-        seconds: completion_seconds + externality + output_externality,
+        seconds: completion_seconds + externality + output_externality + delivery_externality,
     }
 }
 
@@ -649,6 +751,61 @@ mod tests {
             ..traffic
         };
         assert_eq!(plan.input_completion(a, extra), (1.0, 0.0));
+        Ok(())
+    }
+    #[test]
+    fn full_client_result_is_independent_of_scheduler_missing_uploads() -> anyhow::Result<()> {
+        use sccache::build_runtime::wire::{ClientDeliveryRates, PeerDownloadRate};
+        let network = NetworkSnapshot::default();
+        let server =
+            ServerId::from_digest(std::array::from_fn(|index| 1_u16.to_le_bytes()[index % 2]));
+        let requester = sccache::dist::ServerId::from_digest([7; 32]);
+        let path = "192.168.76.1,192.168.76.2".parse()?;
+        let mut rates = ClientDeliveryRates {
+            scheduler: Some(CachePathRate {
+                path,
+                bytes_per_second: 10 << 20,
+            }),
+            peers: Vec::new(),
+        };
+        let cost = ActionCost {
+            phase: Default::default(),
+            execution_nanoseconds: 1,
+            output_bytes: 0,
+            result_bytes: 100 << 20,
+            output_requests: 0,
+        };
+        let receiver = (requester, rates.clone());
+        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None)
+            .with_receiver(Some(&receiver));
+        assert_eq!(
+            plan.client_completion(worker(1), 0.0, 0.0, cost),
+            (10.0, 0.0)
+        );
+        let missing = ActionCost {
+            output_bytes: 100 << 20,
+            ..cost
+        };
+        assert_eq!(
+            plan.client_completion(worker(1), 0.0, 5.0, missing),
+            (15.0, 0.0)
+        );
+        rates.peers.push(PeerDownloadRate {
+            source: server,
+            path,
+            logical_bytes_per_second: 100 << 20,
+        });
+        let receiver = (requester, rates);
+        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None)
+            .with_receiver(Some(&receiver));
+        assert_eq!(
+            plan.client_completion(worker(1), 0.0, 0.0, cost),
+            (1.0, 0.0)
+        );
+        assert_eq!(
+            plan.client_completion(worker(1), 0.0, 5.0, missing),
+            (5.0, 0.0)
+        );
         Ok(())
     }
 }
