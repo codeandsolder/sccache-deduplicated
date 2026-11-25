@@ -1,0 +1,11 @@
+experimental = ["wrapper-scripts"]
+
+# Isolate test processes, not compilation: managed sccache remains active
+# while Cargo builds the test binaries. Compose with cargo-affected's runner.
+[scripts.wrapper.isolate-cache-daemon]
+command = ["env", "-u", "SCCACHE_SERVER_UDS", "-u", "SCCACHE_SERVER_PORT"]
+target-runner = "within-wrapper"
+
+[[profile.ci-isolated.scripts]]
+filter = "all()"
+run-wrapper = "isolate-cache-daemon"
