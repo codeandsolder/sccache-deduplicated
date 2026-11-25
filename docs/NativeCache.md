@@ -1075,15 +1075,18 @@ result limit. Publication pins its local result, then atomically charges only
 additional unique bytes into the grace pool; if actual capacity is exhausted,
 it waits outside the compiler slot with cancellation and lease checks. Existing
 grace leases never expire early. New forecast admission pauses while exact
-publishers are waiting. The persistent history format is version 2.
+publishers are waiting. The persistent history format is version 5.
 
 The opt-in `native_placement_replay` trace target logs JSON assignment records
 with job ID, hashed command family, selected worker, all eligible workers'
 predicted completion and contention-penalized scores, and healthy candidates.
 Assignment records also include the selected worker's contemporaneous host-wide
-prior. Verified completion records contain the original prediction, scheduler
-assignment-to-commit elapsed time, predicted cost, actual execution time,
-total result bytes and negotiated upload measurements. Join by job ID within
+prior. Verified completion records contain the predicted publication timestamp,
+predicted client completion, scheduler assignment-to-commit elapsed time,
+predicted cost, actual execution time, total result bytes and negotiated
+upload measurements. The replay report compares publication against actual
+publication, not against client completion (which is not measured by this
+event), and uses stable worker public-key identities. Join by job ID within
 the scheduler epoch. This supports evaluating prediction error and selection
 behavior on genuine compilation workloads. Counterfactual worker timings
 are forecasts, not measured speedups; a full causal trace replay requires

@@ -1268,7 +1268,7 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
             );
         }
         assert!(
-            value["actual_seconds"]
+            value["actual_publication_seconds"]
                 .as_f64()
                 .is_some_and(|seconds| seconds > 0.0)
         );

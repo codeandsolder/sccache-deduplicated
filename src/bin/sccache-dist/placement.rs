@@ -497,7 +497,7 @@ pub(super) struct PlacementEstimate {
     pub(super) inputs_ready_at: f64,
     pub(super) ready_at: f64,
     pub(super) negotiation_at: f64,
-    publication_seconds: f64,
+    pub(super) publication_at: f64,
     post_negotiation_seconds: f64,
     pub(super) cost: ActionCost,
 }
@@ -585,7 +585,7 @@ pub(super) fn native_estimate(
         negotiation_at,
         inputs_ready_at: adjusted.inputs_ready_at,
         completion_seconds,
-        publication_seconds: publication,
+        publication_at: negotiation_at + publication,
         post_negotiation_seconds: delivery,
         missing_input_union_bytes: bytes,
         input_wire_bytes: adjusted.traffic.wire_bytes,

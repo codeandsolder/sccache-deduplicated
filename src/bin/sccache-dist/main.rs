@@ -1548,11 +1548,12 @@ impl SchedulerIncoming for Scheduler {
                         }
                         trace!(target: "native_placement_replay", "{}", serde_json::json!({
                             "kind": "completed", "job": job.0, "worker": server_id,
-                            "class": class, "predicted_seconds": detail.prediction.map(|prediction| prediction.completion_seconds),
+                            "class": class, "predicted_publication_seconds": detail.prediction.map(|prediction| prediction.publication_at),
+                            "predicted_client_completion_seconds": detail.prediction.map(|prediction| prediction.completion_seconds),
                             "actual_inputs_ready_seconds": detail.inputs_staged_at.map(|staged| staged.saturating_duration_since(detail.assigned_at).as_secs_f64()),
                             "actual_result_negotiation_seconds": detail.publication_began_at.map(|began| began.saturating_duration_since(detail.assigned_at).as_secs_f64()),
                             "actual_staging_start_seconds": (detail.state == JobState::Started).then(|| detail.state_since.saturating_duration_since(detail.assigned_at).as_secs_f64()),
-                            "actual_seconds": now.saturating_duration_since(detail.assigned_at).as_secs_f64(),
+                            "actual_publication_seconds": now.saturating_duration_since(detail.assigned_at).as_secs_f64(),
                             "result_bytes": manifest.blobs().ok().map(|blobs| blobs.values().copied().fold(0_u64, u64::saturating_add)),
                             "execution_nanoseconds": observed.execution_nanoseconds,
                             "worker_timing": observed.worker_timing,
