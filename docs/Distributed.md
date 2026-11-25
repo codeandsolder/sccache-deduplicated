@@ -379,7 +379,11 @@ the client to receive malicious compiled objects.
 
 Protocol 5 uses native mutual TLS for scheduler RPCs, worker RPCs and the
 native cache. The scheduler acts as the local CA. Bootstrap tokens authorize
-initial enrollment only; subsequent requests authenticate the role-bound leaf.
+initial enrollment and recovery of expired leaves only; subsequent requests
+authenticate the role-bound leaf. A still-valid persisted identity does not
+require a bootstrap token. Existing clusters refuse to start without their
+durable enrollment registry; restore it from a consistent backup rather than
+creating an empty registry under an established CA.
 Each peer's persistent P-256 public-key SHA-256 digest is its identity, not its
 address or current leaf. Leaves renew with the same key, and TLS contexts reload
 without stopping in-flight transfers. Job and exact-content capabilities still
@@ -409,13 +413,17 @@ and native cache listeners bind the configured address family on all interfaces.
 For offline administration, `sccache-dist cluster-revoke --directory /var/lib/sccache-cluster/scheduler --peer PEER_ID`
 requires the scheduler to be stopped (exclusive registry lock). The scheduler
 rejects revoked peers and distributes permanent revocations in heartbeats.
+Workers reject new peer requests if their scheduler revocation snapshot becomes
+stale, without interrupting authorized transfers already in progress.
 `sccache-dist cluster-status --client-config /path/to/client.toml` provides
 authenticated JSON status for token-configured clients.
 
 Protocol 5 / rollout epoch 6 is incompatible with the previous transport; do
 not mix binaries or use the old HTTP health endpoint. The managed fleet's
 `fleet/prepare-host ROLE CA_PEM SCHEDULER_ID` stages the new trust configuration
-before the coordinated cutover.
+before the coordinated cutover. The scheduler host requires a native bundle
+built with `--scheduler-dashboard`, including the matching WASM/JS/CSS assets.
+The held release timers resume only after all hosts have committed the cutover.
 
 ## Configuration
 

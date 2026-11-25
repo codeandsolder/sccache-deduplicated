@@ -271,7 +271,7 @@ case "$phase" in
       for ((i=0;i<60;i++)); do
         if "$dist" cluster-status --client-config /etc/sccache/client-shared.toml \
           && curl --fail --silent --show-error --max-time 5 -o /dev/null http://127.0.0.1:10604/ \
-          && curl --fail --silent --show-error --max-time 5 -o /dev/null http://127.0.0.1:10604/pkg/sccache-dashboard_bg.wasm; then exit 0; fi
+          && cmp -s "$dashboard_link/sccache-dashboard_bg.wasm" <(curl --fail --silent --show-error --max-time 5 http://127.0.0.1:10604/pkg/sccache-dashboard_bg.wasm); then exit 0; fi
         sleep 1
       done
       echo "scheduler did not become ready" >&2; exit 1

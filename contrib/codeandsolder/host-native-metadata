@@ -41,25 +41,48 @@ trusted_path() {
 }
 
 # A scheduler generation has the same base release features plus the UI.
+# All assets must be readable by the unprivileged scheduler account.
+dashboard_manifest() (
+    local directory="$1" file mode
+    cd "$directory"
+    for file in sccache-dashboard.js sccache-dashboard_bg.wasm sccache-dashboard.css; do
+        [[ -s "pkg/$file" && -f "pkg/$file" ]] || exit 1
+    done
+    [[ -z "$(find pkg ! -type f ! -type d -print -quit)" ]] || exit 1
+    while IFS= read -r -d '' file; do
+        trusted_path "$directory/$file" || exit 1
+        mode="$(stat -c '%a' "$file")"
+        if [[ -d "$file" ]]; then
+            (( (8#$mode & 005) == 005 )) || exit 1
+        else
+            (( (8#$mode & 004) == 004 )) || exit 1
+        fi
+    done < <(find pkg -print0)
+    find pkg -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum
+)
+
 # Check the complete set of paths before reading a checksum manifest; never
 # permit a manifest to name an external file or traverse a symlink.
 bundle_manifest() (
-    local directory="$1" dashboard="$2" file
+    local directory="$1" dashboard="$2"
     cd "$directory"
     sha256sum sccache sccache-dist build.txt
     if (( dashboard )); then
-        for file in sccache-dashboard.js sccache-dashboard_bg.wasm sccache-dashboard.css; do
-            [[ -s "pkg/$file" && -f "pkg/$file" ]] || exit 1
-        done
-        [[ -z "$(find pkg ! -type f ! -type d -print -quit)" ]] || exit 1
-        while IFS= read -r -d '' file; do
-            trusted_path "$directory/$file" || exit 1
-        done < <(find pkg -print0)
-        find pkg -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum
+        dashboard_manifest "$directory"
     else
         [[ ! -e pkg && ! -L pkg ]] || exit 1
     fi
 )
+
+dashboard_check() {
+    local directory="$1" link="$2" manifest="$3" expected
+    [[ -L "$link" && "$(readlink "$link")" == "$directory/pkg" ]] || return 1
+    trusted_path "$directory/SHA256SUMS" || return 1
+    # Read only the generated asset rows, not filenames from an untrusted
+    # manifest. Recompute the canonical list from trusted regular files.
+    expected="$(dashboard_manifest "$directory")" || return 1
+    [[ "$expected" == "$(sed -n '/^[0-9a-f]\{64\}  pkg\//p' "$manifest")" ]]
+}
 
 verify() {
     local directory="$1" published="$2" dashboard="${3:-0}" field native official file expected
@@ -116,6 +139,7 @@ case "${1:-}" in
         verify "$2" "$3" "$dashboard"
         ;;
     dashboard-select) [[ $# == 3 ]]; dashboard_select "$2" "$3" ;;
-    *) echo "usage: $0 fingerprint | verify ABSOLUTE_BUNDLE_DIRECTORY PUBLISHED_BUILD_TXT [--scheduler-dashboard] | dashboard-select BUNDLE_DIRECTORY ASSET_LINK" >&2; exit 2 ;;
+    dashboard-check) [[ $# == 4 ]]; dashboard_check "$2" "$3" "$4" ;;
+    *) echo "usage: $0 fingerprint | verify ABSOLUTE_BUNDLE_DIRECTORY PUBLISHED_BUILD_TXT [--scheduler-dashboard] | dashboard-select BUNDLE_DIRECTORY ASSET_LINK | dashboard-check BUNDLE_DIRECTORY ASSET_LINK MANIFEST" >&2; exit 2 ;;
 esac
 

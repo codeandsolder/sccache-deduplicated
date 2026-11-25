@@ -38,13 +38,19 @@ fi
 
 dashboard_matches() {
     (( dashboard_required == 0 )) && return 0
-    [[ -n "$NATIVE_BUNDLE_ROOT" && -L "$DASHBOARD_LINK" && "$(readlink "$DASHBOARD_LINK")" == "$NATIVE_BUNDLE_ROOT/$1/pkg" && -s "$DASHBOARD_LINK/sccache-dashboard_bg.wasm" && -s "$DASHBOARD_LINK/sccache-dashboard.js" && -s "$DASHBOARD_LINK/sccache-dashboard.css" ]]
+    [[ -n "$NATIVE_BUNDLE_ROOT" ]] || return 1
+    local directory="$NATIVE_BUNDLE_ROOT/$1" manifest="$NATIVE_BUNDLE_ROOT/$1/SHA256SUMS" helper
+    if [[ -r "$STATE_DIR/source_sha" && "$(cat "$STATE_DIR/source_sha")" == "$1" ]]; then
+        manifest="$STATE_DIR/SHA256SUMS"
+    fi
+    helper="$(dirname -- "$(realpath -- "$0")")/host-native-metadata"
+    "$helper" dashboard-check "$directory" "$DASHBOARD_LINK" "$manifest"
 }
 
 dashboard_ready() {
     (( dashboard_required == 0 )) && return 0
     curl --fail --silent --max-time 5 -o /dev/null http://127.0.0.1:10604/ &&
-    curl --fail --silent --max-time 5 -o /dev/null http://127.0.0.1:10604/pkg/sccache-dashboard_bg.wasm
+    cmp -s "$DASHBOARD_LINK/sccache-dashboard_bg.wasm" <(curl --fail --silent --max-time 5 http://127.0.0.1:10604/pkg/sccache-dashboard_bg.wasm)
 }
 LOCK="${SCCACHE_AUTOUPDATE_LOCK:-/run/lock/sccache-autoupdate.lock}"
 MODE=apply

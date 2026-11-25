@@ -35,6 +35,10 @@ trap 'rm -rf "$stage"' EXIT
 for asset in sccache-dashboard.js sccache-dashboard_bg.wasm sccache-dashboard.css; do
     test -s "$stage/$asset"
 done
+# The installed scheduler runs under a separate service account. The build
+# directory remains private, but the published asset tree must be readable.
+find "$stage" -type d -exec chmod 0755 {} +
+find "$stage" -type f -exec chmod 0644 {} +
 # Only replace an existing generation after all build steps have succeeded.
 rm -rf "$output_dir"
 mv "$stage" "$output_dir"
