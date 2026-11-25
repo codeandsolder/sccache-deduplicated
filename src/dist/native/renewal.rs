@@ -31,6 +31,10 @@ impl Renewals {
         Self::spawn(interval, move |ticket| client.renew(ticket))
     }
 
+    pub(super) fn start_retention(client: NativeCacheClient, interval: Duration) -> Result<Self> {
+        Self::spawn(interval, move |group| client.renew_retention(group))
+    }
+
     fn spawn(
         interval: Duration,
         renew: impl Fn(Ticket) -> Result<()> + Send + 'static,

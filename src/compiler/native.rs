@@ -44,6 +44,7 @@ struct DirectEndpoint {
     client: std::sync::Mutex<Option<NativeCacheClient>>,
     auth: DistAuth,
     local: Option<LocalExecutor>,
+    intermediates: crate::dist::native::result_session::Registry,
 }
 
 enum Endpoint {
@@ -105,6 +106,7 @@ impl NativeCompilerClient {
                 client: std::sync::Mutex::new(None),
                 auth,
                 local,
+                intermediates: Default::default(),
             })),
             policy,
             toolchains,
@@ -131,6 +133,74 @@ impl NativeCompilerClient {
         }
     }
 
+    pub(crate) fn reference(
+        &self,
+        file: &std::fs::File,
+    ) -> Result<
+        Option<(
+            crate::build_runtime::BlobRef,
+            crate::build_runtime::ReferenceBlobProvider,
+        )>,
+    > {
+        use crate::{
+            build_runtime::intermediate_fs::intermediate_reference,
+            protocol::{TransferReply, TransferRequest},
+        };
+        let Some(reference) = intermediate_reference(file)? else {
+            return Ok(None);
+        };
+        match &self.endpoint {
+            Endpoint::Direct(endpoint) => {
+                // SAFETY: geteuid only queries process credentials.
+                endpoint
+                    .intermediates
+                    .get(unsafe { libc::geteuid() }, reference.session)?
+                    .authorize(reference.blob)?;
+            }
+            Endpoint::Namespace { connection, .. } => {
+                ensure!(
+                    matches!(
+                        connection.blocking_lock().transfer(
+                            TransferRequest::IntermediateAuthorize {
+                                session: reference.session,
+                                blob: reference.blob
+                            }
+                        )?,
+                        TransferReply::Ack
+                    ),
+                    "unexpected intermediate authorization response"
+                );
+            }
+        }
+        Ok(Some((
+            reference.blob,
+            crate::dist::native::intermediate::source(reference),
+        )))
+    }
+
+    pub(crate) async fn hash_files(
+        self: &Arc<Self>,
+        files: &[PathBuf],
+        pool: &tokio::runtime::Handle,
+    ) -> Result<Vec<String>> {
+        let jobs = files.iter().map(|path| {
+            let client = Arc::clone(self);
+            let path = path.clone();
+            pool.spawn_blocking(move || {
+                let file = std::fs::File::open(path)?;
+                if let Some((blob, _)) = client.reference(&file)? {
+                    Ok(crate::util::hex(&blob.id.0))
+                } else {
+                    crate::util::Digest::reader_sync(file)
+                }
+            })
+        });
+        futures::future::try_join_all(jobs)
+            .await?
+            .into_iter()
+            .collect()
+    }
+
     pub fn toolchain_digests(&self) -> Arc<SourceDigestCache> {
         Arc::clone(&self.toolchain_digests)
     }
@@ -139,12 +209,50 @@ impl NativeCompilerClient {
         &self.policy
     }
 
-    pub fn serve_namespace(&self, stream: broker::DaemonStream) -> Result<()> {
+    pub fn serve_namespace(&self, stream: broker::DaemonStream, uid: u32) -> Result<()> {
         let client = self.connect_http()?;
         let Endpoint::Direct(endpoint) = &self.endpoint else {
             anyhow::bail!("native namespace endpoint cannot serve");
         };
-        broker::serve_action(&client, &self.policy, stream, endpoint.local.as_ref())
+        broker::serve_action(
+            &client,
+            &self.policy,
+            stream,
+            endpoint.local.as_ref(),
+            &endpoint.intermediates,
+            uid,
+        )
+    }
+
+    pub(crate) fn open_intermediate(
+        &self,
+        uid: u32,
+    ) -> Result<(
+        crate::build_runtime::wire::Ticket,
+        Arc<crate::dist::native::result_session::NativeResultSession>,
+    )> {
+        let Endpoint::Direct(endpoint) = &self.endpoint else {
+            anyhow::bail!("intermediate registry is daemon-owned");
+        };
+        let session = Arc::new(
+            crate::dist::native::result_session::NativeResultSession::open(
+                self.connect_http()?,
+                Duration::from_secs(self.policy.renewal_interval_secs),
+            )?,
+        );
+        let token = endpoint.intermediates.insert(uid, &session)?;
+        Ok((token, session))
+    }
+
+    pub(crate) fn intermediate(
+        &self,
+        uid: u32,
+        token: crate::build_runtime::wire::Ticket,
+    ) -> Result<Arc<crate::dist::native::result_session::NativeResultSession>> {
+        let Endpoint::Direct(endpoint) = &self.endpoint else {
+            anyhow::bail!("intermediate registry is daemon-owned");
+        };
+        endpoint.intermediates.get(uid, token)
     }
 
     pub async fn status(&self) -> DistInfo {
@@ -254,12 +362,15 @@ impl NativeCompilerClient {
                     let Endpoint::Direct(endpoint) = &self.endpoint else {
                         unreachable!()
                     };
-                    self.connect_http()?.run_action(
+                    self.connect_http()?.run_action_retained(
                         &plan.spec,
                         &plan.inputs,
                         &plan.destinations,
                         &self.policy.build_policy(mode),
                         endpoint.local.as_ref(),
+                        &endpoint.intermediates,
+                        // SAFETY: geteuid only queries process credentials.
+                        unsafe { libc::geteuid() },
                     )
                 }))
                 .await?
@@ -358,6 +469,7 @@ impl CompilerPlan {
         packagers: DistPackagers,
         platform: ContentId,
         toolchain_digests: &SourceDigestCache,
+        native: Option<&NativeCompilerClient>,
     ) -> Result<Self> {
         let mut layout = pkg::CompilerInputs::new(transformer);
         layout.directory(cwd)?;
@@ -395,7 +507,12 @@ impl CompilerPlan {
             after.0,
             after.1
         );
-        let inputs = inputs.native_mapping()?.prepare()?;
+        let mapped = inputs.native_mapping()?;
+        let inputs = if let Some(native) = native {
+            mapped.prepare_with_references(&|file, _| native.reference(file))?
+        } else {
+            mapped.prepare()?
+        };
         let layout = layout.into_native_mapping()?.prepare()?;
         let directories = pkg::native_directory_metadata()?;
         let inputs = vec![toolchain, inputs, layout];
@@ -692,6 +809,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                     packagers,
                     preparation_client.policy.platform,
                     &preparation_client.toolchain_digests,
+                    Some(&preparation_client),
                 )
             }))
         })();
@@ -817,6 +935,8 @@ mod tests {
             anyhow::bail!("real compiler arguments are not cacheable");
         };
         let hashed = rt.block_on(hasher.generate_hash_key(GenerateHashKeyContext {
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            native: None,
             creator: &creator,
             cwd: cwd.clone(),
             env_vars: environment.clone(),
@@ -879,6 +999,7 @@ mod tests {
             compilation.into_dist_packagers(transformer)?,
             platform,
             &SourceDigestCache::default(),
+            None,
         )?;
         let store = NativeStore::open(&cwd.join("native-store"))?;
         let _leases = plan

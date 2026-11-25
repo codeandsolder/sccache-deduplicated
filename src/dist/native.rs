@@ -71,6 +71,19 @@ pub(super) struct DownloadRequest {
 }
 
 #[derive(Serialize, Deserialize)]
+pub(super) struct RetainRequest {
+    pub group: Ticket,
+    pub action: Ticket,
+    pub result: crate::build_runtime::ResultId,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct RetainedDownloadRequest {
+    pub group: Ticket,
+    pub blob: BlobRef,
+}
+
+#[derive(Serialize, Deserialize)]
 pub(super) struct CloseRequest {
     pub ticket: Ticket,
     pub delivery: Option<crate::build_runtime::wire::ClientDeliveryObservation>,
@@ -1164,6 +1177,88 @@ impl NativeCacheClient {
         self.control("renew", &ticket)
     }
 
+    /// Open a build-scoped immutable result retention lease.
+    /// # Errors
+    /// Returns an error when the scheduler cannot admit the lease.
+    pub fn open_retention(&self) -> Result<Ticket> {
+        self.control("retain_open", &())
+    }
+
+    /// Pin the exact committed result under the build lease.
+    /// # Errors
+    /// Returns an error for an expired, unauthorized, or changed result.
+    pub fn retain_result(
+        &self,
+        group: Ticket,
+        action: Ticket,
+        result: crate::build_runtime::ResultId,
+    ) -> Result<()> {
+        self.control(
+            "retain_add",
+            &RetainRequest {
+                group,
+                action,
+                result,
+            },
+        )
+    }
+
+    /// Renew a build lease in one RPC regardless of its artifact count.
+    /// # Errors
+    /// Returns an error for an expired or unauthorized lease.
+    pub fn renew_retention(&self, group: Ticket) -> Result<()> {
+        self.control("retain_renew", &group)
+    }
+
+    /// Release the build lease and its retained content.
+    /// # Errors
+    /// Returns an error if the scheduler rejects the release.
+    pub fn close_retention(&self, group: Ticket) -> Result<()> {
+        self.control("retain_close", &group)
+    }
+
+    /// Download retained content with the ordinary authenticated, measured
+    /// direct-peer transport and a verified scheduler fallback.
+    /// # Errors
+    /// Returns an error for an unavailable or corrupt retained blob.
+    #[cfg(all(target_os = "linux", feature = "native-store"))]
+    pub fn download_retained(
+        &self,
+        group: Ticket,
+        blob: BlobRef,
+        mut destination: impl Write,
+    ) -> Result<()> {
+        let plans = self.retained_source_plans(group, &[blob]);
+        if let Some(plan) = plans.get(&blob.id)
+            && let Some(mut file) = self.try_peer_blob(plan, |reader, encoding| {
+                let mut file = tempfile::tempfile()?;
+                crate::build_runtime::transfer_native_blob(
+                    reader,
+                    io::sink(),
+                    &mut file,
+                    blob,
+                    encoding,
+                )?;
+                file.rewind()?;
+                Ok(file)
+            })
+        {
+            io::copy(&mut file, &mut destination)?;
+            return Ok(());
+        }
+        let request = codec().serialize(&RetainedDownloadRequest { group, blob })?;
+        let (reader, encoding) = self
+            .receive_blob("retain_download", request, blob, self.timeout)?
+            .context("native retained content unavailable")?;
+        crate::build_runtime::transfer_native_blob(
+            reader,
+            io::sink(),
+            &mut destination,
+            blob,
+            encoding,
+        )
+    }
+
     /// Report a failed compilation without publishing any shared result.
     ///
     /// # Errors
@@ -1280,8 +1375,18 @@ impl NativeCacheClient {
             ticket,
             id: blob.id,
         })?;
+        self.receive_blob("download", request, blob, timeout)
+    }
+
+    fn receive_blob(
+        &self,
+        operation: &str,
+        request: Vec<u8>,
+        blob: BlobRef,
+        timeout: Duration,
+    ) -> Result<Option<(MeasuredReader<reqwest::blocking::Response>, BlobEncoding)>> {
         let (response, address) = self.send_to_cache(
-            "download",
+            operation,
             request,
             timeout,
             Some(Transfer::Download(blob.size)),
@@ -1472,3 +1577,9 @@ pub use local::LocalExecutor;
 
 #[cfg(all(target_os = "linux", feature = "dist-client"))]
 pub(crate) mod broker;
+
+#[cfg(all(target_os = "linux", feature = "dist-client"))]
+pub(crate) mod result_session;
+
+#[cfg(all(target_os = "linux", feature = "dist-client"))]
+pub(crate) mod intermediate;

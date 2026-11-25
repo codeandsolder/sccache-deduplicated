@@ -133,7 +133,7 @@ impl<'a> LocalInputs<'a> {
     fn matching_sources(&self, id: ContentId) -> impl Iterator<Item = Box<dyn Read + Send>> + '_ {
         self.0
             .values()
-            .filter_map(move |tree| tree.open_blob(id).ok())
+            .filter_map(move |tree| tree.open_local_blob(id).ok())
     }
 
     pub(super) fn tree(&self, id: TreeId) -> Result<&PreparedTree> {
@@ -225,7 +225,7 @@ type BlobDownload<'a> = dyn FnMut(BlobRef, &mut dyn Write) -> Result<()> + 'a;
 
 pub(super) enum Delivery<'a> {
     Scheduler(Pin<'a>, Option<Box<Publication>>),
-    Local(Box<CapturedExecution>),
+    Local(Box<CapturedExecution>, Pin<'a>),
 }
 
 pub(super) struct Publication {
@@ -258,6 +258,26 @@ impl Publication {
 }
 
 impl Delivery<'_> {
+    pub(super) fn retain(
+        &mut self,
+        session: &super::result_session::NativeResultSession,
+        manifest: &ResultManifest,
+        interval: Duration,
+    ) -> Result<()> {
+        match self {
+            Self::Scheduler(pin, publication) => {
+                if let Some(pending) = publication.take() {
+                    pin.client.with_renewal(pin.ticket, interval, |check| {
+                        check()?;
+                        pending.confirm(pin)
+                    })?;
+                }
+                session.retain(pin.ticket, manifest)
+            }
+            Self::Local(_, pin) => session.retain(pin.ticket, manifest),
+        }
+    }
+
     pub(super) fn with_download<T>(
         &mut self,
         renewal_interval: Duration,
@@ -286,12 +306,13 @@ impl Delivery<'_> {
                             }
                             Ok((result, delivery.observation(started.elapsed())))
                         })?;
+                *publication = None;
                 if pin.assigned {
                     pin.delivery = Some(observation);
                 }
                 Ok(value)
             }
-            Self::Local(captured) => operation(&mut |blob, output| {
+            Self::Local(captured, _) => operation(&mut |blob, output| {
                 copy_verified(captured.open_blob(blob.id)?, blob, output)
             }),
         }
@@ -317,9 +338,50 @@ impl NativeCacheClient {
         policy: &NativeBuildPolicy,
         local: Option<&LocalExecutor>,
     ) -> Result<NativeBuildResult> {
+        self.run_action_inner(spec, inputs, destinations, policy, local, None)
+    }
+
+    pub(crate) fn run_action_retained(
+        &self,
+        spec: &ExecutionSpec,
+        inputs: &[PreparedTree],
+        destinations: &BTreeMap<String, PathBuf>,
+        policy: &NativeBuildPolicy,
+        local: Option<&LocalExecutor>,
+        registry: &super::result_session::Registry,
+        uid: u32,
+    ) -> Result<NativeBuildResult> {
+        self.run_action_inner(
+            spec,
+            inputs,
+            destinations,
+            policy,
+            local,
+            Some((registry, uid)),
+        )
+    }
+
+    fn run_action_inner(
+        &self,
+        spec: &ExecutionSpec,
+        inputs: &[PreparedTree],
+        destinations: &BTreeMap<String, PathBuf>,
+        policy: &NativeBuildPolicy,
+        local: Option<&LocalExecutor>,
+        retention: Option<(&super::result_session::Registry, u32)>,
+    ) -> Result<NativeBuildResult> {
         let mut inputs = LocalInputs::new(spec, inputs)?;
         let destinations = verify_destinations(spec, destinations)?;
-        let selected = destinations.keys().cloned().collect();
+        let destinations = super::intermediate::Destinations::new(destinations)?;
+        let groups = destinations
+            .sessions()
+            .into_iter()
+            .map(|token| {
+                let (registry, uid) = retention.context("retention registry unavailable")?;
+                registry.get(uid, token)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let selected = destinations.eager.keys().cloned().collect();
         match self.acquire_action(spec, &mut inputs, policy, local, &selected)? {
             Outcome::Ready {
                 mut delivery,
@@ -334,13 +396,18 @@ impl NativeCacheClient {
                         fetch_result(
                             spec,
                             &manifest,
-                            &destinations,
+                            &destinations.eager,
                             &inputs,
                             policy.max_result_bytes,
                             download,
                         )
                     })?;
+                for group in groups {
+                    delivery.retain(&group, &manifest, policy.renewal_interval)?;
+                }
+                let references = destinations.stage(&manifest)?;
                 let output = staged.install()?;
+                references.install()?;
                 Ok(NativeBuildResult { source, output })
             }
             Outcome::Failed { source, failure } => Ok(NativeBuildResult {
@@ -687,13 +754,12 @@ impl NativeCacheClient {
     ) -> Result<Outcome<'a>> {
         inputs.progress(NativeProgress::Phase(Phase::LocalCompile))?;
         let captured = local.execute(self, pin.ticket, spec, inputs, policy, start)?;
-        drop(pin);
         let source = NativeBuildSource::Local;
         if let Some(manifest) = captured.successful_result() {
             Ok(Outcome::Ready {
                 manifest: manifest.clone(),
                 source,
-                delivery: Delivery::Local(Box::new(captured)),
+                delivery: Delivery::Local(Box::new(captured), pin),
             })
         } else {
             Ok(Outcome::Failed {
@@ -792,6 +858,13 @@ impl<D: FnMut(BlobRef, &mut dyn Write) -> Result<()>> ResultBlobs<'_, D> {
                 .open(path)
                 .ok()?;
             let metadata = file.metadata().ok()?;
+            if crate::build_runtime::intermediate_fs::intermediate_reference(&file)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return None;
+            }
             (metadata.is_file() && metadata.len() == blob.size)
                 .then(|| Box::new(file) as Box<dyn Read + Send>)
         });
@@ -914,6 +987,24 @@ pub(super) fn fetch_result(
         stderr,
         files: staged,
     })
+}
+
+#[derive(Default)]
+pub(super) struct StagedIntermediates(Vec<(StagedOutput, PathBuf)>);
+
+impl StagedIntermediates {
+    pub(super) fn file(&mut self, file: NamedTempFile, destination: PathBuf) {
+        self.0.push((StagedOutput::File(file), destination));
+    }
+    pub(super) fn tree(&mut self, tree: MaterializedTree, destination: PathBuf) {
+        self.0.push((StagedOutput::Tree(tree), destination));
+    }
+    pub(super) fn install(self) -> Result<()> {
+        for (file, path) in self.0 {
+            file.publish(&path)?;
+        }
+        Ok(())
+    }
 }
 
 pub(super) struct StagedResult {

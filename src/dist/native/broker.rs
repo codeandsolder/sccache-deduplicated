@@ -142,8 +142,10 @@ pub fn serve_action(
     policy: &NativeNamespacePolicy,
     mut stream: DaemonStream,
     local: Option<&LocalExecutor>,
+    registry: &super::result_session::Registry,
+    uid: u32,
 ) -> Result<()> {
-    serve_inner(client, policy, &mut stream, local)
+    serve_inner(client, policy, &mut stream, local, registry, uid)
 }
 
 fn serve_inner(
@@ -151,9 +153,15 @@ fn serve_inner(
     policy: &NativeNamespacePolicy,
     stream: &mut DaemonStream,
     local: Option<&LocalExecutor>,
+    registry: &super::result_session::Registry,
+    uid: u32,
 ) -> Result<()> {
-    let (spec, mode, selected): (ExecutionSpec, ActionMode, BTreeSet<String>) =
-        receive(stream, policy.max_metadata_bytes)?;
+    let (spec, mode, selected, retained): (
+        ExecutionSpec,
+        ActionMode,
+        BTreeSet<String>,
+        BTreeSet<crate::build_runtime::wire::Ticket>,
+    ) = receive(stream, policy.max_metadata_bytes)?;
     ensure!(
         selected.iter().all(|name| spec.outputs.contains_key(name)),
         "undeclared selected result output"
@@ -162,6 +170,10 @@ fn serve_inner(
         spec.platform == policy.platform,
         "native namespace platform mismatch"
     );
+    let retained = retained
+        .into_iter()
+        .map(|token| registry.get(uid, token))
+        .collect::<Result<Vec<_>>>()?;
     let build_policy = policy.build_policy(mode);
     let mut inputs = RemoteInputs {
         stream,
@@ -185,7 +197,10 @@ fn serve_inner(
             delivery.with_download(build_policy.renewal_interval, &blobs, |download| {
                 send(
                     stream,
-                    &Event::Ready { source, manifest },
+                    &Event::Ready {
+                        source,
+                        manifest: manifest.clone(),
+                    },
                     policy.max_metadata_bytes,
                 )?;
                 loop {
@@ -208,6 +223,9 @@ fn serve_inner(
             // Closing a connection-owned result lease is independent of local
             // file installation. Send completion only after all transfers and
             // their validation have finished.
+            for group in retained {
+                delivery.retain(&group, &manifest, build_policy.renewal_interval)?;
+            }
             drop(delivery);
             send(stream, &Event::Done, policy.max_metadata_bytes)?;
         }
@@ -278,8 +296,13 @@ fn run_inner(
     destinations: &BTreeMap<String, PathBuf>,
 ) -> Result<NativeBuildResult> {
     let limit = policy.max_metadata_bytes;
-    let selected = destinations.keys().cloned().collect::<BTreeSet<_>>();
-    send(stream, &(spec, mode, selected), limit)?;
+    let destinations = super::intermediate::Destinations::new(destinations.clone())?;
+    let selected = destinations.eager.keys().cloned().collect::<BTreeSet<_>>();
+    send(
+        stream,
+        &(spec, mode, selected, destinations.sessions()),
+        limit,
+    )?;
     let mut advertised = BTreeMap::<TreeId, BTreeMap<ContentId, u64>>::new();
     let mut buffer = vec![0; stream.chunk_bytes()];
     loop {
@@ -322,7 +345,7 @@ fn run_inner(
                 let staged = fetch_result(
                     spec,
                     &manifest,
-                    destinations,
+                    &destinations.eager,
                     inputs,
                     policy.max_result_bytes,
                     |blob, destination| {
@@ -335,10 +358,10 @@ fn run_inner(
                 send(stream, &ResultRequest::Finish, limit)?;
                 match receive(stream, limit)? {
                     Event::Done => {
-                        return Ok(NativeBuildResult {
-                            source,
-                            output: staged.install()?,
-                        });
+                        let references = destinations.stage(&manifest)?;
+                        let output = staged.install()?;
+                        references.install()?;
+                        return Ok(NativeBuildResult { source, output });
                     }
                     _ => bail!("unexpected native result completion"),
                 }

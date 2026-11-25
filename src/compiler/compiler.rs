@@ -578,6 +578,8 @@ impl<T: CommandCreatorSync> Clone for Box<dyn CompilerProxy<T>> {
 }
 
 pub struct GenerateHashKeyContext<'a, T> {
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    pub native: Option<Arc<super::native::NativeCompilerClient>>,
     pub creator: &'a T,
     pub cwd: PathBuf,
     pub env_vars: Vec<(OsString, OsString)>,
@@ -653,6 +655,8 @@ where
         activity::phase(Phase::HashInputs);
         let result = self
             .generate_hash_key(GenerateHashKeyContext {
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                native: native.clone(),
                 creator: &creator,
                 cwd: cwd.clone(),
                 env_vars: env_vars.clone(),
@@ -2891,6 +2895,8 @@ LLVM version: 6.0",
                 };
                 hasher
                     .generate_hash_key(GenerateHashKeyContext {
+                        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                        native: None,
                         creator: &creator,
                         cwd: cwd.to_path_buf(),
                         env_vars: vec![],
@@ -2956,6 +2962,8 @@ LLVM version: 6.0",
             };
             Ok(hasher
                 .generate_hash_key(GenerateHashKeyContext {
+                    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                    native: None,
                     creator: &creator,
                     cwd: cwd.to_path_buf(),
                     env_vars: vec![],
@@ -3051,6 +3059,8 @@ LLVM version: 6.0",
             };
             Ok(hasher
                 .generate_hash_key(GenerateHashKeyContext {
+                    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                    native: None,
                     creator: &creator,
                     cwd: cwd.to_path_buf(),
                     env_vars: vec![],
@@ -3133,6 +3143,8 @@ LLVM version: 6.0",
                 };
                 hasher
                     .generate_hash_key(GenerateHashKeyContext {
+                        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                        native: None,
                         creator: &creator,
                         cwd: cwd.to_path_buf(),
                         env_vars: vec![],
@@ -3206,6 +3218,8 @@ LLVM version: 6.0",
                 };
                 hasher
                     .generate_hash_key(GenerateHashKeyContext {
+                        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                        native: None,
                         creator: &creator,
                         cwd: cwd.to_path_buf(),
                         env_vars: vec![],

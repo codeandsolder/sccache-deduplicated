@@ -3067,6 +3067,8 @@ mod test {
                     <CCompilerHasher<Gcc> as CompilerHasher<ProcessCommandCreator>>::generate_hash_key(
                         &mut hasher,
                         GenerateHashKeyContext {
+                            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                            native: None,
                             creator: &creator,
                             cwd: cwd.clone(),
                             env_vars: env,

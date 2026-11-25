@@ -245,7 +245,7 @@ impl Pending {
                 let PendingAction { permit, upload, .. } = *action;
                 let (manifest, transfer) = upload.context("missing result negotiation")?;
                 let result = transfer.publish(|staged| permit.publish_pinned(&manifest, staged));
-                Ok(Ready::Result(Box::new(result?)))
+                Ok(Ready::Result(Arc::new(result?)))
             }
             Self::Tree { manifest, transfer } => Ok(Ready::Tree(Box::new(TreeDelivery::new(
                 transfer.publish(|staged| store.publish_tree_pinned(&manifest, staged))?,
@@ -359,7 +359,7 @@ impl PeerInputClaim {
 }
 
 enum Ready {
-    Result(Box<ResultLease>),
+    Result(Arc<ResultLease>),
     Tree(Box<TreeDelivery>),
 }
 
@@ -448,6 +448,7 @@ pub struct NativeSessions {
     coordinator: BuildCoordinator,
     limits: SessionLimits,
     sessions: Mutex<HashMap<Ticket, SharedSession>>,
+    retained: retention::RetentionGroups,
     active_uploads: Arc<AtomicUsize>,
     backfills: Mutex<HashMap<ContentId, Weak<Backfill>>>,
     peer_wake: Condvar,
@@ -505,6 +506,7 @@ impl NativeSessions {
             coordinator: BuildCoordinator::new(store),
             limits,
             sessions: Mutex::new(HashMap::new()),
+            retained: retention::RetentionGroups::default(),
             active_uploads: Arc::new(AtomicUsize::new(0)),
             backfills: Mutex::new(HashMap::new()),
             peer_wake: Condvar::new(),
@@ -661,7 +663,7 @@ impl NativeSessions {
         drop(expired);
         self.reap_backfills(now)?;
         self.recovery.reap()?;
-        Ok(count)
+        Ok(count + self.retained.reap(now)?)
     }
 
     // A canceled origin can leave an upload claim alive in a flight shared
@@ -759,7 +761,7 @@ impl NativeSessions {
                 let ticket = self.register(
                     Kind::Action,
                     publisher,
-                    Phase::Ready(Ready::Result(Box::new(lease))),
+                    Phase::Ready(Ready::Result(Arc::new(lease))),
                 )?;
                 Ok(NativeAdmission::Hit { ticket, manifest })
             }
@@ -2082,6 +2084,7 @@ impl Drop for UploadSlot {
 }
 
 mod recovery;
+mod retention;
 mod telemetry;
 pub use telemetry::{ManifestStatus, RecoveryStatus, SessionStatus, TicketStatus};
 

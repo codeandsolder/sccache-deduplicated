@@ -10,5 +10,5 @@ cargo_wrapper_main() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    cargo_wrapper_main /usr/local/libexec/sccache-bin/sccache "$@"
+    cargo_wrapper_main /usr/local/bin/sccache "$@"
 fi
