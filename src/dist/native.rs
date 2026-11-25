@@ -63,6 +63,12 @@ pub(super) struct DownloadRequest {
 }
 
 #[derive(Serialize, Deserialize)]
+pub(super) struct StatusRequest {
+    pub ticket: Ticket,
+    pub preview: bool,
+}
+
+#[derive(Serialize, Deserialize)]
 pub(super) struct BlobSourceRequest {
     pub ticket: Ticket,
     pub blobs: Vec<BlobRef>,
@@ -531,7 +537,7 @@ impl NativeCacheClient {
     }
 
     /// Observe a scheduler-dispatched worker job over its authenticated HTTPS
-    /// endpoint. Successful outputs are read separately from the scheduler.
+    /// endpoint. Successful outputs are delivered separately.
     ///
     /// # Errors
     /// Returns an error for a rejected job, invalid certificate or transport
@@ -542,6 +548,21 @@ impl NativeCacheClient {
         timeout: Duration,
         max_response_bytes: u64,
     ) -> Result<NativeRunResult> {
+        match self.observe_worker(allocation, timeout, max_response_bytes, |_| {
+            None::<std::convert::Infallible>
+        })? {
+            std::ops::ControlFlow::Continue(result) => Ok(result),
+            std::ops::ControlFlow::Break(never) => match never {},
+        }
+    }
+
+    fn observe_worker<T>(
+        &self,
+        allocation: &WorkerAllocation,
+        timeout: Duration,
+        max_response_bytes: u64,
+        mut early: impl FnMut(crate::build_runtime::wire::NativeJobPhase) -> Option<T>,
+    ) -> Result<std::ops::ControlFlow<T, NativeRunResult>> {
         ensure!(
             !timeout.is_zero() && max_response_bytes > 0 && max_response_bytes < u64::MAX,
             "invalid native run limits"
@@ -596,7 +617,11 @@ impl NativeCacheClient {
             let remaining = timeout.saturating_sub(started.elapsed());
             ensure!(!remaining.is_zero(), "native worker deadline exceeded");
             match rpc(NativeRunRequest::Poll, remaining) {
-                Ok(NativeRunResult::Pending(_)) => {}
+                Ok(NativeRunResult::Pending(phase)) => {
+                    if let Some(value) = early(phase) {
+                        return Ok(std::ops::ControlFlow::Break(value));
+                    }
+                }
                 Ok(NativeRunResult::Acknowledged) => {
                     anyhow::bail!("unexpected native worker acknowledgement")
                 }
@@ -610,7 +635,7 @@ impl NativeCacheClient {
                             );
                         }
                     }
-                    return Ok(result);
+                    return Ok(std::ops::ControlFlow::Continue(result));
                 }
                 Err(error) if retryable_transport_error(&error) => {
                     debug!("retrying native worker status: {error:#}");
@@ -1101,7 +1126,24 @@ impl NativeCacheClient {
     /// # Errors
     /// Returns an error on an unavailable ticket or transport failure.
     pub fn status(&self, ticket: Ticket) -> Result<NativeStatus> {
-        self.control("status", &ticket)
+        self.control(
+            "status",
+            &StatusRequest {
+                ticket,
+                preview: false,
+            },
+        )
+    }
+
+    #[cfg(all(target_os = "linux", feature = "dist-client"))]
+    fn preview_status(&self, ticket: Ticket) -> Result<NativeStatus> {
+        self.control(
+            "status",
+            &StatusRequest {
+                ticket,
+                preview: true,
+            },
+        )
     }
 
     /// Release a result ticket or cancel an unfinished action.

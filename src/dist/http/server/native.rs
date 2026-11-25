@@ -30,7 +30,7 @@ use crate::{
     dist::native::{
         BlobSourceRequest, CommitRequest, DownloadRequest, ExecutionRequest, InputPrefetchRequest,
         ManifestRequest, OpenTreeRequest, PackageAcquisition, PackageLocator, PackagePlanRequest,
-        codec,
+        StatusRequest, codec,
     },
 };
 
@@ -652,7 +652,8 @@ fn dispatch(
             )
         }
         "status" if publisher == Publisher::Client => {
-            encode(&sessions.status(metadata(request, limit)?)?, limit)
+            let StatusRequest { ticket, preview } = metadata(request, limit)?;
+            encode(&sessions.status_with_preview(ticket, preview)?, limit)
         }
         "close" => {
             sessions.close(metadata(request, limit)?, publisher)?;

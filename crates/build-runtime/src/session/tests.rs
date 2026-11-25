@@ -326,6 +326,22 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     let result = manifest(b"object");
     let missing = service.begin(ticket, publisher, result.clone())?.missing;
     assert_eq!(
+        service.status_with_preview(ticket, true)?,
+        NativeStatus::Negotiated(result.clone())
+    );
+    assert_eq!(
+        service.authorize_blob_sources(ticket, Publisher::Client, &missing)?,
+        (Some(worker), vec![false])
+    );
+    assert!(
+        service
+            .download(ticket, Publisher::Client, missing[0].id)
+            .unwrap_err()
+            .is::<NativeContentPending>()
+    );
+    service.renew(ticket, Publisher::Client)?;
+
+    assert_eq!(
         service.schedule(ticket, &request()?, |_, _| bail!("duplicate assignment"))?,
         expected
     );
@@ -371,6 +387,28 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
         service.schedule(ticket, &failed, |_, _| Ok(expected.clone()))?,
         expected
     );
+    // The same bytes are already durable from the previous action. A
+    // negotiated result can read those bytes before commit, but a subsequent
+    // failed publication must never be observable as a ready result.
+    assert!(
+        service
+            .begin(ticket, publisher, result.clone())?
+            .missing
+            .is_empty()
+    );
+    assert_eq!(service.status(ticket)?, NativeStatus::Compiling);
+    assert_eq!(
+        service.status_with_preview(ticket, true)?,
+        NativeStatus::Negotiated(result)
+    );
+    assert_eq!(
+        service.authorize_blob_sources(ticket, Publisher::Client, &missing)?,
+        (Some(worker), vec![true])
+    );
+    let mut bytes = Vec::new();
+    decoded_download(&service, ticket, Publisher::Client, missing[0].id)?
+        .read_to_end(&mut bytes)?;
+    assert_eq!(bytes, b"object");
     service.fail(ticket, publisher)?;
     assert_eq!(
         service.schedule(ticket, &failed, |_, _| bail!(

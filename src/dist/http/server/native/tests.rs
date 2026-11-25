@@ -300,6 +300,7 @@ fn verify_peer_delivery(
     blob: BlobRef,
     bytes: &[u8],
     network: &NetworkMeter,
+    committed: bool,
 ) -> Result<()> {
     use crate::dist::JobAuthorizer;
     use std::{
@@ -361,7 +362,7 @@ fn verify_peer_delivery(
         let plan = plans
             .get(&blob.id)
             .context("missing authorized result source")?;
-        assert!(plan.scheduler_present);
+        assert_eq!(plan.scheduler_present, committed);
         assert_eq!(plan.sources.len(), 1);
         // The source grant comes from the live scheduler, but the configured
         // data fallback is deliberately unavailable. The worker must supply
@@ -409,15 +410,20 @@ fn verify_peer_delivery(
         bad.store(true, Ordering::Relaxed);
         assert!(direct.try_peer_blob(plan, receive).is_none());
         // The durable scheduler copy still restores the result, without a rerun.
-        let mut fallback = Vec::new();
-        client.download(ticket, blob, &mut fallback)?;
-        assert_eq!(fallback, bytes);
+        if committed {
+            let mut fallback = Vec::new();
+            client.download(ticket, blob, &mut fallback)?;
+            assert_eq!(fallback, bytes);
+        } else {
+            assert!(client.download(ticket, blob, Vec::new()).is_err());
+        }
         Ok(())
     })();
     let _ = stop.send(());
     handle
         .join()
         .map_err(|_| anyhow::anyhow!("peer delivery test listener panicked"))??;
+    endpoint.sources.lock().unwrap().remove(&blob.id);
     outcome
 }
 
@@ -497,9 +503,31 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
             worker_client.begin(ticket, output.clone())?.missing,
             vec![blob]
         );
+        assert_eq!(client.status(ticket)?, NativeStatus::Compiling);
+        assert_eq!(
+            sessions.status_with_preview(ticket, true)?,
+            NativeStatus::Negotiated(output.clone())
+        );
+        assert_eq!(
+            sessions.authorize_blob_sources(ticket, Publisher::Client, &[blob])?,
+            (Some(url.worker.current()?.id()?), vec![false])
+        );
         assert!(
             sessions
-                .authorize_blob_sources(ticket, Publisher::Client, &[blob])
+                .download(ticket, Publisher::Client, blob.id)
+                .unwrap_err()
+                .is::<NativeContentPending>()
+        );
+        assert!(
+            sessions
+                .authorize_blob_sources(
+                    ticket,
+                    Publisher::Client,
+                    &[BlobRef {
+                        size: blob.size + 1,
+                        ..blob
+                    }]
+                )
                 .is_err()
         );
         assert!(
@@ -527,6 +555,7 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
                 .upload(ticket, blob, Cursor::new(vec![0; bytes.len()]))
                 .is_err()
         );
+        verify_peer_delivery(url, &client, ticket, blob, &bytes, network, false)?;
         worker_client.upload(ticket, blob, Cursor::new(bytes.clone()))?;
         let retention = Duration::from_millis(299_123);
         assert_eq!(worker_client.commit(ticket, retention, None)?, output);
@@ -583,7 +612,7 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
             ]
         );
         assert_eq!(client.status(ticket)?, NativeStatus::Ready(output.clone()));
-        verify_peer_delivery(url, &client, ticket, blob, &bytes, network)?;
+        verify_peer_delivery(url, &client, ticket, blob, &bytes, network, true)?;
         let mut downloaded = Vec::new();
         client.download(ticket, blob, &mut downloaded)?;
         assert_eq!(downloaded, bytes);
@@ -699,17 +728,17 @@ fn metadata_is_bounded_and_rejects_trailing_bytes() -> Result<()> {
         "POST",
         "/api/v5/native/client/status",
         Vec::new(),
-        vec![0; 33],
+        vec![0; 34],
     );
-    assert!(metadata::<crate::build_runtime::wire::Ticket>(&request, 32).is_err());
+    assert!(metadata::<StatusRequest>(&request, 33).is_err());
     let request = Request::fake_http_from(
         "127.0.0.1:0".parse()?,
         "POST",
         "/api/v5/native/client/status",
         Vec::new(),
-        vec![0; 33],
+        vec![0; 34],
     );
-    assert!(metadata::<crate::build_runtime::wire::Ticket>(&request, 64).is_err());
+    assert!(metadata::<StatusRequest>(&request, 64).is_err());
     let header = UploadHeader {
         ticket: crate::build_runtime::wire::Ticket([7; 32]),
         blob: BlobRef {

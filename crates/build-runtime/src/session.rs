@@ -381,7 +381,7 @@ enum Committed {
 
 enum Phase {
     Pending(Box<Pending>),
-    Publishing,
+    Publishing(Option<ResultManifest>),
     Ready(Ready),
     Failed,
 }
@@ -403,6 +403,21 @@ struct Session {
     publisher: Publisher,
     kind: Kind,
     phase: Phase,
+}
+
+impl Session {
+    fn negotiated_result(&self) -> Option<&ResultManifest> {
+        // Local execution and trees keep their existing publication semantics.
+        self.allocation.as_ref()?;
+        match &self.phase {
+            Phase::Pending(pending) => match &**pending {
+                Pending::Action(action) => action.upload.as_ref().map(|(manifest, _)| manifest),
+                Pending::Tree { .. } => None,
+            },
+            Phase::Publishing(manifest) => manifest.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 type SharedSession = Arc<Mutex<Session>>;
@@ -606,7 +621,7 @@ impl NativeSessions {
             // Never wait on another session's I/O while holding the global map.
             map.retain(|_, shared| match shared.try_lock() {
                 Ok(mut state) => {
-                    if state.expires <= now && !matches!(state.phase, Phase::Publishing) {
+                    if state.expires <= now && !matches!(state.phase, Phase::Publishing(_)) {
                         expired.push(std::mem::replace(&mut state.phase, Phase::Failed));
                         false
                     } else {
@@ -809,7 +824,7 @@ impl NativeSessions {
     ) -> Result<ScheduleReply> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
-        if !matches!(state.phase, Phase::Publishing) {
+        if !matches!(state.phase, Phase::Publishing(_)) {
             self.touch(&mut state)?;
         }
         let declaration =
@@ -911,7 +926,9 @@ impl NativeSessions {
     pub fn renew(&self, ticket: Ticket, publisher: Publisher) -> Result<()> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
-        if matches!(state.phase, Phase::Ready(_)) && publisher == Publisher::Client {
+        if publisher == Publisher::Client
+            && (matches!(state.phase, Phase::Ready(_)) || state.negotiated_result().is_some())
+        {
             self.authorize_reader(&mut state, publisher)
         } else {
             self.authorize(&mut state, publisher)
@@ -1180,7 +1197,9 @@ impl NativeSessions {
                 Phase::Pending(pending) => pending.check_complete()?,
                 _ => bail!("native session cannot commit"),
             }
-            let Phase::Pending(pending) = std::mem::replace(&mut state.phase, Phase::Publishing)
+            let preview = state.negotiated_result().cloned();
+            let Phase::Pending(pending) =
+                std::mem::replace(&mut state.phase, Phase::Publishing(preview))
             else {
                 bail!("native phase changed");
             };
@@ -1232,16 +1251,30 @@ impl NativeSessions {
     /// # Errors
     /// Returns an error for unknown or expired tickets.
     pub fn status(&self, ticket: Ticket) -> Result<NativeStatus> {
+        self.status_with_preview(ticket, false)
+    }
+
+    /// Request a provisional result manifest once the producing worker has
+    /// negotiated it. Ordinary status polling does not resend this metadata.
+    ///
+    /// # Errors
+    /// Returns an error for unknown or expired tickets.
+    pub fn status_with_preview(&self, ticket: Ticket, preview: bool) -> Result<NativeStatus> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         ensure!(state.kind == Kind::Action, "native ticket is not an action");
         if matches!(state.phase, Phase::Ready(_) | Phase::Failed) {
             self.touch(&mut state)?;
-        } else if !matches!(state.phase, Phase::Publishing) {
+        } else if !matches!(state.phase, Phase::Publishing(_)) {
             ensure!(state.expires > Instant::now(), "native ticket expired");
         }
         Ok(match &state.phase {
-            Phase::Pending(_) | Phase::Publishing => NativeStatus::Compiling,
+            Phase::Pending(_) | Phase::Publishing(_) if preview => state
+                .negotiated_result()
+                .map_or(NativeStatus::Compiling, |manifest| {
+                    NativeStatus::Negotiated(manifest.clone())
+                }),
+            Phase::Pending(_) | Phase::Publishing(_) => NativeStatus::Compiling,
             Phase::Ready(Ready::Result(lease)) => NativeStatus::Ready(lease.manifest().clone()),
             Phase::Ready(Ready::Tree(_)) => bail!("native action has a tree result"),
             Phase::Failed => NativeStatus::Failed,
@@ -1266,29 +1299,24 @@ impl NativeSessions {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.authorize_reader(&mut state, reader)?;
-        let Phase::Ready(lease) = &state.phase else {
-            bail!("native delivery not ready");
-        };
         let declared = |manifest: &BTreeMap<ContentId, u64>| {
             blobs
                 .iter()
                 .all(|blob| manifest.get(&blob.id) == Some(&blob.size))
         };
-        let (producer, pinned) = match lease {
-            Ready::Result(lease) => {
+        let producer = state
+            .allocation
+            .as_ref()
+            .map(|allocation| allocation.worker.peer);
+        let (producer, pinned) = match &state.phase {
+            Phase::Ready(Ready::Result(lease)) => {
                 ensure!(
                     declared(&lease.manifest().blobs()?),
                     "undeclared result source"
                 );
-                (
-                    state
-                        .allocation
-                        .as_ref()
-                        .map(|allocation| allocation.worker.peer),
-                    true,
-                )
+                (producer, true)
             }
-            Ready::Tree(delivery) => match &delivery.source {
+            Phase::Ready(Ready::Tree(delivery)) => match &delivery.source {
                 TreeSource::Stored(tree) => {
                     ensure!(declared(tree.blobs()), "undeclared tree source");
                     (None, true)
@@ -1298,6 +1326,16 @@ impl NativeSessions {
                     (None, false)
                 }
             },
+            _ => {
+                let preview = state
+                    .negotiated_result()
+                    .context("native delivery not ready")?;
+                ensure!(
+                    declared(&preview.blobs()?),
+                    "undeclared negotiated result source"
+                );
+                (producer, false)
+            }
         };
         drop(state);
         let availability = if pinned {
@@ -1326,6 +1364,20 @@ impl NativeSessions {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.authorize_reader(&mut state, reader)?;
+        // A negotiated result may already share content with the durable
+        // CAS. Permit reads of those verified files, not staged uploads.
+        if let Some(manifest) = state.negotiated_result() {
+            let size = *manifest
+                .blobs()?
+                .get(&id)
+                .context("undeclared negotiated result blob")?;
+            drop(state);
+            let file = self
+                .store()
+                .open_available_physical(BlobRef { id, size })?
+                .ok_or(NativeContentPending)?;
+            return encode_delivery(file, false);
+        }
         let Phase::Ready(lease) = &mut state.phase else {
             bail!("native content not available");
         };
@@ -1865,7 +1917,7 @@ impl NativeSessions {
             let mut state = Self::lock(&session)?;
             self.authorize_reader(&mut state, reader)?;
             ensure!(
-                !matches!(state.phase, Phase::Publishing),
+                !matches!(state.phase, Phase::Publishing(_)),
                 "native publication in progress"
             );
             state.expires = Instant::now();

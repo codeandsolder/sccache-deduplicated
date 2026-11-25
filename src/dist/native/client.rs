@@ -22,7 +22,7 @@ use crate::build_runtime::{
     PreparedTree, ResultManifest, TreeId, TreeManifest, materialize_tree,
     wire::{
         InputDemand, InputPoll, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply,
-        Ticket,
+        Ticket, WorkerAllocation,
     },
 };
 
@@ -208,8 +208,37 @@ pub(super) enum Outcome<'a> {
 type BlobDownload<'a> = dyn FnMut(BlobRef, &mut dyn Write) -> Result<()> + 'a;
 
 pub(super) enum Delivery<'a> {
-    Scheduler(Pin<'a>),
+    Scheduler(Pin<'a>, Option<Box<Publication>>),
     Local(Box<CapturedExecution>),
+}
+
+pub(super) struct Publication {
+    allocation: WorkerAllocation,
+    manifest: ResultManifest,
+    deadline: Instant,
+    max_result_bytes: u64,
+}
+
+impl Publication {
+    fn confirm(&self, pin: &Pin<'_>) -> Result<()> {
+        let manifest = pin.client.await_result_commit(pin.ticket, self.deadline)?;
+        ensure!(
+            manifest == self.manifest,
+            "native committed result differs from negotiation"
+        );
+        // Durable publication is authoritative. Acknowledge promptly to
+        // release the worker reservation, but do not wait for a lost RPC.
+        let remaining = self
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(250));
+        if !remaining.is_zero() {
+            let _ = pin
+                .client
+                .run_worker(&self.allocation, remaining, self.max_result_bytes);
+        }
+        Ok(())
+    }
 }
 
 impl Delivery<'_> {
@@ -220,17 +249,23 @@ impl Delivery<'_> {
         operation: impl FnOnce(&mut BlobDownload<'_>) -> Result<T>,
     ) -> Result<T> {
         match self {
-            Self::Scheduler(pin) => {
+            Self::Scheduler(pin, publication) => {
                 pin.client
                     .with_renewal(pin.ticket, renewal_interval, |check| {
                         let mut delivery = super::peer_delivery::ResultDelivery::new(
-                            pin.client, pin.ticket, declared,
+                            pin.client,
+                            pin.ticket,
+                            declared,
+                            publication.as_ref().map(|pending| pending.deadline),
                         );
                         let result = operation(&mut |blob, output| {
                             check()?;
                             delivery.download(blob, output)
                         })?;
                         check()?;
+                        if let Some(publication) = publication {
+                            publication.confirm(pin)?;
+                        }
                         Ok(result)
                     })
             }
@@ -315,7 +350,7 @@ impl NativeCacheClient {
                         ticket,
                     };
                     return Ok(Outcome::Ready {
-                        delivery: Delivery::Scheduler(pin),
+                        delivery: Delivery::Scheduler(pin, None),
                         source: NativeBuildSource::Hit,
                         manifest,
                     });
@@ -414,8 +449,17 @@ impl NativeCacheClient {
         // Only the worker RPC needs a separate thread; the original provider
         // (including the namespace stream) remains owned by this thread.
         let result = thread::scope(|scope| {
-            let worker =
-                scope.spawn(|| self.run_worker(&allocation, remaining, policy.max_result_bytes));
+            let worker = scope.spawn(|| {
+                self.observe_worker(&allocation, remaining, policy.max_result_bytes, |phase| {
+                    if phase == crate::build_runtime::wire::NativeJobPhase::Publishing
+                        && let Ok(NativeStatus::Negotiated(manifest)) =
+                            self.preview_status(pin.ticket)
+                    {
+                        return Some(manifest);
+                    }
+                    None
+                })
+            });
             let supply = self.supply_until_ready(
                 pin.ticket,
                 &request.input_trees,
@@ -430,8 +474,10 @@ impl NativeCacheClient {
             let terminal = supply.is_err()
                 && (worker.is_finished()
                     || matches!(
-                        self.status(pin.ticket),
-                        Ok(NativeStatus::Ready(_) | NativeStatus::Failed)
+                        self.preview_status(pin.ticket),
+                        Ok(NativeStatus::Negotiated(_)
+                            | NativeStatus::Ready(_)
+                            | NativeStatus::Failed)
                     ));
             if supply.is_err() && !terminal {
                 let _ = self.close(pin.ticket);
@@ -444,6 +490,26 @@ impl NativeCacheClient {
             }
             result
         });
+        let result = match result {
+            Ok(std::ops::ControlFlow::Break(manifest)) => {
+                validate_manifest(spec, &manifest, policy.max_result_bytes)?;
+                let publication = Publication {
+                    allocation,
+                    manifest: manifest.clone(),
+                    deadline: start
+                        .checked_add(policy.timeout)
+                        .context("native publication deadline overflow")?,
+                    max_result_bytes: policy.max_result_bytes,
+                };
+                return Ok(Outcome::Ready {
+                    delivery: Delivery::Scheduler(pin, Some(Box::new(publication))),
+                    source,
+                    manifest,
+                });
+            }
+            Ok(std::ops::ControlFlow::Continue(result)) => Ok(result),
+            Err(error) => Err(error),
+        };
         let error = match result {
             Ok(NativeRunResult::Stored) => None,
             Ok(failure @ NativeRunResult::Failed { .. }) => {
@@ -464,7 +530,7 @@ impl NativeCacheClient {
         // terminal response was lost, expired, or the worker restarted.
         match (self.status(pin.ticket), error) {
             (Ok(NativeStatus::Ready(manifest)), _) => Ok(Outcome::Ready {
-                delivery: Delivery::Scheduler(pin),
+                delivery: Delivery::Scheduler(pin, None),
                 source,
                 manifest,
             }),

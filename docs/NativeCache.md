@@ -1188,11 +1188,14 @@ when bound and authenticated just like all other routes.
 
 Result publication retains the existing manifest and unique missing-content
 negotiation: the producing worker only uploads blobs absent from the scheduler
-CAS, then commits the durable result. Direct client result delivery follows
-that commit, and can also use other resident workers for cache hits. It does
-not weaken the durable publication guarantee or require rerunning compilation
-when a peer disappears. Selective output materialization is orthogonal to source
-selection; receivers request only the selected exact content.
+CAS, then commits the durable result. Once the worker negotiates its validated
+manifest, the client can stage requested blobs concurrently with the scheduler
+upload, from the worker or already verified scheduler CAS files. Missing
+scheduler fallback content waits for commit. No successful result is exposed
+until the scheduler confirms the same complete manifest durably committed;
+the namespace broker withholds its final Done frame until confirmation.
+Cache hits can also use resident workers. Selective output materialization
+is orthogonal to source selection; receivers request only selected content.
 
 The native cache listener meters encoded HTTP payload bytes before delivery
 to the transport or after reception from it; logical lengths are tracked

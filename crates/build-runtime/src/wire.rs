@@ -136,6 +136,8 @@ pub enum NativeAdmission {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeStatus {
     Compiling,
+    /// A worker has negotiated immutable successful output; durable commit is pending.
+    Negotiated(ResultManifest),
     Ready(ResultManifest),
     Failed,
 }

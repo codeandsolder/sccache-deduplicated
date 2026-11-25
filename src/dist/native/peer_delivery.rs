@@ -70,7 +70,9 @@ impl NativeCacheClient {
                     &self.cache_routes(),
                     transfer,
                 )
-                .unwrap_or(50_000_000 + u128::from(plan.blob.size) * 1_000_000_000 / (16 << 20))
+                .unwrap_or_else(|| {
+                    50_000_000 + u128::from(plan.blob.size) * 1_000_000_000 / (16 << 20)
+                })
         } else {
             // A scheduler miss would require another content acquisition and
             // relay. Prefer an authenticated peer; no origin bytes are needed.
@@ -178,12 +180,40 @@ impl NativeCacheClient {
 }
 
 #[cfg(feature = "dist-client")]
+impl NativeCacheClient {
+    /// A negotiated manifest is not a successful result until the scheduler
+    /// confirms its durable publication. Wait only to the action's deadline.
+    pub(super) fn await_result_commit(
+        &self,
+        ticket: Ticket,
+        deadline: Instant,
+    ) -> Result<crate::build_runtime::ResultManifest> {
+        use crate::build_runtime::wire::NativeStatus;
+        let mut delay = Duration::from_millis(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.status(ticket) {
+                Ok(NativeStatus::Ready(manifest)) => return Ok(manifest),
+                Ok(NativeStatus::Failed) => anyhow::bail!("native result publication failed"),
+                Ok(NativeStatus::Compiling | NativeStatus::Negotiated(_)) => {}
+                Err(error) if super::retryable_transport_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+            anyhow::ensure!(!remaining.is_zero(), "native publication deadline exceeded");
+            std::thread::sleep(delay.min(remaining));
+            delay = (delay * 2).min(Duration::from_millis(100));
+        }
+    }
+}
+
+#[cfg(feature = "dist-client")]
 pub(super) struct ResultDelivery<'a> {
     client: &'a NativeCacheClient,
     ticket: Ticket,
     declared: &'a BTreeMap<ContentId, u64>,
     plans: BTreeMap<ContentId, Option<BlobSourcePlan>>,
     obtained: Instant,
+    publication_deadline: Option<Instant>,
 }
 
 #[cfg(feature = "dist-client")]
@@ -192,6 +222,7 @@ impl<'a> ResultDelivery<'a> {
         client: &'a NativeCacheClient,
         ticket: Ticket,
         declared: &'a BTreeMap<ContentId, u64>,
+        publication_deadline: Option<Instant>,
     ) -> Self {
         Self {
             client,
@@ -199,6 +230,7 @@ impl<'a> ResultDelivery<'a> {
             declared,
             plans: BTreeMap::new(),
             obtained: Instant::now(),
+            publication_deadline,
         }
     }
 
@@ -223,6 +255,14 @@ impl<'a> ResultDelivery<'a> {
                 .into_iter()
                 .map(|blob| (blob.id, plans.remove(&blob.id))),
         );
+    }
+
+    fn wait_for_fallback(&mut self) -> Result<()> {
+        if let Some(deadline) = self.publication_deadline {
+            self.client.await_result_commit(self.ticket, deadline)?;
+            self.publication_deadline = None;
+        }
+        Ok(())
     }
 
     pub(super) fn download(
@@ -253,6 +293,34 @@ impl<'a> ResultDelivery<'a> {
             io::copy(&mut staging, &mut destination)?;
             return Ok(());
         }
+        if let Some(deadline) = self.publication_deadline {
+            let timeout = self
+                .client
+                .timeout
+                .min(deadline.saturating_duration_since(Instant::now()));
+            if !timeout.is_zero() {
+                match self
+                    .client
+                    .try_download_response(self.ticket, blob, timeout)
+                {
+                    Ok(Some((reader, encoding))) => {
+                        return crate::build_runtime::transfer_native_blob(
+                            reader,
+                            io::sink(),
+                            destination,
+                            blob,
+                            encoding,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) if super::retryable_transport_error(&error) => {
+                        debug!("retrying provisional scheduler delivery after commit: {error:#}")
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        self.wait_for_fallback()?;
         self.client.download(self.ticket, blob, destination)
     }
 }
