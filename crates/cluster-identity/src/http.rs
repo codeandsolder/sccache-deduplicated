@@ -19,18 +19,20 @@ use axum::{
     routing::{MethodRouter, any, get},
 };
 use bincode::Options;
+use btls::{
+    asn1::Asn1Time,
+    ssl::{
+        Ssl, SslContext, SslContextBuilder, SslMethod, SslOptions, SslSessionCacheMode,
+        SslVerifyMode, SslVersion,
+    },
+    x509::{X509, store::X509StoreBuilder},
+};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use openssl::{asn1::Asn1Time, x509::X509};
-use rustls::{
-    RootCertStore, ServerConfig,
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
-    server::WebPkiClientVerifier,
-};
 use tokio::{net::TcpStream, time::timeout};
-use tokio_rustls::TlsAcceptor;
+use tokio_btls::SslStream;
 use tower::ServiceExt as _;
 
 use super::{
@@ -173,40 +175,36 @@ fn probe() -> MethodRouter {
         .fallback(|| std::future::ready(StatusCode::NOT_FOUND))
 }
 
-fn server_config(credentials: &TlsCredentials, allow_enrollment: bool) -> Result<ServerConfig> {
+fn server_config(credentials: &TlsCredentials, allow_enrollment: bool) -> Result<SslContext> {
     ensure!(
         credentials.role != Role::Client,
         "client-only credential cannot serve TLS"
     );
-    let mut roots = RootCertStore::empty();
-    roots.add(CertificateDer::from(credentials.ca.to_der()?))?;
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let verifier =
-        WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider));
-    let verifier = if allow_enrollment {
-        verifier.allow_unauthenticated()
-    } else {
-        verifier
+    let mut store = X509StoreBuilder::new()?;
+    store.add_cert(&credentials.ca)?;
+    let mut config = SslContextBuilder::new(SslMethod::tls())?;
+    config.set_min_proto_version(Some(SslVersion::TLS1_3))?;
+    config.set_max_proto_version(Some(SslVersion::TLS1_3))?;
+    config.set_cert_store(store.build())?;
+    config.set_certificate(&credentials.certificate)?;
+    config.set_private_key(credentials.identity.private_key())?;
+    config.check_private_key()?;
+    config.add_client_ca(&credentials.ca)?;
+    let mut mode = SslVerifyMode::PEER;
+    if !allow_enrollment {
+        mode |= SslVerifyMode::FAIL_IF_NO_PEER_CERT;
     }
-    .build()?;
-    let mut config = ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(
-            vec![CertificateDer::from(credentials.certificate.to_der()?)],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                credentials.identity.private_key().private_key_to_pkcs8()?,
-            )),
-        )?;
-    // Recheck the full current client certificate on every new connection.
-    config.send_tls13_tickets = 0;
-    Ok(config)
+    config.set_verify(mode)?;
+    // Every new connection must present its currently valid identity.
+    let _ = config.set_options(SslOptions::NO_TICKET);
+    let _ = config.set_session_cache_mode(SslSessionCacheMode::OFF);
+    Ok(config.build())
 }
 
 /// Shared TLS listener configuration. Replacing credentials only affects
 /// future handshakes; in-flight streams retain their authenticated identity.
 pub struct ClusterListener {
-    config: RwLock<Arc<ServerConfig>>,
+    config: RwLock<Arc<SslContext>>,
     id: PeerId,
     role: Role,
     ca_fingerprint: [u8; 32],
@@ -241,7 +239,7 @@ impl ClusterListener {
             allow_enrollment,
             id: credentials.id()?,
             role: credentials.role,
-            ca_fingerprint: openssl::sha::sha256(&credentials.ca.to_der()?),
+            ca_fingerprint: btls::sha::sha256(&credentials.ca.to_der()?),
         })
     }
 
@@ -253,7 +251,7 @@ impl ClusterListener {
         ensure!(
             self.id == credentials.id()?
                 && self.role == credentials.role
-                && self.ca_fingerprint == openssl::sha::sha256(&credentials.ca.to_der()?),
+                && self.ca_fingerprint == btls::sha::sha256(&credentials.ca.to_der()?),
             "listener renewal cannot change the local identity, role or CA"
         );
         let config = Arc::new(server_config(credentials, self.allow_enrollment)?);
@@ -369,13 +367,15 @@ impl ClusterListener {
             .read()
             .map_err(|_| anyhow::anyhow!("cluster TLS configuration poisoned"))?
             .clone();
-        let stream = timeout(CONTROL_TIMEOUT, TlsAcceptor::from(config).accept(socket)).await??;
+        let mut stream = SslStream::new(Ssl::new(&config)?, socket)?;
+        timeout(CONTROL_TIMEOUT, std::pin::Pin::new(&mut stream).accept()).await??;
         let peer = stream
-            .get_ref()
-            .1
-            .peer_certificates()
-            .and_then(|chain| chain.first())
-            .map(|leaf| AuthenticatedPeer::from_verified_leaf(leaf.as_ref(), address, path))
+            .ssl()
+            .peer_certificate()
+            .map(|leaf| {
+                stream.ssl().verify_result()?;
+                AuthenticatedPeer::from_verified_leaf(&leaf.to_der()?, address, path)
+            })
             .transpose()?;
         let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
             let mut request = request.map(Body::new);

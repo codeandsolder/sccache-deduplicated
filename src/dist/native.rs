@@ -121,7 +121,7 @@ enum Role {
 /// to its scheduler-assigned job and the delegated ticket.
 #[derive(Clone)]
 pub struct NativeCacheClient {
-    routes: std::sync::Arc<crate::dist::cluster::BlockingRoutes>,
+    routes: std::sync::Arc<crate::dist::cluster::ClusterRoutes>,
     peer: std::sync::Arc<sccache_cluster_identity::PeerCredentials>,
     address: std::net::SocketAddr,
     candidates: std::sync::Arc<
@@ -138,7 +138,7 @@ impl NativeCacheClient {
     /// # Errors
     /// Returns an error for invalid endpoint configuration or HTTP setup.
     pub fn new(
-        base: &reqwest::Url,
+        base: &url::Url,
         peer: std::sync::Arc<sccache_cluster_identity::PeerCredentials>,
         timeout: Duration,
         metadata_limit: u64,
@@ -149,7 +149,7 @@ impl NativeCacheClient {
             "invalid native client bounds"
         );
         Ok(Self {
-            routes: std::sync::Arc::new(crate::dist::cluster::BlockingRoutes::for_peer(
+            routes: std::sync::Arc::new(crate::dist::cluster::ClusterRoutes::for_peer(
                 std::sync::Arc::clone(&peer),
             )),
             peer,
@@ -196,11 +196,14 @@ impl NativeCacheClient {
                 Role::Scheduler,
                 crate::dist::cluster_routes::Route::unbound(self.peer.scheduler_address()),
             )?;
-            let response = client
-                .get(base.join("/api/v1/scheduler/native_routes")?)
-                .header(reqwest::header::ACCEPT, "application/octet-stream")
-                .timeout(Duration::from_millis(500))
-                .send()?
+            let response = crate::http_client::io_runtime()?
+                .block_on(
+                    client
+                        .get(base.join("/api/v1/scheduler/native_routes")?.as_str())
+                        .header(http::header::ACCEPT, "application/octet-stream")
+                        .timeout(Duration::from_millis(500))
+                        .send(),
+                )?
                 .error_for_status()?;
             let reply: Reply = decode_response(response, 4096)?;
             ensure!(reply.routes.valid(), "invalid scheduler routes");
@@ -273,7 +276,7 @@ impl NativeCacheClient {
         &self,
         operation: &str,
         address: crate::dist::cluster_routes::Route,
-    ) -> Result<reqwest::blocking::RequestBuilder> {
+    ) -> Result<wreq::RequestBuilder> {
         let (path, job) = self.operation_path(operation);
         let (http, base) = self.routes.endpoint(
             self.peer.scheduler_id(),
@@ -282,9 +285,9 @@ impl NativeCacheClient {
         )?;
         let url = base.join(&path)?;
         let mut request = http
-            .post(url)
+            .post(url.as_str())
             .timeout(self.timeout)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
+            .header(http::header::CONTENT_TYPE, "application/octet-stream");
         if let Some(job) = job {
             request = request.header("X-Sccache-Native-Job", job.to_string());
         }
@@ -311,10 +314,7 @@ impl NativeCacheClient {
         body: Vec<u8>,
         timeout: Duration,
         transfer: Option<Transfer>,
-    ) -> Result<(
-        reqwest::blocking::Response,
-        crate::dist::cluster_routes::Route,
-    )> {
+    ) -> Result<(wreq::Response, crate::dist::cluster_routes::Route)> {
         let start = Instant::now();
         let mut last_error = None;
         let body = bytes::Bytes::from(body);
@@ -322,11 +322,12 @@ impl NativeCacheClient {
             let remaining = timeout
                 .checked_sub(start.elapsed())
                 .context("native request deadline expired")?;
-            let response = self
-                .request_at(operation, address)?
-                .timeout(remaining)
-                .body(body.clone())
-                .send();
+            let response = crate::http_client::io_runtime()?.block_on(
+                self.request_at(operation, address)?
+                    .timeout(remaining)
+                    .body(body.clone())
+                    .send(),
+            );
             match response {
                 Err(error) if error.is_connect() => {
                     self.routes.failed(
@@ -347,7 +348,7 @@ impl NativeCacheClient {
         operation: &str,
         body: Vec<u8>,
         timeout: Duration,
-    ) -> Result<reqwest::blocking::Response> {
+    ) -> Result<wreq::Response> {
         self.send_to_cache(operation, body, timeout, None)
             .map(|(response, _)| response)
     }
@@ -375,7 +376,7 @@ impl NativeCacheClient {
                 .checked_sub(start.elapsed())
                 .context("package provisioning deadline expired")?;
             let response = self.send_replayable(operation, data.clone(), remaining)?;
-            if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            if response.status() != http::StatusCode::SERVICE_UNAVAILABLE {
                 return decode_response(response.error_for_status()?, self.metadata_limit);
             }
             drop(response);
@@ -645,17 +646,18 @@ impl NativeCacheClient {
                 let (http, base) = self.routes.endpoint(allocation.peer, role, address)?;
                 let url =
                     crate::dist::http::urls::server_run_native_job(&base, JobId(allocation.job))?;
-                let response = http
-                    .post(url)
-                    .bearer_auth(&allocation.auth)
-                    .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-                    .timeout(
-                        remaining
-                            .saturating_sub(started.elapsed())
-                            .min(Duration::from_secs(5)),
-                    )
-                    .body(codec().serialize(&operation)?)
-                    .send();
+                let response = crate::http_client::io_runtime()?.block_on(
+                    http.post(url.as_str())
+                        .bearer_auth(&allocation.auth)
+                        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                        .timeout(
+                            remaining
+                                .saturating_sub(started.elapsed())
+                                .min(Duration::from_secs(5)),
+                        )
+                        .body(codec().serialize(&operation)?)
+                        .send(),
+                );
                 match response {
                     Err(error) if error.is_connect() => {
                         self.routes.failed(allocation.peer, role, address);
@@ -1068,9 +1070,9 @@ impl NativeCacheClient {
                 .context("native upload deadline expired")?;
             let client = self.routes.streaming_endpoint(peer, role, address)?;
             let mut request = client
-                .request(reqwest::Method::POST, &path)?
+                .request(http::Method::POST, &path)?
                 .timeout(remaining)
-                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
+                .header(http::header::CONTENT_TYPE, "application/octet-stream");
             if let Some(job) = job {
                 request = request.header("X-Sccache-Native-Job", job.to_string());
             }
@@ -1107,8 +1109,8 @@ impl NativeCacheClient {
                     return Ok(response.bytes);
                 }
                 Err(error) => {
-                    let transport = error.downcast_ref::<reqwest::Error>();
-                    let connect = transport.is_some_and(reqwest::Error::is_connect);
+                    let transport = error.downcast_ref::<wreq::Error>();
+                    let connect = transport.is_some_and(wreq::Error::is_connect);
                     let interrupted = transport.is_some_and(|error| {
                         error.is_connect()
                             || error.is_timeout()
@@ -1265,7 +1267,10 @@ impl NativeCacheClient {
         &self,
         ticket: Ticket,
         blob: BlobRef,
-    ) -> Result<(MeasuredReader<reqwest::blocking::Response>, BlobEncoding)> {
+    ) -> Result<(
+        MeasuredReader<crate::http_client::ResponseReader>,
+        BlobEncoding,
+    )> {
         self.try_download_response(ticket, blob, self.timeout)?
             .context("native content not yet available")
     }
@@ -1275,7 +1280,12 @@ impl NativeCacheClient {
         ticket: Ticket,
         blob: BlobRef,
         timeout: Duration,
-    ) -> Result<Option<(MeasuredReader<reqwest::blocking::Response>, BlobEncoding)>> {
+    ) -> Result<
+        Option<(
+            MeasuredReader<crate::http_client::ResponseReader>,
+            BlobEncoding,
+        )>,
+    > {
         let request = codec().serialize(&DownloadRequest {
             ticket,
             id: blob.id,
@@ -1286,7 +1296,7 @@ impl NativeCacheClient {
             timeout,
             Some(Transfer::Download(blob.size)),
         )?;
-        if response.status() == reqwest::StatusCode::ACCEPTED {
+        if response.status() == http::StatusCode::ACCEPTED {
             return Ok(None);
         }
         let response = response.error_for_status()?;
@@ -1302,7 +1312,7 @@ impl NativeCacheClient {
             sccache_cluster_identity::Role::Scheduler,
             address,
             response,
-        );
+        )?;
         Ok(Some((response, encoding)))
     }
 }
@@ -1338,13 +1348,13 @@ impl<R: Read> Read for InputDownload<R> {
 }
 
 fn retryable_transport_error(error: &anyhow::Error) -> bool {
-    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+    if let Some(error) = error.downcast_ref::<wreq::Error>() {
         return error.is_timeout()
             || error.is_connect()
             || error.is_body()
             || error.is_request()
             || error.status().is_some_and(|status| {
-                status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                status.is_server_error() || status == http::StatusCode::TOO_MANY_REQUESTS
             });
     }
     error.downcast_ref::<io::Error>().is_some_and(|error| {
@@ -1416,12 +1426,10 @@ fn copy_verified(reader: impl Read, blob: BlobRef, mut destination: impl Write) 
     Ok(())
 }
 
-fn decode_response<T: DeserializeOwned>(
-    response: reqwest::blocking::Response,
-    limit: u64,
-) -> Result<T> {
-    let mut bytes = Vec::new();
-    response.take(limit + 1).read_to_end(&mut bytes)?;
+fn decode_response<T: DeserializeOwned>(response: wreq::Response, limit: u64) -> Result<T> {
+    let bytes = crate::http_client::io_runtime()?.block_on(
+        crate::http_client::read_bounded_bytes_async(response, usize::try_from(limit)?),
+    )?;
     ensure!(
         u64::try_from(bytes.len())? <= limit,
         "native response exceeds configured limit"

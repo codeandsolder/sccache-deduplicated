@@ -110,7 +110,7 @@ impl WorkerRoutes {
         let scheduler = self.control().await?;
         let url = urls::scheduler_worker_route(scheduler.base(), server)?;
         let reply: WorkerRouteHttpResponse =
-            send_async(scheduler.client().get(url), RequestClass::Control).await?;
+            send_async(scheduler.client().get(url.as_str()), RequestClass::Control).await?;
         self.allocation(server, reply.routes.clone())?;
         Ok(reply.routes)
     }
@@ -134,13 +134,13 @@ impl WorkerRoutes {
         let result = async {
             let path = self.path(server, Role::Worker, address).await?;
             let response = path
-                .request(reqwest::Method::GET, PROBE_PATH)?
+                .request(http::Method::GET, PROBE_PATH)?
                 .timeout(PROBE_TIMEOUT)
                 .send()
                 .await?;
             Ok::<_, anyhow::Error>((
-                response.status() == reqwest::StatusCode::NO_CONTENT,
-                ConnectionPath::from_response(response.headers(), response.extensions()),
+                response.status() == http::StatusCode::NO_CONTENT,
+                ConnectionPath::from_response(&response),
             ))
         }
         .await;
@@ -157,7 +157,7 @@ impl WorkerRoutes {
         &self,
         server: ServerId,
         class: RequestClass,
-        request: impl Fn(&reqwest::Client, &reqwest::Url) -> Result<reqwest::RequestBuilder>,
+        request: impl Fn(&wreq::Client, &url::Url) -> Result<wreq::RequestBuilder>,
     ) -> Result<T> {
         let mut routes = self.addresses(server).await?;
         let mut last_error = None;
@@ -174,8 +174,8 @@ impl WorkerRoutes {
                 match send_async(request(&path.client(), path.base())?, class).await {
                     Err(error)
                         if error
-                            .downcast_ref::<reqwest::Error>()
-                            .is_some_and(reqwest::Error::is_connect) =>
+                            .downcast_ref::<wreq::Error>()
+                            .is_some_and(wreq::Error::is_connect) =>
                     {
                         self.book.observe(server, Role::Worker, address, None);
                         last_error = Some(error);

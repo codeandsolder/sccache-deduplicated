@@ -583,7 +583,7 @@ fn cluster_status(client_config: &Path) -> Result<i32> {
         Role::Client,
         move || Ok(token.clone()),
     )?;
-    let routes = dist::cluster::BlockingRoutes::for_peer(std::sync::Arc::clone(&peer));
+    let routes = dist::cluster::ClusterRoutes::for_peer(std::sync::Arc::clone(&peer));
     let (http, base) = routes.endpoint(
         peer.scheduler_id(),
         Role::Scheduler,

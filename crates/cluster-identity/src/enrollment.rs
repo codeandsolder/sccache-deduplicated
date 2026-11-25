@@ -2,7 +2,7 @@
 
 use super::{ClusterCa, Identity, PeerId, Registry, Role, key_id, validate_request_key};
 use anyhow::{Context, Result, ensure};
-use openssl::{
+use btls::{
     sha::sha256,
     x509::{X509, X509Req},
 };

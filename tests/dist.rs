@@ -905,7 +905,7 @@ fn failing_server_process() -> Result<()> {
         Some(SocketAddr::from(([0, 0, 0, 0], server_addr.port()))),
         sccache::dist::cluster::open_peer(
             serde_json::from_str(&env::var(harness::CUSTOM_SERVER_CLUSTER_ENV)?)?,
-            &reqwest::Url::parse(&scheduler_url)?,
+            &url::Url::parse(&scheduler_url)?,
             sccache_cluster_identity::Role::Worker,
             move || Ok(token.clone()),
         )?,

@@ -4,7 +4,7 @@
 use std::{fs, io::Write, path::Path};
 
 use anyhow::{Context, Result, ensure};
-use openssl::{
+use btls::{
     asn1::{Asn1Integer, Asn1Time},
     bn::{BigNum, MsbOption},
     ec::{EcGroup, EcKey},
@@ -20,7 +20,7 @@ use openssl::{
 
 pub use sccache_peer_identity::{NetworkPath, PeerConfig, PeerId, Role};
 
-fn key_id<T: openssl::pkey::HasPublic>(key: &PKeyRef<T>) -> Result<PeerId> {
+fn key_id<T: btls::pkey::HasPublic>(key: &PKeyRef<T>) -> Result<PeerId> {
     Ok(PeerId::from_digest(sha256(&key.public_key_to_der()?)))
 }
 
@@ -43,7 +43,7 @@ fn validate_request_key(key: &PKeyRef<Public>) -> Result<()> {
 fn name(common_name: &str) -> Result<X509Name> {
     let mut name = X509NameBuilder::new()?;
     name.append_entry_by_nid(Nid::COMMONNAME, common_name)?;
-    Ok(name.build())
+    Ok(name.build()?)
 }
 
 fn serial() -> Result<Asn1Integer> {
@@ -54,8 +54,8 @@ fn serial() -> Result<Asn1Integer> {
 
 fn certificate_builder(
     subject: &X509Name,
-    issuer: &openssl::x509::X509NameRef,
-    key: &PKeyRef<impl openssl::pkey::HasPublic>,
+    issuer: &btls::x509::X509NameRef,
+    key: &PKeyRef<impl btls::pkey::HasPublic>,
     days: u32,
 ) -> Result<X509Builder> {
     ensure!(days > 0, "certificate validity must be positive");
@@ -153,14 +153,21 @@ impl ClusterCa {
             let key = generate_key()?;
             let name = name("sccache cluster CA")?;
             let mut builder = certificate_builder(&name, &name, &key, 3650)?;
-            builder
-                .append_extension(BasicConstraints::new().critical().ca().pathlen(0).build()?)?;
+            builder.append_extension(
+                BasicConstraints::new()
+                    .critical()
+                    .ca()
+                    .pathlen(0)
+                    .build()?
+                    .as_ref(),
+            )?;
             builder.append_extension(
                 KeyUsage::new()
                     .critical()
                     .key_cert_sign()
                     .crl_sign()
-                    .build()?,
+                    .build()?
+                    .as_ref(),
             )?;
             builder.sign(&key, MessageDigest::sha256())?;
             let mut bytes = key.private_key_to_pem_pkcs8()?;
@@ -202,20 +209,32 @@ impl ClusterCa {
         let identity = key_id(&key)?;
         let tls_name = role.tls_name(identity);
         let subject = name(role.label())?;
-        let mut builder =
-            certificate_builder(&subject, self.certificate.subject_name(), &key, days)?;
-        builder.append_extension(BasicConstraints::new().critical().build()?)?;
-        builder.append_extension(KeyUsage::new().critical().digital_signature().build()?)?;
+        let mut builder = certificate_builder(
+            &subject,
+            self.certificate
+                .subject_name()
+                .context("missing CA subject")?,
+            &key,
+            days,
+        )?;
+        builder.append_extension(BasicConstraints::new().critical().build()?.as_ref())?;
+        builder.append_extension(
+            KeyUsage::new()
+                .critical()
+                .digital_signature()
+                .build()?
+                .as_ref(),
+        )?;
         let mut usage = ExtendedKeyUsage::new();
         usage.client_auth();
         if role != Role::Client {
             usage.server_auth();
         }
-        builder.append_extension(usage.critical().build()?)?;
+        builder.append_extension(usage.critical().build()?.as_ref())?;
         let san = SubjectAlternativeName::new()
             .dns(&tls_name)
             .build(&builder.x509v3_context(Some(&self.certificate), None))?;
-        builder.append_extension(san)?;
+        builder.append_extension(&san)?;
         Ok(builder)
     }
 }
@@ -227,7 +246,7 @@ impl ClusterCa {
 ///
 /// # Errors
 /// Returns an error for unexpected or missing SANs or mismatched identity.
-pub fn authenticated_peer(certificate: &openssl::x509::X509Ref, role: Role) -> Result<PeerId> {
+pub fn authenticated_peer(certificate: &btls::x509::X509Ref, role: Role) -> Result<PeerId> {
     let key = certificate.public_key()?;
     validate_request_key(&key)?;
     let identity = key_id(&key)?;
@@ -237,9 +256,7 @@ pub fn authenticated_peer(certificate: &openssl::x509::X509Ref, role: Role) -> R
         .context("missing peer SAN")?;
     ensure!(
         names.len() == 1
-            && names
-                .get(0)
-                .and_then(openssl::x509::GeneralNameRef::dnsname)
+            && names.get(0).and_then(btls::x509::GeneralNameRef::dnsname)
                 == Some(expected.as_str()),
         "unexpected peer role or identity"
     );
@@ -280,7 +297,7 @@ pub fn scheduler_registry(directory: &Path) -> Result<Registry> {
 mod http;
 pub use http::{
     AuthenticatedPeer, ClusterHttpClient, ClusterListener, ClusterRouter, EnrollmentClient,
-    PATH_HEADER, SchedulerEnrollment, blocking_client, blocking_client_bound,
+    PATH_HEADER, SchedulerEnrollment,
 };
 
 mod lifecycle;

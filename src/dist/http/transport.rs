@@ -18,7 +18,6 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_mins(20);
 
 /// Decide whether the expected response is small protocol metadata or a
 /// compressed build result which may legitimately exceed ordinary limits.
-#[cfg(feature = "dist-client")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestClass {
     /// Scheduler and worker control messages, which must return promptly.
@@ -42,7 +41,6 @@ impl RequestClass {
     }
 }
 
-#[cfg(feature = "dist-client")]
 const fn response_limit(success: bool, class: RequestClass) -> Option<usize> {
     if success {
         match class {
@@ -107,16 +105,33 @@ fn check_advertised_length(length: Option<u64>, limit: usize) -> Result<()> {
 
 #[cfg(feature = "dist-client")]
 pub async fn send_async<T: serde::de::DeserializeOwned>(
-    req: reqwest::RequestBuilder,
+    req: wreq::RequestBuilder,
     class: RequestClass,
 ) -> Result<T> {
-    let mut res = req.timeout(class.timeout()).send().await?;
+    send(req.timeout(class.timeout()), Some(class)).await
+}
+
+#[cfg(feature = "dist-server")]
+pub(super) async fn send_control<T: serde::de::DeserializeOwned>(
+    req: wreq::RequestBuilder,
+) -> Result<T> {
+    send(req, None).await
+}
+
+async fn send<T: serde::de::DeserializeOwned>(
+    req: wreq::RequestBuilder,
+    class: Option<RequestClass>,
+) -> Result<T> {
+    let res = req.send().await?;
     let status = res.status();
-    let limit = response_limit(status.is_success(), class);
+    let limit = response_limit(status.is_success(), class.unwrap_or(RequestClass::Control));
     let bytes = if let Some(limit) = limit {
         check_advertised_length(res.content_length(), limit)?;
         let mut body = Vec::new();
-        while let Some(chunk) = res.chunk().await? {
+        use futures::StreamExt;
+        let mut stream = std::pin::pin!(res.bytes_stream());
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
             let total = body
                 .len()
                 .checked_add(chunk.len())
@@ -144,34 +159,6 @@ pub async fn send_async<T: serde::de::DeserializeOwned>(
     decode_bincode(&bytes).context("failed to decode distributed HTTP response")
 }
 
-#[cfg(feature = "dist-server")]
-pub(super) fn send_blocking<T: serde::de::DeserializeOwned>(
-    req: reqwest::blocking::RequestBuilder,
-) -> Result<T> {
-    let res = req.send()?;
-    let status = res.status();
-    let limit = if status.is_success() {
-        CONTROL_RESPONSE_LIMIT
-    } else {
-        ERROR_RESPONSE_LIMIT
-    };
-    check_advertised_length(res.content_length(), limit)?;
-    let body = read_bounded(res, limit).map_err(|error| match error {
-        BoundedReadError::Io(error) => {
-            anyhow!("error reading distributed HTTP response body: {error}")
-        }
-        BoundedReadError::TooLarge => anyhow!("distributed HTTP response exceeds {limit} bytes"),
-    })?;
-    if !status.is_success() {
-        anyhow::bail!(
-            "Error {}: {}",
-            status.as_u16(),
-            String::from_utf8_lossy(&body)
-        );
-    }
-    decode_bincode(&body).context("failed to decode distributed HTTP response")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,7 +168,7 @@ mod tests {
         status: u16,
         body: Vec<u8>,
         reported_length: Option<usize>,
-    ) -> (reqwest::Url, std::thread::JoinHandle<()>) {
+    ) -> (url::Url, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener");
         let url = format!(
@@ -213,14 +200,14 @@ mod tests {
     }
 
     #[cfg(feature = "dist-server")]
-    #[test]
-    fn blocking_control_errors_cannot_buffer_unbounded_bodies() {
+    #[tokio::test]
+    async fn control_errors_cannot_buffer_unbounded_bodies() {
         let (url, handler) = mock_response(500, vec![b'x'; ERROR_RESPONSE_LIMIT + 1], None);
-        let client = reqwest::blocking::Client::builder()
+        let client = wreq::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
             .expect("test client");
-        let result = send_blocking::<u8>(client.get(url));
+        let result = send_control::<u8>(client.get(url.as_str())).await;
         assert!(result.unwrap_err().to_string().contains("exceeds"));
         handler.join().expect("response server");
     }
@@ -232,11 +219,11 @@ mod tests {
         // A body larger than the control-plane limit must be rejected even
         // when the declared length is incorrect or missing.
         let (url, handler) = mock_response(200, payload, Some(CONTROL_RESPONSE_LIMIT + 1));
-        let client = reqwest::Client::builder()
+        let client = wreq::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
             .expect("test client");
-        let result = send_async::<Vec<u8>>(client.get(url), RequestClass::Control).await;
+        let result = send_async::<Vec<u8>>(client.get(url.as_str()), RequestClass::Control).await;
         assert!(result.unwrap_err().to_string().contains("exceeds"));
         handler.join().expect("response server");
     }
@@ -247,11 +234,11 @@ mod tests {
         let payload = vec![123u8; CONTROL_RESPONSE_LIMIT + 1];
         let serialized = bincode::serialize(&payload).expect("encode build response");
         let (url, handler) = mock_response(200, serialized, None);
-        let client = reqwest::Client::builder()
+        let client = wreq::Client::builder()
             .timeout(Duration::from_secs(20))
             .build()
             .expect("test client");
-        let result: Vec<u8> = send_async(client.get(url), RequestClass::BuildResult)
+        let result: Vec<u8> = send_async(client.get(url.as_str()), RequestClass::BuildResult)
             .await
             .expect("large result must remain supported");
         assert_eq!(result.len(), CONTROL_RESPONSE_LIMIT + 1);
@@ -263,11 +250,11 @@ mod tests {
     #[tokio::test]
     async fn async_server_error_body_has_separate_smaller_budget() {
         let (url, handler) = mock_response(500, vec![b'x'; ERROR_RESPONSE_LIMIT + 1], None);
-        let client = reqwest::Client::builder()
+        let client = wreq::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
             .expect("test client");
-        let result = send_async::<u8>(client.get(url), RequestClass::BuildResult).await;
+        let result = send_async::<u8>(client.get(url.as_str()), RequestClass::BuildResult).await;
         assert!(result.unwrap_err().to_string().contains("exceeds"));
         handler.join().expect("response server");
     }

@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, num::NonZeroUsize};
 
 fn worker(
     root: &std::path::Path,
-    url: reqwest::Url,
+    url: url::Url,
     peer: Arc<sccache_cluster_identity::PeerCredentials>,
 ) -> Result<NativeWorker> {
     NativeWorker::new(
@@ -155,7 +155,7 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
     }));
     let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
     socket.set_nonblocking(true)?;
-    let url = reqwest::Url::parse(&format!("https://{}/", socket.local_addr()?))?;
+    let url = url::Url::parse(&format!("https://{}/", socket.local_addr()?))?;
     let (stop, mut stopped) = tokio::sync::oneshot::channel();
     let delegation_rx = Arc::new(delegation_rx);
     let worker_status = |Extension(peer): Extension<AuthenticatedPeer>| async move {

@@ -8,6 +8,7 @@ use std::{
 #[cfg(feature = "dist-server")]
 use std::net::SocketAddr;
 
+use crate::http_client::{ResponseReader, io_runtime};
 use anyhow::{Context, Result};
 use sccache_cluster_identity::{
     ClusterHttpClient, PeerConfig, PeerCredentials, PeerId, Role, TlsCredentials,
@@ -48,14 +49,12 @@ pub const fn wildcard(address: SocketAddr) -> SocketAddr {
 /// Returns an error when scheduler resolution, runtime initialization or enrollment fails.
 pub fn open_peer(
     config: PeerConfig,
-    scheduler: &reqwest::Url,
+    scheduler: &url::Url,
     role: Role,
     enrollment_token: impl Fn() -> Result<String> + Send + Sync + 'static,
 ) -> Result<Arc<PeerCredentials>> {
     let address = sccache_cluster_identity::endpoint(scheduler)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let runtime = io_runtime()?;
     let peer = runtime.block_on(PeerCredentials::open(
         config,
         address,
@@ -77,18 +76,17 @@ struct PathKey {
 
 struct TransportPath {
     credentials: Arc<TlsCredentials>,
-    blocking: Option<(reqwest::blocking::Client, reqwest::Url)>,
     streaming: Option<Arc<ClusterHttpClient>>,
 }
 
 /// Reusable per-path pools. A renewed leaf invalidates only the affected pools.
-pub struct BlockingRoutes {
+pub struct ClusterRoutes {
     current: Arc<Current>,
     paths: Mutex<HashMap<PathKey, TransportPath>>,
     book: Arc<RouteBook>,
 }
 
-impl BlockingRoutes {
+impl ClusterRoutes {
     pub fn new(current: impl Fn() -> Result<Arc<TlsCredentials>> + Send + Sync + 'static) -> Self {
         Self {
             current: Arc::new(current),
@@ -108,20 +106,22 @@ impl BlockingRoutes {
         })
     }
 
-    fn probe(&self, peer: PeerId, role: Role, probe: Probe) {
+    async fn probe(&self, peer: PeerId, role: Role, probe: Probe) {
         let address = probe.address;
         let start = Instant::now();
-        let result = (|| -> Result<(bool, ConnectionPath)> {
+        let result = async {
             let (client, base) = self.endpoint(peer, role, address)?;
             let response = client
-                .get(base.join(PROBE_PATH)?)
+                .get(base.join(PROBE_PATH)?.as_str())
                 .timeout(PROBE_TIMEOUT)
-                .send()?;
-            Ok((
-                response.status() == reqwest::StatusCode::NO_CONTENT,
-                ConnectionPath::from_response(response.headers(), response.extensions()),
+                .send()
+                .await?;
+            Ok::<_, anyhow::Error>((
+                response.status() == http::StatusCode::NO_CONTENT,
+                ConnectionPath::from_response(&response),
             ))
-        })();
+        }
+        .await;
         let (elapsed, path) = result.ok().filter(|(success, _)| *success).map_or_else(
             || (None, ConnectionPath::default()),
             |(_, path)| (Some(start.elapsed()), path),
@@ -140,23 +140,28 @@ impl BlockingRoutes {
         &self,
         routes: impl IntoIterator<Item = (PeerId, Role, &'a RouteSet)>,
     ) {
-        std::thread::scope(|scope| {
-            for (peer, role, routes) in routes {
-                for probe in self.book.reserve(peer, role, routes) {
-                    scope.spawn(move || self.probe(peer, role, probe));
-                }
-            }
+        let Ok(runtime) = io_runtime() else {
+            return;
+        };
+        let probes = routes.into_iter().flat_map(|(peer, role, routes)| {
+            self.book
+                .reserve(peer, role, routes)
+                .into_iter()
+                .map(move |probe| self.probe(peer, role, probe))
         });
+        runtime.block_on(futures::future::join_all(probes));
     }
 
     /// Refresh measurements outside the heartbeat and allocation request pools.
     pub fn prime(self: &Arc<Self>, peer: PeerId, role: Role, routes: &RouteSet) {
-        let pending = self.book.reserve(peer, role, routes);
-        for address in pending {
+        let Ok(runtime) = io_runtime() else {
+            return;
+        };
+        for probe in self.book.reserve(peer, role, routes) {
             let this = Arc::clone(self);
-            let _ = std::thread::Builder::new()
-                .name("cluster-route-probe".into())
-                .spawn(move || this.probe(peer, role, address));
+            runtime.spawn(async move {
+                this.probe(peer, role, probe).await;
+            });
         }
     }
 
@@ -231,19 +236,19 @@ impl BlockingRoutes {
         peer: PeerId,
         role: Role,
         address: Route,
-        response: reqwest::blocking::Response,
-    ) -> MeasuredReader<reqwest::blocking::Response> {
+        response: wreq::Response,
+    ) -> Result<MeasuredReader<ResponseReader>> {
         let length = response.content_length();
-        let path = ConnectionPath::from_response(response.headers(), response.extensions());
-        MeasuredReader::new(
-            response,
+        let path = ConnectionPath::from_response(&response);
+        Ok(MeasuredReader::new(
+            ResponseReader::new(response)?,
             Arc::clone(&self.book),
             peer,
             role,
             address,
             length,
             path,
-        )
+        ))
     }
 
     pub(super) fn local_source(
@@ -281,13 +286,11 @@ impl BlockingRoutes {
         }
         let path = paths.entry(key).or_insert_with(|| TransportPath {
             credentials: Arc::clone(&credentials),
-            blocking: None,
             streaming: None,
         });
         if !Arc::ptr_eq(&path.credentials, &credentials) {
             *path = TransportPath {
                 credentials,
-                blocking: None,
                 streaming: None,
             };
         }
@@ -305,23 +308,9 @@ impl BlockingRoutes {
         peer: PeerId,
         role: Role,
         address: Route,
-    ) -> Result<(reqwest::blocking::Client, reqwest::Url)> {
-        self.with_path(peer, role, address, |path| {
-            if let Some(client) = &path.blocking {
-                return Ok(client.clone());
-            }
-            let binding = address.binding();
-            let client = sccache_cluster_identity::blocking_client_bound(
-                &path.credentials,
-                peer,
-                role,
-                address.address,
-                Duration::from_mins(20),
-                binding.as_ref().map(|(ip, name)| (*ip, name.as_deref())),
-            )?;
-            path.blocking = Some(client.clone());
-            Ok(client)
-        })
+    ) -> Result<(wreq::Client, url::Url)> {
+        let transport = self.streaming_endpoint(peer, role, address)?;
+        Ok((transport.client(), transport.base().clone()))
     }
 
     pub(super) fn streaming_endpoint(
@@ -356,9 +345,7 @@ impl BlockingRoutes {
 /// # Errors
 /// Returns an error when runtime initialization or renewal fails.
 pub fn refresh_blocking(peer: &PeerCredentials) -> Result<Arc<TlsCredentials>> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let runtime = io_runtime()?;
     runtime
         .block_on(peer.refresh())
         .context("renew cluster credential")

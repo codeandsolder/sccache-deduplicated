@@ -26,7 +26,7 @@ pub(crate) mod transport;
 mod worker_routes;
 
 mod common {
-    use reqwest::header;
+    use http::header;
     use serde::{Deserialize, Serialize};
     #[cfg(all(test, feature = "dist-server"))]
     use {crate::util::BASE64_URL_SAFE_ENGINE, base64::Engine};
@@ -35,26 +35,11 @@ mod common {
     use crate::errors::{Context, Result};
 
     // Note that content-length is necessary due to https://github.com/tiny-http/tiny-http/issues/147
-    pub trait ReqwestRequestBuilderExt: Sized {
+    pub trait RequestBuilderExt: Sized {
         fn bincode<T: serde::Serialize + ?Sized>(self, bincode: &T) -> Result<Self>;
         fn bytes(self, bytes: Vec<u8>) -> Self;
     }
-    impl ReqwestRequestBuilderExt for reqwest::blocking::RequestBuilder {
-        fn bincode<T: serde::Serialize + ?Sized>(self, bincode: &T) -> Result<Self> {
-            let bytes =
-                bincode::serialize(bincode).context("Failed to serialize body to bincode")?;
-            Ok(self.bytes(bytes))
-        }
-        fn bytes(self, bytes: Vec<u8>) -> Self {
-            self.header(
-                header::CONTENT_TYPE,
-                mime::APPLICATION_OCTET_STREAM.to_string(),
-            )
-            .header(header::CONTENT_LENGTH, bytes.len())
-            .body(bytes)
-        }
-    }
-    impl ReqwestRequestBuilderExt for reqwest::RequestBuilder {
+    impl RequestBuilderExt for wreq::RequestBuilder {
         fn bincode<T: serde::Serialize + ?Sized>(self, bincode: &T) -> Result<Self> {
             let bytes =
                 bincode::serialize(bincode).context("Failed to serialize body to bincode")?;
@@ -169,7 +154,7 @@ pub mod urls {
     /// # Errors
     ///
     /// Returns an error if `scheduler_url` cannot be used as a base URL.
-    pub fn scheduler_alloc_job(scheduler_url: &reqwest::Url) -> Result<reqwest::Url> {
+    pub fn scheduler_alloc_job(scheduler_url: &url::Url) -> Result<url::Url> {
         Ok(scheduler_url.join("/api/v1/scheduler/alloc_job")?)
     }
 
@@ -179,9 +164,9 @@ pub mod urls {
     ///
     /// Returns an error if `scheduler_url` cannot be used as a base URL.
     pub fn scheduler_worker_route(
-        scheduler_url: &reqwest::Url,
+        scheduler_url: &url::Url,
         server_id: ServerId,
-    ) -> Result<reqwest::Url> {
+    ) -> Result<url::Url> {
         Ok(scheduler_url.join(&format!("/api/v1/scheduler/worker_route/{server_id}"))?)
     }
 
@@ -191,9 +176,9 @@ pub mod urls {
     ///
     /// Returns an error if `scheduler_url` cannot be used as a base URL.
     pub fn scheduler_worker_name(
-        scheduler_url: &reqwest::Url,
+        scheduler_url: &url::Url,
         server_id: ServerId,
-    ) -> Result<reqwest::Url> {
+    ) -> Result<url::Url> {
         Ok(scheduler_url.join(&format!("/api/v1/scheduler/worker_name/{server_id}"))?)
     }
 
@@ -202,7 +187,7 @@ pub mod urls {
     /// # Errors
     ///
     /// Returns an error if `scheduler_url` cannot be used as a base URL.
-    pub fn scheduler_heartbeat_server(scheduler_url: &reqwest::Url) -> Result<reqwest::Url> {
+    pub fn scheduler_heartbeat_server(scheduler_url: &url::Url) -> Result<url::Url> {
         Ok(scheduler_url.join("/api/v4/scheduler/heartbeat_server")?)
     }
 
@@ -211,10 +196,7 @@ pub mod urls {
     /// # Errors
     ///
     /// Returns an error if `scheduler_url` cannot be used as a base URL.
-    pub fn scheduler_job_state(
-        scheduler_url: &reqwest::Url,
-        job_id: JobId,
-    ) -> Result<reqwest::Url> {
+    pub fn scheduler_job_state(scheduler_url: &url::Url, job_id: JobId) -> Result<url::Url> {
         Ok(scheduler_url.join(&format!("/api/v1/scheduler/job_state/{job_id}"))?)
     }
 
@@ -223,7 +205,7 @@ pub mod urls {
     /// # Errors
     ///
     /// Returns an error if `scheduler_url` cannot be used as a base URL.
-    pub fn scheduler_status(scheduler_url: &reqwest::Url) -> Result<reqwest::Url> {
+    pub fn scheduler_status(scheduler_url: &url::Url) -> Result<url::Url> {
         Ok(scheduler_url.join("/api/v1/scheduler/status")?)
     }
 
@@ -231,42 +213,42 @@ pub mod urls {
     ///
     /// # Errors
     /// Returns an error if the worker origin is not a valid base URL.
-    pub fn server_assign_job(base: &reqwest::Url, job_id: JobId) -> Result<reqwest::Url> {
+    pub fn server_assign_job(base: &url::Url, job_id: JobId) -> Result<url::Url> {
         Ok(base.join(&format!("/api/v1/distserver/assign_job/{job_id}"))?)
     }
     /// Build the worker native assignment endpoint.
     ///
     /// # Errors
     /// Returns an error if the worker origin is not a valid base URL.
-    pub fn server_assign_native_job(base: &reqwest::Url, job_id: JobId) -> Result<reqwest::Url> {
+    pub fn server_assign_native_job(base: &url::Url, job_id: JobId) -> Result<url::Url> {
         Ok(base.join(&format!("/api/v5/distserver/assign_native_job/{job_id}"))?)
     }
     /// Build the worker peer blob endpoint.
     ///
     /// # Errors
     /// Returns an error if the worker origin is not a valid base URL.
-    pub fn server_native_blob(base: &reqwest::Url) -> Result<reqwest::Url> {
+    pub fn server_native_blob(base: &url::Url) -> Result<url::Url> {
         Ok(base.join("/api/v3/distserver/native_blob")?)
     }
     /// Build the worker native execution endpoint.
     ///
     /// # Errors
     /// Returns an error if the worker origin is not a valid base URL.
-    pub fn server_run_native_job(base: &reqwest::Url, job_id: JobId) -> Result<reqwest::Url> {
+    pub fn server_run_native_job(base: &url::Url, job_id: JobId) -> Result<url::Url> {
         Ok(base.join(&format!("/api/v5/distserver/run_native_job/{job_id}"))?)
     }
     /// Build the worker toolchain submission endpoint.
     ///
     /// # Errors
     /// Returns an error if the worker origin is not a valid base URL.
-    pub fn server_submit_toolchain(base: &reqwest::Url, job_id: JobId) -> Result<reqwest::Url> {
+    pub fn server_submit_toolchain(base: &url::Url, job_id: JobId) -> Result<url::Url> {
         Ok(base.join(&format!("/api/v1/distserver/submit_toolchain/{job_id}"))?)
     }
     /// Build the worker archive execution endpoint.
     ///
     /// # Errors
     /// Returns an error if the worker origin is not a valid base URL.
-    pub fn server_run_job(base: &reqwest::Url, job_id: JobId) -> Result<reqwest::Url> {
+    pub fn server_run_job(base: &url::Url, job_id: JobId) -> Result<url::Url> {
         Ok(base.join(&format!("/api/v2/distserver/run_job/{job_id}"))?)
     }
 }
@@ -274,7 +256,7 @@ pub mod urls {
 #[cfg(feature = "dist-server")]
 mod server {
     use self::cluster_http::{Listener, ListenerRole, Request, binary, path_route, route, routes};
-    use crate::dist::cluster::{BlockingRoutes, refresh_blocking};
+    use crate::dist::cluster::{ClusterRoutes, refresh_blocking};
     use crate::util::num_cpus;
     use axum::{
         Json, Router,
@@ -301,10 +283,10 @@ mod server {
     use std::time::{Duration, Instant};
 
     use super::common::{
-        AllocJobHttpResponse, HeartbeatReply, HeartbeatServerHttpRequest, ReqwestRequestBuilderExt,
+        AllocJobHttpResponse, HeartbeatReply, HeartbeatServerHttpRequest, RequestBuilderExt,
         RunJobHttpRequest, WorkerNameHttpResponse, WorkerRouteHttpResponse,
     };
-    use super::transport::{self, send_blocking};
+    use super::transport::{self, send_control};
     use super::urls;
     use crate::build_runtime::{
         BlobRef, ContentId,
@@ -1525,7 +1507,7 @@ mod server {
             let current = Arc::new(Mutex::new(credential));
             let outbound = Arc::clone(&current);
             let requester = Arc::new(SchedulerRequester {
-                routes: Arc::new(BlockingRoutes::new(move || {
+                routes: Arc::new(ClusterRoutes::new(move || {
                     outbound
                         .lock()
                         .map(|leaf| Arc::clone(&leaf))
@@ -1753,7 +1735,7 @@ mod server {
     }
 
     pub(super) struct SchedulerRequester {
-        routes: Arc<BlockingRoutes>,
+        routes: Arc<ClusterRoutes>,
         addresses: Mutex<HashMap<ServerId, (sccache_peer_identity::RouteSet, Instant)>>,
     }
 
@@ -1802,7 +1784,7 @@ mod server {
             &self,
             id: ServerId,
             address: crate::dist::cluster_routes::Route,
-        ) -> Result<(reqwest::blocking::Client, reqwest::Url)> {
+        ) -> Result<(wreq::Client, url::Url)> {
             self.routes.endpoint(id, Role::Worker, address)
         }
 
@@ -1827,7 +1809,7 @@ mod server {
                     JobAssignment::Native(_) => urls::server_assign_native_job(&base, job_id)?,
                 };
                 let req = client
-                    .post(url)
+                    .post(url.as_str())
                     .bearer_auth(&auth)
                     .timeout(ASSIGN_JOB_TIMEOUT);
                 let req = match &assignment {
@@ -1836,11 +1818,11 @@ mod server {
                         .header("Content-Type", "application/octet-stream")
                         .body(crate::dist::native::codec().serialize(&**assignment)?),
                 };
-                match send_blocking(req) {
+                match crate::http_client::io_runtime()?.block_on(send_control(req)) {
                     Err(error)
                         if error
-                            .downcast_ref::<reqwest::Error>()
-                            .is_some_and(reqwest::Error::is_connect) =>
+                            .downcast_ref::<wreq::Error>()
+                            .is_some_and(wreq::Error::is_connect) =>
                     {
                         self.failed(server_id, address);
                         last_error = Some(error);
@@ -1875,7 +1857,7 @@ mod server {
             handler: S,
         ) -> Result<Self> {
             if let Some(name) = &worker_name {
-                reqwest::header::HeaderValue::from_str(name).context("invalid worker name")?;
+                http::header::HeaderValue::from_str(name).context("invalid worker name")?;
             }
             let mut jwt_key = vec![0; JWT_KEY_LENGTH];
             rand::fill(&mut jwt_key);
@@ -1925,7 +1907,7 @@ mod server {
             let tls = Arc::new(ClusterListener::new(&credentials)?);
             let scheduler_id = peer.scheduler_id();
             let requester = Arc::new(ServerRequester {
-                routes: BlockingRoutes::for_peer(Arc::clone(&peer)),
+                routes: ClusterRoutes::for_peer(Arc::clone(&peer)),
                 peer: Arc::clone(&peer),
             });
             let heartbeat_requester = Arc::clone(&requester);
@@ -1990,7 +1972,7 @@ mod server {
                     let heartbeat_result = (|| -> Result<HeartbeatReply> {
                         let (client, base) = heartbeat_requester.endpoint()?;
                         let mut heartbeat_request = client
-                            .post(urls::scheduler_heartbeat_server(&base)?)
+                            .post(urls::scheduler_heartbeat_server(&base)?.as_str())
                             // A stalled scheduler must not permanently stop heartbeats.
                             .timeout(HEARTBEAT_INTERVAL);
                         if let Some(worker_name) = worker_name.as_ref() {
@@ -2011,9 +1993,8 @@ mod server {
                                 BASE64_URL_SAFE_ENGINE.encode(platform.0),
                             );
                         }
-                        heartbeat_request
-                            .bincode(&heartbeat_req)
-                            .and_then(send_blocking)
+                        crate::http_client::io_runtime()?
+                            .block_on(send_control(heartbeat_request.bincode(&heartbeat_req)?))
                     })();
                     match heartbeat_result {
                         Ok(HeartbeatReply {
@@ -2076,12 +2057,12 @@ mod server {
     }
 
     struct ServerRequester {
-        routes: BlockingRoutes,
+        routes: ClusterRoutes,
         peer: Arc<PeerCredentials>,
     }
 
     impl ServerRequester {
-        fn endpoint(&self) -> Result<(reqwest::blocking::Client, reqwest::Url)> {
+        fn endpoint(&self) -> Result<(wreq::Client, url::Url)> {
             self.routes.endpoint(
                 self.peer.scheduler_id(),
                 Role::Scheduler,
@@ -2099,13 +2080,13 @@ mod server {
             let publish = || {
                 let (client, base) = self.endpoint()?;
                 let url = urls::scheduler_job_state(&base, job_id)?;
-                send_blocking(
+                crate::http_client::io_runtime()?.block_on(send_control(
                     client
-                        .post(url)
+                        .post(url.as_str())
                         // Never retain an execution slot forever on a stalled ACK.
                         .timeout(HEARTBEAT_TIMEOUT)
                         .bincode(&state)?,
-                )
+                ))
             };
             // A lost response may follow a successful scheduler transition.
             // The scheduler accepts repeated state updates and terminal acks.
@@ -2208,15 +2189,15 @@ mod client {
     use crate::compression::deflate::ZlibWriter;
     use async_trait::async_trait;
     use byteorder::{BigEndian, WriteBytesExt};
-    use reqwest::Body;
     use std::collections::HashMap;
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+    use wreq::Body;
 
     use super::common::{
-        AllocJobHttpResponse, ReqwestRequestBuilderExt, RunJobHttpRequest, WorkerNameHttpResponse,
+        AllocJobHttpResponse, RequestBuilderExt, RunJobHttpRequest, WorkerNameHttpResponse,
     };
     use super::transport::{RequestClass, send_async};
     use super::urls;
@@ -2272,7 +2253,7 @@ mod client {
         async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
             let scheduler = self.worker_routes.control().await?;
             let url = urls::scheduler_alloc_job(scheduler.base())?;
-            let req = scheduler.client().post(url).bincode(&tc)?;
+            let req = scheduler.client().post(url.as_str()).bincode(&tc)?;
 
             match send_async(req, RequestClass::Control).await? {
                 AllocJobHttpResponse::Success {
@@ -2323,7 +2304,7 @@ mod client {
                     return fallback;
                 }
             };
-            let req = scheduler.client().get(url);
+            let req = scheduler.client().get(url.as_str());
 
             let checked_at = Instant::now();
             match send_async::<WorkerNameHttpResponse>(req, RequestClass::WorkerName).await {
@@ -2350,7 +2331,7 @@ mod client {
         async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
             let scheduler = self.worker_routes.control().await?;
             let url = urls::scheduler_status(scheduler.base())?;
-            let req = scheduler.client().get(url);
+            let req = scheduler.client().get(url.as_str());
             send_async(req, RequestClass::Control).await
         }
 
@@ -2373,7 +2354,7 @@ mod client {
                             toolchain_file.into(),
                         ));
                         Ok(client
-                            .post(url)
+                            .post(url.as_str())
                             .bearer_auth(&job_alloc.auth)
                             .body(Body::wrap_stream(stream)))
                     },
@@ -2430,10 +2411,10 @@ mod client {
                     |client, base| {
                         let url = urls::server_run_job(base, job_alloc.job_id)?;
                         Ok(client
-                            .post(url)
+                            .post(url.as_str())
                             .bearer_auth(&job_alloc.auth)
-                            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-                            .header(reqwest::header::CONTENT_LENGTH, body.len())
+                            .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                            .header(http::header::CONTENT_LENGTH, body.len())
                             .body(body.clone()))
                     },
                 )

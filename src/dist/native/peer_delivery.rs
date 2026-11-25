@@ -104,7 +104,10 @@ impl NativeCacheClient {
     pub(in crate::dist) fn try_peer_blob<T>(
         &self,
         plan: &BlobSourcePlan,
-        mut consume: impl FnMut(MeasuredReader<reqwest::blocking::Response>, BlobEncoding) -> Result<T>,
+        mut consume: impl FnMut(
+            MeasuredReader<crate::http_client::ResponseReader>,
+            BlobEncoding,
+        ) -> Result<T>,
     ) -> Option<T> {
         self.probe_sources([plan]);
         let blob = plan.blob;
@@ -170,20 +173,27 @@ impl NativeCacheClient {
         source: &BlobSource,
         address: crate::dist::cluster_routes::Route,
         remaining: Duration,
-    ) -> Result<Option<(MeasuredReader<reqwest::blocking::Response>, BlobEncoding)>> {
+    ) -> Result<
+        Option<(
+            MeasuredReader<crate::http_client::ResponseReader>,
+            BlobEncoding,
+        )>,
+    > {
         let (client, base) = self.routes.endpoint(source.peer, Role::Worker, address)?;
-        let response = client
-            .post(crate::dist::http::urls::server_native_blob(&base)?)
-            .bearer_auth(&source.token)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .timeout(remaining)
-            .body(codec().serialize(&blob)?)
-            .send()?;
+        let response = crate::http_client::io_runtime()?.block_on(
+            client
+                .post(crate::dist::http::urls::server_native_blob(&base)?.as_str())
+                .bearer_auth(&source.token)
+                .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                .timeout(remaining)
+                .body(codec().serialize(&blob)?)
+                .send(),
+        )?;
         if matches!(
             response.status(),
-            reqwest::StatusCode::NOT_FOUND
-                | reqwest::StatusCode::UNAUTHORIZED
-                | reqwest::StatusCode::FORBIDDEN
+            http::StatusCode::NOT_FOUND
+                | http::StatusCode::UNAUTHORIZED
+                | http::StatusCode::FORBIDDEN
         ) {
             return Ok(None);
         }
@@ -197,7 +207,7 @@ impl NativeCacheClient {
         )?;
         let reader = self
             .routes
-            .measure_response(source.peer, Role::Worker, address, response);
+            .measure_response(source.peer, Role::Worker, address, response)?;
         Ok(Some((reader, encoding)))
     }
 }

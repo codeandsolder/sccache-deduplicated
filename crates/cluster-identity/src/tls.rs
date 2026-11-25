@@ -1,24 +1,24 @@
 //! TLS contexts with an exclusive cluster trust store and role-bound peer names.
 
 use super::{Identity, PeerId, Role, authenticated_peer};
-use anyhow::{Result, ensure};
-use openssl::{
+use anyhow::{Context, Result, ensure};
+use btls::{
     stack::Stack,
-    x509::{X509, X509PurposeId, X509Ref, X509StoreContext, store::X509StoreBuilder},
+    x509::{X509, X509Ref, X509StoreContext, store::X509StoreBuilder, verify::X509Purpose},
 };
 use std::time::Duration;
 
-fn validate_purpose(ca: &X509Ref, leaf: &X509Ref, purpose: X509PurposeId) -> Result<()> {
+fn validate_purpose(ca: &X509Ref, leaf: &X509Ref, purpose: X509Purpose) -> Result<()> {
     let mut store = X509StoreBuilder::new()?;
     store.add_cert(ca.to_owned())?;
-    store.set_purpose(purpose)?;
+    store.verify_param_mut().set_purpose(purpose)?;
     let store = store.build();
     let chain = Stack::new()?;
     let mut context = X509StoreContext::new()?;
     let (valid, error) = context.init(&store, leaf, &chain, |context| {
-        Ok((context.verify_cert()?, context.error()))
+        Ok((context.verify_cert()?, context.verify_result()))
     })?;
-    ensure!(valid, "invalid cluster leaf: {error}");
+    ensure!(valid, "invalid cluster leaf: {error:?}");
     Ok(())
 }
 
@@ -42,7 +42,8 @@ pub fn verify_leaf_identity(
     ensure!(
         certificate
             .issuer_name()
-            .try_cmp(ca.subject_name())?
+            .context("missing certificate issuer")?
+            .try_cmp(ca.subject_name().context("missing CA subject")?)?
             .is_eq(),
         "unexpected certificate issuer"
     );
@@ -64,9 +65,9 @@ impl TlsCredentials {
     /// Rejects a leaf with an unexpected key, identity, role or issuer signature.
     pub fn new(identity: Identity, certificate: X509, ca: X509, role: Role) -> Result<Self> {
         verify_leaf_identity(&identity, &certificate, &ca, role)?;
-        validate_purpose(&ca, &certificate, X509PurposeId::SSL_CLIENT)?;
+        validate_purpose(&ca, &certificate, X509Purpose::TlsClient)?;
         if role != Role::Client {
-            validate_purpose(&ca, &certificate, X509PurposeId::SSL_SERVER)?;
+            validate_purpose(&ca, &certificate, X509Purpose::TlsServer)?;
         }
         Ok(Self {
             identity,
@@ -123,7 +124,7 @@ impl TlsCredentials {
     /// Returns an error if the time cannot be compared to the certificate.
     pub fn renewal_due(&self, within: Duration) -> Result<bool> {
         let remaining =
-            openssl::asn1::Asn1Time::days_from_now(0)?.diff(self.certificate.not_after())?;
+            btls::asn1::Asn1Time::days_from_now(0)?.diff(self.certificate.not_after())?;
         let seconds = i64::from(remaining.days) * 86400 + i64::from(remaining.secs);
         Ok(u64::try_from(seconds).map_or(true, |seconds| seconds <= within.as_secs()))
     }

@@ -643,16 +643,16 @@ impl NativeCacheClient {
                     // prefix of the IPC frame. Realign before another demand.
                     reader.discard_unread()?;
                     let status = error
-                        .downcast_ref::<reqwest::Error>()
-                        .and_then(reqwest::Error::status);
+                        .downcast_ref::<wreq::Error>()
+                        .and_then(wreq::Error::status);
                     if retryable_transport_error(&error)
-                        || status == Some(reqwest::StatusCode::CONFLICT)
+                        || status == Some(http::StatusCode::CONFLICT)
                     {
                         debug!("retrying native input upload after polling: {error:#}");
                         thread::sleep(Duration::from_millis(50));
                         return Ok(());
                     }
-                    if status != Some(reqwest::StatusCode::UNPROCESSABLE_ENTITY) {
+                    if status != Some(http::StatusCode::UNPROCESSABLE_ENTITY) {
                         return Err(error);
                     }
                     // Only a verified content mismatch makes this locator

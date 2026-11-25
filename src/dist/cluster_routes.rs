@@ -74,14 +74,11 @@ pub struct ConnectionPath {
 }
 
 impl ConnectionPath {
-    pub fn from_response(
-        headers: &reqwest::header::HeaderMap,
-        extensions: &http::Extensions,
-    ) -> Self {
-        let reported = reported_path(headers);
-        let local = extensions
-            .get::<hyper_util::client::legacy::connect::HttpInfo>()
-            .map(|info| info.local_addr().ip().to_canonical())
+    pub fn from_response(response: &wreq::Response) -> Self {
+        let reported = reported_path(response.headers());
+        let local = response
+            .local_addr()
+            .map(|addr| addr.ip().to_canonical())
             .or_else(|| reported.map(|path| path.remote));
         Self {
             reported,
@@ -683,7 +680,7 @@ impl RouteBook {
     }
 }
 
-pub(super) fn reported_path(headers: &reqwest::header::HeaderMap) -> Option<NetworkPath> {
+pub(super) fn reported_path(headers: &http::header::HeaderMap) -> Option<NetworkPath> {
     headers
         .get(sccache_cluster_identity::PATH_HEADER)?
         .to_str()

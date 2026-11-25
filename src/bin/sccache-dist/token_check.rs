@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use sccache::dist::http::{ClientAuthCheck, ClientVisibleMsg};
-use sccache::http_client::{self, new_reqwest_blocking_client};
+use sccache::http_client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::result::Result as StdResult;
@@ -62,9 +62,9 @@ impl EqCheck {
 // Don't check a token is valid (it may not even be a JWT) just forward it to
 // an API and check for success
 pub struct ProxyTokenCheck {
-    client: reqwest::blocking::Client,
+    client: wreq::Client,
     maybe_auth_cache: Option<Mutex<(HashMap<String, Instant>, Duration)>>,
-    url: reqwest::Url,
+    url: url::Url,
 }
 
 impl ClientAuthCheck for ProxyTokenCheck {
@@ -81,7 +81,7 @@ impl ClientAuthCheck for ProxyTokenCheck {
     }
 }
 
-fn url_without_query(url: &reqwest::Url) -> String {
+fn url_without_query(url: &url::Url) -> String {
     let mut safe = url.clone();
     safe.set_query(None);
     safe.set_fragment(None);
@@ -108,7 +108,9 @@ impl ProxyTokenCheck {
         let maybe_auth_cache: Option<Mutex<(HashMap<String, Instant>, Duration)>> =
             cache_secs.map(|secs| Mutex::new((HashMap::new(), Duration::from_secs(secs))));
         Ok(Self {
-            client: new_reqwest_blocking_client()?,
+            client: wreq::Client::builder()
+                .redirect(wreq::redirect::Policy::limited(10))
+                .build()?,
             maybe_auth_cache,
             url: url.parse().context("Invalid proxy token validation URL")?,
         })
@@ -132,12 +134,14 @@ impl ProxyTokenCheck {
             }
         }
         // Make a request to another API, which as a side effect should actually check the token
-        let res = self
-            .client
-            .get(self.url.clone())
-            .bearer_auth(token)
-            .timeout(http_client::AUTH_REQUEST_TIMEOUT)
-            .send()
+        let res = http_client::io_runtime()?
+            .block_on(
+                self.client
+                    .get(self.url.as_str())
+                    .bearer_auth(token)
+                    .timeout(http_client::AUTH_REQUEST_TIMEOUT)
+                    .send(),
+            )
             .context("Failed to make request to proxying url")?;
         if !res.status().is_success() {
             bail!(
@@ -182,16 +186,25 @@ impl ClientAuthCheck for ValidJWTCheck {
 
 impl ValidJWTCheck {
     pub fn new(audience: String, issuer: String, jwks_url: &str) -> Result<Self> {
-        let client = new_reqwest_blocking_client()?;
-        let res = client
-            .get(jwks_url)
-            .timeout(http_client::AUTH_REQUEST_TIMEOUT)
-            .send()
+        let client = wreq::Client::builder()
+            .redirect(wreq::redirect::Policy::limited(10))
+            .build()?;
+        let res = http_client::io_runtime()?
+            .block_on(
+                client
+                    .get(jwks_url)
+                    .timeout(http_client::AUTH_REQUEST_TIMEOUT)
+                    .send(),
+            )
             .context("Failed to make request to JWKs url")?;
         if !res.status().is_success() {
             bail!("Could not retrieve JWKs, HTTP error: {}", res.status())
         }
-        let jwks: Jwks = http_client::read_bounded_json(res, http_client::JWKS_LIMIT)
+        let jwks: Jwks = http_client::io_runtime()?
+            .block_on(http_client::read_bounded_json_async(
+                res,
+                http_client::JWKS_LIMIT,
+            ))
             .context("Failed to parse JWKs json")?;
         let keys = jwks
             .keys
@@ -275,7 +288,7 @@ mod tests {
 
     #[test]
     fn proxy_validation_url_logs_without_query_or_fragment() -> anyhow::Result<()> {
-        let url: reqwest::Url = "https://example.test/check?api_key=secret#fragment".parse()?;
+        let url: url::Url = "https://example.test/check?api_key=secret#fragment".parse()?;
         let safe = url_without_query(&url);
         assert_eq!(safe, "https://example.test/check");
         assert!(!safe.contains("secret"));

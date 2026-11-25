@@ -67,7 +67,7 @@ fn limits() -> SessionLimits {
 }
 
 struct TestEndpoint {
-    url: reqwest::Url,
+    url: url::Url,
     scheduler: ServerId,
     client: Arc<PeerCredentials>,
     rejected_config: PeerConfig,
@@ -101,15 +101,15 @@ fn make_client(endpoint: &TestEndpoint, token: &str) -> Result<NativeCacheClient
     )
 }
 impl TestEndpoint {
-    fn raw(&self, peer: &PeerCredentials) -> Result<(reqwest::blocking::Client, reqwest::Url)> {
+    fn raw(&self, peer: &PeerCredentials) -> Result<(wreq::Client, url::Url)> {
         let credential = peer.current()?;
-        sccache_cluster_identity::blocking_client(
+        let transport = sccache_cluster_identity::ClusterHttpClient::new(
             &credential,
             self.scheduler,
             Role::Scheduler,
             sccache_cluster_identity::endpoint(&self.url)?,
-            Duration::from_secs(10),
-        )
+        )?;
+        Ok((transport.client(), transport.base().clone()))
     }
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -230,7 +230,7 @@ fn with_native_service(
             })
         },
     )?;
-    let url = reqwest::Url::parse(&format!("https://{}/", server.local_addr()?))?;
+    let url = url::Url::parse(&format!("https://{}/", server.local_addr()?))?;
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let handle = thread::spawn(move || server.run_until(stopped));
     let outcome = (|| {
@@ -269,15 +269,18 @@ fn verify_compressed_download(
 ) -> Result<()> {
     // Negotiation preserves the authenticated verified-bytes contract.
     let (http, url) = endpoint.raw(&endpoint.client)?;
-    let compressed = http
-        .post(url.join("/api/v5/native/client/download")?)
-        .bearer_auth("client-token")
-        .header("Content-Type", "application/octet-stream")
-        .body(codec().serialize(&DownloadRequest {
-            ticket,
-            id: blob.id,
-        })?)
-        .send()?
+    let compressed = crate::http_client::io_runtime()?
+        .block_on(
+            http.post(url.join("/api/v5/native/client/download")?.as_str())
+                .bearer_auth("client-token")
+                .header("Content-Type", "application/octet-stream")
+                .body(codec().serialize(&DownloadRequest {
+                    ticket,
+                    id: blob.id,
+                })?)
+                .timeout(Duration::from_secs(10))
+                .send(),
+        )?
         .error_for_status()?;
     assert_eq!(
         compressed
@@ -289,7 +292,7 @@ fn verify_compressed_download(
     );
     let mut decoded = Vec::new();
     crate::build_runtime::transfer_native_blob(
-        compressed,
+        crate::http_client::ResponseReader::new(compressed)?,
         std::io::sink(),
         &mut decoded,
         blob,
@@ -387,7 +390,7 @@ fn verify_peer_delivery(
         // data fallback is deliberately unavailable. The worker must supply
         // the bytes directly without contacting that data listener.
         let unavailable = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let base = reqwest::Url::parse(&format!("https://{}/", unavailable.local_addr()?))?;
+        let base = url::Url::parse(&format!("https://{}/", unavailable.local_addr()?))?;
         let direct = NativeCacheClient::new(
             &base,
             Arc::clone(&endpoint.client),
@@ -600,17 +603,16 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
                 .is_err()
         );
         let (http, base) = url.raw(&url.client)?;
-        let source_request = |blobs: Vec<BlobRef>| -> Result<reqwest::blocking::Response> {
-            Ok(http
-                .post(base.join("/api/v5/native/client/blob_sources")?)
-                .header("Content-Type", "application/octet-stream")
-                .body(codec().serialize(&BlobSourceRequest { ticket, blobs })?)
-                .send()?)
+        let source_request = |blobs: Vec<BlobRef>| -> Result<wreq::Response> {
+            Ok(crate::http_client::io_runtime()?.block_on(
+                http.post(base.join("/api/v5/native/client/blob_sources")?.as_str())
+                    .header("Content-Type", "application/octet-stream")
+                    .body(codec().serialize(&BlobSourceRequest { ticket, blobs })?)
+                    .timeout(Duration::from_secs(10))
+                    .send(),
+            )?)
         };
-        assert_eq!(
-            source_request(vec![blob])?.status(),
-            reqwest::StatusCode::OK
-        );
+        assert_eq!(source_request(vec![blob])?.status(), http::StatusCode::OK);
         assert!(
             !source_request(vec![BlobRef {
                 size: blob.size + 1,
@@ -1044,25 +1046,32 @@ fn lazy_admission_prefetch_and_origin_backfill_over_http() -> Result<()> {
             ticket: read.ticket,
             missing: vec![missing],
         };
-        request
-            .post(base.join("/api/v5/native/worker/input_prefetch")?)
-            .bearer_auth("worker-token")
-            .header("Content-Type", "application/octet-stream")
-            .header("X-Sccache-Native-Job", "42")
-            .body(codec().serialize(&prefetch)?)
-            .send()?
+        crate::http_client::io_runtime()?
+            .block_on(
+                request
+                    .post(base.join("/api/v5/native/worker/input_prefetch")?.as_str())
+                    .bearer_auth("worker-token")
+                    .header("Content-Type", "application/octet-stream")
+                    .header("X-Sccache-Native-Job", "42")
+                    .body(codec().serialize(&prefetch)?)
+                    .timeout(Duration::from_secs(10))
+                    .send(),
+            )?
             .error_for_status()?;
-        let pending = request
-            .post(base.join("/api/v5/native/worker/download")?)
-            .bearer_auth("worker-token")
-            .header("Content-Type", "application/octet-stream")
-            .header("X-Sccache-Native-Job", "42")
-            .body(codec().serialize(&DownloadRequest {
-                ticket: read.ticket,
-                id: missing.id,
-            })?)
-            .send()?;
-        assert_eq!(pending.status(), reqwest::StatusCode::ACCEPTED);
+        let pending = crate::http_client::io_runtime()?.block_on(
+            request
+                .post(base.join("/api/v5/native/worker/download")?.as_str())
+                .bearer_auth("worker-token")
+                .header("Content-Type", "application/octet-stream")
+                .header("X-Sccache-Native-Job", "42")
+                .body(codec().serialize(&DownloadRequest {
+                    ticket: read.ticket,
+                    id: missing.id,
+                })?)
+                .timeout(Duration::from_secs(10))
+                .send(),
+        )?;
+        assert_eq!(pending.status(), http::StatusCode::ACCEPTED);
         assert_eq!(
             client.poll_input(ticket)?,
             InputPoll::Demand(InputDemand {

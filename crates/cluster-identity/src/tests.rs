@@ -1,5 +1,5 @@
 use super::*;
-use openssl::{
+use btls::{
     ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode, SslVersion},
     x509::{
         X509Ref,
@@ -20,8 +20,8 @@ impl TlsCredentials {
     /// # Errors
     /// Returns an error if TLS context setup fails.
     fn connector(&self) -> Result<SslConnector> {
-        let mut connector = SslConnector::builder(SslMethod::tls_client())?;
-        connector.set_cert_store(trust_store(&self.ca)?);
+        let mut connector = SslConnector::builder(SslMethod::tls())?;
+        connector.set_cert_store(trust_store(&self.ca)?)?;
         connector.set_certificate(&self.certificate)?;
         connector.set_private_key(self.identity.private_key())?;
         connector.check_private_key()?;
@@ -39,8 +39,8 @@ impl TlsCredentials {
             "client-only credential cannot serve TLS"
         );
         ensure!(!allowed_roles.is_empty(), "server must allow a peer role");
-        let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())?;
-        acceptor.set_cert_store(trust_store(&self.ca)?);
+        let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())?;
+        acceptor.set_cert_store(trust_store(&self.ca)?)?;
         acceptor.set_certificate(&self.certificate)?;
         acceptor.set_private_key(self.identity.private_key())?;
         acceptor.check_private_key()?;
@@ -50,14 +50,14 @@ impl TlsCredentials {
             SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
             move |verified, context| {
                 verified
-                    && (context.error_depth() != 0
+                    && (context.error_depth() != Some(0)
                         || context.current_cert().is_some_and(|leaf| {
                             allowed_roles
                                 .iter()
                                 .any(|role| authenticated_peer(leaf, *role).is_ok())
                         }))
             },
-        );
+        )?;
         Ok(acceptor.build())
     }
 
@@ -71,7 +71,7 @@ impl TlsCredentials {
         expected: PeerId,
         role: Role,
         timeout: Duration,
-    ) -> Result<openssl::ssl::SslStream<TcpStream>> {
+    ) -> Result<btls::ssl::SslStream<TcpStream>> {
         let stream = TcpStream::connect_timeout(&address, timeout)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;

@@ -2,14 +2,14 @@
 //! blocking body adapter, a failed connection cannot read ahead from IPC.
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
+use futures::StreamExt;
 use std::{
     io::{self, Read},
-    sync::{OnceLock, mpsc},
+    sync::mpsc,
 };
-use tokio::{runtime::Runtime, sync::oneshot};
+use tokio::sync::oneshot;
 
 const CHUNK: usize = 128 * 1024;
-static RUNTIME: OnceLock<io::Result<Runtime>> = OnceLock::new();
 
 enum Event {
     Read(oneshot::Sender<io::Result<Option<Bytes>>>),
@@ -28,7 +28,7 @@ pub(super) struct Reply {
 }
 
 async fn reply(
-    request: reqwest::RequestBuilder,
+    request: wreq::RequestBuilder,
     length: u64,
     limit: u64,
     demand: mpsc::Sender<Event>,
@@ -43,18 +43,17 @@ async fn reply(
             Err(error) => Some((Err(error), None)),
         }
     });
-    let mut response = request
-        .header(reqwest::header::CONTENT_LENGTH, length)
-        .body(reqwest::Body::wrap_stream(stream))
+    let response = request
+        .header(http::header::CONTENT_LENGTH, length)
+        .body(wreq::Body::wrap_stream(stream))
         .send()
         .await?
         .error_for_status()?;
-    let path = super::super::cluster_routes::ConnectionPath::from_response(
-        response.headers(),
-        response.extensions(),
-    );
+    let path = super::super::cluster_routes::ConnectionPath::from_response(&response);
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+    let mut stream = std::pin::pin!(response.bytes_stream());
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
         ensure!(
             (bytes.len() as u64).saturating_add(chunk.len() as u64) <= limit,
             "native upload response exceeds configured limit"
@@ -67,21 +66,12 @@ async fn reply(
 /// Only the calling thread reads the source, and only when the HTTP body is
 /// polled. The stream never owns the IPC reader, even during cancellation.
 pub(super) fn send(
-    request: reqwest::RequestBuilder,
+    request: wreq::RequestBuilder,
     length: u64,
     limit: u64,
     mut source: impl Read,
 ) -> Result<Attempt> {
-    let runtime = RUNTIME
-        .get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .thread_name("native-upload-io")
-                .enable_all()
-                .build()
-        })
-        .as_ref()
-        .map_err(|error| anyhow::anyhow!("initialize native upload runtime: {error}"))?;
+    let runtime = crate::http_client::io_runtime()?;
     let (events, receive) = mpsc::channel();
     let demand = events.clone();
     runtime.spawn(async move {
@@ -145,7 +135,7 @@ mod tests {
         let socket = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let address = socket.local_addr()?;
         drop(socket);
-        let request = reqwest::Client::builder()
+        let request = wreq::Client::builder()
             .no_proxy()
             .build()?
             .post(format!("http://{address}/upload"))

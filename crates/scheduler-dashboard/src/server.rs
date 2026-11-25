@@ -371,13 +371,15 @@ mod tests {
         Ok(())
     }
 
-    async fn first_event(response: &mut reqwest::Response) -> Result<NativeEvent> {
+    async fn first_event(response: wreq::Response) -> Result<NativeEvent> {
+        use futures::StreamExt as _;
         let mut buffer = Vec::new();
+        let mut body = std::pin::pin!(response.bytes_stream());
         loop {
-            let chunk = response
-                .chunk()
-                .await?
-                .context("event stream ended before data")?;
+            let chunk = body
+                .next()
+                .await
+                .context("event stream ended before data")??;
             buffer.extend_from_slice(&chunk);
             if let Some(end) = buffer.windows(2).position(|pair| pair == b"\n\n") {
                 let message = std::str::from_utf8(&buffer[..end])?;
@@ -399,11 +401,11 @@ mod tests {
         let base = format!("http://{}", listener.local_addr()?);
         let router = router(state.clone(), metrics, Path::new("."));
         let server = tokio::spawn(async move { axum::serve(listener, router).await });
-        let client = reqwest::Client::builder()
+        let client = wreq::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(5))
             .build()?;
-        let mut response = client
+        let response = client
             .get(format!("{base}/api/events"))
             .send()
             .await?
@@ -413,24 +415,17 @@ mod tests {
             "text/event-stream"
         );
         let mut snapshot = DashboardData::default();
-        assert!(apply_event(
-            &mut snapshot,
-            first_event(&mut response).await?
-        ));
+        assert!(apply_event(&mut snapshot, first_event(response).await?));
         assert_eq!(snapshot, state.snapshot());
-        drop(response);
         let mut changed = Snapshot::default();
         changed.totals.workers = 7;
         state.publish(Ok(changed), false, None)?;
-        let mut response = client
+        let response = client
             .get(format!("{base}/api/events"))
             .send()
             .await?
             .error_for_status()?;
-        assert!(apply_event(
-            &mut snapshot,
-            first_event(&mut response).await?
-        ));
+        assert!(apply_event(&mut snapshot, first_event(response).await?));
         assert_eq!(snapshot, state.snapshot());
         assert_eq!(
             snapshot

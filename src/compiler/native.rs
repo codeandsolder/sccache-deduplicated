@@ -168,11 +168,11 @@ impl NativeCompilerClient {
                 let result = async {
                     let scheduler = scheduler.as_ref().context("scheduler URL unavailable")?;
                     let url = dist::http::urls::scheduler_status(&scheduler.to_url())?;
-                    let client = crate::http_client::new_reqwest_client_builder()?
+                    let client = crate::http_client::new_http_client_builder()
                         .timeout(Duration::from_secs(config.request_timeout_secs))
                         .build()?;
                     dist::http::transport::send_async(
-                        client.get(url),
+                        client.get(url.as_str()),
                         dist::http::transport::RequestClass::Control,
                     )
                     .await
@@ -762,7 +762,7 @@ mod tests {
     use std::{ffi::OsString, io::Read};
 
     fn config() -> Result<Config> {
-        let endpoint = HTTPUrl::from_url(reqwest::Url::parse("http://127.0.0.1:1/")?);
+        let endpoint = HTTPUrl::from_url(url::Url::parse("http://127.0.0.1:1/")?);
         let mut config = Config::default();
         config.dist.scheduler_url = Some(endpoint.clone());
         config.dist.native = Some(NativeClientConfig {

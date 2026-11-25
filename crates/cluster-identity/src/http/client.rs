@@ -7,45 +7,20 @@ use std::{
 
 use anyhow::{Result, ensure};
 use bincode::Options;
-use openssl::x509::X509;
-use rustls::{
-    ClientConfig, RootCertStore,
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+use btls::x509::X509;
+use futures::StreamExt;
+use wreq::tls::{
+    TlsVersion,
+    trust::{CertStore, Identity as HttpIdentity},
 };
 
 use super::{CONTROL_LIMIT, CONTROL_TIMEOUT, ENROLL_CLIENT, ENROLL_WORKER, RENEW, codec};
 use crate::{EnrollmentRequest, EnrollmentResponse, Identity, PeerId, Role, TlsCredentials};
 
-fn client_config(ca: &X509, credentials: Option<&TlsCredentials>) -> Result<ClientConfig> {
-    let mut roots = RootCertStore::empty();
-    roots.add(CertificateDer::from(ca.to_der()?))?;
-    let config = ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_root_certificates(roots);
-    let config = match credentials {
-        Some(credentials) => {
-            ensure!(
-                credentials.ca.to_der()? == ca.to_der()?,
-                "credential belongs to another cluster"
-            );
-            config.with_client_auth_cert(
-                vec![CertificateDer::from(credentials.certificate.to_der()?)],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    credentials.identity.private_key().private_key_to_pkcs8()?,
-                )),
-            )?
-        }
-        None => config.with_no_client_auth(),
-    };
-    Ok(config)
-}
-
 /// A pooled HTTPS connection path to one specific cluster service.
 pub struct ClusterHttpClient {
-    client: reqwest::Client,
-    base: reqwest::Url,
+    client: wreq::Client,
+    base: url::Url,
 }
 
 impl ClusterHttpClient {
@@ -98,22 +73,41 @@ impl ClusterHttpClient {
         credentials: Option<&TlsCredentials>,
         source: Option<(IpAddr, Option<&str>)>,
     ) -> Result<Self> {
-        let config = client_config(ca, credentials)?;
         ensure!(
             role != Role::Client,
             "client-only identity has no TLS service"
         );
         let name = role.tls_name(expected);
-        let base = reqwest::Url::parse(&format!("https://{name}:{}/", address.port()))?;
-        let mut builder = reqwest::Client::builder()
-            .tls_backend_preconfigured(config)
+        let base = url::Url::parse(&format!("https://{name}:{}/", address.port()))?;
+        let roots = CertStore::builder()
+            .add_der_cert(&ca.to_der()?)
+            .verify_host(&name)
+            .build()?;
+        let mut builder = wreq::Client::builder()
+            .tls_cert_store(roots)
+            .tls_min_version(TlsVersion::TLS_1_3)
+            .tls_max_version(TlsVersion::TLS_1_3)
+            .http1_only()
             .resolve(&name, address)
             .no_proxy()
             .pool_max_idle_per_host(2)
             .pool_idle_timeout(std::time::Duration::from_secs(20))
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(wreq::redirect::Policy::none())
             .connect_timeout(CONTROL_TIMEOUT)
             .read_timeout(std::time::Duration::from_secs(90));
+        if let Some(credentials) = credentials {
+            ensure!(
+                credentials.ca.to_der()? == ca.to_der()?,
+                "credential belongs to another cluster"
+            );
+            builder = builder.tls_identity(HttpIdentity::from_pkcs8_pem(
+                &credentials.certificate.to_pem()?,
+                &credentials
+                    .identity
+                    .private_key()
+                    .private_key_to_pem_pkcs8()?,
+            )?);
+        }
         if let Some((ip, device)) = source {
             builder = builder.local_address(ip);
             #[cfg(target_os = "linux")]
@@ -129,13 +123,13 @@ impl ClusterHttpClient {
 
     /// The pinned service origin, independent of its candidate socket address.
     #[must_use = "requests must target the logical TLS authority"]
-    pub const fn base(&self) -> &reqwest::Url {
+    pub const fn base(&self) -> &url::Url {
         &self.base
     }
 
     /// Clone the pooled HTTP client for integration with existing RPC builders.
     #[must_use = "use the client only for its pinned logical service origin"]
-    pub fn client(&self) -> reqwest::Client {
+    pub fn client(&self) -> wreq::Client {
         self.client.clone()
     }
 
@@ -143,7 +137,7 @@ impl ClusterHttpClient {
     ///
     /// # Errors
     /// Returns an error if the path escapes the configured service origin.
-    pub fn request(&self, method: reqwest::Method, path: &str) -> Result<reqwest::RequestBuilder> {
+    pub fn request(&self, method: http::Method, path: &str) -> Result<wreq::RequestBuilder> {
         let url = self.base.join(path)?;
         ensure!(
             url.origin() == self.base.origin()
@@ -151,62 +145,8 @@ impl ClusterHttpClient {
                 && url.password().is_none(),
             "request leaves cluster service origin"
         );
-        Ok(self.client.request(method, url))
+        Ok(self.client.request(method, url.as_str()))
     }
-}
-
-/// Blocking HTTP client bound to the expected principal and candidate endpoint.
-///
-/// # Errors
-/// Returns an error if trust, identity or HTTP configuration is invalid.
-pub fn blocking_client(
-    credentials: &TlsCredentials,
-    expected: PeerId,
-    role: Role,
-    address: SocketAddr,
-    timeout: std::time::Duration,
-) -> Result<(reqwest::blocking::Client, reqwest::Url)> {
-    blocking_client_bound(credentials, expected, role, address, timeout, None)
-}
-
-/// Blocking transport with an optional explicit local address/device.
-///
-/// # Errors
-/// Returns an error for invalid trust or transport configuration.
-pub fn blocking_client_bound(
-    credentials: &TlsCredentials,
-    expected: PeerId,
-    role: Role,
-    address: SocketAddr,
-    timeout: std::time::Duration,
-    source: Option<(IpAddr, Option<&str>)>,
-) -> Result<(reqwest::blocking::Client, reqwest::Url)> {
-    ensure!(
-        role != Role::Client,
-        "client-only identity has no TLS service"
-    );
-    let name = role.tls_name(expected);
-    let base = reqwest::Url::parse(&format!("https://{name}:{}/", address.port()))?;
-    let mut builder = reqwest::blocking::Client::builder()
-        .tls_backend_preconfigured(client_config(&credentials.ca, Some(credentials))?)
-        .resolve(&name, address)
-        .no_proxy()
-        .pool_max_idle_per_host(2)
-        .pool_idle_timeout(std::time::Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(CONTROL_TIMEOUT)
-        .timeout(timeout);
-    if let Some((ip, device)) = source {
-        builder = builder.local_address(ip);
-        #[cfg(target_os = "linux")]
-        if let Some(device) = device {
-            builder = builder.interface(device);
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = device;
-    }
-    let client = builder.build()?;
-    Ok((client, base))
 }
 
 /// A client pinned to the cluster CA and expected scheduler public key.
@@ -258,7 +198,7 @@ impl EnrollmentClient {
         };
         let request = self
             .transport
-            .request(reqwest::Method::POST, path)?
+            .request(http::Method::POST, path)?
             .bearer_auth(token);
         self.issue(request, identity, role).await
     }
@@ -269,7 +209,7 @@ impl EnrollmentClient {
     /// Returns an error if the issuer refuses renewal or the new leaf is invalid.
     pub async fn renew(&self, identity: Identity, role: Role) -> Result<TlsCredentials> {
         self.issue(
-            self.transport.request(reqwest::Method::POST, RENEW)?,
+            self.transport.request(http::Method::POST, RENEW)?,
             identity,
             role,
         )
@@ -278,19 +218,21 @@ impl EnrollmentClient {
 
     async fn issue(
         &self,
-        request: reqwest::RequestBuilder,
+        request: wreq::RequestBuilder,
         identity: Identity,
         role: Role,
     ) -> Result<TlsCredentials> {
-        let mut reply = request
+        let reply = request
             .timeout(CONTROL_TIMEOUT)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .header(http::header::CONTENT_TYPE, "application/octet-stream")
             .body(codec().serialize(&EnrollmentRequest::new(&identity)?)?)
             .send()
             .await?
             .error_for_status()?;
         let mut bytes = Vec::new();
-        while let Some(chunk) = reply.chunk().await? {
+        let mut stream = std::pin::pin!(reply.bytes_stream());
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
             ensure!(
                 chunk.len() <= CONTROL_LIMIT.saturating_sub(bytes.len()),
                 "certificate response exceeds limit"
@@ -383,7 +325,7 @@ mod tests {
     }
 
     fn expired_leaf(ca: &ClusterCa, identity: Identity) -> Result<TlsCredentials> {
-        use openssl::{asn1::Asn1Time, hash::MessageDigest};
+        use btls::{asn1::Asn1Time, hash::MessageDigest};
         let mut builder = ca.leaf_builder(&identity.request()?, Role::Worker, 7)?;
         builder.set_not_before(Asn1Time::from_unix(1)?.as_ref())?;
         builder.set_not_after(Asn1Time::from_unix(2)?.as_ref())?;
@@ -457,7 +399,7 @@ mod tests {
         let data =
             ClusterHttpClient::new(&credentials, server.id, Role::Scheduler, server.address)?;
         let probe = data
-            .request(reqwest::Method::GET, "/api/v1/cluster/probe")?
+            .request(http::Method::GET, "/api/v1/cluster/probe")?
             .send()
             .await?;
         assert_eq!(probe.status(), StatusCode::NO_CONTENT);
@@ -481,7 +423,7 @@ mod tests {
             EnrollmentClient::new(&server.ca, server.id, server.address, None)?;
         let probe = without_certificate
             .transport
-            .request(reqwest::Method::GET, "/api/v1/cluster/probe")?
+            .request(http::Method::GET, "/api/v1/cluster/probe")?
             .send()
             .await;
         assert!(probe.is_err());
@@ -661,7 +603,7 @@ mod worker_tests {
         let first_path = ClusterHttpClient::new(&scheduler, worker_id, Role::Worker, first_addr)?;
         assert_eq!(
             first_path
-                .request(reqwest::Method::GET, "/probe")?
+                .request(http::Method::GET, "/probe")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -682,7 +624,7 @@ mod worker_tests {
                 (source, Some("lo")),
             )?;
             let response = bound
-                .request(reqwest::Method::GET, "/probe")?
+                .request(http::Method::GET, "/probe")?
                 .send()
                 .await?
                 .error_for_status()?;
@@ -706,7 +648,7 @@ mod worker_tests {
         let second_path = ClusterHttpClient::new(&scheduler, worker_id, Role::Worker, second_addr)?;
         assert_eq!(
             second_path
-                .request(reqwest::Method::GET, "/probe")?
+                .request(http::Method::GET, "/probe")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -716,14 +658,14 @@ mod worker_tests {
         );
         assert!(
             second_path
-                .request(reqwest::Method::GET, "//foreign.invalid/")
+                .request(http::Method::GET, "//foreign.invalid/")
                 .is_err()
         );
         let wrong_peer =
             ClusterHttpClient::new(&scheduler, scheduler_id, Role::Worker, second_addr)?;
         assert!(
             wrong_peer
-                .request(reqwest::Method::GET, "/probe")?
+                .request(http::Method::GET, "/probe")?
                 .send()
                 .await
                 .is_err()
@@ -732,7 +674,7 @@ mod worker_tests {
             ClusterHttpClient::with_trust(&ca, worker_id, Role::Worker, first_addr, None, None)?;
         assert!(
             anonymous
-                .request(reqwest::Method::GET, "/probe")?
+                .request(http::Method::GET, "/probe")?
                 .send()
                 .await
                 .is_err()
@@ -740,7 +682,7 @@ mod worker_tests {
         let wrong_role = ClusterHttpClient::new(&renewed, worker_id, Role::Worker, first_addr)?;
         assert_eq!(
             wrong_role
-                .request(reqwest::Method::GET, "/probe")?
+                .request(http::Method::GET, "/probe")?
                 .send()
                 .await?
                 .status(),

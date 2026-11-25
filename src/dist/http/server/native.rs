@@ -61,7 +61,7 @@ pub(super) type ResultObserver<'a> = dyn Fn(crate::dist::ServerId, crate::dist::
 
 struct PackageService {
     limits: PackageImportLimits,
-    upstreams: BTreeMap<String, (reqwest::Url, reqwest::blocking::Client)>,
+    upstreams: BTreeMap<String, (url::Url, wreq::Client)>,
 }
 
 impl PackageService {
@@ -71,10 +71,10 @@ impl PackageService {
         };
         let mut upstreams = BTreeMap::new();
         for (name, upstream) in &config.package_upstreams {
-            let client = crate::http_client::new_reqwest_blocking_builder()?
+            let client = crate::http_client::new_http_client_builder()
                 .timeout(Duration::from_secs(upstream.timeout_secs))
                 .connect_timeout(Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none())
+                .redirect(wreq::redirect::Policy::none())
                 .pool_max_idle_per_host(0)
                 .no_proxy()
                 .build()?;
@@ -109,7 +109,9 @@ impl PackageService {
             self.limits,
             &std::env::current_exe()?,
             || {
-                let response = client.get(url).send()?.error_for_status()?;
+                let response = crate::http_client::io_runtime()?
+                    .block_on(client.get(url.as_str()).send())?
+                    .error_for_status()?;
                 ensure!(
                     response
                         .content_length()
@@ -118,7 +120,13 @@ impl PackageService {
                 );
                 let size = response.content_length().or(locator.expected_size);
                 let peer = observed_response_peer(&response, Peer::Upstream);
-                Ok(network.meter(Direction::Receive, peer, response, size.unwrap_or(0), size))
+                Ok(network.meter(
+                    Direction::Receive,
+                    peer,
+                    crate::http_client::ResponseReader::new(response)?,
+                    size.unwrap_or(0),
+                    size,
+                ))
             },
         )
     }
@@ -355,14 +363,14 @@ pub(super) fn physical_blob_response(mut file: File, encoding: BlobEncoding) -> 
     Ok(response)
 }
 
-fn observed_response_peer(response: &reqwest::blocking::Response, peer: Peer) -> Peer {
+fn observed_response_peer(response: &wreq::Response, peer: Peer) -> Peer {
     response
-        .extensions()
-        .get::<hyper_util::client::legacy::connect::HttpInfo>()
-        .map_or(peer, |info| {
+        .local_addr()
+        .zip(response.remote_addr())
+        .map_or(peer, |(local, remote)| {
             peer.on_path(crate::build_runtime::NetworkPath::new(
-                info.local_addr().ip(),
-                info.remote_addr().ip(),
+                local.ip(),
+                remote.ip(),
             ))
         })
 }
@@ -387,13 +395,15 @@ pub(super) fn fetch_peer(
             break;
         }
         let (client, base) = routes.endpoint(source.server, address)?;
-        let response = client
-            .post(super::super::urls::server_native_blob(&base)?)
-            .timeout(timeout.min(remaining))
-            .bearer_auth(&source.token)
-            .header("Content-Type", "application/octet-stream")
-            .body(codec().serialize(&blob)?)
-            .send();
+        let response = crate::http_client::io_runtime()?.block_on(
+            client
+                .post(super::super::urls::server_native_blob(&base)?.as_str())
+                .timeout(timeout.min(remaining))
+                .bearer_auth(&source.token)
+                .header("Content-Type", "application/octet-stream")
+                .body(codec().serialize(&blob)?)
+                .send(),
+        );
         match response {
             Err(error) if error.is_connect() => routes.failed(source.server, address),
             result => {
@@ -405,7 +415,7 @@ pub(super) fn fetch_peer(
     let Some((response, address)) = selected else {
         return Ok(None);
     };
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
+    if response.status() == http::StatusCode::NOT_FOUND {
         return Ok(None);
     }
     let response = response.error_for_status()?;
@@ -423,7 +433,7 @@ pub(super) fn fetch_peer(
         sccache_cluster_identity::Role::Worker,
         address,
         response,
-    );
+    )?;
     let response = network.meter(Direction::Receive, peer, response, blob.size, size);
     Ok(Some((response, encoding)))
 }

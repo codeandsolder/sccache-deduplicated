@@ -89,7 +89,7 @@ const REDIRECT_WITH_AUTH_JSON: &str = r#"<!doctype html>
 
 mod code_grant_pkce {
     use super::warn_if_short_lived;
-    use crate::http_client::{self, new_reqwest_blocking_client};
+    use crate::http_client::{self, new_http_client_builder};
     use crate::util::BASE64_URL_SAFE_ENGINE;
     use base64::Engine;
     use serde::{Deserialize, Serialize};
@@ -206,12 +206,14 @@ mod code_grant_pkce {
             grant_type: GRANT_TYPE_PARAM_VALUE,
             redirect_uri,
         };
-        let client = new_reqwest_blocking_client()?;
-        let res = client
-            .post(token_url)
-            .timeout(http_client::AUTH_REQUEST_TIMEOUT)
-            .json(&token_request)
-            .send()?;
+        let client = new_http_client_builder().build()?;
+        let res = http_client::io_runtime()?.block_on(
+            client
+                .post(token_url)
+                .timeout(http_client::AUTH_REQUEST_TIMEOUT)
+                .json(&token_request)
+                .send(),
+        )?;
         if !res.status().is_success() {
             bail!(
                 "Sending code to {token_url} failed, HTTP error: {}",
@@ -220,7 +222,11 @@ mod code_grant_pkce {
         }
 
         let (token, expires_at) = handle_token_response(
-            http_client::read_bounded_json(res, http_client::TOKEN_JSON_LIMIT)
+            http_client::io_runtime()?
+                .block_on(http_client::read_bounded_json_async(
+                    res,
+                    http_client::TOKEN_JSON_LIMIT,
+                ))
                 .context("Failed to parse token response as JSON")?,
         )?;
         warn_if_short_lived(expires_at);

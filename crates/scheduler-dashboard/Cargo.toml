@@ -10,7 +10,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 ui = ["dep:leptos", "dep:leptos_meta", "dep:stylance", "dep:chrono"]
-ssr = ["dep:serde_json", "ui", "leptos/ssr", "dep:leptos_axum", "dep:any_spawner", "dep:axum", "dep:tokio", "dep:tower-http", "dep:reqwest", "dep:futures", "dep:anyhow", "dep:log"]
+ssr = ["dep:serde_json", "ui", "leptos/ssr", "dep:leptos_axum", "dep:any_spawner", "dep:axum", "dep:tokio", "dep:tower-http", "dep:wreq", "dep:url", "dep:futures", "dep:anyhow", "dep:log"]
 hydrate = ["dep:serde_json", "ui", "leptos/hydrate", "dep:wasm-bindgen", "dep:gloo-events", "dep:web-sys", "dep:send_wrapper", "dep:serde_urlencoded"]
 
 [dependencies]
@@ -26,7 +26,8 @@ axum = { version = "0.8", optional = true }
 leptos_axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync"], optional = true }
 tower-http = { version = "0.7", features = ["fs", "set-header"], optional = true }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"], optional = true }
+wreq = { workspace = true, optional = true }
+url = { version = "2", optional = true }
 futures = { version = "0.3", optional = true }
 stylance = { version = "0.8", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }

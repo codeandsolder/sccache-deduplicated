@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use openssl::{asn1::Asn1Time, x509::X509};
+use btls::{asn1::Asn1Time, x509::X509};
 
 use super::{EnrollmentClient, Identity, PeerId, Role, TlsCredentials};
 use sccache_peer_identity::PeerConfig;
@@ -217,7 +217,7 @@ impl PeerCredentials {
 ///
 /// # Errors
 /// Returns an error for insecure URLs, embedded credentials or no endpoint.
-pub fn endpoint(url: &reqwest::Url) -> Result<SocketAddr> {
+pub fn endpoint(url: &url::Url) -> Result<SocketAddr> {
     ensure!(
         url.scheme() == "https"
             && url.username().is_empty()

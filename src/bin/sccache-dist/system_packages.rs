@@ -128,7 +128,7 @@ fn parse_repository_record(line: &str) -> Result<Candidate> {
     let [name, version, architecture, digest, repo, url] = fields[..] else {
         unreachable!("field count validated");
     };
-    let parsed = reqwest::Url::parse(url).context("invalid repository package URL")?;
+    let parsed = url::Url::parse(url).context("invalid repository package URL")?;
     ensure!(
         matches!(parsed.scheme(), "http" | "https" | "file")
             && parsed.query().is_none()

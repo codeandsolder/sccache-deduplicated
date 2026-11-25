@@ -60,8 +60,8 @@ struct QuerySeries {
 }
 
 struct Source {
-    base: reqwest::Url,
-    client: reqwest::Client,
+    base: url::Url,
+    client: wreq::Client,
     definitions: Vec<PanelDefinition>,
     ingress_host: Option<String>,
     queries: Semaphore,
@@ -155,7 +155,7 @@ impl MetricsService {
         );
         let source = url
             .map(|url| -> Result<_> {
-                let mut base = reqwest::Url::parse(url)?;
+                let mut base = url::Url::parse(url)?;
                 ensure!(
                     matches!(base.scheme(), "http" | "https")
                         && base.host().is_some()
@@ -170,9 +170,9 @@ impl MetricsService {
                 }
                 Ok(Arc::new(Source {
                     base,
-                    client: reqwest::Client::builder()
+                    client: wreq::Client::builder()
                         .timeout(Duration::from_secs(10))
-                        .redirect(reqwest::redirect::Policy::none())
+                        .redirect(wreq::redirect::Policy::none())
                         .no_proxy()
                         .build()?,
                     definitions: serde_json::from_str(include_str!("../panels.json"))?,
@@ -325,11 +325,16 @@ fn expression(
     output
 }
 
-async fn get_json<T: serde::de::DeserializeOwned>(source: &Source, url: reqwest::Url) -> Result<T> {
+async fn get_json<T: serde::de::DeserializeOwned>(source: &Source, url: url::Url) -> Result<T> {
     let _permit = source.queries.acquire().await?;
-    let response = source.client.get(url).send().await?.error_for_status()?;
+    let response = source
+        .client
+        .get(url.as_str())
+        .send()
+        .await?
+        .error_for_status()?;
     let mut bytes = Vec::new();
-    let mut body = response.bytes_stream();
+    let mut body = std::pin::pin!(response.bytes_stream());
     while let Some(chunk) = body.next().await {
         let chunk = chunk?;
         ensure!(

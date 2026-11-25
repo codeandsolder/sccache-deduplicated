@@ -559,8 +559,7 @@ impl DistSystem {
         drop(listener);
         fs::File::create(format!("{}.ready", server_cfg_path.to_str().unwrap())).unwrap();
 
-        let url =
-            HTTPUrl::from_url(reqwest::Url::parse(&format!("https://{server_addr}")).unwrap());
+        let url = HTTPUrl::from_url(url::Url::parse(&format!("https://{server_addr}")).unwrap());
         let handle = ServerHandle::Container {
             cid: server_name,
             url,
@@ -600,8 +599,7 @@ impl DistSystem {
         let pid = child.id();
         self.server_processes.push(child);
 
-        let url =
-            HTTPUrl::from_url(reqwest::Url::parse(&format!("https://{}", server_addr)).unwrap());
+        let url = HTTPUrl::from_url(url::Url::parse(&format!("https://{}", server_addr)).unwrap());
         let handle = ServerHandle::Process { pid, url };
         self.wait_server_ready(&handle);
         handle
@@ -679,7 +677,7 @@ impl DistSystem {
 
     pub fn scheduler_url(&self) -> HTTPUrl {
         let url = format!("https://{}", self.scheduler_addr);
-        HTTPUrl::from_url(reqwest::Url::parse(&url).unwrap())
+        HTTPUrl::from_url(url::Url::parse(&url).unwrap())
     }
 
     pub fn cluster_config(&self) -> sccache_peer_identity::PeerConfig {
@@ -706,20 +704,32 @@ impl DistSystem {
         )
         .map_err(|error| error.to_string())?;
         let credentials = peer.current().map_err(|error| error.to_string())?;
-        let (client, base) = sccache_cluster_identity::blocking_client(
+        let transport = sccache_cluster_identity::ClusterHttpClient::new(
             &credentials,
             id,
             sccache_cluster_identity::Role::Scheduler,
             self.scheduler_addr,
-            Duration::from_secs(2),
         )
         .map_err(|error| error.to_string())?;
-        let url = dist::http::urls::scheduler_status(&base).map_err(|error| error.to_string())?;
-        let res = client.get(url).send().map_err(|error| error.to_string())?;
+        let url = dist::http::urls::scheduler_status(transport.base())
+            .map_err(|error| error.to_string())?;
+        let runtime = sccache::http_client::io_runtime().map_err(|error| error.to_string())?;
+        let res = runtime
+            .block_on(
+                transport
+                    .client()
+                    .get(url.as_str())
+                    .timeout(Duration::from_secs(2))
+                    .send(),
+            )
+            .map_err(|error| error.to_string())?;
         if !res.status().is_success() {
             return Err(format!("scheduler status request failed: {}", res.status()));
         }
-        bincode::deserialize_from(res).map_err(|error| error.to_string())
+        let bytes = runtime
+            .block_on(res.bytes())
+            .map_err(|error| error.to_string())?;
+        bincode::deserialize(&bytes).map_err(|error| error.to_string())
     }
 }
 

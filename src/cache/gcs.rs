@@ -15,7 +15,7 @@
 
 use crate::cache::CacheMode;
 use crate::errors::{Result, anyhow};
-use crate::http_client::{self, new_reqwest_client_builder};
+use crate::http_client::{self, new_http_client_builder};
 use opendal::Operator;
 use opendal::{OperationContext, services::Gcs};
 use opendal_layer_logging::LoggingLayer;
@@ -96,9 +96,7 @@ async fn fetch_taskcluster_token(url: &str, scope: &str) -> Result<String> {
     debug!("gcs: start to load token from: {url}");
 
     let user_agent = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    let client = new_reqwest_client_builder()?
-        .user_agent(user_agent)
-        .build()?;
+    let client = new_http_client_builder().user_agent(user_agent).build()?;
     let res = client
         .get(url)
         .timeout(http_client::AUTH_REQUEST_TIMEOUT)

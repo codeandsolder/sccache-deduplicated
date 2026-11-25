@@ -147,24 +147,25 @@ fn addresses() -> Result<[SocketAddr; 3]> {
         .map_err(|_| anyhow::anyhow!("wrong listener count"))
 }
 
-fn fetch_status(
-    http: &reqwest::blocking::Client,
-    scheduler: &reqwest::Url,
-) -> Result<SchedulerStatusResult> {
-    Ok(http
-        .get(scheduler.join("/api/v1/scheduler/status")?)
-        .header("Accept", "application/json")
-        .send()?
-        .error_for_status()?
-        .json()?)
+fn fetch_status(http: &wreq::Client, scheduler: &url::Url) -> Result<SchedulerStatusResult> {
+    sccache::http_client::io_runtime()?.block_on(async {
+        Ok(http
+            .get(scheduler.join("/api/v1/scheduler/status")?.as_str())
+            .header("Accept", "application/json")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    })
 }
 
 fn native_worker_config(
     root: &Path,
     cluster: sccache_peer_identity::PeerConfig,
     worker_address: SocketAddr,
-    scheduler_url: reqwest::Url,
-    cache_url: reqwest::Url,
+    scheduler_url: url::Url,
+    cache_url: url::Url,
     platform: &str,
     transfer: sccache::build_runtime::PackageTransferCost,
 ) -> server::Config {
@@ -211,10 +212,10 @@ struct Fleet {
     cluster: sccache_peer_identity::PeerConfig,
     worker_cluster: sccache_peer_identity::PeerConfig,
     peer: std::sync::Arc<sccache_cluster_identity::PeerCredentials>,
-    status_base: reqwest::Url,
-    cache_url: reqwest::Url,
-    scheduler_url: reqwest::Url,
-    http: reqwest::blocking::Client,
+    status_base: url::Url,
+    cache_url: url::Url,
+    scheduler_url: url::Url,
+    http: wreq::Client,
 }
 
 impl Fleet {
@@ -243,8 +244,8 @@ impl Fleet {
         transfer: sccache::build_runtime::PackageTransferCost,
     ) -> Result<Self> {
         let [scheduler_address, cache_address, worker_address] = addresses()?;
-        let scheduler_url = reqwest::Url::parse(&format!("https://{scheduler_address}/"))?;
-        let cache_url = reqwest::Url::parse(&format!("https://{cache_address}/"))?;
+        let scheduler_url = url::Url::parse(&format!("https://{scheduler_address}/"))?;
+        let cache_url = url::Url::parse(&format!("https://{cache_address}/"))?;
         let scheduler_directory = root.join("scheduler-store");
         let worker_directory = root.join("worker-store");
         let cluster_directory = root.join("cluster");
@@ -315,13 +316,13 @@ impl Fleet {
             )
             .ok())
         })?;
-        let (http, status_base) = sccache_cluster_identity::blocking_client(
+        let transport = sccache_cluster_identity::ClusterHttpClient::new(
             peer.current()?.as_ref(),
             scheduler_id,
             sccache_cluster_identity::Role::Scheduler,
             scheduler_address,
-            Duration::from_secs(2),
         )?;
+        let (http, status_base) = (transport.client(), transport.base().clone());
         let status = || fetch_status(&http, &status_base);
         let mut worker_process = Process::start(
             root,
@@ -518,7 +519,7 @@ fn provisioning_config(root: &Path, fleet: &Fleet) -> Result<PathBuf> {
 }
 
 struct OriginalUpstream {
-    origin: reqwest::Url,
+    origin: url::Url,
     requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -544,7 +545,7 @@ impl OriginalUpstream {
         use http::{Method, StatusCode, header};
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
-        let origin = reqwest::Url::parse(&format!("http://{}/", listener.local_addr()?))?;
+        let origin = url::Url::parse(&format!("http://{}/", listener.local_addr()?))?;
         let (stop, shutdown) = tokio::sync::oneshot::channel();
         let archives = Arc::new(archives);
         let active = Arc::new(active);

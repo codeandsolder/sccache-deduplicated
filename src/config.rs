@@ -183,7 +183,7 @@ pub fn parse_size(val: &str) -> Option<u64> {
 
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HTTPUrl(reqwest::Url);
+pub struct HTTPUrl(url::Url);
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 impl Serialize for HTTPUrl {
     fn serialize<S>(&self, serializer: S) -> StdResult<S::Ok, S::Error>
@@ -206,13 +206,13 @@ impl<'a> Deserialize<'a> for HTTPUrl {
     }
 }
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
-fn parse_http_url(url: &str) -> Result<reqwest::Url> {
+fn parse_http_url(url: &str) -> Result<url::Url> {
     use std::net::SocketAddr;
     let url = url.parse::<SocketAddr>().map_or_else(
-        |_| reqwest::Url::parse(url),
+        |_| url::Url::parse(url),
         |sa| {
             warn!("Url {url} has no scheme, assuming http");
-            reqwest::Url::parse(&format!("http://{sa}"))
+            url::Url::parse(&format!("http://{sa}"))
         },
     )?;
     if url.scheme() != "http" && url.scheme() != "https" {
@@ -227,11 +227,11 @@ fn parse_http_url(url: &str) -> Result<reqwest::Url> {
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 impl HTTPUrl {
     #[must_use = "the returned wrapper contains the supplied HTTP URL"]
-    pub const fn from_url(u: reqwest::Url) -> Self {
+    pub const fn from_url(u: url::Url) -> Self {
         Self(u)
     }
     #[must_use = "the HTTP URL is returned without modifying the wrapper"]
-    pub fn to_url(&self) -> reqwest::Url {
+    pub fn to_url(&self) -> url::Url {
         self.0.clone()
     }
 }
@@ -2156,7 +2156,7 @@ pub mod scheduler {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct PackageUpstream {
-        pub origin: reqwest::Url,
+        pub origin: url::Url,
         pub timeout_secs: u64,
     }
 

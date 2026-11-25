@@ -39,7 +39,7 @@ pub use compiler::rust_link;
 pub mod compression;
 pub mod config;
 pub mod dist;
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-client")]
 pub mod http_client;
 mod jobserver;
 pub mod lru_disk_cache;

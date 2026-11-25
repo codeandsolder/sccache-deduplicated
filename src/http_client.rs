@@ -17,84 +17,120 @@ pub const TOKEN_JSON_LIMIT: usize = 64 * 1024;
 /// Total deadline for authentication requests.
 pub const AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[cfg(all(feature = "reqwest", not(target_os = "android"), any(unix, windows)))]
-fn mozilla_root_certificates() -> reqwest::Result<Vec<reqwest::Certificate>> {
-    webpki_root_certs::TLS_SERVER_ROOT_CERTS
-        .iter()
-        .map(|cert| reqwest::Certificate::from_der(cert.as_ref()))
-        .collect()
+/// Public-CA HTTP client; storage operations set their own deadlines.
+pub(crate) fn new_http_client_builder() -> wreq::ClientBuilder {
+    wreq::Client::builder().redirect(wreq::redirect::Policy::limited(10))
 }
 
-/// Use the platform verifier augmented with Mozilla roots on platforms where
-/// reqwest supports merging roots. Android uses its own platform verifier.
-pub(crate) fn new_reqwest_client_builder() -> reqwest::Result<reqwest::ClientBuilder> {
-    let builder = reqwest::Client::builder();
-    #[cfg(all(not(target_os = "android"), any(unix, windows)))]
-    let builder = builder.tls_certs_merge(mozilla_root_certificates()?);
-    Ok(builder)
+/// Shared asynchronous network reactor for synchronous compiler/storage callers.
+/// Use only at synchronous boundaries; async callers await requests directly.
+#[cfg(any(feature = "dist-server", feature = "dist-client"))]
+pub fn io_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: std::sync::OnceLock<std::io::Result<tokio::runtime::Runtime>> =
+        std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("sccache-http-io")
+                .enable_all()
+                .build()
+        })
+        .as_ref()
+        .map_err(|error| anyhow!("initialize HTTP runtime: {error}"))
+}
+
+/// A bounded asynchronous download feeding a synchronous storage consumer.
+/// Dropping the reader cancels the producer, including a pending body read.
+#[cfg(any(feature = "dist-server", feature = "dist-client"))]
+pub(crate) struct ResponseReader {
+    chunks: tokio::sync::mpsc::Receiver<std::io::Result<Option<bytes::Bytes>>>,
+    current: bytes::Bytes,
+    producer: tokio::task::JoinHandle<()>,
+    finished: bool,
 }
 
 #[cfg(any(feature = "dist-server", feature = "dist-client"))]
-pub(crate) fn new_reqwest_blocking_builder() -> reqwest::Result<reqwest::blocking::ClientBuilder> {
-    // Include certificate-rebuilt scheduler clients: all blocking control-plane
-    // requests need finite deadlines even after trust-root rotation.
-    let builder = reqwest::blocking::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(90));
-    #[cfg(all(not(target_os = "android"), any(unix, windows)))]
-    let builder = builder.tls_certs_merge(mozilla_root_certificates()?);
-    Ok(builder)
-}
-
-/// Build the blocking HTTP client used by distributed components.
-/// Pooling is disabled because connections may outlive their original runtime.
-/// # Errors
-/// Returns an error if reqwest cannot initialize the configured client.
-#[cfg(any(feature = "dist-server", feature = "dist-client"))]
-pub fn new_reqwest_blocking_client() -> Result<reqwest::blocking::Client> {
-    new_reqwest_blocking_builder()?
-        .pool_max_idle_per_host(0)
-        .build()
-        .context("failed to build blocking HTTP client")
-}
-
-/// Parse an authentication JSON response without trusting Content-Length or
-/// allocating unbounded memory for chunked/streamed bodies.
-///
-/// # Errors
-/// Returns an error if the body is too large, unreadable or malformed JSON.
-#[cfg(any(feature = "dist-server", feature = "dist-client"))]
-pub fn read_bounded_json<T: DeserializeOwned>(
-    mut response: reqwest::blocking::Response,
-    limit: usize,
-) -> Result<T> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        anyhow::bail!("authentication HTTP response exceeds {limit} bytes");
+impl ResponseReader {
+    pub(crate) fn new(response: wreq::Response) -> Result<Self> {
+        use futures::StreamExt;
+        let (tx, chunks) = tokio::sync::mpsc::channel(2);
+        let producer = io_runtime()?.spawn(async move {
+            let mut stream = std::pin::pin!(response.bytes_stream());
+            while let Some(chunk) = stream.next().await {
+                let mut chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(std::io::Error::other(error.without_uri())))
+                            .await;
+                        return;
+                    }
+                };
+                while !chunk.is_empty() {
+                    let piece = chunk.split_to(chunk.len().min(128 * 1024));
+                    if tx.send(Ok(Some(piece))).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(Ok(None)).await;
+        });
+        Ok(Self {
+            chunks,
+            current: bytes::Bytes::new(),
+            producer,
+            finished: false,
+        })
     }
-    let mut data = Vec::new();
-    response
-        .by_ref()
-        .take((limit as u64).saturating_add(1))
-        .read_to_end(&mut data)
-        .context("failed to read authentication JSON")?;
-    anyhow::ensure!(
-        data.len() <= limit,
-        "authentication HTTP response exceeds {limit} bytes"
-    );
-    serde_json::from_slice(&data).context("failed to decode authentication JSON")
+}
+
+#[cfg(any(feature = "dist-server", feature = "dist-client"))]
+impl Read for ResponseReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        use bytes::Buf;
+        if buffer.is_empty() || self.finished {
+            return Ok(0);
+        }
+        while self.current.is_empty() {
+            match self.chunks.blocking_recv() {
+                Some(Ok(Some(chunk))) => self.current = chunk,
+                Some(Ok(None)) => {
+                    self.finished = true;
+                    return Ok(0);
+                }
+                Some(Err(error)) => {
+                    self.finished = true;
+                    return Err(error);
+                }
+                None => {
+                    self.finished = true;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "HTTP download producer terminated",
+                    ));
+                }
+            }
+        }
+        let count = buffer.len().min(self.current.len());
+        buffer[..count].copy_from_slice(&self.current[..count]);
+        self.current.advance(count);
+        Ok(count)
+    }
+}
+
+#[cfg(any(feature = "dist-server", feature = "dist-client"))]
+impl Drop for ResponseReader {
+    fn drop(&mut self) {
+        self.producer.abort();
+    }
 }
 
 /// Read an authentication response body with an explicit byte budget.
 ///
 /// # Errors
 /// Returns an error on transport failure or oversized response.
-pub async fn read_bounded_bytes_async(
-    mut response: reqwest::Response,
-    limit: usize,
-) -> Result<Vec<u8>> {
+pub async fn read_bounded_bytes_async(response: wreq::Response, limit: usize) -> Result<Vec<u8>> {
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)
@@ -102,7 +138,10 @@ pub async fn read_bounded_bytes_async(
         anyhow::bail!("authentication HTTP response exceeds {limit} bytes");
     }
     let mut data = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+    use futures::StreamExt;
+    let mut stream = std::pin::pin!(response.bytes_stream());
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
         let total = data
             .len()
             .checked_add(chunk.len())
@@ -122,7 +161,7 @@ pub async fn read_bounded_bytes_async(
 /// # Errors
 /// Returns an error for oversized, unreadable or malformed JSON bodies.
 pub async fn read_bounded_json_async<T: DeserializeOwned>(
-    response: reqwest::Response,
+    response: wreq::Response,
     limit: usize,
 ) -> Result<T> {
     let data = read_bounded_bytes_async(response, limit).await?;
@@ -138,9 +177,7 @@ mod tests {
 
     #[test]
     fn http_builders_load_trust_roots() -> crate::errors::Result<()> {
-        new_reqwest_client_builder()?.build()?;
-        #[cfg(any(feature = "dist-server", feature = "dist-client"))]
-        new_reqwest_blocking_client()?;
+        new_http_client_builder().build()?;
         Ok(())
     }
 
@@ -168,10 +205,7 @@ mod tests {
         Ok(())
     }
 
-    fn local_response(
-        body: Vec<u8>,
-        content_length: bool,
-    ) -> (reqwest::Url, thread::JoinHandle<()>) {
+    fn local_response(body: Vec<u8>, content_length: bool) -> (url::Url, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener");
         let url = format!("http://{}/oauth", listener.local_addr().expect("address"))
             .parse()
@@ -197,41 +231,11 @@ mod tests {
         (url, server)
     }
 
-    #[cfg(any(feature = "dist-server", feature = "dist-client"))]
-    #[test]
-    fn blocking_json_reader_limits_unknown_length_responses() {
-        let (url, server) = local_response(vec![b'x'; TOKEN_JSON_LIMIT + 1], false);
-        let client = new_reqwest_blocking_client().expect("client");
-        let res = client.get(url).send().expect("response");
-        assert!(
-            read_bounded_json::<serde_json::Value>(res, TOKEN_JSON_LIMIT)
-                .expect_err("oversized body")
-                .to_string()
-                .contains("exceeds")
-        );
-        server.join().expect("server");
-    }
-
-    #[cfg(any(feature = "dist-server", feature = "dist-client"))]
-    #[test]
-    fn blocking_json_reader_accepts_small_json() {
-        let (url, server) = local_response(br#"{"keys":[]}"#.to_vec(), true);
-        let client = new_reqwest_blocking_client().expect("client");
-        let res = client.get(url).send().expect("response");
-        let value: serde_json::Value =
-            read_bounded_json(res, JWKS_LIMIT).expect("well-formed JSON");
-        assert_eq!(value["keys"].as_array().expect("keys").len(), 0);
-        server.join().expect("server");
-    }
-
     #[tokio::test]
     async fn async_json_reader_limits_unknown_length_responses() {
         let (url, server) = local_response(vec![b'x'; TOKEN_JSON_LIMIT + 1], false);
-        let client = new_reqwest_client_builder()
-            .expect("client builder")
-            .build()
-            .expect("client");
-        let res = client.get(url).send().await.expect("response");
+        let client = new_http_client_builder().build().expect("client");
+        let res = client.get(url.as_str()).send().await.expect("response");
         assert!(
             read_bounded_json_async::<serde_json::Value>(res, TOKEN_JSON_LIMIT)
                 .await
@@ -245,11 +249,8 @@ mod tests {
     #[tokio::test]
     async fn async_json_reader_accepts_small_json() {
         let (url, server) = local_response(br#"{"access_token":"test"}"#.to_vec(), false);
-        let client = new_reqwest_client_builder()
-            .expect("client builder")
-            .build()
-            .expect("client");
-        let res = client.get(url).send().await.expect("response");
+        let client = new_http_client_builder().build().expect("client");
+        let res = client.get(url.as_str()).send().await.expect("response");
         let value: serde_json::Value = read_bounded_json_async(res, TOKEN_JSON_LIMIT)
             .await
             .expect("JSON");
