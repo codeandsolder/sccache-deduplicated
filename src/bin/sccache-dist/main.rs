@@ -168,6 +168,7 @@ fn create_jwt_server_token(
     header: &jwt::Header,
     key: &[u8],
 ) -> Result<String> {
+    jsonwebtoken_btls::install()?;
     anyhow::ensure!(key.len() == 256 / 8, "Size of secret key incorrect");
     let key = jwt::EncodingKey::from_secret(key)?;
     jwt::encode(header, &ServerJwt { exp: 0, server_id }, &key).map_err(Into::into)
@@ -182,6 +183,7 @@ fn check_jwt_server_token(
     key: &jwt::DecodingKey,
     validation: &jwt::Validation,
 ) -> Option<ServerId> {
+    jsonwebtoken_btls::install().ok()?;
     jwt::decode::<ServerJwt>(server_token, key, validation)
         .map(|res| res.claims.server_id)
         .ok()

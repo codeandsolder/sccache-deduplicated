@@ -411,12 +411,14 @@ jobs:
             --edges normal --prefix none --format '{p}')"
           # These alternate application stacks were deliberately removed.
           printf '%s\n' "$packages" | awk '
-            $1 ~ /^(rouille|tiny_http|ureq|ureq-proto|native-tls|hyper-tls|tokio-native-tls|ring|miniz_oxide|libmount|version-compare)$/ {
+            $1 ~ /^(rouille|tiny_http|ureq|ureq-proto|native-tls|hyper-tls|tokio-native-tls|ring|aws-lc-rs|aws-lc-sys|openssl|openssl-sys|rustls|tokio-rustls|hyper-rustls|reqwest|miniz_oxide|libmount|version-compare)$/ {
               print "Unexpected release dependency: " $0 > "/dev/stderr"; invalid=1
             }
             END { exit invalid }'
           zlib="$(printf '%s\n' "$packages" | awk '$1 == "zlib-rs" { sub(/ \(\*\)$/, ""); print }' | sort -u)"
           [[ "$zlib" == *"github.com/codeandsolder/zlib-rs-fast"* && "$zlib" != *$'\n'* ]]
+          btls="$(printf '%s\n' "$packages" | awk '$1 == "btls-sys" { sub(/ \(\*\)$/, ""); print }' | sort -u)"
+          [[ "$btls" == *"github.com/codeandsolder/btls-fast"* && "$btls" != *$'\n'* ]]
       - name: Check exact scheduler release feature profile
         shell: bash
         run: |

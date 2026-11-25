@@ -893,6 +893,7 @@ mod server {
     }
     impl JWTJobAuthorizer {
         fn boxed(server_key: &[u8]) -> Result<Box<Self>> {
+            jsonwebtoken_btls::install()?;
             anyhow::ensure!(
                 server_key.len() == JWT_KEY_LENGTH,
                 "Invalid job JWT key length"

@@ -66,13 +66,12 @@ hyper-util = { version = "0.1.3", optional = true, features = [
 ] }
 itertools = "0.15"
 jobserver = "0.1"
-jwt = { package = "jsonwebtoken", version = "12", optional = true, default-features = false, features = [
-  "aws_lc_rs",
-] }
+jwt = { package = "jsonwebtoken", version = "12", optional = true, default-features = false }
+jsonwebtoken-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d", optional = true }
 libc = "0.2.153"
 linked-hash-map = "0.5"
 log = "0.4"
-lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "525578d9305c8f255b3b161054b4b628ac0a9e31", optional = true }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "e58a7abdb5a0f47a969771fc0b6837c5103863ee", optional = true }
 memchr = "2"
 mime = "0.3"
 object = { version = "0.41", default-features = false, features = ["read", "std"] }
@@ -269,6 +268,7 @@ dist-server = [
   "native-store",
   "url/serde",
   "jwt",
+  "dep:jsonwebtoken-btls",
   "zlib-rs-fast",
   "dep:nix",
   "http-client",
@@ -286,9 +286,9 @@ exclude = ["tests/test-crate"]
 members = ["crates/build-runtime", "crates/cluster-identity", "crates/peer-identity", "crates/scheduler-dashboard", "tests/integration/randomize_readdir"]
 
 [workspace.dependencies]
-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "3d979440cbcc6c3ad5d5f2734feba1476f3f79c0" }
-tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "3d979440cbcc6c3ad5d5f2734feba1476f3f79c0" }
-wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "c6b998cfacfdc512471e3ba7a582482f49ac4834", default-features = false, features = ["tokio-rt", "native-roots", "webpki-roots", "stream", "json", "form", "query", "system-proxy", "http2"] }
+btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d" }
+tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d" }
+wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "af3924b6d06039a49b0f1cd2b6eac688d49f5a23", default-features = false, features = ["tokio-rt", "native-roots", "webpki-roots", "stream", "json", "form", "query", "system-proxy", "http2"] }
 
 [[bench]]
 harness = false
