@@ -1085,8 +1085,16 @@ prior. Verified completion records contain the predicted publication timestamp,
 predicted client completion, scheduler assignment-to-commit elapsed time,
 predicted cost, actual execution time, total result bytes and negotiated
 upload measurements. The replay report compares publication against actual
-publication, not against client completion (which is not measured by this
-event), and uses stable worker public-key identities. Join by job ID within
+publication, not against client completion, and uses stable worker public-key
+identities. A successful remote receiver piggybacks a delivery receipt on its
+existing result-lease close. The scheduler validates the original authenticated
+requester, committed manifest bounds, and one receipt per allocation. It logs
+elapsed scheduler-monotonic time from allocation start to receipt (including
+allocation overhead, delivery and the close RPC), staging time, and unique
+logical content bytes split by successful direct or scheduler source. Local
+installation after the broker's Done frame is outside this measurement. The
+replay separately evaluates end-to-end delivery forecasts using these receipts;
+missing receipts are not interpreted as zero-duration delivery. Join by job ID within
 the scheduler epoch. This supports evaluating prediction error and selection
 behavior on genuine compilation workloads. Counterfactual worker timings
 are forecasts, not measured speedups; a full causal trace replay requires

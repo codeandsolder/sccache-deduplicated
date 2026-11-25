@@ -233,6 +233,8 @@ pub(super) struct ResultDelivery<'a> {
     plans: BTreeMap<ContentId, Option<BlobSourcePlan>>,
     obtained: Instant,
     publication_deadline: Option<Instant>,
+    delivered: std::collections::BTreeSet<ContentId>,
+    observation: crate::build_runtime::wire::ClientDeliveryObservation,
 }
 
 #[cfg(feature = "dist-client")]
@@ -250,6 +252,8 @@ impl<'a> ResultDelivery<'a> {
             plans: BTreeMap::new(),
             obtained: Instant::now(),
             publication_deadline,
+            delivered: std::collections::BTreeSet::new(),
+            observation: Default::default(),
         }
     }
 
@@ -284,6 +288,27 @@ impl<'a> ResultDelivery<'a> {
         Ok(())
     }
 
+    pub(super) fn observation(
+        &self,
+        elapsed: Duration,
+    ) -> crate::build_runtime::wire::ClientDeliveryObservation {
+        crate::build_runtime::wire::ClientDeliveryObservation {
+            staging_nanoseconds: u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            ..self.observation
+        }
+    }
+
+    fn record(&mut self, blob: BlobRef, direct: bool) {
+        if self.delivered.insert(blob.id) {
+            self.observation.unique_blobs += 1;
+            if direct {
+                self.observation.direct_bytes += blob.size;
+            } else {
+                self.observation.scheduler_bytes += blob.size;
+            }
+        }
+    }
+
     pub(super) fn download(
         &mut self,
         blob: BlobRef,
@@ -310,6 +335,7 @@ impl<'a> ResultDelivery<'a> {
             })
         {
             io::copy(&mut staging, &mut destination)?;
+            self.record(blob, true);
             return Ok(());
         }
         if let Some(deadline) = self.publication_deadline {
@@ -323,13 +349,15 @@ impl<'a> ResultDelivery<'a> {
                     .try_download_response(self.ticket, blob, timeout)
                 {
                     Ok(Some((reader, encoding))) => {
-                        return crate::build_runtime::transfer_native_blob(
+                        crate::build_runtime::transfer_native_blob(
                             reader,
                             io::sink(),
                             destination,
                             blob,
                             encoding,
-                        );
+                        )?;
+                        self.record(blob, false);
+                        return Ok(());
                     }
                     Ok(None) => {}
                     Err(error) if super::retryable_transport_error(&error) => {
@@ -340,6 +368,8 @@ impl<'a> ResultDelivery<'a> {
             }
         }
         self.wait_for_fallback()?;
-        self.client.download(self.ticket, blob, destination)
+        self.client.download(self.ticket, blob, destination)?;
+        self.record(blob, false);
+        Ok(())
     }
 }

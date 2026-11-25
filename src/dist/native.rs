@@ -70,6 +70,12 @@ pub(super) struct DownloadRequest {
 }
 
 #[derive(Serialize, Deserialize)]
+pub(super) struct CloseRequest {
+    pub ticket: Ticket,
+    pub delivery: Option<crate::build_runtime::wire::ClientDeliveryObservation>,
+}
+
+#[derive(Serialize, Deserialize)]
 pub(super) struct StatusRequest {
     pub ticket: Ticket,
     pub preview: bool,
@@ -1180,7 +1186,28 @@ impl NativeCacheClient {
     /// # Errors
     /// Returns an error if the ticket cannot be closed.
     pub fn close(&self, ticket: Ticket) -> Result<()> {
-        self.control("close", &ticket)
+        self.control(
+            "close",
+            &CloseRequest {
+                ticket,
+                delivery: None,
+            },
+        )
+    }
+
+    #[cfg(all(target_os = "linux", feature = "dist-client"))]
+    fn close_delivered(
+        &self,
+        ticket: Ticket,
+        delivery: crate::build_runtime::wire::ClientDeliveryObservation,
+    ) -> Result<()> {
+        self.control(
+            "close",
+            &CloseRequest {
+                ticket,
+                delivery: Some(delivery),
+            },
+        )
     }
 
     /// Stream a result blob into caller-owned staging storage and verify it.

@@ -108,7 +108,7 @@ impl ActionCost {
             && self.output_requests <= 1_000_000
             && self.phase.valid()
     }
-    pub(crate) const fn baseline(placement: &NativePlacement) -> Self {
+    pub(crate) fn baseline(placement: &NativePlacement) -> Self {
         Self {
             phase: PhaseCost {
                 staging_nanoseconds: 0,

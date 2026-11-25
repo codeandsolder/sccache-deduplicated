@@ -172,7 +172,7 @@ fn serve_inner(
         }
         Outcome::Ready {
             source,
-            delivery,
+            mut delivery,
             manifest,
         } => {
             validate_manifest(&spec, &manifest, policy.max_result_bytes)?;

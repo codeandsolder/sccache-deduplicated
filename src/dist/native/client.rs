@@ -21,8 +21,8 @@ use crate::build_runtime::{
     ActionMode, Artifact, BlobRef, CapturedExecution, ExecutionSpec, MaterializedTree,
     PreparedTree, ResultManifest, TreeId, TreeManifest, materialize_tree,
     wire::{
-        InputDemand, InputPoll, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply,
-        Ticket, WorkerAllocation,
+        ClientDeliveryObservation, InputDemand, InputPoll, NativeAdmission, NativeRunResult,
+        NativeStatus, ScheduleReply, Ticket, WorkerAllocation,
     },
 };
 
@@ -181,11 +181,17 @@ impl StagedOutput {
 pub(super) struct Pin<'a> {
     client: &'a NativeCacheClient,
     pub(super) ticket: Ticket,
+    assigned: bool,
+    delivery: Option<ClientDeliveryObservation>,
 }
 
 impl Drop for Pin<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.client.close(self.ticket) {
+        let result = self.delivery.map_or_else(
+            || self.client.close(self.ticket),
+            |observation| self.client.close_delivered(self.ticket, observation),
+        );
+        if let Err(error) = result {
             debug!("native session could not be closed: {error:#}");
         }
     }
@@ -243,31 +249,37 @@ impl Publication {
 
 impl Delivery<'_> {
     pub(super) fn with_download<T>(
-        &self,
+        &mut self,
         renewal_interval: Duration,
         declared: &BTreeMap<crate::build_runtime::ContentId, u64>,
         operation: impl FnOnce(&mut BlobDownload<'_>) -> Result<T>,
     ) -> Result<T> {
         match self {
             Self::Scheduler(pin, publication) => {
-                pin.client
-                    .with_renewal(pin.ticket, renewal_interval, |check| {
-                        let mut delivery = super::peer_delivery::ResultDelivery::new(
-                            pin.client,
-                            pin.ticket,
-                            declared,
-                            publication.as_ref().map(|pending| pending.deadline),
-                        );
-                        let result = operation(&mut |blob, output| {
+                let started = Instant::now();
+                let (value, observation) =
+                    pin.client
+                        .with_renewal(pin.ticket, renewal_interval, |check| {
+                            let mut delivery = super::peer_delivery::ResultDelivery::new(
+                                pin.client,
+                                pin.ticket,
+                                declared,
+                                publication.as_ref().map(|pending| pending.deadline),
+                            );
+                            let result = operation(&mut |blob, output| {
+                                check()?;
+                                delivery.download(blob, output)
+                            })?;
                             check()?;
-                            delivery.download(blob, output)
+                            if let Some(publication) = publication {
+                                publication.confirm(pin)?;
+                            }
+                            Ok((result, delivery.observation(started.elapsed())))
                         })?;
-                        check()?;
-                        if let Some(publication) = publication {
-                            publication.confirm(pin)?;
-                        }
-                        Ok(result)
-                    })
+                if pin.assigned {
+                    pin.delivery = Some(observation);
+                }
+                Ok(value)
             }
             Self::Local(captured) => operation(&mut |blob, output| {
                 copy_verified(captured.open_blob(blob.id)?, blob, output)
@@ -297,7 +309,7 @@ impl NativeCacheClient {
         let destinations = verify_destinations(spec, destinations)?;
         match self.acquire_action(spec, &mut inputs, policy, local)? {
             Outcome::Ready {
-                delivery,
+                mut delivery,
                 source,
                 manifest,
             } => {
@@ -348,6 +360,8 @@ impl NativeCacheClient {
                     let pin = Pin {
                         client: self,
                         ticket,
+                        assigned: false,
+                        delivery: None,
                     };
                     return Ok(Outcome::Ready {
                         delivery: Delivery::Scheduler(pin, None),
@@ -385,6 +399,8 @@ impl NativeCacheClient {
                     let pin = Pin {
                         client: self,
                         ticket,
+                        assigned: false,
+                        delivery: None,
                     };
                     return self.run_admitted(pin, spec, inputs, policy, start, local);
                 }
@@ -417,7 +433,7 @@ impl NativeCacheClient {
 
     fn run_admitted<'a>(
         &self,
-        pin: Pin<'a>,
+        mut pin: Pin<'a>,
         spec: &ExecutionSpec,
         inputs: &mut impl InputProvider,
         policy: &NativeBuildPolicy,
@@ -438,6 +454,7 @@ impl NativeCacheClient {
                 bail!("native worker unavailable: {message}");
             }
         };
+        pin.assigned = true;
         inputs.progress(NativeProgress::Assigned {
             job: allocation.job,
             worker: allocation.peer,

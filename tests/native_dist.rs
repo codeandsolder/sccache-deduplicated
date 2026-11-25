@@ -1162,6 +1162,7 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
     let contents = fs::read_to_string(log)?;
     let mut assignments = BTreeMap::new();
     let mut completed = Vec::new();
+    let mut delivered = BTreeMap::new();
     for line in contents
         .lines()
         .filter(|line| line.contains("native_placement_replay"))
@@ -1176,6 +1177,9 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
                 assert!(assignments.insert(job, value).is_none());
             }
             Some("completed") => completed.push(value),
+            Some("delivered") => {
+                assert!(delivered.insert(job, value).is_none());
+            }
             _ => (),
         }
     }
@@ -1304,8 +1308,43 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
                 .context("missing verified result size")?,
         );
     }
+    assert!(
+        !delivered.is_empty(),
+        "automatic remote restoration must report delivery"
+    );
+    for (&job, receipt) in &delivered {
+        let publication = completed
+            .iter()
+            .find(|value| value["job"].as_u64() == Some(job))
+            .context("delivery without commit")?;
+        assert_eq!(receipt["worker"], publication["worker"]);
+        let bytes = receipt["direct_bytes"]
+            .as_u64()
+            .context("missing direct bytes")?
+            .checked_add(
+                receipt["scheduler_bytes"]
+                    .as_u64()
+                    .context("missing scheduler bytes")?,
+            )
+            .context("delivery overflow")?;
+        assert!(
+            bytes
+                <= publication["result_bytes"]
+                    .as_u64()
+                    .context("missing result bytes")?
+        );
+        assert!(
+            receipt["actual_client_completion_seconds"]
+                .as_f64()
+                .is_some_and(|seconds| seconds > 0.0)
+        );
+    }
     // Expose actual canary records in --nocapture logs for the report tool.
-    for value in assignments.values().chain(completed.iter()) {
+    for value in assignments
+        .values()
+        .chain(completed.iter())
+        .chain(delivered.values())
+    {
         println!("{value}");
     }
     Ok(())

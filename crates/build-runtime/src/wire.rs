@@ -326,6 +326,16 @@ impl ClientDeliveryRates {
     }
 }
 
+/// Successfully staged unique content, split by the actual delivery source.
+/// Counts exclude failed attempts and repeated reads of the same content.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientDeliveryObservation {
+    pub direct_bytes: u64,
+    pub scheduler_bytes: u64,
+    pub unique_blobs: u64,
+    pub staging_nanoseconds: u64,
+}
+
 /// Coherent snapshot of a worker's measured transfer and compiler service.
 /// Revision is monotonic within the authenticated worker incarnation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

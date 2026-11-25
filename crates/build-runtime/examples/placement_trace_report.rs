@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 struct Forecast {
     seconds: f64,
     publication_at: f64,
+    completion_seconds: f64,
     inputs_ready_at: Option<f64>,
     negotiation_at: Option<f64>,
 }
@@ -53,10 +54,22 @@ struct Completion {
     predicted_cost: Option<Cost>,
 }
 
+#[derive(Debug, PartialEq, Deserialize)]
+struct Delivered {
+    job: u64,
+    worker: PeerId,
+    actual_client_completion_seconds: f64,
+    staging_nanoseconds: u64,
+    direct_bytes: u64,
+    scheduler_bytes: u64,
+    unique_blobs: u64,
+}
+
 #[derive(Default)]
 struct Trace {
     assignments: BTreeMap<u64, Assignment>,
     completions: BTreeMap<u64, Completion>,
+    deliveries: BTreeMap<u64, Delivered>,
 }
 
 fn insert<T: PartialEq>(entries: &mut BTreeMap<u64, T>, job: u64, value: T) -> Result<()> {
@@ -95,6 +108,11 @@ impl Trace {
                     let event: Completion = serde_json::from_value(value)
                         .with_context(|| format!("invalid completion at line {}", index + 1))?;
                     insert(&mut trace.completions, event.job, event)?;
+                }
+                Some("delivered") => {
+                    let event: Delivered = serde_json::from_value(value)
+                        .with_context(|| format!("invalid delivery at line {}", index + 1))?;
+                    insert(&mut trace.deliveries, event.job, event)?;
                 }
                 _ => (),
             }
@@ -161,6 +179,11 @@ impl Errors {
 #[derive(Default)]
 struct Metrics {
     publication_seconds: Errors,
+    client_completion_seconds: Errors,
+    direct_delivery_bytes: u128,
+    scheduler_delivery_bytes: u128,
+    delivered_unique_blobs: u128,
+    delivery_staging_nanoseconds: u128,
     inputs_ready_seconds: Errors,
     result_negotiation_seconds: Errors,
     learned_execution_seconds: Errors,
@@ -177,6 +200,11 @@ struct Metrics {
 #[derive(Serialize)]
 struct MetricSummary {
     publication_seconds: ErrorSummary,
+    client_completion_seconds: ErrorSummary,
+    direct_delivery_bytes: u128,
+    scheduler_delivery_bytes: u128,
+    delivered_unique_blobs: u128,
+    delivery_staging_nanoseconds: u128,
     inputs_ready_seconds: ErrorSummary,
     result_negotiation_seconds: ErrorSummary,
     learned_execution_seconds: ErrorSummary,
@@ -260,9 +288,35 @@ impl Metrics {
         Ok(())
     }
 
+    fn add_delivery(&mut self, assignment: &Assignment, delivery: &Delivered) -> Result<()> {
+        ensure!(
+            assignment.worker == delivery.worker,
+            "delivery worker differs from assignment for job {}",
+            delivery.job
+        );
+        let selected = assignment
+            .candidates
+            .get(&assignment.worker)
+            .context("selected worker has no delivery forecast")?;
+        self.client_completion_seconds.add(
+            selected.completion_seconds,
+            delivery.actual_client_completion_seconds,
+        )?;
+        self.direct_delivery_bytes += u128::from(delivery.direct_bytes);
+        self.scheduler_delivery_bytes += u128::from(delivery.scheduler_bytes);
+        self.delivered_unique_blobs += u128::from(delivery.unique_blobs);
+        self.delivery_staging_nanoseconds += u128::from(delivery.staging_nanoseconds);
+        Ok(())
+    }
+
     fn summarize(self) -> MetricSummary {
         MetricSummary {
             publication_seconds: self.publication_seconds.summarize(),
+            client_completion_seconds: self.client_completion_seconds.summarize(),
+            direct_delivery_bytes: self.direct_delivery_bytes,
+            scheduler_delivery_bytes: self.scheduler_delivery_bytes,
+            delivered_unique_blobs: self.delivered_unique_blobs,
+            delivery_staging_nanoseconds: self.delivery_staging_nanoseconds,
             inputs_ready_seconds: self.inputs_ready_seconds.summarize(),
             result_negotiation_seconds: self.result_negotiation_seconds.summarize(),
             learned_execution_seconds: self.learned_execution_seconds.summarize(),
@@ -283,6 +337,8 @@ struct Report {
     assignments: usize,
     completions: usize,
     matched: usize,
+    deliveries: usize,
+    matched_deliveries: usize,
     assignments_without_completion: usize,
     completions_without_assignment: usize,
     total: MetricSummary,
@@ -303,11 +359,27 @@ fn evaluate(trace: &Trace) -> Result<Report> {
             matched += 1;
         }
     }
-    ensure!(matched > 0, "no matched native placement observations");
+    let mut matched_deliveries = 0;
+    for (&id, delivery) in &trace.deliveries {
+        if let Some(assignment) = trace.assignments.get(&id) {
+            metrics.add_delivery(assignment, delivery)?;
+            workers
+                .entry(assignment.worker)
+                .or_default()
+                .add_delivery(assignment, delivery)?;
+            matched_deliveries += 1;
+        }
+    }
+    ensure!(
+        matched > 0 || matched_deliveries > 0,
+        "no matched native placement observations"
+    );
     Ok(Report {
         assignments: trace.assignments.len(),
         completions: trace.completions.len(),
         matched,
+        deliveries: trace.deliveries.len(),
+        matched_deliveries,
         assignments_without_completion: trace.assignments.len() - matched,
         completions_without_assignment: trace.completions.len() - matched,
         total: metrics.summarize(),
@@ -347,12 +419,25 @@ mod tests {
             "upload_bytes": 0, "result_bytes": 1000, "upload_requests": 0,
             "predicted_cost": {"execution_nanoseconds": 1_400_000_000, "output_bytes": 0, "result_bytes": 1000, "output_requests": 0},
         });
+        let delivered = serde_json::json!({
+            "kind": "delivered", "job": 1, "worker": worker, "actual_client_completion_seconds": 2.25,
+            "staging_nanoseconds": 750_000_000, "direct_bytes": 900, "scheduler_bytes": 100, "unique_blobs": 2,
+        });
         let mut unmatched = assigned.clone();
         unmatched["job"] = serde_json::json!(2);
-        let lines =
-            format!("other log\n[TRACE] {assigned}\n{unmatched}\n{completed}\n{completed}\n");
+        let lines = format!(
+            "other log\n[TRACE] {assigned}\n{unmatched}\n{completed}\n{completed}\n{delivered}\n{delivered}\n"
+        );
         let report = evaluate(&Trace::read(lines.as_bytes())?)?;
         assert_eq!(report.matched, 1);
+        assert_eq!(report.matched_deliveries, 1);
+        assert_eq!(
+            report.total.client_completion_seconds.mean_absolute_error,
+            Some(0.25)
+        );
+        assert_eq!(report.total.direct_delivery_bytes, 900);
+        assert_eq!(report.total.scheduler_delivery_bytes, 100);
+        assert_eq!(report.total.delivered_unique_blobs, 2);
         assert_eq!(
             report.total.inputs_ready_seconds.mean_absolute_error,
             Some(0.25)

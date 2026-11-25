@@ -21,8 +21,9 @@ use crate::{
     PackageImportLimits, PackageTransferCost, ResultLease, ResultManifest, StagedBlob, TreeId,
     TreeLease, TreeManifest, UploadReservation, VerifiedPackage,
     wire::{
-        ActionRequest, BeginResult, InputDemand, InputPoll, NativeAdmission, NativeStatus,
-        Publisher, ScheduleReply, Ticket, TreeOffer, TreeRead, WorkerAllocation,
+        ActionRequest, BeginResult, ClientDeliveryObservation, InputDemand, InputPoll,
+        NativeAdmission, NativeStatus, Publisher, ScheduleReply, Ticket, TreeOffer, TreeRead,
+        WorkerAllocation,
     },
 };
 
@@ -395,6 +396,20 @@ enum Kind {
 struct DelegatedAllocation {
     declaration: [u8; 32],
     worker: WorkerAllocation,
+    requester: crate::PeerId,
+    allocation_started: Instant,
+    delivery_reported: bool,
+}
+
+/// An authenticated receipt for a committed remote action. The scheduler
+/// owns the elapsed clock; client timing and byte counts are advisory.
+#[derive(Debug, Clone, Copy)]
+pub struct DeliveryReceipt {
+    pub worker: crate::PeerId,
+    pub job: u64,
+    pub requester: crate::PeerId,
+    pub elapsed: Duration,
+    pub observation: ClientDeliveryObservation,
 }
 
 struct Session {
@@ -817,6 +832,7 @@ impl NativeSessions {
         &self,
         ticket: Ticket,
         request: &ActionRequest,
+        requester: crate::PeerId,
         allocate: impl FnOnce(
             BTreeMap<ContentId, u64>,
             Vec<&BTreeMap<ContentId, u64>>,
@@ -833,7 +849,7 @@ impl NativeSessions {
         // origin. Replay survives execution, publication and failure.
         if let Some(allocation) = &state.allocation {
             ensure!(
-                allocation.declaration == declaration,
+                allocation.declaration == declaration && allocation.requester == requester,
                 "allocation declaration differs from admission"
             );
             return Ok(ScheduleReply::Assigned(allocation.worker.clone()));
@@ -876,11 +892,15 @@ impl NativeSessions {
                     .context("missing admitted input manifest")
             })
             .collect::<Result<Vec<_>>>()?;
+        let allocation_started = Instant::now();
         let reply = allocate(blobs, trees)?;
         if let ScheduleReply::Assigned(allocation) = &reply {
             state.allocation = Some(DelegatedAllocation {
                 declaration,
                 worker: allocation.clone(),
+                requester,
+                allocation_started,
+                delivery_reported: false,
             });
             state.publisher = Publisher::Worker {
                 peer: allocation.peer,
@@ -1905,6 +1925,68 @@ impl NativeSessions {
         drop(pending);
         drop(guard);
         Ok(())
+    }
+
+    /// Record the receiver's successful staging receipt once, while the
+    /// result lease still proves both publication and allocation ownership.
+    ///
+    /// # Errors
+    /// Returns an error for an expired/uncommitted ticket, another requester,
+    /// or counts exceeding the verified manifest.
+    pub fn record_client_delivery(
+        &self,
+        ticket: Ticket,
+        requester: crate::PeerId,
+        observation: ClientDeliveryObservation,
+    ) -> Result<Option<DeliveryReceipt>> {
+        let session = self.get(ticket)?;
+        let mut state = Self::lock(&session)?;
+        self.authorize_reader(&mut state, Publisher::Client)?;
+        let Phase::Ready(Ready::Result(lease)) = &state.phase else {
+            bail!("native delivery is not committed");
+        };
+        let declared = lease.manifest().blobs()?;
+        let size = declared
+            .values()
+            .copied()
+            .try_fold(0_u64, u64::checked_add)
+            .context("result size overflow")?;
+        let bytes = observation
+            .direct_bytes
+            .checked_add(observation.scheduler_bytes)
+            .context("delivery size overflow")?;
+        ensure!(
+            bytes <= size
+                && observation.unique_blobs <= u64::try_from(declared.len())?
+                && (observation.unique_blobs != 0 || bytes == 0),
+            "delivery exceeds result manifest"
+        );
+        let Some(allocation) = state.allocation.as_mut() else {
+            return Ok(None);
+        };
+        ensure!(
+            requester == allocation.requester,
+            "native delivery requester differs from allocation"
+        );
+        if allocation.delivery_reported {
+            return Ok(None);
+        }
+        let elapsed = allocation.allocation_started.elapsed();
+        ensure!(
+            Duration::from_nanos(observation.staging_nanoseconds)
+                <= elapsed.saturating_add(Duration::from_secs(1)),
+            "invalid delivery duration"
+        );
+        allocation.delivery_reported = true;
+        let receipt = DeliveryReceipt {
+            worker: allocation.worker.peer,
+            job: allocation.worker.job,
+            requester,
+            elapsed,
+            observation,
+        };
+        drop(state);
+        Ok(Some(receipt))
     }
 
     /// Release a delivery ticket, or cancel an unfinished action.

@@ -28,9 +28,9 @@ use crate::{
     },
     config::scheduler::NativeCacheConfig,
     dist::native::{
-        BlobSourceRequest, CommitRequest, DownloadRequest, ExecutionRequest, InputPrefetchRequest,
-        ManifestRequest, OpenTreeRequest, PackageAcquisition, PackageLocator, PackagePlanRequest,
-        ScheduleRequest, StatusRequest, codec,
+        BlobSourceRequest, CloseRequest, CommitRequest, DownloadRequest, ExecutionRequest,
+        InputPrefetchRequest, ManifestRequest, OpenTreeRequest, PackageAcquisition, PackageLocator,
+        PackagePlanRequest, ScheduleRequest, StatusRequest, codec,
     },
 };
 
@@ -628,7 +628,7 @@ fn dispatch(
             let requester_id = request.id();
             let request = spec.action_request()?;
             encode(
-                &sessions.schedule(ticket, &request, |inputs, trees| {
+                &sessions.schedule(ticket, &request, requester_id, |inputs, trees| {
                     let blobs = inputs
                         .iter()
                         .map(|(&id, &size)| BlobRef { id, size })
@@ -663,7 +663,27 @@ fn dispatch(
             encode(&sessions.status_with_preview(ticket, preview)?, limit)
         }
         "close" => {
-            sessions.close(metadata(request, limit)?, publisher)?;
+            let CloseRequest { ticket, delivery } = metadata(request, limit)?;
+            if publisher == Publisher::Client
+                && let Some(delivery) = delivery
+            {
+                match sessions.record_client_delivery(ticket, request.id(), delivery) {
+                    Ok(Some(receipt)) => {
+                        trace!(target: "native_placement_replay", "{}", serde_json::json!({
+                            "kind": "delivered", "job": receipt.job, "worker": receipt.worker,
+                            "requester": receipt.requester,
+                            "actual_client_completion_seconds": receipt.elapsed.as_secs_f64(),
+                            "staging_nanoseconds": receipt.observation.staging_nanoseconds,
+                            "direct_bytes": receipt.observation.direct_bytes,
+                            "scheduler_bytes": receipt.observation.scheduler_bytes,
+                            "unique_blobs": receipt.observation.unique_blobs,
+                        }))
+                    }
+                    Ok(None) => {}
+                    Err(error) => debug!("native delivery observation rejected: {error:#}"),
+                }
+            }
+            sessions.close(ticket, publisher)?;
             encode(&(), limit)
         }
         "blob_sources" => {
