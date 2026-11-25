@@ -340,12 +340,11 @@ impl Filesystem for VirtualFs {
     ) {
         // Only hold the table lock while obtaining the reader. A seek/read
         // pair is atomic per handle; unrelated files can decode independently.
-        let reader = match self.handles.lock() {
-            Ok(handles) => handles.readers.get(&fh).cloned(),
-            Err(_) => {
-                reply.error(Errno::EIO);
-                return;
-            }
+        let reader = if let Ok(handles) = self.handles.lock() {
+            handles.readers.get(&fh).cloned()
+        } else {
+            reply.error(Errno::EIO);
+            return;
         };
         let Some(reader) = reader else {
             reply.error(Errno::EBADF);
