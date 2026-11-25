@@ -1,3 +1,11 @@
+#![allow(
+    clippy::empty_enum,
+    reason = "Leptos component macros generate uninhabited prop-state enums"
+)]
+#![allow(
+    clippy::unused_async,
+    reason = "Leptos server-function macro requires an async RPC signature"
+)]
 use leptos::prelude::*;
 #[cfg(feature = "ssr")]
 use leptos_meta::MetaTags;
@@ -213,8 +221,18 @@ fn FleetMetrics() -> impl IntoView {
     }
 }
 
+// These values feed rounded human-readable labels and SVG coordinates, never
+// admission or cache accounting. The integer authoritative value stays intact.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "approximate display coordinates and labels"
+)]
+const fn display_count(value: u64) -> f64 {
+    value as f64
+}
+
 fn bytes(value: u64) -> String {
-    let mut scaled = value as f64;
+    let mut scaled = display_count(value);
     for unit in ["B", "KiB", "MiB", "GiB", "TiB", "PiB"] {
         if scaled < 1024.0 || unit == "PiB" {
             return format!("{scaled:.1} {unit}");
@@ -233,7 +251,12 @@ fn age(value: f64) -> String {
 fn age_since(sampled_at: Option<u64>, then_ms: u64) -> String {
     sampled_at.map_or_else(
         || "—".into(),
-        |now| age(now.saturating_mul(1000).saturating_sub(then_ms) as f64 / 1000.0),
+        |now| {
+            age(
+                std::time::Duration::from_millis(now.saturating_mul(1000).saturating_sub(then_ms))
+                    .as_secs_f64(),
+            )
+        },
     )
 }
 fn timestamp(value: Option<u64>) -> String {

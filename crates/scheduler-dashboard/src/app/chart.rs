@@ -1,6 +1,8 @@
 //! Dependency-light SVG history charts with gap-aware paths and readable units.
+use super::display_count;
 use crate::{MetricSeries, styles};
 use leptos::prelude::*;
+use std::time::Duration;
 
 const COLORS: [&str; 10] = [
     "#56b4e9", "#e69f00", "#009e73", "#cc79a7", "#f0e442", "#e76f51", "#88aaff", "#b2df8a",
@@ -49,9 +51,10 @@ fn plot_path(points: &[(f64, Option<f64>)], bounds: Bounds, step: u64) -> String
     let mut previous = None;
     for &(time, value) in points {
         if let Some(value) = value.filter(|value| value.is_finite() && time.is_finite()) {
-            let x = 10.0 + (time - bounds.start) / (bounds.end - bounds.start).max(1.0) * 580.0;
-            let y = 150.0 - (value - bounds.min) / (bounds.max - bounds.min) * 140.0;
-            let command = if previous.is_some_and(|last| time - last <= step as f64 * 1.5) {
+            let x =
+                ((time - bounds.start) / (bounds.end - bounds.start).max(1.0)).mul_add(580.0, 10.0);
+            let y = ((value - bounds.min) / (bounds.max - bounds.min)).mul_add(-140.0, 150.0);
+            let command = if previous.is_some_and(|last| time - last <= display_count(step) * 1.5) {
                 'L'
             } else {
                 'M'
@@ -99,37 +102,44 @@ fn value_label(value: f64, unit: &str) -> String {
 }
 
 fn axis_time(time: f64, range: f64) -> String {
-    chrono::DateTime::from_timestamp(time as i64, 0).map_or_else(
-        || "—".into(),
-        |date| {
-            date.format(if range >= 86400.0 {
-                "%m-%d %H:%M"
-            } else {
-                "%H:%M:%S"
-            })
-            .to_string()
-        },
-    )
+    Duration::try_from_secs_f64(time)
+        .ok()
+        .and_then(|duration| {
+            chrono::DateTime::from_timestamp(
+                i64::try_from(duration.as_secs()).ok()?,
+                duration.subsec_nanos(),
+            )
+        })
+        .map_or_else(
+            || "—".into(),
+            |date| {
+                date.format(if range >= 86400.0 {
+                    "%m-%d %H:%M"
+                } else {
+                    "%H:%M:%S"
+                })
+                .to_string()
+            },
+        )
 }
 
-#[component]
-pub(super) fn Graph(series: Vec<MetricSeries>, unit: String, step: u64) -> impl IntoView {
+pub(super) fn graph(series: Vec<MetricSeries>, unit: &str, step: u64) -> impl IntoView + use<> {
     let Some(bounds) = bounds(&series) else {
         return view! {<p class=styles::muted>"No samples"</p>}.into_any();
     };
     let range = bounds.end - bounds.start;
     view! {
-        <div class=styles::axis><span>{value_label(bounds.max,&unit)}</span><span>{format!("{:.0} min · UTC",range/60.0)}</span></div>
+        <div class=styles::axis><span>{value_label(bounds.max,unit)}</span><span>{format!("{:.0} min · UTC",range/60.0)}</span></div>
         <svg class=styles::chart viewBox="0 0 600 160" role="img" aria-label="Metric history" preserveAspectRatio="none">
             <path d="M10,10 H590 M10,80 H590 M10,150 H590" stroke="currentColor" opacity="0.2" fill="none"/>
             {series.iter().enumerate().map(|(index,series)| view!{
                 <path d=plot_path(&series.points,bounds,step) stroke=COLORS[index%COLORS.len()] stroke-width="1.5" stroke-linecap="round" vector-effect="non-scaling-stroke" fill="none"><title>{series.label.clone()}</title></path>
             }).collect_view()}
         </svg>
-        <div class=styles::axis><span>{value_label(bounds.min,&unit)}</span><span>{axis_time(bounds.start,range)}</span><span>{axis_time(bounds.end,range)}</span></div>
+        <div class=styles::axis><span>{value_label(bounds.min,unit)}</span><span>{axis_time(bounds.start,range)}</span><span>{axis_time(bounds.end,range)}</span></div>
         <div class=styles::legend>{series.into_iter().enumerate().map(|(index,series)| {
             let last = series.points.last().and_then(|(_,value)| *value);
-            view!{<div><span style:color=COLORS[index%COLORS.len()]>"● "</span>{series.label}<b>{last.map_or_else(|| "—".into(), |value| value_label(value,&unit))}</b></div>}
+            view!{<div><span style:color=COLORS[index%COLORS.len()]>"● "</span>{series.label}<b>{last.map_or_else(|| "—".into(), |value| value_label(value,unit))}</b></div>}
         }).collect_view()}</div>
     }.into_any()
 }
@@ -172,7 +182,7 @@ pub(super) fn PanelContent(
 ) -> impl IntoView {
     use crate::PanelKind;
     if panel.kind == PanelKind::Timeseries {
-        return view! { <Graph series=panel.series unit=panel.unit step=step/> }.into_any();
+        return graph(panel.series, &panel.unit, step).into_any();
     }
     let rows = panel
         .series
@@ -189,8 +199,9 @@ pub(super) fn PanelContent(
     if rows.is_empty() {
         return view! {<p class=styles::muted>"No samples"</p>}.into_any();
     }
-    let stale =
-        move |time: f64| sampled_at.is_some_and(|end| end as f64 - time > step as f64 * 1.5);
+    let stale = move |time: f64| {
+        sampled_at.is_some_and(|end| display_count(end) - time > display_count(step) * 1.5)
+    };
     match panel.kind {
         PanelKind::Stat => view! {
             <div class=styles::metricstats>

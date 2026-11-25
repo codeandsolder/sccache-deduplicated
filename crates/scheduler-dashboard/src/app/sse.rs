@@ -1,4 +1,4 @@
-//! EventSource lifecycle is owned by the reactive component. The browser
+//! `EventSource` lifecycle is owned by the reactive component. The browser
 //! reconnects transport failures; every new connection starts with a reset.
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
