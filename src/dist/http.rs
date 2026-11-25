@@ -1289,7 +1289,7 @@ mod server {
                             let res = try_or_500_log!(
                                 req_id,
                                 handler.handle_assign_native_job(
-                                    Arc::clone(requester),
+                                    Arc::<ServerRequester>::clone(requester),
                                     job_id,
                                     assignment
                                 )

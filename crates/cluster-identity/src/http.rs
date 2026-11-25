@@ -139,6 +139,7 @@ pub struct ClusterRouter {
     router: Router,
     id: PeerId,
     role: Role,
+    ca_fingerprint: [u8; 32],
     allow_enrollment: bool,
 }
 
@@ -336,6 +337,7 @@ impl ClusterListener {
             router,
             id: self.id,
             role: self.role,
+            ca_fingerprint: self.ca_fingerprint,
             allow_enrollment: self.allow_enrollment,
         }
     }
@@ -349,6 +351,7 @@ impl ClusterListener {
         ensure!(
             router.id == self.id
                 && router.role == self.role
+                && router.ca_fingerprint == self.ca_fingerprint
                 && router.allow_enrollment == self.allow_enrollment,
             "cluster router belongs to a different listener"
         );
