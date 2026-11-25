@@ -28,7 +28,8 @@ jobs:
   strict-dashboard-ssr:
     uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@7d0552029497cf094787c3593f804d5bce137c4b # main
     with:
-      cargo-args: "--locked -p sccache -p sccache-dashboard --no-default-features --features sccache/scheduler-dashboard,sccache-dashboard/ssr --lib --bins"
+      # Check the exact native scheduler release composition, not only the UI crate.
+      cargo-args: "--locked -p sccache -p sccache-dashboard --no-default-features --features sccache/s3,sccache/gha,sccache/dist-client,sccache/dist-server,sccache/direct-metrics,sccache/vendored-openssl,sccache/scheduler-dashboard,sccache-dashboard/ssr --lib --bins"
       python-ci-paths: tools
       allow-test-panics: true
 

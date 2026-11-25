@@ -206,13 +206,6 @@ impl NativeCompilerClient {
             anyhow::bail!("namespace client cannot authenticate directly with scheduler");
         };
         let DirectEndpoint { config, auth, .. } = endpoint.as_ref();
-        let token = match auth {
-            DistAuth::Token { token } => token.clone(),
-            DistAuth::Oauth2CodeGrantPKCE { auth_url, .. }
-            | DistAuth::Oauth2Implicit { auth_url, .. } => {
-                DistClientContainer::get_cached_config_auth_token(auth_url)?
-            }
-        };
         let mut saved = endpoint
             .client
             .lock()
@@ -234,7 +227,7 @@ impl NativeCompilerClient {
             cluster,
             &scheduler.to_url(),
             sccache_cluster_identity::Role::Client,
-            &token,
+            || DistClientContainer::enrollment_token(auth),
         )?;
         let client = NativeCacheClient::new(
             &config.endpoint.to_url(),

@@ -22,6 +22,33 @@ fn validate_purpose(ca: &X509Ref, leaf: &X509Ref, purpose: X509PurposeId) -> Res
     Ok(())
 }
 
+/// Verify the persisted identity and issuer independently of certificate
+/// lifetime. Only renewal recovery uses this without the full TLS checks.
+pub(crate) fn verify_leaf_identity(
+    identity: &Identity,
+    certificate: &X509Ref,
+    ca: &X509Ref,
+    role: Role,
+) -> Result<()> {
+    ensure!(
+        authenticated_peer(certificate, role)? == identity.id()?,
+        "issued certificate does not match local key"
+    );
+    let issuer_key = ca.public_key()?;
+    ensure!(
+        certificate.verify(&issuer_key)?,
+        "invalid cluster leaf signature"
+    );
+    ensure!(
+        certificate
+            .issuer_name()
+            .try_cmp(ca.subject_name())?
+            .is_eq(),
+        "unexpected certificate issuer"
+    );
+    Ok(())
+}
+
 /// A local TLS leaf and key, restricted to its enrolled role and cluster.
 pub struct TlsCredentials {
     pub(crate) identity: Identity,
@@ -36,22 +63,7 @@ impl TlsCredentials {
     /// # Errors
     /// Rejects a leaf with an unexpected key, identity, role or issuer signature.
     pub fn new(identity: Identity, certificate: X509, ca: X509, role: Role) -> Result<Self> {
-        ensure!(
-            authenticated_peer(&certificate, role)? == identity.id()?,
-            "issued certificate does not match local key"
-        );
-        let issuer_key = ca.public_key()?;
-        ensure!(
-            certificate.verify(&issuer_key)?,
-            "invalid cluster leaf signature"
-        );
-        ensure!(
-            certificate
-                .issuer_name()
-                .try_cmp(ca.subject_name())?
-                .is_eq(),
-            "unexpected certificate issuer"
-        );
+        verify_leaf_identity(&identity, &certificate, &ca, role)?;
         validate_purpose(&ca, &certificate, X509PurposeId::SSL_CLIENT)?;
         if role != Role::Client {
             validate_purpose(&ca, &certificate, X509PurposeId::SSL_SERVER)?;

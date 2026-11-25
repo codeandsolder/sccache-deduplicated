@@ -702,7 +702,7 @@ impl DistSystem {
             config,
             &self.scheduler_url().to_url(),
             sccache_cluster_identity::Role::Client,
-            sccache::config::INSECURE_DIST_CLIENT_TOKEN,
+            || Ok(sccache::config::INSECURE_DIST_CLIENT_TOKEN.to_owned()),
         )
         .map_err(|error| error.to_string())?;
         let credentials = peer.current().map_err(|error| error.to_string())?;

@@ -230,7 +230,7 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
         },
         &url,
         Role::Worker,
-        "test",
+        || Ok("test".into()),
     )?;
     let result = (|| -> Result<()> {
         let queue = Arc::new(ExecutionQueue::new(NonZeroUsize::MIN));

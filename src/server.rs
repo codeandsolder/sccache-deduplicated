@@ -498,16 +498,6 @@ impl DistClientContainer {
         if let Some(ref addr) = config.scheduler_url {
             let url = addr.to_url();
             info!("Enabling distributed sccache to {url}");
-            let auth_token = match &config.auth {
-                config::DistAuth::Token { token } => Ok(token.to_owned()),
-                config::DistAuth::Oauth2CodeGrantPKCE { auth_url, .. }
-                | config::DistAuth::Oauth2Implicit { auth_url, .. } => {
-                    Self::get_cached_config_auth_token(auth_url)
-                }
-            };
-            let auth_token = try_or_fail_with_message!(
-                auth_token.context("could not load client auth token, run |sccache --dist-auth|")
-            );
             let cluster = try_or_fail_with_message!(
                 config
                     .cluster
@@ -520,7 +510,7 @@ impl DistClientContainer {
                     cluster,
                     address,
                     sccache_cluster_identity::Role::Client,
-                    &auth_token,
+                    || Self::enrollment_token(&config.auth),
                 )
                 .await
             );
@@ -553,7 +543,18 @@ impl DistClientContainer {
         }
     }
 
-    pub(crate) fn get_cached_config_auth_token(auth_url: &str) -> Result<String> {
+    pub(crate) fn enrollment_token(auth: &config::DistAuth) -> Result<String> {
+        match auth {
+            config::DistAuth::Token { token } => Ok(token.clone()),
+            config::DistAuth::Oauth2CodeGrantPKCE { auth_url, .. }
+            | config::DistAuth::Oauth2Implicit { auth_url, .. } => {
+                Self::get_cached_config_auth_token(auth_url)
+                    .context("could not load enrollment token, run |sccache --dist-auth|")
+            }
+        }
+    }
+
+    fn get_cached_config_auth_token(auth_url: &str) -> Result<String> {
         let cached_config = config::CachedConfig::reload()?;
         cached_config
             .with(|c| c.dist.auth_tokens.get(auth_url).map(String::to_owned))?

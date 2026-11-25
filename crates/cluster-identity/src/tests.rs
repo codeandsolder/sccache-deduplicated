@@ -366,3 +366,37 @@ fn established_cluster_cannot_recreate_lost_registry() -> Result<()> {
     assert!(!directory.path().join("registry.bin").exists());
     Ok(())
 }
+
+#[tokio::test]
+async fn valid_persisted_member_does_not_need_bootstrap_token_or_scheduler() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let ca = ClusterCa::open(&directory.path().join("ca-key.pem"))?;
+    let anchor = directory.path().join("ca.pem");
+    publish_trust_anchor(ca.certificate(), &anchor)?;
+    let config = PeerConfig {
+        directory: directory.path().join("client"),
+        ca_certificate: anchor,
+        scheduler_id: identity(&directory, "scheduler")?.id()?,
+    };
+    let member = open_identity(&config)?;
+    let expected = member.id()?;
+    let leaf = config.directory.join("leaf.der");
+    credentials(&ca, member, Role::Client)?.persist(&leaf)?;
+    let peer = PeerCredentials::open(config.clone(), "127.0.0.1:1".parse()?, Role::Client, || {
+        anyhow::bail!("bootstrap credentials are unavailable")
+    })
+    .await?;
+    assert_eq!(peer.current()?.id()?, expected);
+    fs::write(&leaf, b"corrupt")?;
+    let called = std::cell::Cell::new(false);
+    assert!(
+        PeerCredentials::open(config, "127.0.0.1:1".parse()?, Role::Client, || {
+            called.set(true);
+            anyhow::bail!("must not enroll on corruption")
+        })
+        .await
+        .is_err()
+    );
+    assert!(!called.get());
+    Ok(())
+}

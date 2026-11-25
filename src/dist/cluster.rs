@@ -50,13 +50,18 @@ pub fn open_peer(
     config: PeerConfig,
     scheduler: &reqwest::Url,
     role: Role,
-    token: &str,
+    enrollment_token: impl FnOnce() -> Result<String>,
 ) -> Result<Arc<PeerCredentials>> {
     let address = sccache_cluster_identity::endpoint(scheduler)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let peer = runtime.block_on(PeerCredentials::open(config, address, role, token))?;
+    let peer = runtime.block_on(PeerCredentials::open(
+        config,
+        address,
+        role,
+        enrollment_token,
+    ))?;
     if let Err(error) = runtime.block_on(peer.refresh()) {
         warn!("Cluster certificate renewal will be retried: {error:#}");
     }

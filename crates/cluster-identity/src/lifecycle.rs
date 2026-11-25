@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use openssl::x509::X509;
+use openssl::{asn1::Asn1Time, x509::X509};
 
 use super::{EnrollmentClient, Identity, PeerId, Role, TlsCredentials};
 use sccache_peer_identity::PeerConfig;
@@ -45,6 +45,8 @@ fn load_ca(config: &PeerConfig) -> Result<X509> {
 
 impl PeerCredentials {
     /// Load an existing credential, or enroll the persistent key on first use.
+    /// The bootstrap token is requested only for first enrollment or expired leaves.
+    /// Expired members re-enroll the same key under the current bootstrap policy.
     /// Renewal failure leaves a still-valid existing leaf usable.
     ///
     /// # Errors
@@ -53,7 +55,7 @@ impl PeerCredentials {
         config: PeerConfig,
         scheduler: SocketAddr,
         role: Role,
-        token: &str,
+        enrollment_token: impl FnOnce() -> Result<String>,
     ) -> Result<Self> {
         ensure!(
             role != Role::Scheduler,
@@ -62,17 +64,32 @@ impl PeerCredentials {
         let identity = open_identity(&config)?;
         let ca = load_ca(&config)?;
         let path = config.directory.join("leaf.der");
-        let credential = match fs::metadata(&path) {
-            Ok(_) => TlsCredentials::load(identity, &path, ca.clone(), role).context(
-                "persisted peer certificate is invalid; explicitly re-enroll if required",
-            )?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let client = EnrollmentClient::new(&ca, config.scheduler_id, scheduler, None)?;
-                let credential = client.enroll(identity, role, token).await?;
-                credential.persist(&path)?;
-                credential
-            }
+        let persisted = match fs::read(&path) {
+            Ok(bytes) => Some(X509::from_der(&bytes).context("invalid persisted certificate DER")?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
+        };
+        let credential = if let Some(certificate) = &persisted
+            && !certificate
+                .not_after()
+                .compare(&Asn1Time::days_from_now(0)?)?
+                .is_lt()
+        {
+            TlsCredentials::new(identity, certificate.clone(), ca.clone(), role).context(
+                "persisted peer certificate is invalid; explicitly re-enroll if required",
+            )?
+        } else {
+            // Expired leaves cannot authenticate renewal. Re-enroll the
+            // same private key using bootstrap policy; an invalid or foreign
+            // persisted certificate is never silently treated as absent.
+            if let Some(certificate) = &persisted {
+                super::tls::verify_leaf_identity(&identity, certificate, &ca, role)?;
+            }
+            let token = enrollment_token()?;
+            let client = EnrollmentClient::new(&ca, config.scheduler_id, scheduler, None)?;
+            let credential = client.enroll(identity, role, &token).await?;
+            credential.persist(&path)?;
+            credential
         };
         Ok(Self {
             config,

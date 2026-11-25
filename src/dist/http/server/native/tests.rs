@@ -85,7 +85,7 @@ fn make_client(endpoint: &TestEndpoint, token: &str) -> Result<NativeCacheClient
                     endpoint.rejected_config.clone(),
                     &endpoint.url,
                     Role::Client,
-                    token,
+                    || Ok(token.to_owned()),
                 )?,
                 Duration::from_secs(10),
                 1024 * 1024,
@@ -235,10 +235,12 @@ fn with_native_service(
             directory: cluster.join("rejected"),
             ..client_config.clone()
         };
-        let client =
-            crate::dist::cluster::open_peer(client_config, &url, Role::Client, "client-token")?;
-        let worker =
-            crate::dist::cluster::open_peer(worker_config, &url, Role::Worker, "worker-token")?;
+        let client = crate::dist::cluster::open_peer(client_config, &url, Role::Client, || {
+            Ok("client-token".into())
+        })?;
+        let worker = crate::dist::cluster::open_peer(worker_config, &url, Role::Worker, || {
+            Ok("worker-token".into())
+        })?;
         let endpoint = TestEndpoint {
             url,
             scheduler,

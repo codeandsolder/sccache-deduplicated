@@ -230,7 +230,7 @@ fn package_client(client_config: &Path) -> Result<sccache::dist::native::NativeC
             .context("scheduler endpoint required")?
             .to_url(),
         sccache_cluster_identity::Role::Client,
-        &token,
+        || Ok(token),
     )?;
     NativeCacheClient::new(
         &native.endpoint.to_url(),
@@ -533,7 +533,7 @@ fn run(command: Command) -> Result<i32> {
                     .context("scheduler endpoint required")?
                     .to_url(),
                 Role::Client,
-                &token,
+                || Ok(token),
             )?;
             let routes = dist::cluster::BlockingRoutes::for_peer(std::sync::Arc::clone(&peer));
             let (http, base) = routes.endpoint(
@@ -760,7 +760,7 @@ fn run(command: Command) -> Result<i32> {
                 cluster,
                 &scheduler_url.to_url(),
                 sccache_cluster_identity::Role::Worker,
-                &scheduler_auth,
+                || Ok(scheduler_auth),
             )?;
             #[cfg(target_os = "linux")]
             let native_worker = native_worker

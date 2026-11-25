@@ -311,7 +311,7 @@ impl Fleet {
                 cluster.clone(),
                 &scheduler_url,
                 sccache_cluster_identity::Role::Client,
-                CLIENT_TOKEN,
+                || Ok(CLIENT_TOKEN.to_owned()),
             )
             .ok())
         })?;
@@ -787,7 +787,7 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
             fleet.worker_cluster.clone(),
             &fleet.scheduler_url,
             sccache_cluster_identity::Role::Worker,
-            &format!("{} {}", fleet.worker_id, WORKER_TOKEN),
+            || Ok(format!("{} {}", fleet.worker_id, WORKER_TOKEN)),
         )?,
         Duration::from_secs(5),
         1024 * 1024,

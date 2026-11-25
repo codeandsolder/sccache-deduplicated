@@ -642,14 +642,13 @@ pub(in crate::dist) fn advertised_addresses(
     use sccache_peer_identity::RouteSet;
     use std::net::SocketAddr;
     let addresses = interface_addresses();
+    let ipv4_only = bind.is_ipv4();
     let mut candidates = addresses
         .iter()
         .filter_map(|(&ip, address)| {
             let socket = SocketAddr::new(ip, bind.port());
-            (socket != primary
-                && (bind.is_ipv6() || socket.is_ipv4())
-                && RouteSet::eligible(socket))
-            .then_some((socket, address.name.as_str()))
+            (socket != primary && (!ipv4_only || ip.is_ipv4()) && RouteSet::eligible(socket))
+                .then_some((socket, address.name.as_str()))
         })
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|(socket, name)| (interface_priority(name), *name, *socket));

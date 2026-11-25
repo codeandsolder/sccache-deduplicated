@@ -325,6 +325,8 @@ jobs:
         cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=scheduler-dashboard --bin sccache-dist status_counts_assignment_rpc_reservations
         rustup target add wasm32-unknown-unknown
         env -u RUSTFLAGS cargo check --locked -p sccache-dashboard --no-default-features --features hydrate --target wasm32-unknown-unknown
+        source contrib/codeandsolder/release-protocol.env
+        rustup toolchain install "$rust_toolchain" --profile minimal --target wasm32-unknown-unknown
         scripts/install-scheduler-dashboard-tools.sh target/dashboard-tools
         env -u RUSTFLAGS scripts/build-scheduler-dashboard.sh target/dashboard-tools/wasm-bindgen target/dashboard-tools/stylance
         cargo build --locked --target x86_64-unknown-linux-gnu --no-default-features --features=scheduler-dashboard --bin sccache-dist
