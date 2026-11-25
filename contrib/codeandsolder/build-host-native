@@ -33,7 +33,7 @@ export RUSTFLAGS='-C target-cpu=native'
 # Native code in zstd-sys and vendored OpenSSL should be host-tuned too.
 export CFLAGS="-march=native" CXXFLAGS="-march=native"
 export SCCACHE_START_SERVER=0 SCCACHE_NO_AUTO_START_SERVER=1
-cargo +"$rust_toolchain" build --locked --release --target "$target" --no-default-features --features "$features" --bin sccache --bin sccache-dist
+env -u RUSTC -u RUSTDOC cargo +"$rust_toolchain" build --locked --release --target "$target" --no-default-features --features "$features" --bin sccache --bin sccache-dist
 install -m 0755 "$CARGO_TARGET_DIR/$target/release/sccache" "$stage/sccache"
 install -m 0755 "$CARGO_TARGET_DIR/$target/release/sccache-dist" "$stage/sccache-dist"
 if (( dashboard )); then
