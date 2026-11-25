@@ -4236,8 +4236,6 @@ dependencies = [
  "futures",
  "hostname",
  "http",
- "http-body-util",
- "hyper",
  "hyper-util",
  "itertools 0.15.0",
  "jobserver",
@@ -4327,6 +4325,7 @@ name = "sccache-cluster-identity"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "bincode",
  "bytes",
  "http-body-util",
@@ -4340,6 +4339,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "tower",
 ]
 
 [[package]]
