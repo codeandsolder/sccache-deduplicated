@@ -225,11 +225,14 @@ pub(super) fn routes<S: Send + Sync + 'static>(router: Router<Arc<S>>, state: S)
 /// Stream a blocking file/codec reader with a two-chunk bounded queue. Closing
 /// the response closes the receiver and stops the producer without buffering
 /// the entire artifact.
+const RESPONSE_CHUNK: usize = 128 * 1024;
+const RESPONSE_QUEUE: usize = 2;
+
 pub(super) fn reader_body(mut reader: impl Read + Send + 'static) -> Body {
-    let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(2);
+    let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(RESPONSE_QUEUE);
     tokio::task::spawn_blocking(move || {
         while !tx.is_closed() {
-            let mut buffer = vec![0; 128 * 1024];
+            let mut buffer = vec![0; RESPONSE_CHUNK];
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(size) => {
@@ -566,5 +569,58 @@ mod revocation_tests {
         state.update(Vec::new());
         assert!(state.permits(a));
         assert!(!state.permits(b));
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct InfiniteReader {
+        bytes: Arc<AtomicUsize>,
+        stopped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Read for InfiniteReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            buffer.fill(0x5a);
+            self.bytes.fetch_add(buffer.len(), Ordering::Relaxed);
+            Ok(buffer.len())
+        }
+    }
+
+    impl Drop for InfiniteReader {
+        fn drop(&mut self) {
+            if let Some(stopped) = self.stopped.take() {
+                let _ = stopped.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_response_stops_bounded_reader() {
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let (stopped, done) = tokio::sync::oneshot::channel();
+        let body = reader_body(InfiniteReader {
+            bytes: Arc::clone(&bytes),
+            stopped: Some(stopped),
+        });
+        // Two queued chunks plus the producer's in-flight chunk.
+        let maximum = (RESPONSE_QUEUE + 1) * RESPONSE_CHUNK;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while bytes.load(Ordering::Relaxed) < maximum {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("reader did not fill bounded queue");
+        assert_eq!(bytes.load(Ordering::Relaxed), maximum);
+        drop(body);
+        tokio::time::timeout(Duration::from_secs(5), done)
+            .await
+            .expect("reader did not stop after cancellation")
+            .expect("reader exited without signalling");
+        assert_eq!(bytes.load(Ordering::Relaxed), maximum);
     }
 }
