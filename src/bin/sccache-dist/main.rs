@@ -1667,6 +1667,7 @@ impl SchedulerIncoming for Scheduler {
         if let Some(placement) = &capabilities.native_placement {
             anyhow::ensure!(
                 placement.timing.valid()
+                    && placement.cache_path_rates.valid()
                     && placement.queue.valid()
                     && placement
                         .package_limits

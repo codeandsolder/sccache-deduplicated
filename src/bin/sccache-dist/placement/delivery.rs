@@ -17,13 +17,27 @@ pub(super) struct DeliveryRates {
 }
 
 impl DeliveryRates {
-    pub(super) fn new(network: &DirectionSnapshot, peer: Peer, cost: PackageTransferCost) -> Self {
+    pub(super) fn new(
+        network: &DirectionSnapshot,
+        peer: Peer,
+        cost: PackageTransferCost,
+        current_wire_rate: Option<u64>,
+    ) -> Self {
+        let wire_per_mille = u64::try_from(network.wire_bytes(peer, 1000))
+            .unwrap_or(1000)
+            .max(1);
         Self {
-            raw: network.logical_rate(peer, cost.download_bytes_per_second),
-            archive: network.rate(peer, cost.archive_download_bytes_per_second),
-            wire_per_mille: u64::try_from(network.wire_bytes(peer, 1000))
-                .unwrap_or(1000)
-                .max(1),
+            raw: current_wire_rate.map_or_else(
+                || network.logical_rate(peer, cost.download_bytes_per_second),
+                |rate| {
+                    u64::try_from(u128::from(rate) * 1000 / u128::from(wire_per_mille))
+                        .unwrap_or(u64::MAX)
+                        .clamp(1, 1_000_000_000_000)
+                },
+            ),
+            archive: current_wire_rate
+                .unwrap_or_else(|| network.rate(peer, cost.archive_download_bytes_per_second)),
+            wire_per_mille,
             contention: 1.0,
         }
     }

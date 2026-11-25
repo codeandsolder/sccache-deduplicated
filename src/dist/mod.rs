@@ -1101,6 +1101,7 @@ pub struct NativePlacement {
     pub package_limits: Option<crate::build_runtime::PackageDeliveryLimits>,
     pub residency: Option<crate::build_runtime::BlobResidency>,
     pub timing: crate::build_runtime::wire::WorkerTiming,
+    pub cache_path_rates: crate::build_runtime::wire::CachePathRates,
     pub queue: NativeQueueSnapshot,
 }
 

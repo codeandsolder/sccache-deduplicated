@@ -15,7 +15,7 @@ use super::{
 };
 use crate::dist::{
     ServerId,
-    cluster_routes::{PROBE_PATH, PROBE_TIMEOUT, RouteBook},
+    cluster_routes::{PROBE_PATH, PROBE_TIMEOUT, Probe, RouteBook},
 };
 use sccache_peer_identity::RouteSet;
 
@@ -113,7 +113,8 @@ impl WorkerRoutes {
         }
     }
 
-    async fn probe(&self, server: ServerId, address: SocketAddr) {
+    async fn probe(&self, server: ServerId, probe: Probe) {
+        let address = probe.address;
         let start = Instant::now();
         let result = async {
             let path = self.path(server, Role::Worker, address).await?;
@@ -152,7 +153,7 @@ impl WorkerRoutes {
                     .map(|address| self.probe(server, address)),
             )
             .await;
-            for address in self.book.ordered(server, Role::Worker, &routes) {
+            for address in self.book.ordered(server, Role::Worker, &routes, None) {
                 let path = self.path(server, Role::Worker, address).await?;
                 match send_async(request(&path.client(), path.base())?, class).await {
                     Err(error)

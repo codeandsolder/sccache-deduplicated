@@ -1329,6 +1329,15 @@ mod server {
             Ok(self.routes.ordered(id, Role::Worker, &self.addresses(id)?))
         }
 
+        fn download_endpoints(&self, id: ServerId, size: u64) -> Result<Vec<SocketAddr>> {
+            Ok(self.routes.ordered_transfer(
+                id,
+                Role::Worker,
+                &self.addresses(id)?,
+                crate::dist::cluster_routes::Transfer::Download(size),
+            ))
+        }
+
         fn endpoint(
             &self,
             id: ServerId,

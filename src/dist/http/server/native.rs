@@ -293,7 +293,7 @@ pub(super) fn fetch_peer(
     ensure!(!remaining.is_zero(), "native peer deadline expired");
     let timeout = Duration::from_secs((5 + blob.size.div_ceil(1024 * 1024)).min(60)).min(remaining);
     let mut selected = None;
-    for address in routes.endpoints(source.server)? {
+    for address in routes.download_endpoints(source.server, blob.size)? {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
@@ -309,12 +309,12 @@ pub(super) fn fetch_peer(
         match response {
             Err(error) if error.is_connect() => routes.failed(source.server, address),
             result => {
-                selected = Some(result?);
+                selected = Some((result?, address));
                 break;
             }
         }
     }
-    let Some(response) = selected else {
+    let Some((response, address)) = selected else {
         return Ok(None);
     };
     if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -329,6 +329,12 @@ pub(super) fn fetch_peer(
             .to_str()?,
     )?;
     let size = response.content_length();
+    let response = routes.routes.measure_response(
+        source.server,
+        sccache_cluster_identity::Role::Worker,
+        address,
+        response,
+    );
     let response = network.meter(
         Direction::Receive,
         Peer::Worker(source.server),

@@ -31,6 +31,7 @@ use super::{
 };
 
 mod client;
+mod idle_write;
 pub use client::{ClusterHttpClient, EnrollmentClient, blocking_client};
 
 const CONTROL_LIMIT: usize = 64 * 1024;
@@ -302,7 +303,10 @@ impl ClusterListener {
         http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(CONTROL_TIMEOUT)
-            .serve_connection(TokioIo::new(stream), service)
+            .serve_connection(
+                TokioIo::new(idle_write::IdleWrite::new(stream, Duration::from_secs(90))),
+                service,
+            )
             .await?;
         Ok(())
     }

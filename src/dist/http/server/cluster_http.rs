@@ -7,10 +7,11 @@ use std::{
     io::{self, Read},
     net::{SocketAddr, TcpListener},
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use bytes::Bytes;
-use futures::{TryStreamExt, stream};
+use futures::{StreamExt, stream};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::{
     Response, StatusCode,
@@ -36,8 +37,22 @@ pub(super) struct Request {
 impl Request {
     fn new(peer: AuthenticatedPeer, request: hyper::Request<Incoming>) -> Self {
         let (parts, body) = request.into_parts();
-        let stream = body.into_data_stream().map_err(io::Error::other);
-        let reader = SyncIoBridge::new(StreamReader::new(stream));
+        let stream = stream::unfold(Some(body.into_data_stream()), |state| async move {
+            let mut data = state?;
+            match tokio::time::timeout(BODY_IDLE_TIMEOUT, data.next()).await {
+                Ok(Some(Ok(bytes))) => Some((Ok(bytes), Some(data))),
+                Ok(Some(Err(error))) => Some((Err(io::Error::other(error)), None)),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "distributed request body idle",
+                    )),
+                    None,
+                )),
+            }
+        });
+        let reader = SyncIoBridge::new(StreamReader::new(Box::pin(stream)));
         Self {
             parts,
             id: peer.id(),
@@ -106,6 +121,8 @@ fn error_response(status: StatusCode, message: &'static str) -> Response<Cluster
     *reply.status_mut() = status;
     reply
 }
+
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 type Handler = dyn Fn(&Request) -> rouille::Response + Send + Sync;
 

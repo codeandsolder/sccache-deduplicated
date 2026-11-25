@@ -9,7 +9,9 @@ use std::{
 use anyhow::{Context, Result};
 use sccache_cluster_identity::{PeerConfig, PeerCredentials, PeerId, Role, TlsCredentials};
 
-use super::cluster_routes::{PROBE_PATH, PROBE_TIMEOUT, RouteBook};
+use super::cluster_routes::{
+    MeasuredReader, PROBE_PATH, PROBE_TIMEOUT, Probe, RouteBook, Transfer,
+};
 use sccache_peer_identity::RouteSet;
 
 type Current = dyn Fn() -> Result<Arc<TlsCredentials>> + Send + Sync;
@@ -58,7 +60,7 @@ type BlockingPath = (Arc<TlsCredentials>, reqwest::blocking::Client, reqwest::Ur
 pub struct BlockingRoutes {
     current: Arc<Current>,
     paths: Mutex<HashMap<PathKey, BlockingPath>>,
-    book: RouteBook,
+    book: Arc<RouteBook>,
 }
 
 impl BlockingRoutes {
@@ -66,7 +68,7 @@ impl BlockingRoutes {
         Self {
             current: Arc::new(current),
             paths: Mutex::default(),
-            book: RouteBook::default(),
+            book: Arc::default(),
         }
     }
 
@@ -74,7 +76,8 @@ impl BlockingRoutes {
         Self::new(move || peer.current())
     }
 
-    fn probe(&self, peer: PeerId, role: Role, address: SocketAddr) {
+    fn probe(&self, peer: PeerId, role: Role, probe: Probe) {
+        let address = probe.address;
         let start = Instant::now();
         let result = (|| -> Result<bool> {
             let (client, base) = self.endpoint(peer, role, address)?;
@@ -103,7 +106,7 @@ impl BlockingRoutes {
                 scope.spawn(move || self.probe(peer, role, address));
             }
         });
-        self.book.ordered(peer, role, routes)
+        self.book.ordered(peer, role, routes, None)
     }
 
     /// Refresh measurements outside the heartbeat and allocation request pools.
@@ -118,7 +121,57 @@ impl BlockingRoutes {
     }
 
     pub fn ordered(&self, peer: PeerId, role: Role, routes: &RouteSet) -> Vec<SocketAddr> {
-        self.book.ordered(peer, role, routes)
+        self.book.ordered(peer, role, routes, None)
+    }
+
+    pub(super) fn ordered_transfer(
+        &self,
+        peer: PeerId,
+        role: Role,
+        routes: &RouteSet,
+        transfer: Transfer,
+    ) -> Vec<SocketAddr> {
+        self.book.ordered(peer, role, routes, Some(transfer))
+    }
+
+    pub(super) fn best_rate(
+        &self,
+        peer: PeerId,
+        role: Role,
+        routes: &RouteSet,
+        transfer: Transfer,
+    ) -> Option<u64> {
+        self.book.best_rate(peer, role, routes, transfer)
+    }
+
+    pub(super) fn transferred(
+        &self,
+        peer: PeerId,
+        role: Role,
+        address: SocketAddr,
+        transfer: Transfer,
+        elapsed: Duration,
+    ) {
+        self.book
+            .transferred(peer, role, address, transfer, elapsed);
+    }
+
+    pub(super) fn measure_response(
+        &self,
+        peer: PeerId,
+        role: Role,
+        address: SocketAddr,
+        response: reqwest::blocking::Response,
+    ) -> MeasuredReader<reqwest::blocking::Response> {
+        let length = response.content_length();
+        MeasuredReader::new(
+            response,
+            Arc::clone(&self.book),
+            peer,
+            role,
+            address,
+            length,
+        )
     }
 
     pub fn failed(&self, peer: PeerId, role: Role, address: SocketAddr) {

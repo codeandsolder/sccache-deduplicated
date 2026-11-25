@@ -211,6 +211,24 @@ pub enum ScheduleReply {
     Unavailable { message: String },
 }
 
+/// Fresh, authenticated cache-route body goodput, in worker-relative
+/// directions and encoded bytes per second. Absence is not a zero-rate link.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachePathRates {
+    pub download: Option<u64>,
+    pub upload: Option<u64>,
+}
+
+impl CachePathRates {
+    #[must_use]
+    pub fn valid(self) -> bool {
+        [self.download, self.upload]
+            .into_iter()
+            .flatten()
+            .all(|rate| (64 * 1024..=1_000_000_000_000).contains(&rate))
+    }
+}
+
 /// Coherent snapshot of a worker's measured transfer and compiler service.
 /// Revision is monotonic within the authenticated worker incarnation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

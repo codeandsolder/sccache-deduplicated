@@ -74,6 +74,7 @@ pub(super) struct NativeTransferPlan<'a> {
     send_demands: BTreeMap<Peer, TransferDemand>,
     send_baseline: BTreeMap<Peer, f64>,
     receive_demands: BTreeMap<Peer, TransferDemand>,
+    path_rates: BTreeMap<Peer, sccache::build_runtime::wire::CachePathRates>,
 }
 
 fn active_demands(network: &DirectionSnapshot) -> BTreeMap<Peer, TransferDemand> {
@@ -124,7 +125,27 @@ impl<'a> NativeTransferPlan<'a> {
         servers: &HashMap<ServerId, ServerDetails>,
         packages: Option<&'a PackageCatalog>,
     ) -> Self {
+        let path_rates: BTreeMap<_, _> = servers
+            .iter()
+            .filter_map(|(&id, details)| {
+                let rates = details
+                    .capabilities
+                    .native_placement
+                    .as_ref()?
+                    .cache_path_rates;
+                rates.valid().then_some((Peer::Worker(id), rates))
+            })
+            .collect();
         let mut send_demands = active_demands(&network.send);
+        let mut receive_demands = active_demands(&network.receive);
+        for (peer, rates) in &path_rates {
+            if let Some((demand, rate)) = send_demands.get_mut(peer).zip(rates.download) {
+                demand.bytes_per_second = rate;
+            }
+            if let Some((demand, rate)) = receive_demands.get_mut(peer).zip(rates.upload) {
+                demand.bytes_per_second = rate;
+            }
+        }
         // Other workers' predicted input closures are only needed if they can
         // contend for a known shared resource. Avoid scanning them otherwise.
         if !network.send.shared.is_empty() {
@@ -134,7 +155,12 @@ impl<'a> NativeTransferPlan<'a> {
                     let Some(forecast) = WorkerForecast::new(details, None) else {
                         continue;
                     };
-                    let rates = DeliveryRates::new(&network.send, peer, placement.timing.transfer);
+                    let rates = DeliveryRates::new(
+                        &network.send,
+                        peer,
+                        placement.timing.transfer,
+                        placement.cache_path_rates.download,
+                    );
                     let traffic = pipeline::publication_forecast(
                         forecast,
                         &dist::NativeInputBlobs::new(),
@@ -143,7 +169,12 @@ impl<'a> NativeTransferPlan<'a> {
                     )
                     .traffic;
                     if traffic.wire_bytes > 0 {
-                        let demand = Self::input_demand(&network.send, peer, traffic);
+                        let demand = Self::input_demand(
+                            &network.send,
+                            peer,
+                            traffic,
+                            placement.cache_path_rates.download,
+                        );
                         send_demands.insert(peer, demand);
                     }
                 }
@@ -156,7 +187,8 @@ impl<'a> NativeTransferPlan<'a> {
             receive: &network.receive,
             send_demands,
             send_baseline,
-            receive_demands: active_demands(&network.receive),
+            receive_demands,
+            path_rates,
         }
     }
 
@@ -164,6 +196,7 @@ impl<'a> NativeTransferPlan<'a> {
         network: &DirectionSnapshot,
         peer: Peer,
         traffic: InputTraffic,
+        current_wire_rate: Option<u64>,
     ) -> TransferDemand {
         let bytes = traffic.wire_bytes;
         let active = network
@@ -174,7 +207,7 @@ impl<'a> NativeTransferPlan<'a> {
         TransferDemand {
             // Active worker input bytes already belong to the reserved input union.
             bytes: bytes.max(u128::from(active)),
-            bytes_per_second: network.rate(peer, fallback),
+            bytes_per_second: current_wire_rate.unwrap_or_else(|| network.rate(peer, fallback)),
         }
     }
 
@@ -182,7 +215,12 @@ impl<'a> NativeTransferPlan<'a> {
         if traffic.wire_bytes == 0 {
             return (0.0, 0.0);
         }
-        let demand = Self::input_demand(self.send, peer, traffic);
+        let demand = Self::input_demand(
+            self.send,
+            peer,
+            traffic,
+            self.path_rates.get(&peer).and_then(|rates| rates.download),
+        );
         marginal_completion(
             self.send,
             &self.send_demands,
@@ -210,7 +248,11 @@ impl<'a> NativeTransferPlan<'a> {
         let already_pending = remaining.get(&peer).map_or(0, |demand| demand.bytes);
         let demand = TransferDemand {
             bytes: already_pending.saturating_add(u128::from(result.expected_bytes)),
-            bytes_per_second: self.receive.rate(peer, result.bytes_per_second),
+            bytes_per_second: self
+                .path_rates
+                .get(&peer)
+                .and_then(|rates| rates.upload)
+                .unwrap_or_else(|| self.receive.rate(peer, result.bytes_per_second)),
         };
         marginal_completion(self.receive, &remaining, &baseline, peer, demand)
     }
@@ -268,7 +310,12 @@ pub(super) fn native_estimate(
         ..
     } = forecast;
     let (bytes, _) = native_missing_inputs(assigned, placement, recent, Some(requested));
-    let mut rates = DeliveryRates::new(plan.send, peer, placement.timing.transfer);
+    let mut rates = DeliveryRates::new(
+        plan.send,
+        peer,
+        placement.timing.transfer,
+        placement.cache_path_rates.download,
+    );
     let initial = pipeline::publication_forecast(forecast, requested, plan.packages, rates);
     let (network, externality) = plan.input_completion(peer, initial.traffic);
     let unconstrained = initial.traffic.wire_time.as_secs_f64();
