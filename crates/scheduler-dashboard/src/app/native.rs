@@ -1,6 +1,6 @@
 //! Scheduler tables use stable identities and independently memoized sections.
 use super::{Stat, age, age_since, bytes, chart::Graph, rate, timestamp};
-use crate::{DashboardData, Job, MetricSeries, Totals, Worker, styles};
+use crate::{CacheSpace, DashboardData, Job, MetricSeries, NativeService, Totals, Worker, styles};
 use leptos::prelude::*;
 use std::collections::BTreeMap;
 
@@ -40,6 +40,20 @@ pub(super) fn NativeStatus(data: Memo<Option<DashboardData>>) -> impl IntoView {
             telemetry
                 .as_ref()
                 .map(|telemetry| (telemetry.cache.clone(), telemetry.cache_error.clone()))
+        })
+    });
+    let service = Memo::new(move |_| {
+        telemetry.with(|value| {
+            value
+                .as_ref()
+                .map(|value| (value.service, value.service_error.clone()))
+        })
+    });
+    let space = Memo::new(move |_| {
+        telemetry.with(|value| {
+            value
+                .as_ref()
+                .map(|value| (value.space, value.space_error.clone()))
         })
     });
     let network = Memo::new(move |_| {
@@ -97,6 +111,19 @@ pub(super) fn NativeStatus(data: Memo<Option<DashboardData>>) -> impl IntoView {
                         <Stat label="Actions" value=cache.actions.to_string()/><Stat label="Results" value=cache.results.to_string()/><Stat label="Trees" value=cache.trees.to_string()/><Stat label="Blobs" value=cache.blobs.to_string()/><Stat label="Logical live bytes" value=bytes(cache.logical_bytes)/><Stat label="GC pending bytes" value=bytes(cache.pending_gc_bytes)/><Stat label="GC pending blobs" value=cache.pending_gc_blobs.to_string()/>
                     </div>
                 }.into_any())}
+            })}
+            <h3>"Filesystem and resident budget"</h3>
+            {move || space.get().map(|(space,error)|view!{
+                {error.map(|error|view!{<p class=styles::warning>{error}</p>})}
+                {space.map(|space| {
+                    let live = cache.with(|value| value.as_ref().and_then(|(cache,error)| error.is_none().then_some(cache.as_ref()).flatten().map(|cache|cache.logical_bytes.saturating_add(cache.pending_gc_bytes))));
+                    view!{<SpaceStatus space=space live=live/>}
+                })}
+            })}
+            <h3>"Native service capacity"</h3>
+            {move || service.get().map(|(service,error)|view!{
+                {error.map(|error|view!{<p class=styles::warning>{error}</p>})}
+                {service.map(|service|view!{<ServiceStatus service=service/>})}
             })}
         </section>
         <section id="network"><h2>"Native transport"</h2>
@@ -244,5 +271,61 @@ fn JobCells(job: Job, sampled_at: Memo<Option<u64>>) -> impl IntoView {
         <td>{move || job.assigned_at_ms.map_or_else(|| "—".into(), |then| age_since(sampled_at.get(),then))}</td><td>{move || job.state_since_ms.map_or_else(|| "—".into(), |then| age_since(sampled_at.get(),then))}</td>
         <td>{job.remaining_input_bytes.map_or_else(|| "—".into(), bytes)}{job.remaining_input_blobs.map(|blobs| format!(" / {blobs} blobs"))}</td>
         <td>{job.predicted_completion_secs.map_or_else(|| "—".into(), age)}</td>
+    }
+}
+
+#[component]
+fn SpaceStatus(space: CacheSpace, live: Option<u64>) -> impl IntoView {
+    let physical_headroom =
+        space
+            .min_available_bytes
+            .zip(space.reserved_bytes)
+            .map(|(minimum, reserved)| {
+                space
+                    .available_bytes
+                    .saturating_sub(minimum)
+                    .saturating_sub(reserved)
+            });
+    let resident_headroom = space
+        .max_resident_bytes
+        .zip(live)
+        .zip(space.reserved_bytes)
+        .map(|((maximum, live), reserved)| maximum.saturating_sub(live).saturating_sub(reserved));
+    let fmt = |value: Option<u64>| value.map_or_else(|| "—".into(), bytes);
+    view! {
+        <div class=styles::stats>
+            <Stat label="Filesystem free" value=bytes(space.available_bytes)/>
+            <Stat label="Free minimum / target" value=format!("{} / {}",fmt(space.min_available_bytes),fmt(space.target_available_bytes))/>
+            <Stat label="Staging reserved" value=fmt(space.reserved_bytes)/>
+            <Stat label="Resident logical / limit" value=format!("{} / {}",fmt(live),fmt(space.max_resident_bytes))/>
+            <Stat label="Resident target" value=fmt(space.target_resident_bytes)/>
+            <Stat label="Physical headroom estimate" value=fmt(physical_headroom)/>
+            <Stat label="Resident headroom estimate" value=fmt(resident_headroom)/>
+        </div>
+        {(space.min_available_bytes.is_some() && space.reserved_bytes.is_none()).then(||view!{<p class=styles::muted>"Space admission or reclamation in progress; reservation observation unavailable."</p>})}
+        <p class=styles::muted>"Physical filesystem free space and uncompressed resident bytes are different quantities. Headroom estimates exclude prospective reclamation."</p>
+    }
+}
+
+#[component]
+fn ServiceStatus(service: NativeService) -> impl IntoView {
+    view! {
+        <div class=styles::stats>
+            <Stat label="Registered tickets / limit" value=format!("{} / {}",service.tickets.map_or_else(||"—".into(),|tickets|tickets.registered.to_string()),service.max_sessions)/>
+            <Stat label="Upload slots" value=format!("{} / {}",service.active_uploads,service.max_uploads)/>
+            <Stat label="Manifest cache" value=service.manifests.map_or_else(||"—".into(),|manifest| format!("{} / {} · {} entries",bytes(manifest.bytes as u64),bytes(service.manifest_budget_bytes as u64),manifest.entries))/>
+            <Stat label="Recovery queued" value=service.recovery.map_or_else(||"—".into(),|queue|format!("{} · {}",queue.queued,bytes(queue.queued_bytes as u64))) />
+            <Stat label="Recovery ready / cooldown" value=service.recovery.map_or_else(||"—".into(),|queue|format!("{} / {}",queue.ready,queue.cooldown))/>
+        </div>
+        {service.tickets.map(|tickets|view!{
+            <div class=styles::stats>
+                <Stat label="Action / tree tickets" value=format!("{} / {}",tickets.action,tickets.tree)/>
+                <Stat label="Pending / publishing" value=format!("{} / {}",tickets.pending,tickets.publishing)/>
+                <Stat label="Ready / failed" value=format!("{} / {}",tickets.ready,tickets.failed)/>
+                <Stat label="Expired (not reaped)" value=tickets.expired.to_string()/>
+                <Stat label="Unobserved ticket phases" value=tickets.busy.to_string()/>
+            </div>
+        })}
+        {service.tickets.is_none().then(||view!{<p class=styles::muted>"Ticket map busy; count unavailable in this sample."</p>})}
     }
 }

@@ -321,6 +321,7 @@ jobs:
           --no-default-features --features=dist-server --bin sccache-dist
         cargo test --locked --target x86_64-unknown-linux-gnu -p sccache-dashboard --features ssr
         cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=scheduler-dashboard --bin sccache-dist scheduler_status
+        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=scheduler-dashboard --bin sccache-dist status_counts_assignment_rpc_reservations
         rustup target add wasm32-unknown-unknown
         env -u RUSTFLAGS cargo check --locked -p sccache-dashboard --no-default-features --features hydrate --target wasm32-unknown-unknown
         scripts/install-scheduler-dashboard-tools.sh target/dashboard-tools

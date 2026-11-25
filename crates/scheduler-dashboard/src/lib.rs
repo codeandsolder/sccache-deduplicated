@@ -120,12 +120,64 @@ pub struct Snapshot {
     pub jobs: Vec<Job>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheSpace {
+    pub available_bytes: u64,
+    pub reserved_bytes: Option<u64>,
+    pub min_available_bytes: Option<u64>,
+    pub target_available_bytes: Option<u64>,
+    pub max_resident_bytes: Option<u64>,
+    pub target_resident_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketCounts {
+    pub registered: usize,
+    pub action: usize,
+    pub tree: usize,
+    pub pending: usize,
+    pub publishing: usize,
+    pub ready: usize,
+    pub failed: usize,
+    pub expired: usize,
+    pub busy: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestCache {
+    pub entries: usize,
+    pub bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryQueue {
+    pub queued: usize,
+    pub queued_bytes: usize,
+    pub ready: usize,
+    pub cooldown: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeService {
+    pub max_sessions: usize,
+    pub max_uploads: usize,
+    pub active_uploads: usize,
+    pub manifest_budget_bytes: usize,
+    pub tickets: Option<TicketCounts>,
+    pub manifests: Option<ManifestCache>,
+    pub recovery: Option<RecoveryQueue>,
+}
+
 /// Independent, periodically collected CAS and network observations.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NativeTelemetry {
     pub sampled_at: u64,
     pub cache: Option<Cache>,
     pub cache_error: Option<String>,
+    pub space: Option<CacheSpace>,
+    pub space_error: Option<String>,
+    pub service: Option<NativeService>,
+    pub service_error: Option<String>,
     pub network: Vec<NetworkPeer>,
     pub shared_capacity: Vec<NetworkGroup>,
     pub independent_capacity: Vec<ConcurrentGroup>,

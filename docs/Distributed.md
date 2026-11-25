@@ -670,6 +670,17 @@ version table presentation are preserved. Both streams expose errors and resynch
 after connection loss. Native telemetry works independently of Liberta.
 Liberta's existing retention and data producers are unchanged.
 
+### Native service and CAS pressure
+
+The dashboard reports ticket populations (including unobserved/contended tickets),
+upload slots, manifest-cache usage and result-recovery queue occupancy. Session
+telemetry never renews leases or takes service slots. A contended session or
+resource is explicitly unavailable in that sample; observations do not wait
+behind long-running I/O or trigger eviction. The CAS view shows physical free
+space separately from logical resident bytes, staging reservations and both
+physical and logical budget watermarks. Headroom estimates exclude prospective
+reclamation and are advisory, not admission guarantees.
+
 ### Portable release package
 
 The CI release workflow additionally publishes

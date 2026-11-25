@@ -1,9 +1,52 @@
 //! Read-only projection of the existing CAS and transport measurements.
-pub(super) fn snapshot(
-    sessions: &crate::build_runtime::NativeSessions,
-    network: &crate::build_runtime::NetworkMeter,
-) -> sccache_dashboard::NativeTelemetry {
-    let mut snapshot = sccache_dashboard::NativeTelemetry::default();
+use crate::build_runtime::{NativeSessions, NetworkMeter, SessionStatus, SpaceStatus};
+use sccache_dashboard::{
+    CacheSpace, ManifestCache, NativeService, NativeTelemetry, RecoveryQueue, TicketCounts,
+};
+
+fn service(status: SessionStatus) -> NativeService {
+    NativeService {
+        max_sessions: status.max_sessions,
+        max_uploads: status.max_uploads,
+        active_uploads: status.active_uploads,
+        manifest_budget_bytes: status.manifest_budget_bytes,
+        tickets: status.tickets.map(|tickets| TicketCounts {
+            registered: tickets.registered,
+            action: tickets.action,
+            tree: tickets.tree,
+            pending: tickets.pending,
+            publishing: tickets.publishing,
+            ready: tickets.ready,
+            failed: tickets.failed,
+            expired: tickets.expired,
+            busy: tickets.busy,
+        }),
+        manifests: status.manifests.map(|manifest| ManifestCache {
+            entries: manifest.entries,
+            bytes: manifest.bytes,
+        }),
+        recovery: status.recovery.map(|queue| RecoveryQueue {
+            queued: queue.queued,
+            queued_bytes: queue.queued_bytes,
+            ready: queue.ready,
+            cooldown: queue.cooldown,
+        }),
+    }
+}
+
+fn space(status: SpaceStatus) -> CacheSpace {
+    CacheSpace {
+        available_bytes: status.available_bytes,
+        reserved_bytes: status.reserved_bytes,
+        min_available_bytes: status.policy.map(|policy| policy.min_available_bytes),
+        target_available_bytes: status.policy.map(|policy| policy.target_available_bytes),
+        max_resident_bytes: status.policy.map(|policy| policy.max_resident_bytes),
+        target_resident_bytes: status.policy.map(|policy| policy.target_resident_bytes),
+    }
+}
+
+pub(super) fn snapshot(sessions: &NativeSessions, network: &NetworkMeter) -> NativeTelemetry {
+    let mut snapshot = NativeTelemetry::default();
     match sessions.store().stats() {
         Ok(stats) => {
             snapshot.cache = Some(sccache_dashboard::Cache {
@@ -21,6 +64,20 @@ pub(super) fn snapshot(
             snapshot.cache_error = Some(
                 "CAS statistics unavailable; showing last successful sample if present".into(),
             );
+        }
+    }
+    match sessions.store().space_status() {
+        Ok(status) => snapshot.space = Some(space(status)),
+        Err(error) => {
+            warn!("dashboard CAS space unavailable: {error:#}");
+            snapshot.space_error = Some("CAS space observation unavailable".into());
+        }
+    }
+    match sessions.telemetry() {
+        Ok(status) => snapshot.service = Some(service(status)),
+        Err(error) => {
+            warn!("dashboard native service telemetry unavailable: {error:#}");
+            snapshot.service_error = Some("Native service observation unavailable".into());
         }
     }
     let network = network.snapshot();
