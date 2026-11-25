@@ -175,10 +175,11 @@ impl BlockingRoutes {
         address: Route,
         path: ConnectionPath,
         bytes: u64,
+        encoded_length: Option<u64>,
         elapsed: Duration,
     ) {
         self.book
-            .verified_download(peer, address, path, bytes, elapsed);
+            .verified_download(peer, address, path, bytes, encoded_length, elapsed);
     }
 
     #[cfg(all(target_os = "linux", feature = "native-store"))]

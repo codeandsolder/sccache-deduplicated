@@ -128,6 +128,7 @@ impl NativeCacheClient {
                 let attempt = Instant::now();
                 match self.receive_peer_blob(blob, source, address, remaining) {
                     Ok(Some((reader, encoding))) => {
+                        let encoded_length = reader.content_length();
                         let (mut connection, evidence) = reader.connection_evidence();
                         match consume(reader, encoding) {
                             Ok(value) => {
@@ -139,6 +140,7 @@ impl NativeCacheClient {
                                         address,
                                         connection,
                                         blob.size,
+                                        encoded_length,
                                         attempt.elapsed(),
                                     );
                                 }

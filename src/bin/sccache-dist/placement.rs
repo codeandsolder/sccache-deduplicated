@@ -18,7 +18,9 @@ use sccache::{
     build_runtime::{
         Direction, DirectionSnapshot, NetworkSnapshot, PackageCatalog, Peer,
         ResultTransferEstimate, TransferDemand, transfer_seconds,
-        wire::{CachePathRate, CachePathRates, ClientDeliveryRates},
+        wire::{
+            CachePathRate, CachePathRates, ClientDeliveryRates, InterfaceReport, PeerDownloadRate,
+        },
     },
     dist::{self, ServerId},
 };
@@ -77,6 +79,7 @@ pub(super) struct NativeTransferPlan<'a> {
     receive_demands: BTreeMap<Peer, TransferDemand>,
     path_rates: BTreeMap<Peer, CachePathRates>,
     direct_inputs: BTreeMap<Peer, DirectInputs>,
+    worker_interfaces: BTreeMap<Peer, InterfaceReport>,
     receiver: Option<&'a (ServerId, ClientDeliveryRates)>,
     remote_fraction: u64,
 }
@@ -161,6 +164,39 @@ fn marginal_completion(
     (completion, externality)
 }
 
+fn interface_rate(
+    report: &InterfaceReport,
+    address: std::net::IpAddr,
+    direction: Direction,
+    rate: u64,
+) -> u64 {
+    report
+        .at(address)
+        .and_then(|interface| interface.available(direction))
+        .map_or(rate, |available| rate.min(available))
+}
+
+fn peer_logical_rate(
+    rate: PeerDownloadRate,
+    source: Option<&InterfaceReport>,
+    receiver: &InterfaceReport,
+) -> u64 {
+    let source_wire = source
+        .and_then(|report| report.at(rate.path.local))
+        .and_then(|interface| interface.available(Direction::Send))
+        .unwrap_or(u64::MAX);
+    let receiver_wire = receiver
+        .at(rate.path.remote)
+        .and_then(|interface| interface.available(Direction::Receive))
+        .unwrap_or(u64::MAX);
+    let logical = (u128::from(source_wire.min(receiver_wire)) * 1000
+        / u128::from(rate.wire_per_mille.max(1)))
+    .min(u128::from(rate.logical_bytes_per_second));
+    u64::try_from(logical)
+        .unwrap_or(rate.logical_bytes_per_second)
+        .max(1)
+}
+
 /// Build the bounded direct-source forecast from the exact input unions,
 /// current receiver measurements and the source's authenticated residency.
 fn direct_input_forecasts(
@@ -207,12 +243,17 @@ fn direct_input_forecasts(
                 source_placement,
                 &source.recent_residency,
             );
+            let logical_rate = peer_logical_rate(
+                *rate,
+                Some(&source_placement.interfaces),
+                &placement.interfaces,
+            );
             for (&id, &size) in &inputs {
                 if residency.contains(id, size) {
                     direct
                         .entry(id)
-                        .and_modify(|best| *best = (*best).max(rate.logical_bytes_per_second))
-                        .or_insert(rate.logical_bytes_per_second);
+                        .and_modify(|best| *best = (*best).max(logical_rate))
+                        .or_insert(logical_rate);
                 }
             }
         }
@@ -230,15 +271,47 @@ impl<'a> NativeTransferPlan<'a> {
         packages: Option<&'a PackageCatalog>,
         requested: Option<&dist::NativeInputBlobs>,
     ) -> Self {
+        let worker_interfaces = servers
+            .iter()
+            .filter_map(|(&id, details)| {
+                let placement = details.capabilities.native_placement.as_ref()?;
+                (details.last_seen.elapsed() < Duration::from_secs(20))
+                    .then(|| (Peer::Worker(id), placement.interfaces.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
         let path_rates: BTreeMap<_, _> = servers
             .iter()
             .filter_map(|(&id, details)| {
-                let rates = details
+                let mut rates = details
                     .capabilities
                     .native_placement
                     .as_ref()?
                     .cache_path_rates;
-                rates.valid().then_some((Peer::Worker(id), rates))
+                if !rates.valid() {
+                    return None;
+                }
+                let peer = Peer::Worker(id);
+                if let Some(report) = worker_interfaces.get(&peer) {
+                    if let Some(rate) = &mut rates.download {
+                        rate.bytes_per_second = interface_rate(
+                            report,
+                            rate.path.remote,
+                            Direction::Receive,
+                            rate.bytes_per_second,
+                        );
+                    }
+                    if let Some(rate) = &mut rates.upload {
+                        rate.bytes_per_second = interface_rate(
+                            report,
+                            rate.path.remote,
+                            Direction::Send,
+                            rate.bytes_per_second,
+                        );
+                    }
+                }
+                // Original telemetry was validated at admission; the capped
+                // rates may be smaller than the minimum measurement size.
+                Some((peer, rates))
             })
             .collect();
         let direct_inputs = direct_input_forecasts(servers, requested);
@@ -261,7 +334,9 @@ impl<'a> NativeTransferPlan<'a> {
         if !network.send.shared.is_empty() {
             for (&id, details) in servers {
                 if let Some(placement) = &details.capabilities.native_placement {
-                    let rate = placement.cache_path_rates.download;
+                    let rate = path_rates
+                        .get(&Peer::Worker(id))
+                        .and_then(|rates| rates.download);
                     let peer = predicted_peer(Peer::Worker(id), rate);
                     let Some(forecast) = WorkerForecast::new(details, None) else {
                         continue;
@@ -302,6 +377,7 @@ impl<'a> NativeTransferPlan<'a> {
             receive_demands,
             path_rates,
             direct_inputs,
+            worker_interfaces,
             receiver: None,
             remote_fraction: 1_000_000,
         }
@@ -335,7 +411,14 @@ impl<'a> NativeTransferPlan<'a> {
         let client = predicted_peer(Peer::Client(*id), rates.scheduler);
         let wire_rate = rates.scheduler.map_or_else(
             || self.send.rate(client, 16 << 20),
-            |rate| rate.bytes_per_second,
+            |rate| {
+                interface_rate(
+                    &rates.interfaces,
+                    rate.path.remote,
+                    Direction::Receive,
+                    rate.bytes_per_second,
+                )
+            },
         );
         // Selection and local reuse affect only client delivery, never the
         // scheduler's independently required durable publication. The exact
@@ -351,21 +434,39 @@ impl<'a> NativeTransferPlan<'a> {
                 .peers
                 .binary_search_by_key(&source, |rate| rate.source)
                 .ok()
-                .map(|index| rates.peers[index].logical_bytes_per_second),
+                .map(|index| rates.peers[index]),
             _ => None,
         };
-        if let Some(rate) = direct_rate {
+        if let Some(route) = direct_rate {
+            let rate = peer_logical_rate(
+                route,
+                self.worker_interfaces.get(&worker.principal()),
+                &rates.interfaces,
+            );
             // Direct is preferred for scheduler misses; for already resident
             // content the receiver chooses the faster observed service.
             let direct_seconds = transfer_seconds(full, rate);
             if direct_seconds <= scheduler_seconds {
-                return (publication.max(direct_seconds), 0.0);
+                return (
+                    publication
+                        .max(direct_seconds)
+                        .max(self.shared_publication_time(worker, route, full, cost.output_bytes)),
+                    0.0,
+                );
             }
             let cached = full - missing;
             let (cached_seconds, externality) =
                 self.client_scheduler_completion(client, negotiation_at, cached, wire_rate);
             let delivery = cached_seconds + transfer_seconds(missing, rate);
-            return (publication.max(delivery), externality);
+            return (
+                publication.max(delivery).max(self.shared_publication_time(
+                    worker,
+                    route,
+                    missing,
+                    cost.output_bytes,
+                )),
+                externality,
+            );
         }
         // The exact future manifest is not known. Verified resident bytes
         // can be staged early; absent bytes become available at commit.
@@ -375,6 +476,43 @@ impl<'a> NativeTransferPlan<'a> {
         let (remainder, second_delay) =
             self.client_scheduler_completion(client, negotiation_at + ready, missing, wire_rate);
         (ready + remainder, first_delay + second_delay)
+    }
+
+    /// Two outputs sharing a known physical sender interface cannot both
+    /// consume its full line rate. Distinct or unknown interfaces do not
+    /// imply an invented cross-path capacity constraint.
+    fn shared_publication_time(
+        &self,
+        worker: Peer,
+        route: PeerDownloadRate,
+        direct_bytes: u128,
+        upload_bytes: u64,
+    ) -> f64 {
+        if direct_bytes == 0 || upload_bytes == 0 {
+            return 0.0;
+        }
+        let Some(report) = self.worker_interfaces.get(&worker.principal()) else {
+            return 0.0;
+        };
+        let Some(publication) = self.path_rate(worker, Direction::Receive) else {
+            return 0.0;
+        };
+        let Some(interface) = report.at(route.path.local) else {
+            return 0.0;
+        };
+        if !interface.addresses.contains(&publication.path.remote) {
+            return 0.0;
+        }
+        let Some(capacity) = interface.available(Direction::Send) else {
+            return 0.0;
+        };
+        let direct_wire = direct_bytes
+            .saturating_mul(u128::from(route.wire_per_mille))
+            .div_ceil(1000);
+        let upload_wire = self
+            .receive
+            .wire_bytes(worker.on_path(publication.path), u128::from(upload_bytes));
+        transfer_seconds(direct_wire.saturating_add(upload_wire), capacity)
     }
 
     fn client_scheduler_completion(
@@ -778,6 +916,7 @@ mod tests {
                 bytes_per_second: 10 << 20,
             }),
             peers: Vec::new(),
+            interfaces: InterfaceReport::default(),
         };
         let cost = ActionCost {
             phase: Default::default(),
@@ -805,6 +944,7 @@ mod tests {
             source: server,
             path,
             logical_bytes_per_second: 100 << 20,
+            wire_per_mille: 1000,
         });
         let receiver = (requester, rates);
         let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None)
@@ -825,6 +965,81 @@ mod tests {
         assert_eq!(
             plan.client_completion(worker(1), 0.0, 5.0, missing),
             (5.0, 0.0)
+        );
+        Ok(())
+    }
+    #[test]
+    fn publication_and_direct_delivery_share_only_known_sender_interface() -> anyhow::Result<()> {
+        use sccache::build_runtime::wire::{InterfaceDirection, InterfaceTraffic};
+        let network = NetworkSnapshot::default();
+        let mut plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None);
+        let worker = worker(1);
+        let source =
+            ServerId::from_digest(std::array::from_fn(|index| 1_u16.to_le_bytes()[index % 2]));
+        let publication: sccache::build_runtime::NetworkPath = "192.168.1.1,192.168.1.2".parse()?;
+        let direct = PeerDownloadRate {
+            source,
+            path: "192.168.1.2,192.168.1.3".parse()?,
+            logical_bytes_per_second: 100 << 20,
+            wire_per_mille: 1000,
+        };
+        plan.path_rates.insert(
+            worker,
+            CachePathRates {
+                download: None,
+                upload: Some(CachePathRate {
+                    path: publication,
+                    bytes_per_second: 100 << 20,
+                }),
+            },
+        );
+        let interface = InterfaceTraffic {
+            index: 1,
+            addresses: vec![publication.remote],
+            nominal_capacity: Some(100 << 20),
+            send: InterfaceDirection::default(),
+            receive: InterfaceDirection::default(),
+        };
+        plan.worker_interfaces.insert(
+            worker,
+            InterfaceReport {
+                interfaces: vec![interface],
+            },
+        );
+        assert_eq!(
+            plan.shared_publication_time(worker, direct, 100 << 20, 100 << 20),
+            2.0
+        );
+        let separate = PeerDownloadRate {
+            path: "192.168.76.2,192.168.76.3".parse()?,
+            ..direct
+        };
+        assert_eq!(
+            plan.shared_publication_time(worker, separate, 100 << 20, 100 << 20),
+            0.0
+        );
+        let compressed = PeerDownloadRate {
+            wire_per_mille: 250,
+            ..direct
+        };
+        assert_eq!(
+            plan.shared_publication_time(worker, compressed, 100 << 20, 100 << 20),
+            1.25
+        );
+        let report = plan.worker_interfaces.get_mut(&worker).unwrap();
+        report.interfaces[0].send = InterfaceDirection {
+            total_bytes_per_second: 50 << 20,
+            external_bytes_per_second: 50 << 20,
+            active_streams: 0,
+        };
+        assert_eq!(
+            plan.shared_publication_time(worker, direct, 100 << 20, 100 << 20),
+            4.0
+        );
+        plan.worker_interfaces.get_mut(&worker).unwrap().interfaces[0].nominal_capacity = None;
+        assert_eq!(
+            plan.shared_publication_time(worker, direct, 100 << 20, 100 << 20),
+            0.0
         );
         Ok(())
     }

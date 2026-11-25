@@ -39,8 +39,10 @@ impl Evidence {
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(all(target_os = "linux", feature = "dist-server"))]
+pub(in crate::dist) use linux::advertised_addresses;
 #[cfg(target_os = "linux")]
-pub(in crate::dist) use linux::{Activity, activity, binding, direct_sources, snapshot};
+pub(in crate::dist) use linux::{Activity, activity, binding, direct_sources, report, snapshot};
 
 #[cfg(not(target_os = "linux"))]
 pub(in crate::dist) struct Activity;
@@ -116,4 +118,9 @@ impl<R: std::io::Read> std::io::Read for TrackedReader<R> {
         }
         Ok(count)
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(in crate::dist) fn report() -> crate::build_runtime::wire::InterfaceReport {
+    crate::build_runtime::wire::InterfaceReport::default()
 }

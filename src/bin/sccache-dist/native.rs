@@ -157,6 +157,7 @@ impl NativeWorker {
         drop(cache);
         placement.cache_path_rates = self.client.path_rates();
         placement.peer_download_rates = self.client.peer_download_rates();
+        placement.interfaces = self.client.interface_report();
         placement.package_limits =
             self.package_import
                 .map(|limits| sccache::build_runtime::PackageDeliveryLimits {
@@ -316,6 +317,7 @@ impl PlacementCache {
             timing,
             cache_path_rates: Default::default(),
             peer_download_rates: Vec::new(),
+            interfaces: Default::default(),
             queue,
         }
     }

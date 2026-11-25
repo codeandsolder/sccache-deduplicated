@@ -1719,6 +1719,7 @@ impl SchedulerIncoming for Scheduler {
             anyhow::ensure!(
                 placement.timing.valid()
                     && placement.cache_path_rates.valid()
+                    && placement.interfaces.valid()
                     && sccache::build_runtime::wire::peer_download_rates_valid(
                         &placement.peer_download_rates
                     )

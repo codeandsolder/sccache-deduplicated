@@ -152,6 +152,7 @@ struct Rate {
     path: Option<NetworkPath>,
     local: Option<IpAddr>,
     quality: interface::Quality,
+    wire_per_mille: u64,
     bytes_per_second: u64,
     expires: Instant,
 }
@@ -186,6 +187,7 @@ fn updated_rate(
         path: connection.reported,
         local: connection.local,
         quality: connection.quality,
+        wire_per_mille: previous.map_or(1000, |rate| rate.wire_per_mille),
         bytes_per_second: rate,
         expires: now + RATE_TTL,
     }
@@ -372,6 +374,7 @@ impl RouteBook {
         address: Route,
         connection: ConnectionPath,
         bytes: u64,
+        encoded_length: Option<u64>,
         elapsed: Duration,
     ) {
         if bytes < MIN_SAMPLE_BYTES
@@ -394,15 +397,28 @@ impl RouteBook {
                 .clamp(64 * 1024, 1_000_000_000_000),
         )
         .unwrap_or(1_000_000_000_000);
-        sample.verified = Some(updated_rate(sample.verified, connection, observed, now));
+        let mut rate = updated_rate(sample.verified, connection, observed, now);
+        if let Some(wire) = encoded_length {
+            let ratio = u64::try_from((u128::from(wire) * 1000 / u128::from(bytes)).clamp(1, 1100))
+                .unwrap_or(1000);
+            rate.wire_per_mille = if sample.verified.is_some_and(|previous| {
+                previous.expires > now && previous.path == connection.reported
+            }) {
+                (rate.wire_per_mille + ratio).div_ceil(2)
+            } else {
+                ratio
+            };
+        }
+        sample.verified = Some(rate);
         drop(samples);
     }
 
     #[cfg(all(target_os = "linux", feature = "native-store"))]
     pub fn peer_download_rates(&self) -> Vec<PeerDownloadRate> {
         let now = Instant::now();
+        let interfaces = interface::snapshot();
         let samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut best = std::collections::BTreeMap::<PeerId, PeerDownloadRate>::new();
+        let mut best = std::collections::BTreeMap::<PeerId, (u128, PeerDownloadRate)>::new();
         for (key, sample) in samples.iter() {
             if key.role != Role::Worker || sample.measured.is_none() || sample.expires <= now {
                 continue;
@@ -417,19 +433,25 @@ impl RouteBook {
                 source: key.peer,
                 path,
                 logical_bytes_per_second: rate.bytes_per_second,
+                wire_per_mille: rate.wire_per_mille,
             };
+            let nominal = (u128::from(4_u64 << 20) * 1_000_000_000)
+                .div_ceil(u128::from(rate.bytes_per_second));
+            let clean_wire = sample.rates[Transfer::Download(0).index()]
+                .filter(|rate| rate.expires > now && rate.quality == interface::Quality::Clean)
+                .map(|rate| rate.bytes_per_second);
+            let cost = sample.measured.map_or(0, |rtt| rtt.as_nanos())
+                + interfaces.cost(rate.local, Transfer::Download(4 << 20), clean_wire, nominal);
             best.entry(key.peer)
                 .and_modify(|current| {
-                    if (observed.logical_bytes_per_second, observed.path)
-                        > (current.logical_bytes_per_second, current.path)
-                    {
-                        *current = observed;
+                    if (cost, observed.path) < (current.0, current.1.path) {
+                        *current = (cost, observed);
                     }
                 })
-                .or_insert(observed);
+                .or_insert((cost, observed));
         }
         drop(samples);
-        let mut best = best.into_values().collect::<Vec<_>>();
+        let mut best = best.into_values().map(|(_, rate)| rate).collect::<Vec<_>>();
         best.sort_unstable_by_key(|rate| {
             (
                 std::cmp::Reverse(rate.logical_bytes_per_second),
@@ -731,10 +753,15 @@ impl<R: Read> Read for MeasuredReader<R> {
 
 /// Discover only addresses covered by the actual listener. No DNS or
 /// multicast infrastructure is required; the configured address is retained.
-#[cfg(all(
-    feature = "dist-server",
-    any(target_os = "linux", target_os = "freebsd")
-))]
+#[cfg(all(feature = "dist-server", target_os = "linux"))]
+pub fn discover(primary: SocketAddr, bind: SocketAddr) -> RouteSet {
+    if !bind.ip().is_unspecified() {
+        return RouteSet::new(primary, [bind]);
+    }
+    RouteSet::new(primary, interface::advertised_addresses(primary, bind))
+}
+
+#[cfg(all(feature = "dist-server", target_os = "freebsd"))]
 pub fn discover(primary: SocketAddr, bind: SocketAddr) -> RouteSet {
     use nix::{ifaddrs::getifaddrs, net::if_::InterfaceFlags};
     use std::net::{IpAddr, SocketAddrV6};
@@ -1000,6 +1027,7 @@ mod tests {
             Route::unbound(endpoint),
             ConnectionPath::reported(Some(path)),
             8 << 20,
+            Some(4 << 20),
             Duration::from_secs(1),
         );
         assert_eq!(
@@ -1007,7 +1035,8 @@ mod tests {
             [PeerDownloadRate {
                 source: peer,
                 path,
-                logical_bytes_per_second: 8 << 20
+                logical_bytes_per_second: 8 << 20,
+                wire_per_mille: 500,
             }]
         );
         book.observe_path(

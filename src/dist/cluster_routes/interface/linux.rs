@@ -102,6 +102,20 @@ struct LocalAddress {
     mask: IpAddr,
 }
 
+fn interface_priority(name: &str) -> u8 {
+    if name == "lo" {
+        0
+    } else if Path::new("/sys/class/net")
+        .join(name)
+        .join("device")
+        .exists()
+    {
+        1
+    } else {
+        2
+    }
+}
+
 fn on_link(source: IpAddr, mask: IpAddr, destination: IpAddr) -> bool {
     match (source, mask, destination) {
         (IpAddr::V4(source), IpAddr::V4(mask), IpAddr::V4(destination)) => {
@@ -121,7 +135,10 @@ fn interface_addresses() -> BTreeMap<IpAddr, LocalAddress> {
     let mut addresses = BTreeMap::<IpAddr, LocalAddress>::new();
     let mut ambiguous = BTreeSet::new();
     for entry in getifaddrs().into_iter().flatten() {
-        if !entry.flags.contains(InterfaceFlags::IFF_UP) {
+        if !entry
+            .flags
+            .contains(InterfaceFlags::IFF_UP | InterfaceFlags::IFF_RUNNING)
+        {
             continue;
         }
         let Some(address) = entry.address else {
@@ -408,6 +425,44 @@ pub(in crate::dist) fn snapshot() -> Snapshot {
     Snapshot { addresses }
 }
 
+pub(in crate::dist) fn report() -> crate::build_runtime::wire::InterfaceReport {
+    use crate::build_runtime::wire::{InterfaceDirection, InterfaceReport, InterfaceTraffic};
+    let mut book = BOOK.lock().unwrap_or_else(PoisonError::into_inner);
+    book.refresh(Instant::now());
+    let mut groups = BTreeMap::<&str, Vec<IpAddr>>::new();
+    for (&ip, address) in &book.addresses {
+        if sccache_peer_identity::RouteSet::eligible(std::net::SocketAddr::new(ip, 1)) {
+            groups.entry(&address.name).or_default().push(ip);
+        }
+    }
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    groups.sort_unstable_by_key(|(name, _)| (interface_priority(name), *name));
+    let direction = |sample: &Sample| InterfaceDirection {
+        total_bytes_per_second: sample.rate.min(1_000_000_000_000),
+        external_bytes_per_second: sample.external.min(sample.rate).min(1_000_000_000_000),
+        active_streams: u32::try_from(sample.counters.active.load(Ordering::Relaxed).min(4096))
+            .unwrap_or(4096),
+    };
+    let mut interfaces = groups
+        .into_iter()
+        .take(16)
+        .filter_map(|(name, mut addresses)| {
+            let link = book.links.get(name)?;
+            addresses.truncate(8);
+            Some(InterfaceTraffic {
+                index: link.index,
+                addresses,
+                nominal_capacity: link.ceiling,
+                send: direction(&link.directions[0]),
+                receive: direction(&link.directions[1]),
+            })
+        })
+        .collect::<Vec<_>>();
+    drop(book);
+    interfaces.sort_unstable_by_key(|interface| interface.index);
+    InterfaceReport { interfaces }
+}
+
 pub(in crate::dist) fn binding(ip: IpAddr) -> Option<String> {
     let mut book = BOOK.lock().unwrap_or_else(PoisonError::into_inner);
     book.refresh(Instant::now());
@@ -421,22 +476,71 @@ pub(in crate::dist) fn direct_sources(destination: IpAddr) -> Vec<IpAddr> {
     let mut book = BOOK.lock().unwrap_or_else(PoisonError::into_inner);
     book.refresh(Instant::now());
     let mut names = BTreeSet::new();
-    let mut sources = Vec::new();
-    if !destination.is_loopback() {
-        for (&source, address) in &book.addresses {
-            if source != destination
+    let mut candidates = book
+        .addresses
+        .iter()
+        .filter(|(source, address)| {
+            !destination.is_loopback()
+                && **source != destination
                 && !source.is_loopback()
-                && RouteSet::eligible(std::net::SocketAddr::new(source, 1))
-                && on_link(source, address.mask, destination)
-                && names.insert(address.name.as_str())
-            {
-                sources.push(source);
-            }
-        }
-    }
+                && RouteSet::eligible(std::net::SocketAddr::new(**source, 1))
+                && on_link(**source, address.mask, destination)
+        })
+        .collect::<Vec<_>>();
+    candidates
+        .sort_unstable_by_key(|(source, address)| (interface_priority(&address.name), **source));
+    let sources = candidates
+        .into_iter()
+        .filter_map(|(&source, address)| names.insert(address.name.as_str()).then_some(source))
+        .take(4)
+        .collect();
     drop(book);
-    sources.truncate(4);
     sources
+}
+
+#[cfg(feature = "dist-server")]
+pub(in crate::dist) fn advertised_addresses(
+    primary: std::net::SocketAddr,
+    bind: std::net::SocketAddr,
+) -> Vec<std::net::SocketAddr> {
+    use sccache_peer_identity::RouteSet;
+    use std::net::SocketAddr;
+    let addresses = interface_addresses();
+    let mut candidates = addresses
+        .iter()
+        .filter_map(|(&ip, address)| {
+            let socket = SocketAddr::new(ip, bind.port());
+            (socket != primary && (bind.is_ipv6() || ip.is_ipv4()) && RouteSet::eligible(socket))
+                .then_some((socket, address.name.as_str()))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|(socket, name)| (interface_priority(name), *name, *socket));
+    // First give each interface/family a slot; then include additional
+    // addresses where the canonical bounded advertisement has room.
+    let mut seen = BTreeSet::new();
+    let (first, rest): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|(socket, name)| seen.insert((*name, socket.is_ipv4())));
+    let ordered = first
+        .into_iter()
+        .chain(rest)
+        .map(|(socket, _)| socket)
+        .collect::<Vec<_>>();
+    let mut v4 = ordered.iter().copied().filter(SocketAddr::is_ipv4);
+    let mut v6 = ordered.iter().copied().filter(SocketAddr::is_ipv6);
+    let mut result = Vec::new();
+    while result.len() < RouteSet::MAX_ALTERNATIVES {
+        let next = if result.len().is_multiple_of(2) {
+            v4.next().or_else(|| v6.next())
+        } else {
+            v6.next().or_else(|| v4.next())
+        };
+        let Some(next) = next else {
+            break;
+        };
+        result.push(next);
+    }
+    result
 }
 
 #[cfg(test)]

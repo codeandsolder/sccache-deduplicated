@@ -286,6 +286,7 @@ pub struct PeerDownloadRate {
     pub source: crate::PeerId,
     pub path: crate::NetworkPath,
     pub logical_bytes_per_second: u64,
+    pub wire_per_mille: u64,
 }
 
 pub const MAX_PEER_DOWNLOAD_RATES: usize = 32;
@@ -295,6 +296,7 @@ impl PeerDownloadRate {
     pub fn valid(self) -> bool {
         self.path.valid()
             && (64 * 1024..=1_000_000_000_000).contains(&self.logical_bytes_per_second)
+            && (1..=1100).contains(&self.wire_per_mille)
     }
 }
 
@@ -306,12 +308,99 @@ pub fn peer_download_rates_valid(rates: &[PeerDownloadRate]) -> bool {
         && rates.windows(2).all(|pair| pair[0].source < pair[1].source)
 }
 
+/// Aggregate interface pressure, including other applications, sampled
+/// on the endpoint itself. Nominal capacity is only set for a known
+/// physical full-duplex Ethernet link.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterfaceDirection {
+    pub total_bytes_per_second: u64,
+    pub external_bytes_per_second: u64,
+    pub active_streams: u32,
+}
+
+impl InterfaceDirection {
+    fn valid(self) -> bool {
+        self.external_bytes_per_second <= self.total_bytes_per_second
+            && self.total_bytes_per_second <= 1_000_000_000_000
+            && self.active_streams <= 4096
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterfaceTraffic {
+    pub index: u32,
+    pub addresses: Vec<std::net::IpAddr>,
+    pub nominal_capacity: Option<u64>,
+    pub send: InterfaceDirection,
+    pub receive: InterfaceDirection,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterfaceReport {
+    pub interfaces: Vec<InterfaceTraffic>,
+}
+
+impl InterfaceReport {
+    #[must_use = "untrusted interface telemetry must be validated"]
+    pub fn valid(&self) -> bool {
+        let mut addresses = BTreeSet::new();
+        self.interfaces.len() <= 16
+            && self
+                .interfaces
+                .windows(2)
+                .all(|pair| pair[0].index < pair[1].index)
+            && self.interfaces.iter().all(|interface| {
+                interface.index != 0
+                    && !interface.addresses.is_empty()
+                    && interface.addresses.len() <= 8
+                    && interface.addresses.windows(2).all(|pair| pair[0] < pair[1])
+                    && interface.addresses.iter().all(|&address| {
+                        sccache_peer_identity::RouteSet::eligible(std::net::SocketAddr::new(
+                            address, 1,
+                        )) && addresses.insert(address)
+                    })
+                    && interface
+                        .nominal_capacity
+                        .is_none_or(|rate| (125_000..=1_000_000_000_000).contains(&rate))
+                    && interface.send.valid()
+                    && interface.receive.valid()
+            })
+    }
+
+    #[must_use = "the interface is used for endpoint capacity estimates"]
+    pub fn at(&self, address: std::net::IpAddr) -> Option<&InterfaceTraffic> {
+        self.interfaces
+            .iter()
+            .find(|interface| interface.addresses.binary_search(&address).is_ok())
+    }
+}
+
+impl InterfaceTraffic {
+    /// Available wire service on an explicitly known full-duplex wired
+    /// interface. Virtual or wireless routes have no invented ceiling.
+    #[must_use = "available capacity constrains the transfer forecast"]
+    pub fn available(&self, direction: crate::Direction) -> Option<u64> {
+        let capacity = self.nominal_capacity?;
+        let load = match direction {
+            crate::Direction::Send => self.send,
+            crate::Direction::Receive => self.receive,
+        };
+        Some(
+            capacity
+                .saturating_sub(load.external_bytes_per_second)
+                .max(capacity / 8)
+                .max(1),
+        )
+    }
+}
+
 /// Fresh receiver-side service estimates for result delivery. The client
 /// principal is established by the scheduler's authenticated connection.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientDeliveryRates {
     pub scheduler: Option<CachePathRate>,
     pub peers: Vec<PeerDownloadRate>,
+    pub interfaces: InterfaceReport,
 }
 
 impl ClientDeliveryRates {
@@ -323,6 +412,7 @@ impl ClientDeliveryRates {
         }
         .valid()
             && peer_download_rates_valid(&self.peers)
+            && self.interfaces.valid()
     }
 }
 

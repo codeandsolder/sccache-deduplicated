@@ -1117,6 +1117,7 @@ pub struct NativePlacement {
     pub timing: crate::build_runtime::wire::WorkerTiming,
     pub cache_path_rates: crate::build_runtime::wire::CachePathRates,
     pub peer_download_rates: Vec<crate::build_runtime::wire::PeerDownloadRate>,
+    pub interfaces: crate::build_runtime::wire::InterfaceReport,
     pub queue: NativeQueueSnapshot,
 }
 

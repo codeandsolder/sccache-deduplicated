@@ -1218,6 +1218,42 @@ result manifest exists, the full logical size is an advisory estimate
 (independent of selective output materialization or local reuse). Histories
 retain both sizes across scheduler restarts.
 
+### Multi-interface measurement and route selection
+
+The transport tests reachability using authenticated lightweight probes;
+bandwidth exploration uses ordinary required CAS bodies, never a synthetic
+bulk payload. On Linux each directly reachable destination can have several
+source-bound transport candidates, with separate pooled connections per
+source address and destination. Explicit on-link candidates bind both the
+source address and interface; the unbound kernel-policy route remains the
+fallback for routed, VPN, unavailable and unsupported paths. Advertisements
+prioritize interface coverage before additional addresses; hot-plugged
+interfaces enter bounded probing without waiting for a full route refresh.
+
+Local RX/TX counters come from the complete interface, not just sccache.
+Bulk body accounting distinguishes managed bytes from estimated external
+traffic and tracks concurrent streams; completed real transfers are classified
+as clean, busy or unknown using endpoint counter deltas and overlap
+generations. Slow busy/unknown samples do not erase or indefinitely extend
+a recent clean rate. Contemporaneous total load and active reservations
+influence actual path costs. Only known physical full-duplex Ethernet links
+supply nominal line capacity; wireless and virtual interfaces are not
+assumed independent physical resources. Socket-local addresses are used for
+receiver measurements where exposed by the transport; unbound uploads use
+a prior actual upload source as an advisory hint, and a changed source
+invalidates its classification.
+
+Worker heartbeat and client allocation include bounded per-interface
+total/external RX/TX service and address inventory. Verified peer downloads
+also report encoded/logical size ratio. Placement caps measured wire rates
+at available known Ethernet endpoint capacity, translates direct logical
+service using its encoded ratio, and accounts for the combined wire
+demand when concurrent scheduler publication and direct client delivery
+share the worker's same known sender interface. Separate interface addresses
+on one device are grouped. Distinct devices are not proof of independent
+end-to-end paths; shared router, switch and Wi-Fi airtime constraints beyond
+the endpoint still require synchronized overlap observations.
+
 The receiver compares authenticated route latency and directional effective
 goodput, using the scheduler as the durable fallback for committed results.
 An absent scheduler input can be obtained from a reachable worker without
