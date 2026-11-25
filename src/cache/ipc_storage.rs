@@ -90,6 +90,9 @@ impl IpcStorage {
     pub(crate) fn dist_client(
         &self,
         config: &crate::config::DistConfig,
+        #[cfg(target_os = "linux")] digest_provider: Option<
+            crate::build_runtime::DescriptorDigestProvider,
+        >,
     ) -> crate::server::DistClientContainer {
         use crate::server::{DistClientContainer, DistClientState};
         #[cfg(target_os = "linux")]
@@ -101,6 +104,7 @@ impl IpcStorage {
                     policy.clone(),
                     config.toolchains.clone(),
                     &config.native_installation_catalogs,
+                    digest_provider,
                 ),
             );
         }

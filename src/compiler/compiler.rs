@@ -1482,8 +1482,8 @@ pub enum CompileResult {
         Duration, // Compilation time
         Pin<Box<dyn Future<Output = Result<CacheWriteInfo>> + Send>>,
     ),
-    /// A native worker already published a result to the scheduler.
-    NativeMiss(MissType, DistType, Duration),
+    /// A native result was verified and delivered, either reused or published.
+    Native(crate::protocol::NativeCompileReport, Duration),
     /// Not in cache and do not cache the results of the compilation.
     NotCached(DistType, Duration),
     /// Not in cache, but the compilation result was determined to be not cacheable.
@@ -1510,8 +1510,8 @@ impl fmt::Debug for CompileResult {
             Self::CacheMiss(ref m, ref dt, ref d, _) => {
                 write!(f, "CompileResult::CacheMiss({d:?}, {m:?}, {dt:?}, _)")
             }
-            Self::NativeMiss(ref m, ref dt, ref d) => {
-                write!(f, "CompileResult::NativeMiss({m:?}, {dt:?}, {d:?})")
+            Self::Native(ref report, ref d) => {
+                write!(f, "CompileResult::Native({report:?}, {d:?})")
             }
             Self::NotCached(ref dt, ref d) => {
                 write!(f, "CompileResult::NotCached({dt:?}, {d:?}_")
@@ -1531,8 +1531,8 @@ impl PartialEq<Self> for CompileResult {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (&Self::Error, &Self::Error) | (&Self::CacheHit(_), &Self::CacheHit(_)) => true,
-            (Self::CacheMiss(m, dt, _, _), Self::CacheMiss(n, dt2, _, _))
-            | (Self::NativeMiss(m, dt, _), Self::NativeMiss(n, dt2, _)) => m == n && dt == dt2,
+            (Self::CacheMiss(m, dt, _, _), Self::CacheMiss(n, dt2, _, _)) => m == n && dt == dt2,
+            (Self::Native(a, _), Self::Native(b, _)) => a == b,
             (Self::NotCached(dt, _), Self::NotCached(dt2, _))
             | (Self::NotCacheable(dt, _), Self::NotCacheable(dt2, _))
             | (Self::CompileFailed(dt, _), Self::CompileFailed(dt2, _)) => dt == dt2,
@@ -1656,7 +1656,7 @@ fn is_known_c_compiler<P: AsRef<Path>>(p: P) -> bool {
 
 /// Installed compiler inputs needed during discovery. Native compilation
 /// shares the content memo with its subsequent executable-tree preparation.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CompilerDiscovery {
     pub dist_archive: Option<PathBuf>,
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
@@ -1664,28 +1664,38 @@ pub struct CompilerDiscovery {
 }
 
 impl CompilerDiscovery {
+    /// Hash one installed tool with the same verified content memo used
+    /// by native toolchain capture. Legacy discovery keeps its digest format.
+    pub async fn hash_toolchain_file(
+        &self,
+        path: &Path,
+        pool: &tokio::runtime::Handle,
+    ) -> Result<String> {
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        if let Some(cache) = &self.native_digests {
+            let path = path.to_owned();
+            let cache = Arc::clone(cache);
+            return pool
+                .spawn_blocking(move || {
+                    let blob = cache.file_digest(&path)?;
+                    Ok(crate::util::hex(&blob.id.0))
+                })
+                .await?;
+        }
+        Digest::file(path, pool).await
+    }
+
     pub async fn hash_toolchain_files(
         &self,
         files: &[PathBuf],
         pool: &tokio::runtime::Handle,
     ) -> Result<Vec<String>> {
-        #[cfg(all(feature = "dist-client", target_os = "linux"))]
-        if let Some(cache) = &self.native_digests {
-            let tasks = files.iter().map(|path| {
-                let path = path.clone();
-                let cache = Arc::clone(cache);
-                pool.spawn_blocking(move || {
-                    let blob = cache.file_digest(&path)?;
-                    // Preserve the original sccache hex representation.
-                    Ok::<_, anyhow::Error>(crate::util::hex(&blob.id.0))
-                })
-            });
-            return futures::future::try_join_all(tasks)
-                .await?
-                .into_iter()
-                .collect();
-        }
-        crate::util::hash_all(files, pool).await
+        futures::future::try_join_all(
+            files
+                .iter()
+                .map(|path| self.hash_toolchain_file(path, pool)),
+        )
+        .await
     }
 }
 
@@ -1735,6 +1745,7 @@ where
             },
             executable.to_owned(),
             &pool,
+            &discovery,
         )
         .await
         .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
@@ -1747,6 +1758,7 @@ where
             },
             executable.to_owned(),
             &pool,
+            &discovery,
         )
         .await
         .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
@@ -1759,11 +1771,21 @@ where
             },
             executable.to_owned(),
             &pool,
+            &discovery,
         )
         .await
         .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
     } else if is_known_c_compiler(executable) {
-        let cc = detect_c_compiler(creator, executable, args, cwd, env.to_vec(), pool).await;
+        let cc = detect_c_compiler(
+            creator,
+            executable,
+            args,
+            cwd,
+            env.to_vec(),
+            pool,
+            &discovery,
+        )
+        .await;
         return cc.map(|c| (c, None));
     } else {
         // Even if it does not look like rustc like it might still be rustc driver
@@ -1777,7 +1799,7 @@ where
         rustc_executable.to_path_buf(),
         env,
         cwd.to_path_buf(),
-        discovery,
+        discovery.clone(),
         pool.clone(),
     )
     .await
@@ -1787,8 +1809,16 @@ where
             // in case we attempted to test for rustc while it didn't look like it, fallback to c compiler detection one lat time
             if maybe_rustc_executable.is_none() {
                 let executable = executable.to_path_buf();
-                let cc =
-                    detect_c_compiler(creator, executable, args, cwd, env.to_vec(), pool).await;
+                let cc = detect_c_compiler(
+                    creator,
+                    executable,
+                    args,
+                    cwd,
+                    env.to_vec(),
+                    pool,
+                    &discovery,
+                )
+                .await;
                 cc.map(|c| (c, None))
             } else {
                 Err(e)
@@ -2037,6 +2067,7 @@ async fn detect_assembler<T>(
     cwd: &Path,
     env: &[(OsString, OsString)],
     pool: &tokio::runtime::Handle,
+    discovery: &CompilerDiscovery,
 ) -> Option<String>
 where
     T: CommandCreatorSync,
@@ -2044,7 +2075,8 @@ where
     let version = assembler_version(creator, executable, extra_args, env).await;
     let path = assembler_path(creator, executable, extra_args, cwd, env).await;
     let contents = match &path {
-        Some(path) => Digest::file(path, pool)
+        Some(path) => discovery
+            .hash_toolchain_file(path, pool)
             .await
             .map_err(|e| debug!("Failed to hash assembler {}: {e}", path.display()))
             .ok(),
@@ -2072,6 +2104,7 @@ async fn detect_c_compiler<T, P>(
     cwd: &Path,
     env: Vec<(OsString, OsString)>,
     pool: tokio::runtime::Handle,
+    discovery: &CompilerDiscovery,
 ) -> Result<Box<dyn Compiler<T>>>
 where
     T: CommandCreatorSync,
@@ -2185,6 +2218,7 @@ compiler_version=__VERSION__
                     cwd,
                     &env,
                     &pool,
+                    discovery,
                 )
                 .await;
                 return CCompiler::new(
@@ -2196,6 +2230,7 @@ compiler_version=__VERSION__
                     },
                     executable,
                     &pool,
+                    discovery,
                 )
                 .await
                 .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
@@ -2208,6 +2243,7 @@ compiler_version=__VERSION__
                     },
                     executable,
                     &pool,
+                    discovery,
                 )
                 .await
                 .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
@@ -2215,7 +2251,7 @@ compiler_version=__VERSION__
             "gcc" | "g++" => {
                 debug!("Found {kind}");
                 let assembler_digest =
-                    detect_assembler(&creator, &executable, &[], cwd, &env, &pool).await;
+                    detect_assembler(&creator, &executable, &[], cwd, &env, &pool, discovery).await;
                 return CCompiler::new(
                     Gcc {
                         gplusplus: kind == "g++",
@@ -2224,6 +2260,7 @@ compiler_version=__VERSION__
                     },
                     executable,
                     &pool,
+                    discovery,
                 )
                 .await
                 .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
@@ -2249,6 +2286,7 @@ compiler_version=__VERSION__
                     },
                     executable,
                     &pool,
+                    discovery,
                 )
                 .await
                 .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
@@ -2273,6 +2311,7 @@ compiler_version=__VERSION__
                     },
                     executable,
                     &pool,
+                    discovery,
                 )
                 .await
                 .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
@@ -2286,13 +2325,14 @@ compiler_version=__VERSION__
                     },
                     executable,
                     &pool,
+                    discovery,
                 )
                 .await
                 .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
             }
             "tasking_vx" => {
                 debug!("Found Tasking VX");
-                return CCompiler::new(TaskingVX, executable, &pool)
+                return CCompiler::new(TaskingVX, executable, &pool, discovery)
                     .await
                     .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
             }

@@ -74,11 +74,97 @@ managed_dist_processes_match() {
     done
 }
 
+metrics_verify_seconds() {
+    local heartbeat_ms="$1"
+    local verify_seconds
+
+    if [[ -n "$METRICS_VERIFY_SECONDS" ]]; then
+        [[ "$METRICS_VERIFY_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+            echo "sccache-release-update: invalid SCCACHE_AUTOUPDATE_METRICS_VERIFY_SECONDS: $METRICS_VERIFY_SECONDS" >&2
+            return 1
+        }
+        printf '%s\n' "$METRICS_VERIFY_SECONDS"
+        return 0
+    fi
+
+    if [[ "$heartbeat_ms" =~ ^[1-9][0-9]*$ ]]; then
+        # Observe at least one full configured heartbeat interval, plus enough
+        # slack for ingestion/query latency. Keep the historical 20s floor for
+        # daemons that emit more frequently than that.
+        verify_seconds=$(( (heartbeat_ms + 999) / 1000 + 15 ))
+        (( verify_seconds >= 20 )) || verify_seconds=20
+    else
+        verify_seconds=20
+    fi
+    printf '%s\n' "$verify_seconds"
+}
+
+verify_metrics_heartbeat() {
+    local not_before="$1"
+    local pid metrics_url heartbeat_ms instance service query_url query verify_seconds deadline response
+    (( VERIFY_METRICS == 1 )) || return 0
+
+    pid="$(systemctl show -p MainPID --value "$LOCAL_SERVICE")"
+    [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/environ" ]] || {
+        echo "sccache-release-update: cannot inspect metrics environment for $LOCAL_SERVICE" >&2
+        return 1
+    }
+    metrics_url="$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^SCCACHE_METRICS_URL=//p' | head -n1)"
+    heartbeat_ms="$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^SCCACHE_METRICS_HEARTBEAT_MS=//p' | head -n1)"
+    instance="$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^SCCACHE_METRICS_INSTANCE=//p' | head -n1)"
+    service="$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^SCCACHE_METRICS_SERVICE=//p' | head -n1)"
+    [[ -n "$instance" ]] || instance="$(hostname)"
+    [[ -n "$metrics_url" ]] || {
+        echo "sccache-release-update: telemetry is required but $LOCAL_SERVICE lacks SCCACHE_METRICS_URL" >&2
+        return 1
+    }
+
+    query_url="$METRICS_QUERY_URL"
+    if [[ -z "$query_url" && "$metrics_url" == */api/v1/import/prometheus ]]; then
+        query_url="${metrics_url%/api/v1/import/prometheus}/api/v1/query"
+    fi
+    [[ -n "$query_url" ]] || {
+        echo "sccache-release-update: cannot infer metrics query URL from $metrics_url; set SCCACHE_AUTOUPDATE_METRICS_QUERY_URL" >&2
+        return 1
+    }
+
+    query="$(python3 - "$instance" "$service" <<'PYQ'
+import json, sys
+instance, service = sys.argv[1:]
+labels = [f'job={json.dumps("sccache")}', f'instance={json.dumps(instance)}', f'resolution={json.dumps("raw")}']
+if service:
+    labels.append(f'service={json.dumps(service)}')
+print('timestamp(sccache_info{' + ','.join(labels) + '})')
+PYQ
+)"
+    verify_seconds="$(metrics_verify_seconds "$heartbeat_ms")"
+    deadline=$((SECONDS + verify_seconds))
+    while (( SECONDS <= deadline )); do
+        if response="$(curl -fsS --connect-timeout 2 --max-time 3 --get --data-urlencode "query=$query" "$query_url" 2>/dev/null)" &&
+           printf '%s' "$response" | python3 -c 'import json,sys
+not_before=float(sys.argv[1]); data=json.load(sys.stdin)
+values=[float(item["value"][1]) for item in data.get("data",{}).get("result",[]) if item.get("value")]
+raise SystemExit(0 if values and max(values) >= not_before else 1)' "$not_before"
+        then
+            return 0
+        fi
+        sleep 0.25
+    done
+    echo "sccache-release-update: no fresh direct-metrics heartbeat after restart within ${verify_seconds}s" >&2
+    return 1
+}
+
+
 case "${1:-}" in
     "") ;;
     --check-only) MODE=check ;;
     --plan-only) MODE=plan ;;
-    *) echo "usage: $0 [--check-only|--plan-only]" >&2; exit 2 ;;
+    --verify-running-metrics)
+        [[ $# == 2 && "$2" =~ ^[0-9]+$ && $EUID == 0 ]] || exit 2
+        verify_metrics_heartbeat "$2"
+        exit $?
+        ;;
+    *) echo "usage: $0 [--check-only|--plan-only|--verify-running-metrics TIMESTAMP]" >&2; exit 2 ;;
 esac
 
 if [[ "$MODE" == check ]]; then
@@ -95,6 +181,10 @@ fi
 mkdir -p "$STATE_DIR" "$CACHE_DIR" "$(dirname "$LOCK")"
 exec 9>"$LOCK"
 flock -n 9 || exit 0
+if [[ "$MODE" == apply && -e /etc/systemd/system/sccache-fleet-rollout-drain ]]; then
+    echo "Coordinated fleet rollout is in progress; refusing independent update" >&2
+    exit 75
+fi
 
 api="https://api.github.com/repos/$REPO"
 ua="sentinelo2-sccache-autoupdate/1"
@@ -371,85 +461,6 @@ local_sccache() {
     fi
 }
 
-metrics_verify_seconds() {
-    local heartbeat_ms="$1"
-    local verify_seconds
-
-    if [[ -n "$METRICS_VERIFY_SECONDS" ]]; then
-        [[ "$METRICS_VERIFY_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
-            echo "sccache-release-update: invalid SCCACHE_AUTOUPDATE_METRICS_VERIFY_SECONDS: $METRICS_VERIFY_SECONDS" >&2
-            return 1
-        }
-        printf '%s\n' "$METRICS_VERIFY_SECONDS"
-        return 0
-    fi
-
-    if [[ "$heartbeat_ms" =~ ^[1-9][0-9]*$ ]]; then
-        # Observe at least one full configured heartbeat interval, plus enough
-        # slack for ingestion/query latency. Keep the historical 20s floor for
-        # daemons that emit more frequently than that.
-        verify_seconds=$(( (heartbeat_ms + 999) / 1000 + 15 ))
-        (( verify_seconds >= 20 )) || verify_seconds=20
-    else
-        verify_seconds=20
-    fi
-    printf '%s\n' "$verify_seconds"
-}
-
-verify_metrics_heartbeat() {
-    local not_before="$1"
-    local pid metrics_url heartbeat_ms instance service query_url query verify_seconds deadline response
-    (( VERIFY_METRICS == 1 )) || return 0
-
-    pid="$(systemctl show -p MainPID --value "$LOCAL_SERVICE")"
-    [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/environ" ]] || {
-        echo "sccache-release-update: cannot inspect metrics environment for $LOCAL_SERVICE" >&2
-        return 1
-    }
-    metrics_url="$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^SCCACHE_METRICS_URL=//p' | head -n1)"
-    heartbeat_ms="$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^SCCACHE_METRICS_HEARTBEAT_MS=//p' | head -n1)"
-    instance="$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^SCCACHE_METRICS_INSTANCE=//p' | head -n1)"
-    service="$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^SCCACHE_METRICS_SERVICE=//p' | head -n1)"
-    [[ -n "$instance" ]] || instance="$(hostname)"
-    [[ -n "$metrics_url" ]] || {
-        echo "sccache-release-update: telemetry is required but $LOCAL_SERVICE lacks SCCACHE_METRICS_URL" >&2
-        return 1
-    }
-
-    query_url="$METRICS_QUERY_URL"
-    if [[ -z "$query_url" && "$metrics_url" == */api/v1/import/prometheus ]]; then
-        query_url="${metrics_url%/api/v1/import/prometheus}/api/v1/query"
-    fi
-    [[ -n "$query_url" ]] || {
-        echo "sccache-release-update: cannot infer metrics query URL from $metrics_url; set SCCACHE_AUTOUPDATE_METRICS_QUERY_URL" >&2
-        return 1
-    }
-
-    query="$(python3 - "$instance" "$service" <<'PYQ'
-import json, sys
-instance, service = sys.argv[1:]
-labels = [f'job={json.dumps("sccache")}', f'instance={json.dumps(instance)}', f'resolution={json.dumps("raw")}']
-if service:
-    labels.append(f'service={json.dumps(service)}')
-print('timestamp(sccache_info{' + ','.join(labels) + '})')
-PYQ
-)"
-    verify_seconds="$(metrics_verify_seconds "$heartbeat_ms")"
-    deadline=$((SECONDS + verify_seconds))
-    while (( SECONDS <= deadline )); do
-        if response="$(curl -fsS --connect-timeout 2 --max-time 3 --get --data-urlencode "query=$query" "$query_url" 2>/dev/null)" &&
-           printf '%s' "$response" | python3 -c 'import json,sys
-not_before=float(sys.argv[1]); data=json.load(sys.stdin)
-values=[float(item["value"][1]) for item in data.get("data",{}).get("result",[]) if item.get("value")]
-raise SystemExit(0 if values and max(values) >= not_before else 1)' "$not_before"
-        then
-            return 0
-        fi
-        sleep 0.25
-    done
-    echo "sccache-release-update: no fresh direct-metrics heartbeat after restart within ${verify_seconds}s" >&2
-    return 1
-}
 
 scheduler_ready() {
     curl -fsS --connect-timeout 3 --max-time 5         "$SCHEDULER_URL/api/v1/scheduler/status" >/dev/null 2>&1

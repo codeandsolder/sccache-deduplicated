@@ -2088,15 +2088,24 @@ where
                             debug!("stats after compile result: {stats:?}");
                             cache_write = Some(future);
                         }
-                        CompileResult::NativeMiss(miss_type, dt, duration) => {
-                            if miss_type == MissType::ForcedRecache {
-                                stats.forced_recaches += 1;
+                        CompileResult::Native(report, duration) => {
+                            use crate::protocol::NativeBuildSource;
+                            res.native = Some(report);
+                            if report.source == NativeBuildSource::Hit {
+                                stats.cache_hits.increment(&kind, lang);
+                                stats.cache_read_hit_duration += duration;
+                            } else {
+                                if report.mode == crate::build_runtime::ActionMode::Refresh {
+                                    stats.forced_recaches += 1;
+                                }
+                                if let NativeBuildSource::Worker(addr) = report.source {
+                                    dist_type = DistType::Ok(addr.to_string());
+                                }
+                                stats.compilations += 1;
+                                stats.cache_misses.increment(&kind, lang);
+                                stats.compiler_write_duration += duration;
+                                stats.cache_writes += 1;
                             }
-                            dist_type = dt;
-                            stats.compilations += 1;
-                            stats.cache_misses.increment(&kind, lang);
-                            stats.compiler_write_duration += duration;
-                            stats.cache_writes += 1;
                         }
                         CompileResult::NotCached(dt, duration) => {
                             debug!("[{out_pretty}]: compile result: not cached");

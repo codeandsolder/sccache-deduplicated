@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use bincode::Options;
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
