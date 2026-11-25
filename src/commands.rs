@@ -807,7 +807,11 @@ where
             let (tx, _rx) = futures::channel::mpsc::channel(1);
             let (_, info) = server::WaitUntilZero::new();
             #[cfg(feature = "dist-client")]
-            let dist_client = storage.dist_client(&config.dist);
+            let dist_client = storage.dist_client(
+                &config.dist,
+                #[cfg(target_os = "linux")]
+                None,
+            );
             #[cfg(not(feature = "dist-client"))]
             let dist_client = server::DistClientContainer::new_disabled();
             let service = server::SccacheService::<C>::new(

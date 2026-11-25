@@ -1,10 +1,12 @@
 //! Root-owned shared daemon; compiler work is delegated to a private child
 //! which enters the peer's filesystem and irreversibly assumes its credentials.
+#[cfg(feature = "dist-client")]
+mod digests;
 mod executor;
 mod peer;
 pub use peer::Peer;
 
-use super::{Message, Phase, SccacheResponse, SccacheService, activity};
+use super::{Message, SccacheResponse, SccacheService, activity};
 use crate::config::{CompilerAliases, Config, SharedDaemonConfig};
 use crate::jobserver::Client;
 use crate::mock_command::CommandCreatorSync;
@@ -13,7 +15,7 @@ use anyhow::{Context, Result, ensure};
 use bincode::Options;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, chown};
 use std::os::unix::net::UnixStream;
@@ -29,6 +31,8 @@ const BROKER_FD: libc::c_int = 3;
 const MOUNT_FD: libc::c_int = 4;
 const ROOT_FD: libc::c_int = 5;
 const STDIN_FD: libc::c_int = 6;
+#[cfg(feature = "dist-client")]
+const DIGEST_FD: libc::c_int = 7;
 
 #[derive(Serialize, Deserialize)]
 struct Credentials {
@@ -42,6 +46,7 @@ struct Credentials {
 
 #[derive(Serialize, Deserialize)]
 struct Job {
+    activity_id: String,
     compile: Compile,
     aliases: CompilerAliases,
     // Tagged serde enums are not supported by bincode. These contain
@@ -50,12 +55,20 @@ struct Job {
     catalogs: Vec<std::path::PathBuf>,
 }
 
+#[derive(Serialize, Deserialize)]
+enum ExecutorEvent {
+    Progress(activity::CompileActivity),
+    Finished(std::result::Result<CompileFinished, String>),
+}
+
 pub(super) struct SharedExecutor {
     pub(super) policy: SharedDaemonConfig,
     jobserver: Client,
     aliases: CompilerAliases,
     toolchains: Vec<u8>,
     catalogs: Vec<std::path::PathBuf>,
+    #[cfg(feature = "dist-client")]
+    digest_memo: Arc<crate::build_runtime::DescriptorMemo>,
 }
 
 fn root_owned(metadata: &fs::Metadata) -> bool {
@@ -169,13 +182,30 @@ fn decode_frame<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
         .deserialize(bytes)?)
 }
 
-async fn read_result(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<CompileFinished> {
-    let len = reader.read_u32().await? as usize;
-    ensure!(len <= MAX_FRAME, "shared executor result exceeds limit");
-    let mut bytes = vec![0; len];
-    reader.read_exact(&mut bytes).await?;
-    let result: std::result::Result<CompileFinished, String> = decode_frame(&bytes)?;
-    result.map_err(anyhow::Error::msg)
+fn read_sync_frame<T: DeserializeOwned>(input: &mut impl Read) -> Result<T> {
+    let mut length = [0_u8; 4];
+    input.read_exact(&mut length)?;
+    let len = u32::from_be_bytes(length) as usize;
+    ensure!(len <= MAX_FRAME, "shared executor input exceeds limit");
+    let mut data = vec![0; len];
+    input.read_exact(&mut data)?;
+    decode_frame(&data)
+}
+
+async fn read_result(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    activity: &activity::Activity,
+) -> Result<CompileFinished> {
+    loop {
+        let len = reader.read_u32().await? as usize;
+        ensure!(len <= MAX_FRAME, "shared executor result exceeds limit");
+        let mut bytes = vec![0; len];
+        reader.read_exact(&mut bytes).await?;
+        match decode_frame(&bytes)? {
+            ExecutorEvent::Progress(sample) => activity.observe_executor(sample)?,
+            ExecutorEvent::Finished(result) => return result.map_err(anyhow::Error::msg),
+        }
+    }
 }
 
 // On cancellation, kill the private process group while the child PID is
@@ -212,6 +242,8 @@ impl SharedExecutor {
             aliases: config.compiler_aliases.clone(),
             toolchains: serde_json::to_vec(&config.dist.toolchains)?,
             catalogs: config.dist.native_installation_catalogs.clone(),
+            #[cfg(feature = "dist-client")]
+            digest_memo: Arc::default(),
         })
     }
 
@@ -244,15 +276,21 @@ impl SharedExecutor {
         C: CommandCreatorSync + Clone + Send + Sync + 'static,
     {
         // The central jobserver gates all UIDs and every private executor.
+        let activity = activity::current().context("missing shared compile activity")?;
+        let waiting = activity::ChildActivity::waiting();
         let _token = self.jobserver.acquire().await?;
+        drop(waiting);
         ensure!(peer::alive(peer.pidfd.as_fd())?, "compile requester exited");
-        activity::phase(Phase::LocalCompile);
         let (broker, helper) = UnixStream::pair()?;
+        #[cfg(feature = "dist-client")]
+        let (digest_broker, digest_helper) = UnixStream::pair()?;
         let descriptors = [
             (duplicate_high(helper.as_fd())?, BROKER_FD),
             (duplicate_high(peer.mount.as_fd())?, MOUNT_FD),
             (duplicate_high(peer.root.as_fd())?, ROOT_FD),
             (duplicate_high(peer.stdin.as_fd())?, STDIN_FD),
+            #[cfg(feature = "dist-client")]
+            (duplicate_high(digest_helper.as_fd())?, DIGEST_FD),
         ];
         let mut command = std::process::Command::new("/proc/self/exe");
         command
@@ -281,6 +319,14 @@ impl SharedExecutor {
         let pid = i32::try_from(child.id().context("missing executor PID")?)?;
         let mut group = GroupGuard(Some(pid));
         drop(helper);
+        #[cfg(feature = "dist-client")]
+        let digest_task = {
+            drop(digest_helper);
+            let pidfd = digests::pidfd(pid)?;
+            let scope = digests::scope(&peer)?;
+            let memo = Arc::clone(&self.digest_memo);
+            tokio::task::spawn_blocking(move || digests::serve(digest_broker, &pidfd, scope, &memo))
+        };
         broker.set_nonblocking(true)?;
         let broker = tokio::net::UnixStream::from_std(broker)?;
         let broker_task = crate::util::spawn(
@@ -289,6 +335,7 @@ impl SharedExecutor {
 
         let mut input = child.stdin.take().context("missing executor input")?;
         let job = Job {
+            activity_id: activity.snapshot().id,
             compile,
             aliases: self.aliases.clone(),
             toolchains: self.toolchains.clone(),
@@ -299,11 +346,13 @@ impl SharedExecutor {
         input.shutdown().await?;
         drop(input);
         let mut output = child.stdout.take().context("missing executor output")?;
-        let result = read_result(&mut output).await?;
+        let result = read_result(&mut output, &activity).await?;
         let status = child.wait().await?;
         group.0 = None;
         // Wait until the private connection has closed, including pending stats.
         broker_task.await??;
+        #[cfg(feature = "dist-client")]
+        digest_task.await??;
         ensure!(status.success(), "shared executor exited with {status}");
         Ok(result)
     }

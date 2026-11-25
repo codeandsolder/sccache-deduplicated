@@ -87,21 +87,28 @@ pub(super) fn alive(pidfd: BorrowedFd<'_>) -> io::Result<bool> {
     }
 }
 
-fn stdin_fd(pidfd: BorrowedFd<'_>) -> Result<OwnedFd> {
-    // SAFETY: the pidfd identifies this authenticated peer, and the kernel
-    // duplicates fd 0 only. No requester-supplied descriptor or PID is used.
-    let result = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), 0, 0) };
+pub(super) fn duplicate_fd(pidfd: BorrowedFd<'_>, fd: libc::c_int) -> io::Result<OwnedFd> {
+    // SAFETY: pidfd identifies a live process, and successful pidfd_getfd
+    // returns a new owned CLOEXEC descriptor for the specified open file.
+    let result = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
     if result < 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EBADF) {
-            return Ok(File::open("/dev/null")?.into());
-        }
-        return Err(error)
-            .context("cannot duplicate peer stdin; shared daemon requires CAP_SYS_PTRACE");
+        return Err(io::Error::last_os_error());
     }
-    let fd = libc::c_int::try_from(result)?;
-    // SAFETY: a successful pidfd_getfd returns a new owned CLOEXEC descriptor.
+    let fd = libc::c_int::try_from(result).map_err(io::Error::other)?;
+    // SAFETY: the syscall returned an owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn stdin_fd(pidfd: BorrowedFd<'_>) -> Result<OwnedFd> {
+    match duplicate_fd(pidfd, 0) {
+        Ok(fd) => Ok(fd),
+        Err(error) if error.raw_os_error() == Some(libc::EBADF) => {
+            Ok(File::open("/dev/null")?.into())
+        }
+        Err(error) => {
+            Err(error).context("cannot duplicate peer stdin; shared daemon requires CAP_SYS_PTRACE")
+        }
+    }
 }
 
 fn read_umask(proc: &Path) -> Result<u32> {

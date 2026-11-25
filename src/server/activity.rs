@@ -212,13 +212,28 @@ impl Activity {
     // clock value. Repeated observations of a phase can never renew it.
     pub(super) fn observe(&self, sample: CompileActivity) -> Result<()> {
         ensure!(
-            self.owner == CompileOwner::Namespace
-                && sample.owner == self.owner
+            self.owner == CompileOwner::Namespace,
+            "not a namespace activity"
+        );
+        self.apply_observation(sample)
+    }
+
+    // Only the private, daemon-spawned executor pipe calls this. The public
+    // observation RPC remains restricted to namespace-owned compilation.
+    #[cfg(target_os = "linux")]
+    pub(super) fn observe_executor(&self, sample: CompileActivity) -> Result<()> {
+        ensure!(self.owner == CompileOwner::Daemon, "not a daemon activity");
+        self.apply_observation(sample)
+    }
+
+    fn apply_observation(&self, sample: CompileActivity) -> Result<()> {
+        ensure!(
+            sample.owner == self.owner
                 && sample.id == self.id
                 && sample.client_pid == self.client_pid
                 && sample.compiler == self.compiler
                 && sample.cwd == self.cwd,
-            "namespace compile observation identity mismatch"
+            "compile observation identity mismatch"
         );
         let now = Instant::now();
         let age = Duration::from_millis(sample.phase_age_ms).min(now.duration_since(self.started));
@@ -349,6 +364,11 @@ pub(crate) fn scope<F: Future>(
     CURRENT.scope(Some(Arc::clone(activity)), future)
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn current() -> Option<Arc<Activity>> {
+    CURRENT.try_with(Clone::clone).ok().flatten()
+}
+
 pub fn phase(phase: Phase) {
     let _ = CURRENT.try_with(|current| {
         if let Some(activity) = current {
@@ -422,6 +442,42 @@ pub fn job(id: u64, worker: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn executor_observations_preserve_daemon_deadlines() -> Result<()> {
+        let identity = CompileIdentity {
+            client_pid: 42,
+            exe: "/usr/bin/rustc".into(),
+            cwd: "/build".into(),
+        };
+        let registry = Registry::default();
+        let registration = registry.register(&identity, CompileOwner::Daemon);
+        let parent = &registration.activity;
+        let child = Activity::new(parent.snapshot().id, &identity, CompileOwner::Daemon);
+        let limits = CompileLimits {
+            phase_timeout_secs: 10,
+            execution_timeout_secs: 30,
+        };
+        child.phase(Phase::PlanCompile);
+        tokio::time::advance(Duration::from_secs(6)).await;
+        parent.observe_executor(child.snapshot())?;
+        assert_eq!(parent.snapshot().phase_age_ms, 6000);
+        assert!(parent.observe(child.snapshot()).is_err());
+        let mut invalid = child.snapshot();
+        invalid.client_pid += 1;
+        assert!(parent.observe_executor(invalid).is_err());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let mut stale = child.snapshot();
+        stale.phase_age_ms = 0;
+        parent.observe_executor(stale)?;
+        assert!(parent.snapshot().deadline_error(limits).is_some());
+        child.phase(Phase::RunDistributed);
+        parent.observe_executor(child.snapshot())?;
+        assert!(parent.snapshot().deadline_error(limits).is_none());
+        assert_eq!(parent.snapshot().owner, CompileOwner::Daemon);
+        Ok(())
+    }
 
     #[tokio::test(start_paused = true)]
     async fn caller_observation_cannot_renew_same_phase_and_preserves_transition_age() -> Result<()>

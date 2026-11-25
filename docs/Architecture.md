@@ -100,7 +100,20 @@ stderr) and the exit code travel back to the CLI.
       C-->>B: exit code + outputs
 ```
 
+### Shared multi-UID server-owned execution (Linux)
+
+A root-owned shared daemon authenticates Unix peers, snapshots the mount/root
+view and credentials, and starts a private helper that drops to those
+credentials before discovering or executing compilers. Cache authority remains
+in the daemon. Private helper progress is reported to the daemon, with
+monotonic phase deadlines and cancellation. The shared supervisor retains
+bounded, version-checked toolchain digest metadata across helpers, scoped to
+credentials and filesystem view. It duplicates only already-open descriptors
+to inspect their metadata; hashing occurs in the unprivileged helper.
+
 ### Client-side mode (`SCCACHE_CLIENT_SIDE`)
+
+Not permitted on managed shared-daemon endpoints.
 
 The compile pipeline runs **in the CLI process itself**. The existing daemon
 owns storage, statistics, toolchain caching and distributed scheduler
