@@ -76,7 +76,7 @@ mod common {
         Success {
             job_alloc: dist::JobAlloc,
             need_toolchain: bool,
-            address: std::net::SocketAddr,
+            routes: sccache_peer_identity::RouteSet,
         },
         Fail {
             msg: String,
@@ -85,7 +85,7 @@ mod common {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct WorkerRouteHttpResponse {
-        pub address: std::net::SocketAddr,
+        pub routes: sccache_peer_identity::RouteSet,
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -104,7 +104,14 @@ mod common {
         pub active_job_ids: Vec<dist::JobId>,
         pub native_placement: Option<dist::NativePlacement>,
         pub server_nonce: dist::ServerNonce,
-        pub address: std::net::SocketAddr,
+        pub routes: sccache_peer_identity::RouteSet,
+    }
+
+    #[cfg(feature = "dist-server")]
+    #[derive(Serialize, Deserialize)]
+    pub struct HeartbeatReply {
+        pub result: dist::HeartbeatServerResult,
+        pub revoked: Vec<sccache_peer_identity::PeerId>,
     }
 
     #[cfg(feature = "dist-server")]
@@ -115,7 +122,7 @@ mod common {
                 .field("active_job_ids", &self.active_job_ids)
                 .field("native_placement_present", &self.native_placement.is_some())
                 .field("server_nonce", &self.server_nonce)
-                .field("address", &self.address)
+                .field("routes", &self.routes)
                 // JWT signing key is deliberately not logged.
                 .finish_non_exhaustive()
         }
@@ -134,7 +141,10 @@ mod common {
                 active_job_ids: Vec::new(),
                 native_placement: None,
                 server_nonce: dist::ServerNonce::new(),
-                address: "127.0.0.1:10501".parse().unwrap(),
+                routes: sccache_peer_identity::RouteSet::new(
+                    "127.0.0.1:10501".parse().unwrap(),
+                    [],
+                ),
             };
             let debug = format!("{heartbeat:?}");
             assert!(!debug.contains(&encoded_secret));
@@ -267,7 +277,7 @@ mod server {
     use std::time::{Duration, Instant};
 
     use super::common::{
-        AllocJobHttpResponse, HeartbeatServerHttpRequest, ReqwestRequestBuilderExt,
+        AllocJobHttpResponse, HeartbeatReply, HeartbeatServerHttpRequest, ReqwestRequestBuilderExt,
         RunJobHttpRequest, WorkerNameHttpResponse, WorkerRouteHttpResponse,
     };
     use super::transport::{self, send_blocking};
@@ -1020,12 +1030,12 @@ mod server {
             let current = Arc::new(Mutex::new(credential));
             let outbound = Arc::clone(&current);
             let requester = Arc::new(SchedulerRequester {
-                routes: BlockingRoutes::new(move || {
+                routes: Arc::new(BlockingRoutes::new(move || {
                     outbound
                         .lock()
                         .map(|leaf| Arc::clone(&leaf))
                         .map_err(|_| anyhow!("scheduler credentials poisoned"))
-                }),
+                })),
                 addresses: Mutex::default(),
             });
             let handler = Arc::new(handler);
@@ -1068,6 +1078,9 @@ mod server {
                         }
                     }
                 })?;
+            let native_endpoint = native_cache
+                .as_ref()
+                .map(|config| (config.public_addr, config.listener_address()));
             if let Some(config) = native_cache {
                 let handler = Arc::clone(&handler);
                 let requester = Arc::clone(&requester);
@@ -1092,7 +1105,7 @@ mod server {
                             anyhow::ensure!(!need_toolchain, "native allocation requested archive");
                             Ok(ScheduleReply::Assigned(WorkerAllocation {
                                 peer: job_alloc.server_id,
-                                address: allocation_routes.address(job_alloc.server_id)?,
+                                routes: allocation_routes.addresses(job_alloc.server_id)?,
                                 job: job_alloc.job_id.0,
                                 auth: job_alloc.auth,
                             }))
@@ -1146,6 +1159,7 @@ mod server {
             info!("Scheduler listening for clients on {}", public_addr);
             let request_count = atomic::AtomicUsize::new(0);
 
+            let registry = Arc::clone(&enrollment);
             let server = Listener::bind(
                 public_addr,
                 tls,
@@ -1166,17 +1180,25 @@ mod server {
                                 let alloc_job_res: AllocJobResult = try_or_500_log!(req_id, handler.handle_alloc_job(&*requester, toolchain));
                                 let res = match alloc_job_res {
                                     AllocJobResult::Success { job_alloc, need_toolchain } => {
-                                        let address = try_or_500_log!(req_id, requester.address(job_alloc.server_id));
-                                        AllocJobHttpResponse::Success { job_alloc, need_toolchain, address }
+                                        let routes = try_or_500_log!(req_id, requester.addresses(job_alloc.server_id));
+                                        AllocJobHttpResponse::Success { job_alloc, need_toolchain, routes }
                                     }
                                     AllocJobResult::Fail { msg } => AllocJobHttpResponse::Fail { msg }
                                 };
                                 prepare_response(request, &res)
                             },
+                            (GET) (/api/v1/scheduler/native_routes) => {
+                                if let Some((primary, bind)) = native_endpoint {
+                                    let routes = crate::dist::cluster_routes::discover(primary, bind);
+                                    prepare_response(request, &WorkerRouteHttpResponse { routes })
+                                } else {
+                                    rouille::Response::empty_404()
+                                }
+                            },
                             (GET) (/api/v1/scheduler/worker_route/{server_id: ServerId}) => {
                                 if let Err(response) = authenticate_client(request) { return response; }
-                                let address = try_or_500_log!(req_id, requester.address(server_id));
-                                prepare_response(request, &WorkerRouteHttpResponse { address })
+                                let routes = try_or_500_log!(req_id, requester.addresses(server_id));
+                                prepare_response(request, &WorkerRouteHttpResponse { routes })
                             },
                             (GET) (/api/v1/scheduler/worker_name/{server_id: ServerId}) => {
                                 if let Err(response) = authenticate_client(request) {
@@ -1208,10 +1230,10 @@ mod server {
 
                                 let HeartbeatServerHttpRequest {
                                     cpu_capacity, active_job_ids, native_placement, jwt_key,
-                                    server_nonce, address,
+                                    server_nonce, routes,
                                 } = heartbeat_server;
                                 let job_authorizer = try_or_400_log!(req_id, JWTJobAuthorizer::boxed(&jwt_key));
-                                try_or_400_log!(req_id, requester.register(server_id, address));
+                                try_or_400_log!(req_id, requester.register(server_id, routes));
                                 let worker_name_nonce = server_nonce.clone();
                                 let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
                                     server_id, server_nonce,
@@ -1230,7 +1252,8 @@ mod server {
                                     // Display metadata must never take a healthy worker offline.
                                     warn!("Could not register display name for {server_id:?}: {error:#}");
                                 }
-                                prepare_response(request, &res)
+                                let revoked = try_or_500_log!(req_id, registry.authority().registry().revoked());
+                                prepare_response(request, &HeartbeatReply { result: res, revoked })
                             },
                             (POST) (/api/v1/scheduler/job_state/{job_id: JobId}) => {
                                 let server_id = check_server_auth_or_err!(request);
@@ -1266,36 +1289,48 @@ mod server {
     }
 
     pub(super) struct SchedulerRequester {
-        routes: BlockingRoutes,
-        addresses: Mutex<HashMap<ServerId, SocketAddr>>,
+        routes: Arc<BlockingRoutes>,
+        addresses: Mutex<HashMap<ServerId, (sccache_peer_identity::RouteSet, Instant)>>,
     }
 
     impl SchedulerRequester {
-        fn register(&self, id: ServerId, address: SocketAddr) -> Result<()> {
-            anyhow::ensure!(
-                !address.ip().is_unspecified()
-                    && !address.ip().is_multicast()
-                    && address.port() != 0,
-                "invalid worker endpoint"
-            );
-            self.addresses
+        fn register(&self, id: ServerId, routes: sccache_peer_identity::RouteSet) -> Result<()> {
+            anyhow::ensure!(routes.valid(), "invalid worker endpoints");
+            let mut addresses = self
+                .addresses
                 .lock()
-                .map_err(|_| anyhow!("worker routes poisoned"))?
-                .insert(id, address);
+                .map_err(|_| anyhow!("worker routes poisoned"))?;
+            addresses.retain(|_, (_, updated)| updated.elapsed() < HEARTBEAT_TIMEOUT);
+            addresses.insert(id, (routes.clone(), Instant::now()));
+            drop(addresses);
+            self.routes.prime(id, Role::Worker, &routes);
             Ok(())
         }
 
-        fn address(&self, id: ServerId) -> Result<SocketAddr> {
+        fn addresses(&self, id: ServerId) -> Result<sccache_peer_identity::RouteSet> {
             self.addresses
                 .lock()
                 .map_err(|_| anyhow!("worker routes poisoned"))?
                 .get(&id)
-                .copied()
+                .filter(|(_, updated)| updated.elapsed() < HEARTBEAT_TIMEOUT)
+                .map(|(routes, _)| routes.clone())
                 .context("worker route unavailable")
         }
 
-        fn endpoint(&self, id: ServerId) -> Result<(reqwest::blocking::Client, reqwest::Url)> {
-            self.routes.endpoint(id, Role::Worker, self.address(id)?)
+        fn endpoints(&self, id: ServerId) -> Result<Vec<SocketAddr>> {
+            Ok(self.routes.ordered(id, Role::Worker, &self.addresses(id)?))
+        }
+
+        fn endpoint(
+            &self,
+            id: ServerId,
+            address: SocketAddr,
+        ) -> Result<(reqwest::blocking::Client, reqwest::Url)> {
+            self.routes.endpoint(id, Role::Worker, address)
+        }
+
+        fn failed(&self, id: ServerId, address: SocketAddr) {
+            self.routes.failed(id, Role::Worker, address);
         }
     }
 
@@ -1307,20 +1342,36 @@ mod server {
             assignment: JobAssignment,
             auth: String,
         ) -> Result<AssignJobResult> {
-            let (client, base) = self.endpoint(server_id)?;
-            let url = match &assignment {
-                JobAssignment::Archive(_) => urls::server_assign_job(&base, job_id)?,
-                JobAssignment::Native(_) => urls::server_assign_native_job(&base, job_id)?,
-            };
-            let req = client.post(url);
-            let req = req.bearer_auth(auth).timeout(ASSIGN_JOB_TIMEOUT);
-            let req = match assignment {
-                JobAssignment::Archive(tc) => req.bincode(&tc)?,
-                JobAssignment::Native(assignment) => req
-                    .header("Content-Type", "application/octet-stream")
-                    .body(crate::dist::native::codec().serialize(&*assignment)?),
-            };
-            send_blocking(req).context("POST to worker assignment failed")
+            let mut last_error = None;
+            for address in self.endpoints(server_id)? {
+                let (client, base) = self.endpoint(server_id, address)?;
+                let url = match &assignment {
+                    JobAssignment::Archive(_) => urls::server_assign_job(&base, job_id)?,
+                    JobAssignment::Native(_) => urls::server_assign_native_job(&base, job_id)?,
+                };
+                let req = client
+                    .post(url)
+                    .bearer_auth(&auth)
+                    .timeout(ASSIGN_JOB_TIMEOUT);
+                let req = match &assignment {
+                    JobAssignment::Archive(tc) => req.bincode(tc)?,
+                    JobAssignment::Native(assignment) => req
+                        .header("Content-Type", "application/octet-stream")
+                        .body(crate::dist::native::codec().serialize(&**assignment)?),
+                };
+                match send_blocking(req) {
+                    Err(error)
+                        if error
+                            .downcast_ref::<reqwest::Error>()
+                            .is_some_and(reqwest::Error::is_connect) =>
+                    {
+                        self.failed(server_id, address);
+                        last_error = Some(error);
+                    }
+                    result => return result.context("POST to worker assignment failed"),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| anyhow!("worker has no route")))
         }
     }
 
@@ -1351,7 +1402,8 @@ mod server {
 
             Ok(Self {
                 public_addr,
-                bind_address: bind_address.unwrap_or(public_addr),
+                bind_address: bind_address
+                    .unwrap_or_else(|| crate::dist::cluster::wildcard(public_addr)),
                 peer,
                 jwt_key,
                 server_nonce,
@@ -1388,6 +1440,8 @@ mod server {
             });
             let heartbeat_requester = Arc::clone(&requester);
             let heartbeat_tls = Arc::clone(&tls);
+            let revocations = Arc::new(cluster_http::Revocations::default());
+            let heartbeat_revocations = Arc::clone(&revocations);
             thread::spawn(move || {
                 let mut last_renewal = Instant::now();
                 let mut active = credentials;
@@ -1429,7 +1483,7 @@ mod server {
                         native_placement: capabilities.native_placement,
                         jwt_key: heartbeat_jwt_key.clone(),
                         server_nonce: server_nonce.clone(),
-                        address: public_addr,
+                        routes: crate::dist::cluster_routes::discover(public_addr, bind_address),
                     };
                     if last_renewal.elapsed() >= Duration::from_hours(1) {
                         last_renewal = Instant::now();
@@ -1445,7 +1499,7 @@ mod server {
                             Err(error) => warn!("Worker certificate renewal failed: {error:#}"),
                         }
                     }
-                    let heartbeat_result = (|| -> Result<HeartbeatServerResult> {
+                    let heartbeat_result = (|| -> Result<HeartbeatReply> {
                         let (client, base) = heartbeat_requester.endpoint()?;
                         let mut heartbeat_request = client
                             .post(urls::scheduler_heartbeat_server(&base)?)
@@ -1474,10 +1528,15 @@ mod server {
                             .and_then(send_blocking)
                     })();
                     match heartbeat_result {
-                        Ok(HeartbeatServerResult {
-                            is_new,
-                            assigned_job_ids,
+                        Ok(HeartbeatReply {
+                            result:
+                                HeartbeatServerResult {
+                                    is_new,
+                                    assigned_job_ids,
+                                },
+                            revoked,
                         }) => {
+                            heartbeat_revocations.update(revoked);
                             trace!(target: "sccache_heartbeat", "Heartbeat success is_new={}", is_new);
                             match heartbeat_handler.handle_reconcile_assignments(
                                 &assigned_job_ids,
@@ -1513,6 +1572,7 @@ mod server {
                 tls,
                 ListenerRole::Worker {
                     scheduler: scheduler_id,
+                    revocations,
                 },
                 num_cpus() * 8,
                 move |request| {
@@ -1806,10 +1866,9 @@ mod client {
                 AllocJobHttpResponse::Success {
                     job_alloc,
                     need_toolchain,
-                    address,
+                    routes,
                 } => {
-                    self.worker_routes
-                        .allocation(job_alloc.server_id, address)?;
+                    self.worker_routes.allocation(job_alloc.server_id, routes)?;
                     Ok(AllocJobResult::Success {
                         job_alloc,
                         need_toolchain,

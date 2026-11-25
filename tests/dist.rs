@@ -914,7 +914,10 @@ fn failing_server_process() -> Result<()> {
     )
     .context("custom failing server should initialize")?;
     env_logger::try_init().ok();
-    server.start().context("custom failing server should run").map(|never| match never {})
+    server
+        .start()
+        .context("custom failing server should run")
+        .map(|never| match never {})
 }
 
 #[test]

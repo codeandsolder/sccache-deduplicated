@@ -238,7 +238,15 @@ impl ClusterListener {
             let authorize = Arc::clone(&authorize);
             async move {
                 match peer.filter(|peer| peer.valid() && authorize(*peer)) {
-                    Some(peer) => handler(peer, request).await,
+                    Some(peer) => {
+                        if request.method() == Method::GET
+                            && request.uri().path() == "/api/v1/cluster/probe"
+                        {
+                            response(StatusCode::NO_CONTENT, Bytes::new())
+                        } else {
+                            handler(peer, request).await
+                        }
+                    }
                     None => response(StatusCode::UNAUTHORIZED, "cluster authentication required"),
                 }
             }
@@ -339,6 +347,9 @@ impl SchedulerEnrollment {
         }) else {
             return response(StatusCode::UNAUTHORIZED, "cluster authentication required");
         };
+        if request.method() == Method::GET && request.uri().path() == "/api/v1/cluster/probe" {
+            return response(StatusCode::NO_CONTENT, Bytes::new());
+        }
         if request.uri().path() == RENEW {
             return self.renew(peer, request).await;
         }

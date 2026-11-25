@@ -3,13 +3,29 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use sccache_cluster_identity::{PeerConfig, PeerCredentials, PeerId, Role, TlsCredentials};
 
+use super::cluster_routes::{PROBE_PATH, PROBE_TIMEOUT, RouteBook};
+use sccache_peer_identity::RouteSet;
+
 type Current = dyn Fn() -> Result<Arc<TlsCredentials>> + Send + Sync;
+
+/// Bind to all interfaces of the configured address family (loopback-only
+/// endpoints remain loopback-only).
+pub fn wildcard(address: SocketAddr) -> SocketAddr {
+    if address.ip().is_loopback() {
+        return address;
+    }
+    let ip = match address.ip() {
+        std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+    };
+    SocketAddr::new(ip, address.port())
+}
 
 /// Open a persisted peer from synchronous daemon/worker initialization.
 pub fn open_peer(
@@ -42,6 +58,7 @@ type BlockingPath = (Arc<TlsCredentials>, reqwest::blocking::Client, reqwest::Ur
 pub struct BlockingRoutes {
     current: Arc<Current>,
     paths: Mutex<HashMap<PathKey, BlockingPath>>,
+    book: RouteBook,
 }
 
 impl BlockingRoutes {
@@ -49,11 +66,63 @@ impl BlockingRoutes {
         Self {
             current: Arc::new(current),
             paths: Mutex::default(),
+            book: RouteBook::default(),
         }
     }
 
     pub fn for_peer(peer: Arc<PeerCredentials>) -> Self {
         Self::new(move || peer.current())
+    }
+
+    fn probe(&self, peer: PeerId, role: Role, address: SocketAddr) {
+        let start = Instant::now();
+        let result = (|| -> Result<bool> {
+            let (client, base) = self.endpoint(peer, role, address)?;
+            let response = client
+                .get(base.join(PROBE_PATH)?)
+                .timeout(PROBE_TIMEOUT)
+                .send()?;
+            Ok(response.status() == reqwest::StatusCode::NO_CONTENT)
+        })();
+        self.book.observe(
+            peer,
+            role,
+            address,
+            result
+                .ok()
+                .filter(|success| *success)
+                .map(|_| start.elapsed()),
+        );
+    }
+
+    /// Probe in parallel, without sending any application request or job token.
+    pub fn select(&self, peer: PeerId, role: Role, routes: &RouteSet) -> Vec<SocketAddr> {
+        let pending = self.book.reserve(peer, role, routes);
+        std::thread::scope(|scope| {
+            for address in pending {
+                scope.spawn(move || self.probe(peer, role, address));
+            }
+        });
+        self.book.ordered(peer, role, routes)
+    }
+
+    /// Refresh measurements outside the heartbeat and allocation request pools.
+    pub fn prime(self: &Arc<Self>, peer: PeerId, role: Role, routes: &RouteSet) {
+        let pending = self.book.reserve(peer, role, routes);
+        for address in pending {
+            let this = Arc::clone(self);
+            let _ = std::thread::Builder::new()
+                .name("cluster-route-probe".into())
+                .spawn(move || this.probe(peer, role, address));
+        }
+    }
+
+    pub fn ordered(&self, peer: PeerId, role: Role, routes: &RouteSet) -> Vec<SocketAddr> {
+        self.book.ordered(peer, role, routes)
+    }
+
+    pub fn failed(&self, peer: PeerId, role: Role, address: SocketAddr) {
+        self.book.observe(peer, role, address, None);
     }
 
     pub fn endpoint(

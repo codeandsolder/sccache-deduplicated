@@ -283,6 +283,7 @@ impl Fleet {
                 },
                 native_cache: Some(scheduler::NativeCacheConfig {
                     public_addr: cache_address,
+                    bind_address: Some(cache_address),
                     directory: scheduler_directory.clone(),
                     space: space(),
                     idle_timeout_secs: 120,
@@ -1448,7 +1449,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let ScheduleReply::Assigned(allocation) = client.schedule(ticket, spec.clone())? else {
         anyhow::bail!("worker not allocated");
     };
-    assert_eq!(allocation.address, worker_address);
+    assert_eq!(allocation.routes.primary, worker_address);
     assert_eq!(
         client.schedule(ticket, spec.clone())?,
         ScheduleReply::Assigned(allocation.clone())

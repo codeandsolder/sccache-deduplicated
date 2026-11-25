@@ -134,6 +134,21 @@ impl Registry {
             .is_some_and(|record| !record.revoked && record.role == role))
     }
 
+    /// Snapshot permanent revocations for authenticated worker distribution.
+    ///
+    /// # Errors
+    /// Returns an error if the registry is unavailable.
+    pub fn revoked(&self) -> Result<Vec<PeerId>> {
+        let records = self
+            .records
+            .lock()
+            .map_err(|_| anyhow::anyhow!("enrollment registry poisoned"))?;
+        Ok(records
+            .iter()
+            .filter_map(|(&id, record)| record.revoked.then_some(id))
+            .collect())
+    }
+
     /// Permanently revoke an enrolled key, including future renewal.
     ///
     /// # Errors

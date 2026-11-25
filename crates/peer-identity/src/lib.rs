@@ -112,3 +112,72 @@ pub struct PeerConfig {
     pub ca_certificate: std::path::PathBuf,
     pub scheduler_id: PeerId,
 }
+
+/// The configured reliable endpoint and bounded alternate interface addresses.
+/// Addresses are routing hints, not authentication credentials.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteSet {
+    pub primary: std::net::SocketAddr,
+    pub alternatives: Vec<std::net::SocketAddr>,
+}
+
+impl RouteSet {
+    pub const MAX_ALTERNATIVES: usize = 8;
+
+    /// Accept routable unicast addresses. Scope-local IPv6 addresses cannot
+    /// be used on another host without its own interface index.
+    #[must_use]
+    pub fn eligible(address: std::net::SocketAddr) -> bool {
+        use std::net::IpAddr;
+        address.port() != 0
+            && match address.ip() {
+                IpAddr::V4(ip) => {
+                    !ip.is_unspecified()
+                        && !ip.is_multicast()
+                        && !ip.is_broadcast()
+                        && !ip.is_link_local()
+                }
+                IpAddr::V6(ip) => {
+                    !ip.is_unspecified()
+                        && !ip.is_multicast()
+                        && !ip.is_unicast_link_local()
+                        && ip.to_ipv4_mapped().is_none()
+                        && matches!(address, std::net::SocketAddr::V6(v6) if v6.scope_id() == 0)
+                }
+            }
+    }
+
+    /// Canonicalize discovered addresses; preserve the configured fallback.
+    #[must_use]
+    pub fn new(
+        primary: std::net::SocketAddr,
+        candidates: impl IntoIterator<Item = std::net::SocketAddr>,
+    ) -> Self {
+        let alternatives = candidates
+            .into_iter()
+            .filter(|&address| {
+                address != primary && Self::eligible(address) && !address.ip().is_loopback()
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .take(Self::MAX_ALTERNATIVES)
+            .collect();
+        Self {
+            primary,
+            alternatives,
+        }
+    }
+
+    /// Reject malformed or oversized remote advertisements.
+    #[must_use]
+    pub fn valid(&self) -> bool {
+        Self::eligible(self.primary)
+            && self.alternatives.len() <= Self::MAX_ALTERNATIVES
+            && *self == Self::new(self.primary, self.alternatives.iter().copied())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = std::net::SocketAddr> + '_ {
+        std::iter::once(self.primary).chain(self.alternatives.iter().copied())
+    }
+}

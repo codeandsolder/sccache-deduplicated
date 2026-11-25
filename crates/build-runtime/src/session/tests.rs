@@ -285,7 +285,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     let worker = test_peer(1);
     let allocation = WorkerAllocation {
         peer: worker,
-        address: "127.0.0.1:10501".parse()?,
+        routes: sccache_peer_identity::RouteSet::new("127.0.0.1:10501".parse()?, []),
         job: 42,
         auth: "proof".into(),
     };
@@ -404,7 +404,7 @@ fn delegation_blocks_early_worker_verification_until_assignment_returns() -> Res
         };
         let worker = WorkerAllocation {
             peer: test_peer(1),
-            address: "127.0.0.1:10501".parse()?,
+            routes: sccache_peer_identity::RouteSet::new("127.0.0.1:10501".parse()?, []),
             job: u64::from(accepted),
             auth: "proof".into(),
         };

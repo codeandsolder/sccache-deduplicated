@@ -215,7 +215,7 @@ pub(super) fn spawn(
         config.public_addr,
     )?;
     let server = Listener::bind(
-        config.public_addr,
+        config.listener_address(),
         tls,
         ListenerRole::Scheduler(enrollment),
         config.http_threads,
@@ -233,7 +233,7 @@ pub(super) fn spawn(
             )
         },
     )?;
-    info!("Native cache listening on {}", config.public_addr);
+    info!("Native cache listening on {}", config.listener_address());
     thread::Builder::new()
         .name("native-cache-maintenance".into())
         .spawn(move || {
@@ -292,14 +292,31 @@ pub(super) fn fetch_peer(
     let remaining = deadline.saturating_duration_since(Instant::now());
     ensure!(!remaining.is_zero(), "native peer deadline expired");
     let timeout = Duration::from_secs((5 + blob.size.div_ceil(1024 * 1024)).min(60)).min(remaining);
-    let (client, base) = routes.endpoint(source.server)?;
-    let response = client
-        .post(super::super::urls::server_native_blob(&base)?)
-        .timeout(timeout)
-        .bearer_auth(source.token)
-        .header("Content-Type", "application/octet-stream")
-        .body(codec().serialize(&blob)?)
-        .send()?;
+    let mut selected = None;
+    for address in routes.endpoints(source.server)? {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let (client, base) = routes.endpoint(source.server, address)?;
+        let response = client
+            .post(super::super::urls::server_native_blob(&base)?)
+            .timeout(timeout.min(remaining))
+            .bearer_auth(&source.token)
+            .header("Content-Type", "application/octet-stream")
+            .body(codec().serialize(&blob)?)
+            .send();
+        match response {
+            Err(error) if error.is_connect() => routes.failed(source.server, address),
+            result => {
+                selected = Some(result?);
+                break;
+            }
+        }
+    }
+    let Some(response) = selected else {
+        return Ok(None);
+    };
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }

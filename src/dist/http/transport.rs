@@ -110,11 +110,7 @@ pub async fn send_async<T: serde::de::DeserializeOwned>(
     req: reqwest::RequestBuilder,
     class: RequestClass,
 ) -> Result<T> {
-    let mut res = req
-        .timeout(class.timeout())
-        .header(reqwest::header::CONNECTION, "close")
-        .send()
-        .await?;
+    let mut res = req.timeout(class.timeout()).send().await?;
     let status = res.status();
     let limit = response_limit(status.is_success(), class);
     let bytes = if let Some(limit) = limit {
@@ -152,7 +148,7 @@ pub async fn send_async<T: serde::de::DeserializeOwned>(
 pub(super) fn send_blocking<T: serde::de::DeserializeOwned>(
     req: reqwest::blocking::RequestBuilder,
 ) -> Result<T> {
-    let res = req.header(reqwest::header::CONNECTION, "close").send()?;
+    let res = req.send()?;
     let status = res.status();
     let limit = if status.is_success() {
         CONTROL_RESPONSE_LIMIT

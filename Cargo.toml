@@ -126,6 +126,7 @@ zlib-rs-fast = { package = "zlib-rs", git = "https://github.com/codeandsolder/zl
 # dist-server only
 nix = { version = "0.32.0", optional = true, features = [
   "mount",
+  "net",
   "fs",
   "user",
   "sched",

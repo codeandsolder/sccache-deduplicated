@@ -5,6 +5,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use super::{
@@ -12,14 +13,19 @@ use super::{
     transport::{RequestClass, send_async},
     urls,
 };
-use crate::dist::ServerId;
+use crate::dist::{
+    ServerId,
+    cluster_routes::{PROBE_PATH, PROBE_TIMEOUT, RouteBook},
+};
+use sccache_peer_identity::RouteSet;
 
 type Path = (Arc<TlsCredentials>, Arc<ClusterHttpClient>);
 
 pub(super) struct WorkerRoutes {
     peer: Arc<PeerCredentials>,
-    workers: Mutex<HashMap<ServerId, SocketAddr>>,
+    workers: Mutex<HashMap<ServerId, RouteSet>>,
     paths: Mutex<HashMap<(ServerId, Role, SocketAddr), Path>>,
+    book: RouteBook,
 }
 
 impl WorkerRoutes {
@@ -28,6 +34,7 @@ impl WorkerRoutes {
             peer,
             workers: Mutex::default(),
             paths: Mutex::default(),
+            book: RouteBook::default(),
         }
     }
 
@@ -71,7 +78,7 @@ impl WorkerRoutes {
         .await
     }
 
-    pub(super) fn allocation(&self, server: ServerId, address: SocketAddr) -> Result<()> {
+    pub(super) fn allocation(&self, server: ServerId, routes: RouteSet) -> Result<()> {
         let mut workers = self
             .workers
             .lock()
@@ -79,30 +86,54 @@ impl WorkerRoutes {
         if workers.len() >= 256 {
             workers.clear();
         }
-        workers.insert(server, address);
+        anyhow::ensure!(routes.valid(), "invalid worker route advertisement");
+        workers.insert(server, routes);
         Ok(())
     }
 
-    async fn refresh_route(&self, server: ServerId) -> Result<SocketAddr> {
+    async fn refresh_route(&self, server: ServerId) -> Result<RouteSet> {
         let scheduler = self.control().await?;
         let url = urls::scheduler_worker_route(scheduler.base(), server)?;
         let reply: WorkerRouteHttpResponse =
             send_async(scheduler.client().get(url), RequestClass::Control).await?;
-        self.allocation(server, reply.address)?;
-        Ok(reply.address)
+        self.allocation(server, reply.routes.clone())?;
+        Ok(reply.routes)
     }
 
-    async fn address(&self, server: ServerId) -> Result<SocketAddr> {
+    async fn addresses(&self, server: ServerId) -> Result<RouteSet> {
         let address = self
             .workers
             .lock()
             .map_err(|_| anyhow::anyhow!("worker routes poisoned"))?
             .get(&server)
-            .copied();
+            .cloned();
         match address {
             Some(address) => Ok(address),
             None => self.refresh_route(server).await,
         }
+    }
+
+    async fn probe(&self, server: ServerId, address: SocketAddr) {
+        let start = Instant::now();
+        let result = async {
+            let path = self.path(server, Role::Worker, address).await?;
+            let response = path
+                .request(reqwest::Method::GET, PROBE_PATH)?
+                .timeout(PROBE_TIMEOUT)
+                .send()
+                .await?;
+            Ok::<_, anyhow::Error>(response.status() == reqwest::StatusCode::NO_CONTENT)
+        }
+        .await;
+        self.book.observe(
+            server,
+            Role::Worker,
+            address,
+            result
+                .ok()
+                .filter(|success| *success)
+                .map(|_| start.elapsed()),
+        );
     }
 
     pub(super) async fn send<T: serde::de::DeserializeOwned>(
@@ -111,25 +142,41 @@ impl WorkerRoutes {
         class: RequestClass,
         request: impl Fn(&reqwest::Client, &reqwest::Url) -> Result<reqwest::RequestBuilder>,
     ) -> Result<T> {
-        let address = self.address(server).await?;
-        let path = self.path(server, Role::Worker, address).await?;
-        match send_async(request(&path.client(), path.base())?, class).await {
-            Err(error)
-                if error
-                    .downcast_ref::<reqwest::Error>()
-                    .is_some_and(reqwest::Error::is_connect) =>
-            {
+        let mut routes = self.addresses(server).await?;
+        let mut last_error = None;
+        for pass in 0..2 {
+            let pending = self.book.reserve(server, Role::Worker, &routes);
+            futures::future::join_all(
+                pending
+                    .into_iter()
+                    .map(|address| self.probe(server, address)),
+            )
+            .await;
+            for address in self.book.ordered(server, Role::Worker, &routes) {
+                let path = self.path(server, Role::Worker, address).await?;
+                match send_async(request(&path.client(), path.base())?, class).await {
+                    Err(error)
+                        if error
+                            .downcast_ref::<reqwest::Error>()
+                            .is_some_and(reqwest::Error::is_connect) =>
+                    {
+                        self.book.observe(server, Role::Worker, address, None);
+                        last_error = Some(error);
+                    }
+                    result => return result,
+                }
+            }
+            if pass == 0 {
                 let replacement = self
                     .refresh_route(server)
                     .await
-                    .context("refresh worker endpoint")?;
-                if replacement == address {
-                    return Err(error);
+                    .context("refresh worker endpoints")?;
+                if replacement == routes {
+                    break;
                 }
-                let fresh = self.path(server, Role::Worker, replacement).await?;
-                send_async(request(&fresh.client(), fresh.base())?, class).await
+                routes = replacement;
             }
-            result => result,
         }
+        Err(last_error.context("no worker route available")?)
     }
 }

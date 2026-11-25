@@ -41,7 +41,7 @@ struct DirectEndpoint {
     config: NativeClientConfig,
     scheduler: Option<HTTPUrl>,
     cluster: Option<sccache_peer_identity::PeerConfig>,
-    peer: std::sync::Mutex<Option<Arc<sccache_cluster_identity::PeerCredentials>>>,
+    client: std::sync::Mutex<Option<NativeCacheClient>>,
     auth: DistAuth,
     local: Option<LocalExecutor>,
 }
@@ -102,7 +102,7 @@ impl NativeCompilerClient {
                 config,
                 scheduler,
                 cluster,
-                peer: std::sync::Mutex::new(None),
+                client: std::sync::Mutex::new(None),
                 auth,
                 local,
             })),
@@ -213,41 +213,36 @@ impl NativeCompilerClient {
                 DistClientContainer::get_cached_config_auth_token(auth_url)?
             }
         };
-        let peer = {
-            let mut saved = endpoint
-                .peer
-                .lock()
-                .map_err(|_| anyhow::anyhow!("native peer credentials poisoned"))?;
-            if saved.is_none() {
-                let cluster = endpoint
-                    .cluster
-                    .clone()
-                    .context("native client cluster trust required")?;
-                let scheduler = endpoint
-                    .scheduler
-                    .as_ref()
-                    .context("native client scheduler endpoint required")?;
-                *saved = Some(crate::dist::cluster::open_peer(
-                    cluster,
-                    &scheduler.to_url(),
-                    sccache_cluster_identity::Role::Client,
-                    &token,
-                )?);
-            }
-            saved
-                .as_ref()
-                .context("missing native peer credentials")?
-                .clone()
-        };
-        if let Err(error) = crate::dist::cluster::refresh_blocking(&peer) {
-            warn!("Native client certificate renewal will be retried: {error:#}");
+        let mut saved = endpoint
+            .client
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native client credentials poisoned"))?;
+        if let Some(client) = saved.as_ref() {
+            client.refresh_credentials();
+            return Ok(client.clone());
         }
-        NativeCacheClient::new(
+        let cluster = endpoint
+            .cluster
+            .clone()
+            .context("native client cluster trust required")?;
+        let scheduler = endpoint
+            .scheduler
+            .as_ref()
+            .context("native client scheduler endpoint required")?;
+        let peer = crate::dist::cluster::open_peer(
+            cluster,
+            &scheduler.to_url(),
+            sccache_cluster_identity::Role::Client,
+            &token,
+        )?;
+        let client = NativeCacheClient::new(
             config.endpoint.to_url(),
             peer,
             Duration::from_secs(config.request_timeout_secs),
             config.max_metadata_bytes,
-        )
+        )?;
+        *saved = Some(client.clone());
+        Ok(client)
     }
 
     async fn execute(

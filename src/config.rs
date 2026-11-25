@@ -2154,6 +2154,7 @@ pub mod scheduler {
     #[serde(deny_unknown_fields)]
     pub struct NativeCacheConfig {
         pub public_addr: SocketAddr,
+        pub bind_address: Option<SocketAddr>,
         pub directory: PathBuf,
         pub space: crate::build_runtime::SpacePolicy,
         pub idle_timeout_secs: u64,
@@ -2172,6 +2173,13 @@ pub mod scheduler {
     }
 
     impl NativeCacheConfig {
+        /// The configured public endpoint is the fallback; a wildcard listener
+        /// accepts authenticated traffic over every eligible interface.
+        pub fn listener_address(&self) -> SocketAddr {
+            self.bind_address
+                .unwrap_or_else(|| crate::dist::cluster::wildcard(self.public_addr))
+        }
+
         /// Validate configuration before binding the listener.
         ///
         /// # Errors

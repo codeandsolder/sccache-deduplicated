@@ -1,9 +1,6 @@
 //! Native cache wire messages, shared by clients and workers.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    net::SocketAddr,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -193,7 +190,7 @@ pub struct TreeRead {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerAllocation {
     pub peer: crate::PeerId,
-    pub address: SocketAddr,
+    pub routes: sccache_peer_identity::RouteSet,
     pub job: u64,
     pub auth: String,
 }
@@ -202,7 +199,7 @@ impl std::fmt::Debug for WorkerAllocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkerAllocation")
             .field("peer", &self.peer)
-            .field("address", &self.address)
+            .field("routes", &self.routes)
             .field("job", &self.job)
             .finish_non_exhaustive()
     }

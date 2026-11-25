@@ -3,9 +3,10 @@
 
 use std::{
     cell::RefCell,
+    collections::BTreeSet,
     io::{self, Read},
     net::{SocketAddr, TcpListener},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use bytes::Bytes;
@@ -187,10 +188,34 @@ async fn dispatch(
     })
 }
 
+/// Until the initial authenticated snapshot arrives, no remote member except
+/// the scheduler may access a worker. Revocations are permanent and monotonic.
+#[derive(Default)]
+pub(super) struct Revocations(RwLock<Option<BTreeSet<PeerId>>>);
+
+impl Revocations {
+    pub(super) fn update(&self, revoked: Vec<PeerId>) {
+        if let Ok(mut current) = self.0.write() {
+            current.get_or_insert_with(BTreeSet::new).extend(revoked);
+        }
+    }
+
+    fn permits(&self, peer: PeerId) -> bool {
+        self.0.read().is_ok_and(|current| {
+            current
+                .as_ref()
+                .is_some_and(|revoked| !revoked.contains(&peer))
+        })
+    }
+}
+
 #[derive(Clone)]
 pub(super) enum ListenerRole {
     Scheduler(Arc<SchedulerEnrollment>),
-    Worker { scheduler: PeerId },
+    Worker {
+        scheduler: PeerId,
+        revocations: Arc<Revocations>,
+    },
 }
 
 /// Bind the listener before starting any dependent background services.
@@ -278,12 +303,15 @@ impl Listener {
                     ListenerRole::Scheduler(enrollment) => {
                         tls.serve_scheduler(socket, enrollment, dispatch).await
                     }
-                    ListenerRole::Worker { scheduler } => {
+                    ListenerRole::Worker {
+                        scheduler,
+                        revocations,
+                    } => {
                         tls.serve_worker(
                             socket,
                             move |peer| match peer.role() {
                                 Role::Scheduler => peer.id() == scheduler,
-                                Role::Client | Role::Worker => true,
+                                Role::Client | Role::Worker => revocations.permits(peer.id()),
                             },
                             dispatch,
                         )

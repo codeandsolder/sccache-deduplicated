@@ -40,6 +40,8 @@ pub mod client_auth;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 pub mod cluster;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
+mod cluster_routes;
+#[cfg(any(feature = "dist-client", feature = "dist-server"))]
 pub mod execution_queue;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 pub mod http;

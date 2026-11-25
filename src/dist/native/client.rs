@@ -85,7 +85,10 @@ impl Read for InputBlob {
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) enum NativeProgress {
     Phase(Phase),
-    Assigned { job: u64, worker: crate::build_runtime::PeerId },
+    Assigned {
+        job: u64,
+        worker: crate::build_runtime::PeerId,
+    },
 }
 
 impl NativeProgress {

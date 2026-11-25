@@ -202,7 +202,10 @@ fn with_native_service(
                     &move |_, _, _| {
                         Ok(ScheduleReply::Assigned(WorkerAllocation {
                             peer: worker,
-                            address: "127.0.0.1:10501".parse().unwrap(),
+                            routes: sccache_peer_identity::RouteSet::new(
+                                "127.0.0.1:10501".parse().unwrap(),
+                                [],
+                            ),
                             job: 42,
                             auth: "allocation-proof".into(),
                         }))
