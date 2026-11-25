@@ -268,7 +268,7 @@ dist-tests = ["dist-client", "dist-server"]
 
 [workspace]
 exclude = ["tests/test-crate", "vendor/tiny_http"]
-members = ["crates/build-runtime", "tests/integration/randomize_readdir"]
+members = ["crates/build-runtime", "crates/cluster-identity", "tests/integration/randomize_readdir"]
 
 [[bench]]
 harness = false

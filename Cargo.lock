@@ -3558,6 +3558,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sccache-cluster-identity"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "openssl",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"

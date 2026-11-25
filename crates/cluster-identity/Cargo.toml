@@ -1,0 +1,16 @@
+[package]
+name = "sccache-cluster-identity"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+description = "Persistent machine identities and cluster certificate issuance for sccache"
+
+[dependencies]
+anyhow = "1"
+openssl = "0.10.75"
+tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true
