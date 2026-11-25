@@ -586,3 +586,61 @@ Until these binaries [are included in releases](https://github.com/mozilla/sccac
 ```
 docker run -ti --rm -v $PWD:/sccache luser/sccache-musl-build:0.1 /bin/bash -c "cd /sccache; cargo build --release --target x86_64-unknown-linux-musl --features=dist-server && strip target/x86_64-unknown-linux-musl/release/sccache-dist && cd target/x86_64-unknown-linux-musl/release/ && tar czf sccache-dist.tar.gz sccache-dist"
 ```
+
+## Local scheduler status dashboard
+
+The optional `scheduler-dashboard` feature adds a read-only Axum listener
+inside the scheduler process. The UI uses Leptos 0.8 server-rendered components
+and Rust/WASM hydration, with separate SSR and hydrate builds. It does not
+require Grafana, a JavaScript framework, or a database for scheduler state.
+The existing distributed protocol and `/api/v1/scheduler/status` are unchanged.
+
+Build the scheduler and browser assets using the repository's Rust toolchain:
+
+```sh
+rustup target add wasm32-unknown-unknown
+# Install the wasm-bindgen-cli version matching Cargo.lock (the script checks it).
+scripts/build-scheduler-dashboard.sh
+cargo build --locked --release --no-default-features --features scheduler-dashboard --bin sccache-dist
+```
+
+Install the generated `target/scheduler-dashboard/pkg` directory alongside
+the scheduler release. Add the following to its TOML configuration (adjust
+the absolute asset directory and optional metrics endpoint):
+
+```toml
+[dashboard]
+bind_address = "127.0.0.1:10604"
+assets = "/opt/sccache/dashboard/pkg"
+# Optional Prometheus-compatible query endpoint, e.g. Liberta.
+# metrics_url = "http://127.0.0.1:8428"
+```
+
+The dashboard is deliberately on a separate, loopback-only listener. Open
+`http://127.0.0.1:10604/` locally or forward the port over SSH when the scheduler
+runs remotely. Never expose it through an unauthenticated public reverse proxy.
+An explicitly configured dashboard with missing assets or an invalid listener
+fails at startup rather than rendering a non-interactive page. Builds without
+the feature reject dashboard configuration.
+
+The scheduler samples live worker capacity, assigned and assigning jobs,
+compiler demand, native queue stages, remaining inputs, assignment-time
+completion estimates, CAS logical accounting, pending garbage collection,
+and directional network observations every two seconds. The most recent 900
+cluster samples are held in memory; history resets with the scheduler.
+The jobs view displays up to 1,000 oldest active jobs and the full count.
+Worker data is sourced from the latest authenticated heartbeat. Expired
+workers are excluded without changing scheduler state. Native compiler slots
+are distinct from legacy archive allocations. Logical CAS bytes are not
+physical filesystem usage, and network goodput estimates are not link rates.
+
+If `metrics_url` is configured, the scheduler independently queries the
+existing telemetry store using a fixed allowlist of the former Grafana
+dashboard's 33 panels. The range is the latest hour, at 30-second steps,
+with a five-minute rate window. Native status remains usable if the metrics
+service is absent or unreachable. Client cache hit rates, compiler/language
+breakdowns, cache-level operation latencies, compile failures, host load,
+Certifex ingress and other fleet-wide observations remain sourced from the
+metrics producer, rather than fabricated from scheduler reservations.
+The UI identifies missing data and query failures. Liberta's existing
+retention and producers are unaffected.

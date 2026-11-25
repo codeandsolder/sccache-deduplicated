@@ -274,6 +274,7 @@ pub fn sccache_client_cfg(
 fn sccache_scheduler_cfg(address: SocketAddr) -> sccache::config::scheduler::Config {
     sccache::config::scheduler::Config {
         maintenance_drain_file: None,
+        dashboard: None,
         native_cache: None,
         job_slack: Default::default(),
         public_addr: address,

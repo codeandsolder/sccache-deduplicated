@@ -145,7 +145,7 @@ pub(super) fn spawn(
     client_auth: Arc<dyn ClientAuthCheck>,
     server_auth: Arc<ServerAuthenticator>,
     network: Arc<NetworkMeter>,
-) -> Result<()> {
+) -> Result<Arc<NativeSessions>> {
     let limits = config.session_limits()?;
     let sessions = Arc::new(NativeSessions::new(
         NativeStore::open_managed(&config.directory, config.space)?,
@@ -212,6 +212,7 @@ pub(super) fn spawn(
         config.directory.join("network-timing.json"),
         config.public_addr,
     )?;
+    let retained_sessions = Arc::clone(&sessions);
     let server = rouille::Server::new(config.public_addr, move |request| {
         respond(
             request,
@@ -256,7 +257,7 @@ pub(super) fn spawn(
             server.run();
             error!("native cache HTTP listener terminated");
         })?;
-    Ok(())
+    Ok(retained_sessions)
 }
 
 const PREFIX: &str = "/api/v5/native/";

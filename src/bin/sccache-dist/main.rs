@@ -32,6 +32,8 @@ mod build;
 
 mod cmdline;
 mod command_helpers;
+#[cfg(feature = "scheduler-dashboard")]
+mod dashboard;
 mod job_telemetry;
 mod placement;
 use placement::{Exploration, NativeTransferPlan, choose_worker, native_estimate};
@@ -487,6 +489,7 @@ fn run(command: Command) -> Result<i32> {
         }
 
         Command::Scheduler(scheduler_config::Config {
+            dashboard,
             public_addr,
             client_auth,
             server_auth,
@@ -572,6 +575,7 @@ fn run(command: Command) -> Result<i32> {
                 check_client_auth,
                 check_server_auth,
                 native_cache,
+                dashboard,
             );
             // A running server never exits successfully (Result<Infallible>).
             match http_scheduler.start()? {}
@@ -1887,6 +1891,11 @@ impl SchedulerIncoming for Scheduler {
         self.is_draining()
     }
 
+    #[cfg(feature = "scheduler-dashboard")]
+    fn handle_dashboard_snapshot(&self) -> Result<sccache_dashboard::Snapshot> {
+        dashboard::snapshot(self)
+    }
+
     fn handle_status(&self) -> Result<SchedulerStatusResult> {
         // LOCKS
         let mut jobs = self
@@ -3072,6 +3081,15 @@ mod scheduler_tests {
             (status.num_cpus, status.max_jobs, status.available_jobs),
             (4, 13, 13)
         );
+        #[cfg(feature = "scheduler-dashboard")]
+        {
+            let snapshot = scheduler.handle_dashboard_snapshot().unwrap();
+            assert_eq!(snapshot.totals.workers, 3);
+            assert_eq!(snapshot.totals.available, status.available_jobs);
+            assert_eq!(snapshot.totals.max_jobs, status.max_jobs);
+            assert_eq!(snapshot.totals.cpu_capacity, 4.0);
+            assert_eq!(snapshot.workers.len(), 3);
+        }
         for _ in 0..13 {
             assert!(matches!(
                 scheduler

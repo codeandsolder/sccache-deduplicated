@@ -252,6 +252,7 @@ impl Fleet {
                     token: WORKER_TOKEN.into(),
                 },
                 maintenance_drain_file: None,
+                dashboard: None,
                 job_slack: scheduler::JobSlackConfig {
                     static_jobs: 0,
                     percent: 0.0,

@@ -1149,6 +1149,7 @@ mod server {
         // Do we believe the server is who they appear to be?
         check_server_auth: ServerAuthCheck,
         native_cache: Option<crate::config::scheduler::NativeCacheConfig>,
+        dashboard: Option<crate::config::scheduler::DashboardConfig>,
     }
 
     impl<S: dist::SchedulerIncoming + 'static> Scheduler<S> {
@@ -1158,6 +1159,7 @@ mod server {
             check_client_auth: Box<dyn ClientAuthCheck>,
             check_server_auth: ServerAuthCheck,
             native_cache: Option<crate::config::scheduler::NativeCacheConfig>,
+            dashboard: Option<crate::config::scheduler::DashboardConfig>,
         ) -> Self {
             Self {
                 public_addr,
@@ -1165,6 +1167,7 @@ mod server {
                 check_client_auth,
                 check_server_auth,
                 native_cache,
+                dashboard,
             }
         }
 
@@ -1175,6 +1178,7 @@ mod server {
                 check_client_auth,
                 check_server_auth,
                 native_cache,
+                dashboard,
             } = self;
             let requester = Arc::new(SchedulerRequester {
                 clients: Mutex::default(),
@@ -1185,6 +1189,8 @@ mod server {
             let handler = Arc::new(handler);
             let check_client_auth: Arc<dyn ClientAuthCheck> = Arc::from(check_client_auth);
             let check_server_auth: Arc<ServerAuthenticator> = Arc::from(check_server_auth);
+            #[cfg(feature = "scheduler-dashboard")]
+            let mut dashboard_native = None;
             if let Some(config) = native_cache {
                 let handler = Arc::clone(&handler);
                 let requester = Arc::clone(&requester);
@@ -1195,7 +1201,7 @@ mod server {
                 let peer_http = native::PeerHttp::default();
                 let network = Arc::new(crate::build_runtime::NetworkMeter::default());
                 let peer_network = Arc::clone(&network);
-                native::spawn(
+                let sessions = native::spawn(
                     &config,
                     move |assignment, snapshot, packages| match handler.handle_alloc_native_job(
                         &*requester,
@@ -1263,9 +1269,37 @@ mod server {
                     },
                     Arc::clone(&check_client_auth),
                     Arc::clone(&check_server_auth),
-                    network,
+                    Arc::clone(&network),
+                )?;
+                #[cfg(feature = "scheduler-dashboard")]
+                {
+                    dashboard_native = Some((sessions, network));
+                }
+                #[cfg(not(feature = "scheduler-dashboard"))]
+                drop(sessions);
+            }
+
+            #[cfg(feature = "scheduler-dashboard")]
+            if let Some(config) = dashboard {
+                let handler = Arc::clone(&handler);
+                sccache_dashboard::server::spawn(
+                    config.bind_address,
+                    &config.assets,
+                    config.metrics_url.as_deref(),
+                    move || {
+                        let mut snapshot = handler.handle_dashboard_snapshot()?;
+                        if let Some((sessions, network)) = &dashboard_native {
+                            fill_dashboard_native(&mut snapshot, sessions, network);
+                        }
+                        Ok(snapshot)
+                    },
                 )?;
             }
+            #[cfg(not(feature = "scheduler-dashboard"))]
+            anyhow::ensure!(
+                dashboard.is_none(),
+                "scheduler-dashboard feature is disabled"
+            );
 
             macro_rules! check_server_auth_or_err {
                 ($request:ident) => {{
@@ -1452,6 +1486,59 @@ mod server {
             server.run();
 
             Err(anyhow!("Rouille scheduler server terminated"))
+        }
+    }
+
+    #[cfg(feature = "scheduler-dashboard")]
+    fn fill_dashboard_native(
+        snapshot: &mut sccache_dashboard::Snapshot,
+        sessions: &crate::build_runtime::NativeSessions,
+        network: &crate::build_runtime::NetworkMeter,
+    ) {
+        match sessions.store().stats() {
+            Ok(stats) => {
+                snapshot.cache = Some(sccache_dashboard::Cache {
+                    actions: stats.actions,
+                    results: stats.results,
+                    trees: stats.trees,
+                    blobs: stats.blobs,
+                    logical_bytes: stats.logical_bytes,
+                    pending_gc_blobs: stats.pending_gc_blobs,
+                    pending_gc_bytes: stats.pending_gc_bytes,
+                })
+            }
+            Err(error) => {
+                warn!("dashboard CAS stats unavailable: {error:#}");
+                snapshot.cache_error = Some("CAS statistics unavailable".into());
+            }
+        }
+        let network = network.snapshot();
+        for (name, direction) in [("Send", network.send), ("Receive", network.receive)] {
+            for (peer, capacity) in direction.peers {
+                snapshot.network.push(sccache_dashboard::NetworkPeer {
+                    peer: format!("{peer:?}"),
+                    direction: name.into(),
+                    observed_bytes_per_second: capacity.observed_bytes_per_second,
+                    isolated_bytes_per_second: capacity.isolated_bytes_per_second,
+                    wire_per_mille: capacity.wire_per_mille,
+                    remaining_bytes: capacity.active_remaining_bytes,
+                    body_bytes: capacity.body_bytes,
+                });
+            }
+            for capacity in direction.shared {
+                snapshot
+                    .shared_capacity
+                    .push(sccache_dashboard::NetworkGroup {
+                        direction: name.into(),
+                        peers: capacity
+                            .members
+                            .iter()
+                            .map(|peer| format!("{peer:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        bytes_per_second: capacity.bytes_per_second,
+                    });
+            }
         }
     }
 

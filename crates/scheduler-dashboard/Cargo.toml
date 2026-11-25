@@ -1,0 +1,32 @@
+[package]
+name = "sccache-dashboard"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+ssr = ["leptos/ssr", "dep:leptos_axum", "dep:any_spawner", "dep:axum", "dep:tokio", "dep:tower-http", "dep:reqwest", "dep:futures", "dep:anyhow", "dep:log"]
+hydrate = ["leptos/hydrate", "dep:wasm-bindgen"]
+
+[dependencies]
+leptos = "0.8"
+leptos_meta = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = { version = "0.2", optional = true }
+anyhow = { version = "1", optional = true }
+any_spawner = { version = "0.3", features = ["tokio"], optional = true }
+log = { version = "0.4", optional = true }
+axum = { version = "0.8", optional = true }
+leptos_axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["rt", "net", "time", "macros"], optional = true }
+tower-http = { version = "0.7", features = ["fs", "set-header"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"], optional = true }
+futures = { version = "0.3", optional = true }
+
+[lints]
+workspace = true
