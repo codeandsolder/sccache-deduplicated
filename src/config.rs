@@ -2358,7 +2358,7 @@ pub mod server {
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
 
-    use crate::errors::{Context, Result};
+    use crate::errors::{Context, Result, bail};
 
     const TEN_GIGS: u64 = 10 * 1024 * 1024 * 1024;
     const fn default_toolchain_cache_size() -> u64 {
