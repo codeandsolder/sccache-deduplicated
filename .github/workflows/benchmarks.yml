@@ -34,7 +34,7 @@ jobs:
           toolchain: "nightly-2026-11-26"
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ff6fd7c37922135c22ee83c77d3e8e91fc9ebac1 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
         with:
           rust-toolchain: ${{ steps.rust.outputs.name }}
 
@@ -57,4 +57,4 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ff6fd7c37922135c22ee83c77d3e8e91fc9ebac1 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
