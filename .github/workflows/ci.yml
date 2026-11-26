@@ -411,7 +411,7 @@ jobs:
             --edges normal --prefix none --format '{p}')"
           # These alternate application stacks were deliberately removed.
           printf '%s\n' "$packages" | awk '
-            $1 ~ /^(rouille|tiny_http|ureq|ureq-proto|native-tls|hyper-tls|tokio-native-tls|ring|aws-lc-rs|aws-lc-sys|openssl|openssl-sys|rustls|tokio-rustls|hyper-rustls|reqwest|miniz_oxide|libmount|version-compare)$/ {
+            $1 ~ /^(rouille|tiny_http|ureq|ureq-proto|native-tls|hyper-tls|tokio-native-tls|ring|aws-lc-rs|aws-lc-sys|rsa|openssl|openssl-sys|rustls|tokio-rustls|hyper-rustls|reqwest|miniz_oxide|libmount|version-compare)$/ {
               print "Unexpected release dependency: " $0 > "/dev/stderr"; invalid=1
             }
             END { exit invalid }'
