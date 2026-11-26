@@ -205,48 +205,50 @@ impl Publication {
         let started = Instant::now();
         loop {
             check()?;
-            let mut state = self
-                .pool
-                .state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            state.reap(Instant::now());
-            let mut additional = 0_u64;
-            for (&id, &size) in &contents {
-                if let Some(&(previous, count)) = state.refs.get(&id) {
-                    ensure!(
-                        previous == size && count < usize::MAX,
-                        "invalid grace content accounting"
-                    );
-                } else {
-                    additional = additional
-                        .checked_add(size)
-                        .context("grace bytes overflow")?;
-                }
-            }
-            // The published result lease pins its content while it waits.
-            // Charge only the exact unique union, not outstanding forecasts.
-            if additional <= self.pool.max_bytes - state.bytes {
-                let expires = Instant::now()
-                    .checked_add(self.pool.duration)
-                    .context("grace deadline overflow")?;
+            {
+                let mut state = self
+                    .pool
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                state.reap(Instant::now());
+                let mut additional = 0_u64;
                 for (&id, &size) in &contents {
-                    state.refs.entry(id).or_insert((size, 0)).1 += 1;
+                    if let Some(&(previous, count)) = state.refs.get(&id) {
+                        ensure!(
+                            previous == size && count < usize::MAX,
+                            "invalid grace content accounting"
+                        );
+                    } else {
+                        additional = additional
+                            .checked_add(size)
+                            .context("grace bytes overflow")?;
+                    }
                 }
-                state.bytes += additional;
-                state.results.push_back(ProtectedResult {
-                    expires,
-                    contents,
-                    _lease: lease,
-                });
+                // The published result lease pins its content while it waits.
+                // Charge only the exact unique union, not outstanding forecasts.
+                if additional <= self.pool.max_bytes - state.bytes {
+                    let expires = Instant::now()
+                        .checked_add(self.pool.duration)
+                        .context("grace deadline overflow")?;
+                    for (&id, &size) in &contents {
+                        state.refs.entry(id).or_insert((size, 0)).1 += 1;
+                    }
+                    state.bytes += additional;
+                    state.results.push_back(ProtectedResult {
+                        expires,
+                        contents,
+                        _lease: lease,
+                    });
+                    drop(state);
+                    return Ok((expires, self.waiting));
+                }
+                if !self.waiting {
+                    state.waiting_publishers += 1;
+                    self.waiting = true;
+                }
                 drop(state);
-                return Ok((expires, self.waiting));
             }
-            if !self.waiting {
-                state.waiting_publishers += 1;
-                self.waiting = true;
-            }
-            drop(state);
             ensure!(
                 started.elapsed() < timeout,
                 "native artifact grace publication timed out"
