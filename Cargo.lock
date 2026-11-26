@@ -407,7 +407,7 @@ dependencies = [
 [[package]]
 name = "btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=0fddfc535515622963dfb4cb658ab63dcfa5307d#0fddfc535515622963dfb4cb658ab63dcfa5307d"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=a4b12ba7391e03470626504fad60d887be790cfb#a4b12ba7391e03470626504fad60d887be790cfb"
 dependencies = [
  "bitflags",
  "btls-sys",
@@ -419,12 +419,10 @@ dependencies = [
 [[package]]
 name = "btls-sys"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=0fddfc535515622963dfb4cb658ab63dcfa5307d#0fddfc535515622963dfb4cb658ab63dcfa5307d"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=a4b12ba7391e03470626504fad60d887be790cfb#a4b12ba7391e03470626504fad60d887be790cfb"
 dependencies = [
  "bindgen",
  "cmake",
- "fs_extra",
- "fslock",
 ]
 
 [[package]]
@@ -1273,16 +1271,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
-name = "fslock"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04412b8935272e3a9bae6f48c7bfff74c2911f60525404edfdd28e49884c3bfb"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "fuser"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2097,7 +2085,7 @@ dependencies = [
 [[package]]
 name = "jsonwebtoken-btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=0fddfc535515622963dfb4cb658ab63dcfa5307d#0fddfc535515622963dfb4cb658ab63dcfa5307d"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=a4b12ba7391e03470626504fad60d887be790cfb#a4b12ba7391e03470626504fad60d887be790cfb"
 dependencies = [
  "btls",
  "jsonwebtoken",
@@ -2409,7 +2397,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 [[package]]
 name = "lurkmoar"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/lurkmoar-rs?rev=e58a7abdb5a0f47a969771fc0b6837c5103863ee#e58a7abdb5a0f47a969771fc0b6837c5103863ee"
+source = "git+https://github.com/codeandsolder/lurkmoar-rs?rev=75f22d14467e185a8d85af9486d9bd28ebd5648d#75f22d14467e185a8d85af9486d9bd28ebd5648d"
 dependencies = [
  "bytes",
  "flate2",
@@ -3667,7 +3655,7 @@ dependencies = [
 [[package]]
 name = "reqsign-azure-storage"
 version = "3.3.1"
-source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=792158bc847448dd4436504f647fec2a59f02be6#792158bc847448dd4436504f647fec2a59f02be6"
+source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=47f82a7fc98c591a16a803de9eeeaa527c2779cb#47f82a7fc98c591a16a803de9eeeaa527c2779cb"
 dependencies = [
  "anyhow",
  "asyncband 0.8.0",
@@ -3688,7 +3676,7 @@ dependencies = [
 [[package]]
 name = "reqsign-core"
 version = "3.3.3"
-source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=792158bc847448dd4436504f647fec2a59f02be6#792158bc847448dd4436504f647fec2a59f02be6"
+source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=47f82a7fc98c591a16a803de9eeeaa527c2779cb#47f82a7fc98c591a16a803de9eeeaa527c2779cb"
 dependencies = [
  "anyhow",
  "asyncband 0.8.0",
@@ -3723,7 +3711,7 @@ dependencies = [
 [[package]]
 name = "reqsign-google"
 version = "3.3.0"
-source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=792158bc847448dd4436504f647fec2a59f02be6#792158bc847448dd4436504f647fec2a59f02be6"
+source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=47f82a7fc98c591a16a803de9eeeaa527c2779cb#47f82a7fc98c591a16a803de9eeeaa527c2779cb"
 dependencies = [
  "bytes",
  "form_urlencoded",
@@ -4981,7 +4969,7 @@ dependencies = [
 [[package]]
 name = "tokio-btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=0fddfc535515622963dfb4cb658ab63dcfa5307d#0fddfc535515622963dfb4cb658ab63dcfa5307d"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=a4b12ba7391e03470626504fad60d887be790cfb#a4b12ba7391e03470626504fad60d887be790cfb"
 dependencies = [
  "btls",
  "btls-sys",
@@ -5725,7 +5713,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "wreq"
 version = "0.16.1"
-source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=af3924b6d06039a49b0f1cd2b6eac688d49f5a23#af3924b6d06039a49b0f1cd2b6eac688d49f5a23"
+source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=a8385c80ba6a5b035067d3a2e472d37df591faf0#a8385c80ba6a5b035067d3a2e472d37df591faf0"
 dependencies = [
  "base64 0.23.1",
  "btls",
