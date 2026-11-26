@@ -52,6 +52,7 @@ fn assignment(marker: u8) -> Result<NativeAssignment> {
         ticket: Ticket([marker; 32]),
         input_blobs: BTreeMap::new(),
         spec: ExecutionSpec {
+            compiler_result: None,
             platform: ContentId::of(b"dispatch-test"),
             root: ExecutionRoot {
                 id: TreeId([0; 32]),

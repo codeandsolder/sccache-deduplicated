@@ -3125,6 +3125,7 @@ mod scheduler_tests {
             receiver: None,
             delivery_profile: None,
             spec: ExecutionSpec {
+                compiler_result: None,
                 platform,
                 root: ExecutionRoot {
                     id: TreeId([0; 32]),

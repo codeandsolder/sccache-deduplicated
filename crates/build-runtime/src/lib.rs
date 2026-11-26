@@ -29,7 +29,9 @@ mod space_policy;
 pub use space_policy::SpacePolicy;
 mod spec;
 pub use recipe::{TreeLayer, TreeRecipe};
-pub use spec::{BuildPath, CommandSpec, ExecutionRoot, ExecutionSpec, OutputSpec};
+pub use spec::{
+    BuildPath, CommandSpec, CompilerResultIdentity, ExecutionRoot, ExecutionSpec, OutputSpec,
+};
 mod tree;
 pub mod wire;
 pub use identity::{

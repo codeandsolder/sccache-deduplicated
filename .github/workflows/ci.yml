@@ -282,7 +282,7 @@ jobs:
     # Single current-Rust Linux lane on every PR and main push.
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@343303848026ed142e48a6a82e7a889080b99b26 # Last reusable workflow without provider-only OIDC permission
     with:
       isolate-public-sccache-server: true
       # Bubblewrap 0.11+ supplies private writable overlay mounts.
