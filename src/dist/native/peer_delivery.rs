@@ -369,12 +369,9 @@ impl<'a> ResultDelivery<'a> {
                 .then(tempfile::tempfile)
                 .transpose()?;
             let direct = {
-                let mut spool_sink;
-                let target = if let Some(file) = &mut spool {
-                    spool_sink = BlobSink::File(file);
-                    &mut spool_sink
-                } else {
-                    &mut *destination
+                let mut target = match &mut spool {
+                    Some(file) => BlobSink::File(file),
+                    None => destination.reborrow(),
                 };
                 self.client
                     .try_peer_blob(plan, |reader, encoding| {
@@ -382,7 +379,7 @@ impl<'a> ResultDelivery<'a> {
                         crate::build_runtime::transfer_native_blob(
                             reader,
                             io::sink(),
-                            &mut *target,
+                            &mut target,
                             blob,
                             encoding,
                         )

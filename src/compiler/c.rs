@@ -2248,7 +2248,7 @@ impl pkg::InputsPackager for CInputsPackager {
 
     #[cfg(target_os = "linux")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        (*self).discover()?.into_native_mapping()
+        (*self).discover()?.into_native_mapping(|_| false)
     }
 }
 

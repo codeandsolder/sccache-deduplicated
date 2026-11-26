@@ -4508,6 +4508,87 @@ fn native_rust_inputs_retain_complete_dependency_artifacts() -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(feature = "dist-client", feature = "native-store", target_os = "linux"))]
+#[test]
+fn canonical_native_generated_inputs_have_stable_metadata_across_leases() -> Result<()> {
+    use crate::build_runtime::{
+        BlobRef, ContentId, NativeStore, ReferenceBlobProvider, TreeEntry, TreePath,
+    };
+    use crate::dist::pkg::InputsPackager as _;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::time::{Duration, UNIX_EPOCH};
+    let tmp = tempfile::tempdir()?;
+    let source = tmp.path().join("project");
+    fs::create_dir(&source)?;
+    let source_file = source.join("main.rs");
+    fs::write(&source_file, b"fn main() {}")?;
+    let source_time = UNIX_EPOCH + Duration::from_secs(123);
+    fs::File::open(&source_file)?.set_times(std::fs::FileTimes::new().set_modified(source_time))?;
+    let content = b"same compiled dependency";
+    let blob = BlobRef {
+        id: ContentId::of(content),
+        size: u64::try_from(content.len())?,
+    };
+    let capture = |lease: &str, timestamp: u64, reference: bool| -> Result<_> {
+        let generated = tmp.path().join(lease);
+        fs::create_dir(&generated)?;
+        let artifact = generated.join("libdep-123.rmeta");
+        fs::write(&artifact, content)?;
+        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o640))?;
+        fs::File::open(&artifact)?.set_times(
+            std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(timestamp)),
+        )?;
+        let mut transformer = dist::PathTransformer::new();
+        transformer.add_root_mapping(source.clone(), "/build");
+        transformer.add_root_mapping(generated, "/intermediate");
+        let packager = RustInputsPackager {
+            env_vars: Vec::new(),
+            input_dirs: Vec::new(),
+            crate_link_paths: Vec::new(),
+            can_trim_rlibs: false,
+            inputs: vec![source_file.clone(), artifact.clone()],
+            path_transformer: transformer,
+            rlib_dep_reader: None,
+        };
+        let mapping = Box::new(packager).native_mapping()?;
+        let prepared = if reference {
+            mapping.prepare_with_references(&|_, path| {
+                Ok((path == artifact).then(|| {
+                    (
+                        blob,
+                        ReferenceBlobProvider::new(move |_| {
+                            Ok(Box::new(std::io::Cursor::new(content)))
+                        }),
+                    )
+                }))
+            })?
+        } else {
+            mapping.prepare()?
+        };
+        assert_eq!(fs::metadata(&artifact)?.mtime(), i64::try_from(timestamp)?);
+        Ok(prepared)
+    };
+    let first = capture("first-lease", 200, false)?;
+    let second = capture("second-lease", 300, true)?;
+    assert_eq!(first.id(), second.id());
+    let generated_path = TreePath::new(b"intermediate/libdep-123.rmeta".to_vec())?;
+    let TreeEntry::File { metadata, .. } = second.manifest().entries[&generated_path] else {
+        bail!("missing generated dependency")
+    };
+    assert_eq!(metadata.mode, 0o640);
+    let store = NativeStore::open(&tmp.path().join("store"))?;
+    let tree = second.import(&store)?;
+    let view = tree.materialize(tmp.path())?;
+    let actual = fs::metadata(view.root().join("intermediate/libdep-123.rmeta"))?;
+    assert_eq!(actual.mtime(), metadata.modified.seconds);
+    assert_eq!(actual.mode() & 0o777, 0o640);
+    assert_eq!(
+        fs::metadata(view.root().join("build/main.rs"))?.modified()?,
+        source_time
+    );
+    Ok(())
+}
+
 #[test]
 #[cfg(feature = "dist-client")]
 fn test_dist_rlib_trimming_preserves_recognized_metadata() -> Result<()> {
@@ -4563,7 +4644,19 @@ impl pkg::InputsPackager for RustInputsPackager {
     // representation of rlibs merely to reduce a per-job archive.
     #[cfg(target_os = "linux")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        (*self).discover()?.into_native_mapping()
+        // A canonical Cargo output root is a generated-input namespace. Its
+        // physical mtime describes delivery/freshness, not the sandbox input.
+        // Normalize the actual remote inode timestamp, not just the key;
+        // preserve all source-file timestamps and exact permission bits.
+        let generated_roots = self
+            .path_transformer
+            .path_mappings()
+            .filter(|(_, logical)| matches!(logical.as_str(), "/intermediate" | "/target"))
+            .map(|(_, logical)| PathBuf::from(logical))
+            .collect::<std::collections::BTreeSet<_>>();
+        (*self).discover()?.into_native_mapping(|logical| {
+            generated_roots.iter().any(|root| logical.starts_with(root))
+        })
     }
 }
 

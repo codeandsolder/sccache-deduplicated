@@ -29,6 +29,8 @@ pub use installation::{InstallationCatalog, InstallationReport};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MappedMetadata {
     Preserve,
+    /// Keep exact permission bits, but give the materialized input a stable timestamp.
+    NormalizeTimestamp(TreeTimestamp),
     Normalize(TreeTimestamp),
 }
 
@@ -370,6 +372,10 @@ fn add_reference(
 fn mapped_file_metadata(stat: &Stat, policy: MappedMetadata) -> Result<TreeMetadata> {
     Ok(match policy {
         MappedMetadata::Preserve => metadata(stat)?,
+        MappedMetadata::NormalizeTimestamp(modified) => TreeMetadata {
+            mode: stat.st_mode & 0o7777,
+            modified,
+        },
         MappedMetadata::Normalize(modified) => TreeMetadata {
             mode: if stat.st_mode & 0o100 == 0 {
                 0o644
@@ -619,8 +625,8 @@ mod tests {
         let second = prepare(200, MappedMetadata::Preserve)?;
         assert_eq!(first.manifest().blobs()?, second.manifest().blobs()?);
         assert_ne!(first.id(), second.id());
-        let first = prepare(100, MappedMetadata::Normalize(stable))?;
-        let second = prepare(200, MappedMetadata::Normalize(stable))?;
+        let first = prepare(100, MappedMetadata::NormalizeTimestamp(stable))?;
+        let second = prepare(200, MappedMetadata::NormalizeTimestamp(stable))?;
         assert_eq!(first.id(), second.id());
         Ok(())
     }

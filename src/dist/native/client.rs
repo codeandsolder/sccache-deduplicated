@@ -230,6 +230,14 @@ pub(super) enum BlobSink<'a> {
 }
 
 impl BlobSink<'_> {
+    pub(super) fn reborrow(&mut self) -> BlobSink<'_> {
+        match self {
+            Self::File(file) => BlobSink::File(file),
+            Self::Memory(bytes) => BlobSink::Memory(bytes),
+            Self::Stream(stream) => BlobSink::Stream(&mut **stream),
+        }
+    }
+
     pub(super) fn reset(&mut self) -> Result<()> {
         match self {
             Self::File(file) => {
@@ -913,24 +921,21 @@ impl<D: FnMut(BlobRef, &mut BlobSink<'_>) -> Result<()>> ResultBlobs<'_, D> {
             None
         };
         {
-            let mut spool_sink;
-            let target = if let Some(file) = &mut spool {
-                spool_sink = BlobSink::File(file.as_file_mut());
-                &mut spool_sink
-            } else {
-                &mut *output
+            let mut target = match &mut spool {
+                Some(file) => BlobSink::File(file.as_file_mut()),
+                None => output.reborrow(),
             };
             let mut reused = false;
             for candidate in existing.into_iter().chain(inputs.matching_sources(blob.id)) {
                 target.reset()?;
-                if copy_verified(candidate, blob, &mut *target).is_ok() {
+                if copy_verified(candidate, blob, &mut target).is_ok() {
                     reused = true;
                     break;
                 }
             }
             if !reused {
                 target.reset()?;
-                (self.download)(blob, target)?;
+                (self.download)(blob, &mut target)?;
             }
         }
         if let Some(mut file) = spool {
