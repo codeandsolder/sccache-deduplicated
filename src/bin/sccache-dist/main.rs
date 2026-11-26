@@ -3830,7 +3830,7 @@ mod scheduler_tests {
             let requester = Arc::clone(&requester);
             async move {
                 scheduler
-                    .handle_alloc_job(requester.as_ref(), test_toolchain('x'))
+                    .handle_alloc_job(requester.as_ref(), test_toolchain('c'))
                     .await
             }
         });

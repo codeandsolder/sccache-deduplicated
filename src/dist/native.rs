@@ -140,6 +140,7 @@ pub struct NativeCacheClient {
     candidates: std::sync::Arc<
         std::sync::Mutex<Option<(sccache_peer_identity::RouteSet, Instant, Instant)>>,
     >,
+    discovery: std::sync::Arc<tokio::sync::Mutex<()>>,
     role: Role,
     metadata_limit: u64,
     timeout: Duration,
@@ -168,6 +169,7 @@ impl NativeCacheClient {
             peer,
             address,
             candidates: std::sync::Arc::default(),
+            discovery: std::sync::Arc::default(),
             role: Role::Client,
             metadata_limit,
             timeout,
@@ -189,13 +191,23 @@ impl NativeCacheClient {
     }
 
     fn cache_routes(&self) -> sccache_peer_identity::RouteSet {
+        crate::http_client::io_runtime().map_or_else(
+            |_| sccache_peer_identity::RouteSet::new(self.address, []),
+            |runtime| runtime.block_on(self.cache_routes_async()),
+        )
+    }
+
+    async fn cache_routes_async(&self) -> sccache_peer_identity::RouteSet {
         use sccache_peer_identity::{Role, RouteSet};
         #[derive(serde::Deserialize)]
         struct Reply {
             routes: RouteSet,
         }
         let fallback = || RouteSet::new(self.address, []);
-        let Ok(mut cached) = self.candidates.lock() else {
+        // No synchronous lock spans a network operation. Concurrent requests
+        // use the last usable advertisement (or the configured endpoint)
+        // instead of queueing behind one slow discovery RPC.
+        let Ok(cached) = self.candidates.lock().map(|cached| cached.clone()) else {
             return fallback();
         };
         if let Some((routes, _, attempted)) = cached.as_ref()
@@ -203,44 +215,56 @@ impl NativeCacheClient {
         {
             return routes.clone();
         }
-        let fetched = (|| -> Result<RouteSet> {
+        let previous = || {
+            cached
+                .as_ref()
+                .filter(|(_, updated, _)| updated.elapsed() < Duration::from_secs(90))
+                .map_or_else(
+                    || (fallback(), Instant::now()),
+                    |(routes, updated, _)| (routes.clone(), *updated),
+                )
+        };
+        let Ok(_discovery) = self.discovery.try_lock() else {
+            return previous().0;
+        };
+        // Recheck after taking ownership in case another request completed
+        // discovery between our snapshot and acquisition of the guard.
+        if let Ok(cached) = self.candidates.lock()
+            && let Some((routes, _, attempted)) = cached.as_ref()
+            && attempted.elapsed() < Duration::from_secs(30)
+        {
+            return routes.clone();
+        }
+        let fetched = async {
             let (client, base) = self.routes.endpoint(
                 self.peer.scheduler_id(),
                 Role::Scheduler,
                 crate::dist::cluster_routes::Route::unbound(self.peer.scheduler_address()),
             )?;
-            let response = crate::http_client::io_runtime()?
-                .block_on(
-                    client
-                        .get(base.join("/api/v1/scheduler/native_routes")?.as_str())
-                        .header(http::header::ACCEPT, "application/octet-stream")
-                        .timeout(Duration::from_millis(500))
-                        .send(),
-                )?
+            let response = client
+                .get(base.join("/api/v1/scheduler/native_routes")?.as_str())
+                .header(http::header::ACCEPT, "application/octet-stream")
+                .timeout(Duration::from_millis(500))
+                .send()
+                .await?
                 .error_for_status()?;
-            let reply: Reply = decode_response(response, 4096)?;
+            let reply: Reply = decode_response_async(response, 4096).await?;
             ensure!(reply.routes.valid(), "invalid scheduler routes");
-            // The local configured endpoint is always the fallback even if the
-            // scheduler advertises a different reachable interface.
-            Ok(RouteSet::new(self.address, reply.routes.iter()))
-        })();
+            Ok::<_, anyhow::Error>(RouteSet::new(self.address, reply.routes.iter()))
+        }
+        .await;
         let (routes, updated) = match fetched {
             Ok(routes) => (routes, Instant::now()),
             Err(error) => {
                 debug!("Native cache path discovery unavailable: {error:#}");
-                cached
-                    .as_ref()
-                    .filter(|(_, updated, _)| updated.elapsed() < Duration::from_secs(90))
-                    .map_or_else(
-                        || (fallback(), Instant::now()),
-                        |(routes, updated, _)| (routes.clone(), *updated),
-                    )
+                previous()
             }
         };
         self.routes
             .prime(self.peer.scheduler_id(), Role::Scheduler, &routes);
-        *cached = Some((routes.clone(), updated, Instant::now()));
-        drop(cached);
+        if let Ok(mut cached) = self.candidates.lock() {
+            *cached = Some((routes.clone(), updated, Instant::now()));
+        }
         routes
     }
 
@@ -311,13 +335,20 @@ impl NativeCacheClient {
         &self,
         transfer: Option<Transfer>,
     ) -> Vec<crate::dist::cluster_routes::Route> {
-        let routes = self.cache_routes();
+        self.order_cache_endpoints(&self.cache_routes(), transfer)
+    }
+
+    fn order_cache_endpoints(
+        &self,
+        routes: &sccache_peer_identity::RouteSet,
+        transfer: Option<Transfer>,
+    ) -> Vec<crate::dist::cluster_routes::Route> {
         let peer = self.peer.scheduler_id();
         let role = sccache_cluster_identity::Role::Scheduler;
-        self.routes.prime(peer, role, &routes);
+        self.routes.prime(peer, role, routes);
         transfer.map_or_else(
-            || self.routes.ordered(peer, role, &routes),
-            |transfer| self.routes.ordered_transfer(peer, role, &routes, transfer),
+            || self.routes.ordered(peer, role, routes),
+            |transfer| self.routes.ordered_transfer(peer, role, routes, transfer),
         )
     }
 
@@ -328,19 +359,31 @@ impl NativeCacheClient {
         timeout: Duration,
         transfer: Option<Transfer>,
     ) -> Result<(wreq::Response, crate::dist::cluster_routes::Route)> {
+        crate::http_client::io_runtime()?
+            .block_on(self.send_to_cache_async(operation, body, timeout, transfer))
+    }
+
+    async fn send_to_cache_async(
+        &self,
+        operation: &str,
+        body: Vec<u8>,
+        timeout: Duration,
+        transfer: Option<Transfer>,
+    ) -> Result<(wreq::Response, crate::dist::cluster_routes::Route)> {
         let start = Instant::now();
         let mut last_error = None;
         let body = bytes::Bytes::from(body);
-        for address in self.cache_endpoints(transfer) {
-            let remaining = timeout
-                .checked_sub(start.elapsed())
-                .context("native request deadline expired")?;
-            let response = crate::http_client::io_runtime()?.block_on(
-                self.request_at(operation, address)?
-                    .timeout(remaining)
-                    .body(body.clone())
-                    .send(),
-            );
+        let routes = self.cache_routes_async().await;
+        for address in self.order_cache_endpoints(&routes, transfer) {
+            let remaining = timeout.checked_sub(start.elapsed()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "native request deadline expired")
+            })?;
+            let response = self
+                .request_at(operation, address)?
+                .timeout(remaining)
+                .body(body.clone())
+                .send()
+                .await;
             match response {
                 Err(error) if error.is_connect() => {
                     self.routes.failed(
@@ -376,15 +419,35 @@ impl NativeCacheClient {
         value: &T,
         timeout: Duration,
     ) -> Result<R> {
+        crate::http_client::io_runtime()?
+            .block_on(self.control_with_timeout_async(operation, value, timeout))
+    }
+
+    async fn control_with_timeout_async<T: Serialize, R: DeserializeOwned>(
+        &self,
+        operation: &str,
+        value: &T,
+        timeout: Duration,
+    ) -> Result<R> {
         ensure!(
             !timeout.is_zero(),
             "native control request deadline expired"
         );
         let data = codec().with_limit(self.metadata_limit).serialize(value)?;
-        let response = self
-            .send_replayable(operation, data, timeout.min(self.timeout))?
-            .error_for_status()?;
-        decode_response(response, self.metadata_limit)
+        let timeout = timeout.min(self.timeout);
+        tokio::time::timeout(timeout, async {
+            let (response, _) = self
+                .send_to_cache_async(operation, data, timeout, None)
+                .await?;
+            decode_response_async(response.error_for_status()?, self.metadata_limit).await
+        })
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "native control request deadline expired",
+            )
+        })?
     }
 
     // Retrying is deliberately limited to package resolution: a busy reply
@@ -1540,9 +1603,15 @@ fn copy_verified(reader: impl Read, blob: BlobRef, mut destination: impl Write) 
 }
 
 fn decode_response<T: DeserializeOwned>(response: wreq::Response, limit: u64) -> Result<T> {
-    let bytes = crate::http_client::io_runtime()?.block_on(
-        crate::http_client::read_bounded_bytes_async(response, usize::try_from(limit)?),
-    )?;
+    crate::http_client::io_runtime()?.block_on(decode_response_async(response, limit))
+}
+
+async fn decode_response_async<T: DeserializeOwned>(
+    response: wreq::Response,
+    limit: u64,
+) -> Result<T> {
+    let bytes =
+        crate::http_client::read_bounded_bytes_async(response, usize::try_from(limit)?).await?;
     ensure!(
         u64::try_from(bytes.len())? <= limit,
         "native response exceeds configured limit"
