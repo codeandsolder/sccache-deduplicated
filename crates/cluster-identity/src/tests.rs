@@ -10,7 +10,7 @@ use std::net::{SocketAddr, TcpStream};
 
 fn trust_store(ca: &X509Ref) -> Result<X509Store> {
     let mut store = X509StoreBuilder::new()?;
-    store.add_cert(ca.to_owned())?;
+    store.add_cert(ca)?;
     Ok(store.build())
 }
 

@@ -26,7 +26,7 @@ use crate::{
 use super::{
     LocalExecutor, NativeBuildPolicy, NativeBuildResult, NativeBuildSource, NativeCacheClient,
     client::{
-        InputBlob, InputProvider, LocalInputs, NativeProgress, Outcome, failed_output,
+        BlobSink, InputBlob, InputProvider, LocalInputs, NativeProgress, Outcome, failed_output,
         fetch_result, validate_manifest, verify_destinations,
     },
     codec, copy_verified,
@@ -213,7 +213,7 @@ fn serve_inner(
                             );
                             let mut writer =
                                 BufWriter::with_capacity(stream.chunk_bytes(), &mut *stream);
-                            download(blob, &mut writer)?;
+                            download(blob, &mut BlobSink::Stream(&mut writer))?;
                             writer.flush()?;
                         }
                     }

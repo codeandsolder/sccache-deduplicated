@@ -221,7 +221,47 @@ pub(super) enum Outcome<'a> {
     },
 }
 
-type BlobDownload<'a> = dyn FnMut(BlobRef, &mut dyn Write) -> Result<()> + 'a;
+/// A destination that is either private staging (safe to reset after a
+/// failed verification) or an irreversible framed IPC stream.
+pub(super) enum BlobSink<'a> {
+    File(&'a mut fs::File),
+    Memory(&'a mut Vec<u8>),
+    Stream(&'a mut dyn Write),
+}
+
+impl BlobSink<'_> {
+    pub(super) fn reset(&mut self) -> Result<()> {
+        match self {
+            Self::File(file) => {
+                file.set_len(0)?;
+                file.rewind()?;
+            }
+            Self::Memory(bytes) => bytes.clear(),
+            Self::Stream(_) => bail!("cannot rewind a result stream"),
+        }
+        Ok(())
+    }
+}
+
+impl Write for BlobSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::File(file) => file.write(bytes),
+            Self::Memory(buffer) => buffer.write(bytes),
+            Self::Stream(stream) => stream.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::File(file) => file.flush(),
+            Self::Memory(buffer) => buffer.flush(),
+            Self::Stream(stream) => stream.flush(),
+        }
+    }
+}
+
+type BlobDownload<'a> = dyn FnMut(BlobRef, &mut BlobSink<'_>) -> Result<()> + 'a;
 
 pub(super) enum Delivery<'a> {
     Scheduler(Pin<'a>, Option<Box<Publication>>),
@@ -823,7 +863,7 @@ struct ResultBlobs<'a, D> {
     download: D,
 }
 
-impl<D: FnMut(BlobRef, &mut dyn Write) -> Result<()>> ResultBlobs<'_, D> {
+impl<D: FnMut(BlobRef, &mut BlobSink<'_>) -> Result<()>> ResultBlobs<'_, D> {
     fn spool_file(&mut self) -> Result<NamedTempFile> {
         if self.spool.is_none() {
             self.spool = Some(tempfile::tempdir()?);
@@ -837,7 +877,7 @@ impl<D: FnMut(BlobRef, &mut dyn Write) -> Result<()>> ResultBlobs<'_, D> {
         &mut self,
         blob: BlobRef,
         existing: Option<&Path>,
-        output: &mut dyn Write,
+        output: &mut BlobSink<'_>,
     ) -> Result<()> {
         if let Some(path) = self.verified.get(&blob.id) {
             io::copy(&mut fs::File::open(path)?, output)?;
@@ -864,26 +904,41 @@ impl<D: FnMut(BlobRef, &mut dyn Write) -> Result<()>> ResultBlobs<'_, D> {
                 .then(|| Box::new(file) as Box<dyn Read + Send>)
         });
         let inputs = self.inputs;
-        for candidate in existing.into_iter().chain(inputs.matching_sources(blob.id)) {
-            let mut file = self.spool_file()?;
-            if copy_verified(candidate, blob, &mut file).is_ok() {
-                file.rewind()?;
-                io::copy(&mut file, output)?;
-                if self.repeated.contains(&blob.id) {
-                    self.verified.insert(blob.id, file.into_temp_path());
+        let repeated = self.repeated.contains(&blob.id);
+        // Repeated content gets one shared spool. A unique blob can be
+        // verified directly in its private destination and reset on failure.
+        let mut spool = if repeated {
+            Some(self.spool_file()?)
+        } else {
+            None
+        };
+        {
+            let mut spool_sink;
+            let target = if let Some(file) = &mut spool {
+                spool_sink = BlobSink::File(file.as_file_mut());
+                &mut spool_sink
+            } else {
+                &mut *output
+            };
+            let mut reused = false;
+            for candidate in existing.into_iter().chain(inputs.matching_sources(blob.id)) {
+                target.reset()?;
+                if copy_verified(candidate, blob, &mut *target).is_ok() {
+                    reused = true;
+                    break;
                 }
-                return Ok(());
+            }
+            if !reused {
+                target.reset()?;
+                (self.download)(blob, target)?;
             }
         }
-        if self.repeated.contains(&blob.id) {
-            let mut file = self.spool_file()?;
-            (self.download)(blob, &mut file)?;
+        if let Some(mut file) = spool {
             file.rewind()?;
             io::copy(&mut file, output)?;
             self.verified.insert(blob.id, file.into_temp_path());
-            return Ok(());
         }
-        (self.download)(blob, output)
+        Ok(())
     }
 }
 
@@ -927,7 +982,7 @@ pub(super) fn fetch_result(
     destinations: &BTreeMap<String, PathBuf>,
     inputs: &LocalInputs<'_>,
     max_result_bytes: u64,
-    download: impl FnMut(BlobRef, &mut dyn Write) -> Result<()>,
+    download: impl FnMut(BlobRef, &mut BlobSink<'_>) -> Result<()>,
 ) -> Result<StagedResult> {
     validate_manifest(spec, manifest, max_result_bytes)?;
     let mut blobs = ResultBlobs {
@@ -940,7 +995,7 @@ pub(super) fn fetch_result(
     let mut diagnostic = |blob: Option<BlobRef>| -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         if let Some(blob) = blob {
-            blobs.write(blob, None, &mut bytes)?;
+            blobs.write(blob, None, &mut BlobSink::Memory(&mut bytes))?;
         }
         Ok(bytes)
     };
@@ -955,7 +1010,7 @@ pub(super) fn fetch_result(
         let temp = match artifact {
             Artifact::File { blob, mode } => {
                 let mut temp = NamedTempFile::new_in(parent)?;
-                blobs.write(*blob, Some(path), &mut temp)?;
+                blobs.write(*blob, Some(path), &mut BlobSink::File(temp.as_file_mut()))?;
                 if let Some(mode) = mode {
                     temp.as_file()
                         .set_permissions(fs::Permissions::from_mode(*mode))?;
@@ -967,10 +1022,12 @@ pub(super) fn fetch_result(
                     blobs.write(
                         blob,
                         None,
-                        &mut fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(path)?,
+                        &mut BlobSink::File(
+                            &mut fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(path)?,
+                        ),
                     )
                 })?)
             }
@@ -1182,6 +1239,27 @@ mod result_tests {
             stderr: None,
         };
         Ok((spec, input, manifest))
+    }
+
+    #[test]
+    fn private_blob_staging_can_retry_after_partial_or_corrupt_delivery() -> Result<()> {
+        let expected = blob(b"correct");
+        let mut file = tempfile::tempfile()?;
+        let mut bytes = Vec::new();
+        for mut sink in [BlobSink::File(&mut file), BlobSink::Memory(&mut bytes)] {
+            assert!(copy_verified(b"corrupt".as_slice(), expected, &mut sink).is_err());
+            sink.reset()?;
+            assert!(copy_verified(b"short".as_slice(), expected, &mut sink).is_err());
+            sink.reset()?;
+            copy_verified(b"correct".as_slice(), expected, &mut sink)?;
+        }
+        file.rewind()?;
+        let mut actual = Vec::new();
+        file.read_to_end(&mut actual)?;
+        assert_eq!(actual, b"correct");
+        assert_eq!(bytes, b"correct");
+        assert!(BlobSink::Stream(&mut io::sink()).reset().is_err());
+        Ok(())
     }
 
     #[test]

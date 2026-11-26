@@ -353,31 +353,53 @@ impl<'a> ResultDelivery<'a> {
     pub(super) fn download(
         &mut self,
         blob: BlobRef,
-        mut destination: impl std::io::Write,
+        destination: &mut super::client::BlobSink<'_>,
     ) -> Result<()> {
+        use super::client::BlobSink;
         use std::io::{self, Seek};
         anyhow::ensure!(
             self.declared.get(&blob.id) == Some(&blob.size),
             "undeclared native result blob"
         );
         self.refresh(blob);
-        if let Some(plan) = self.plans.get(&blob.id).and_then(Option::as_ref)
-            && let Some(mut staging) = self.client.try_peer_blob(plan, |reader, encoding| {
-                let mut staging = tempfile::tempfile()?;
-                crate::build_runtime::transfer_native_blob(
-                    reader,
-                    io::sink(),
-                    &mut staging,
-                    blob,
-                    encoding,
-                )?;
-                staging.rewind()?;
-                Ok(staging)
-            })
-        {
-            io::copy(&mut staging, &mut destination)?;
-            self.record(blob, true);
-            return Ok(());
+        if let Some(plan) = self.plans.get(&blob.id).and_then(Option::as_ref) {
+            // Only IPC needs a separate spool: its frame cannot be rewound
+            // after a failed peer transfer. File and memory staging can.
+            let mut spool = matches!(destination, BlobSink::Stream(_))
+                .then(tempfile::tempfile)
+                .transpose()?;
+            let direct = {
+                let mut spool_sink;
+                let target = if let Some(file) = &mut spool {
+                    spool_sink = BlobSink::File(file);
+                    &mut spool_sink
+                } else {
+                    &mut *destination
+                };
+                self.client
+                    .try_peer_blob(plan, |reader, encoding| {
+                        target.reset()?;
+                        crate::build_runtime::transfer_native_blob(
+                            reader,
+                            io::sink(),
+                            &mut *target,
+                            blob,
+                            encoding,
+                        )
+                    })
+                    .is_some()
+            };
+            if direct {
+                if let Some(mut file) = spool {
+                    file.rewind()?;
+                    io::copy(&mut file, &mut *destination)?;
+                }
+                self.record(blob, true);
+                return Ok(());
+            }
+            if !matches!(destination, BlobSink::Stream(_)) {
+                destination.reset()?;
+            }
         }
         if let Some(deadline) = self.publication_deadline {
             let timeout = self

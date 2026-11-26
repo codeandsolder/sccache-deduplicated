@@ -594,6 +594,38 @@ mod tests {
     }
 
     #[test]
+    fn identical_artifact_bytes_with_different_mtime_change_preserved_tree_identity() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("artifact");
+        fs::write(&path, b"identical dependency bytes")?;
+        let stable = TreeTimestamp {
+            seconds: 1,
+            nanoseconds: 0,
+        };
+        let root = TreeMetadata {
+            mode: 0o755,
+            modified: stable,
+        };
+        let prepare = |seconds, policy| -> Result<PreparedTree> {
+            File::open(&path)?.set_times(fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+            ))?;
+            let mut tree = MappedTree::new(root);
+            tree.add_file(TreePath::new(b"artifact".to_vec())?, path.clone(), policy)?;
+            tree.prepare()
+        };
+        let first = prepare(100, MappedMetadata::Preserve)?;
+        let second = prepare(200, MappedMetadata::Preserve)?;
+        assert_eq!(first.manifest().blobs()?, second.manifest().blobs()?);
+        assert_ne!(first.id(), second.id());
+        let first = prepare(100, MappedMetadata::Normalize(stable))?;
+        let second = prepare(200, MappedMetadata::Normalize(stable))?;
+        assert_eq!(first.id(), second.id());
+        Ok(())
+    }
+
+    #[test]
     fn prepared_content_recovers_from_an_unavailable_alias() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let first = dir.path().join("first");
