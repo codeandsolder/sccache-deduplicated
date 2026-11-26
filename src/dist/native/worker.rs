@@ -228,7 +228,7 @@ pub struct WorkerDelivery<'a> {
     pub package_import: Option<PackageImportLimits>,
     pub transport: &'a PackageTransportTracker,
     pub execution_queue: &'a crate::dist::execution_queue::ExecutionQueue,
-    pub artifact_grace: &'a super::ArtifactGrace,
+    pub artifact_grace: Option<&'a super::ArtifactGrace>,
 }
 
 #[cfg(feature = "dist-client")]
@@ -545,13 +545,15 @@ impl NativeCacheClient {
                 store,
                 policy,
             },
-            Some((
-                delivery.artifact_grace,
-                preparation
-                    .estimated_result_bytes
-                    .unwrap_or(policy.max_result_bytes)
-                    .clamp(1, policy.max_result_bytes),
-            )),
+            delivery.artifact_grace.map(|grace| {
+                (
+                    grace,
+                    preparation
+                        .estimated_result_bytes
+                        .unwrap_or(policy.max_result_bytes)
+                        .clamp(1, policy.max_result_bytes),
+                )
+            }),
             |id, check, on_tree| self.fetch_tree(ticket, id, store, delivery, check, on_tree),
             &|| lease.check(),
             preparation.on_tree,

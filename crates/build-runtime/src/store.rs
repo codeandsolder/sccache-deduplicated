@@ -692,6 +692,18 @@ pub struct NativeStore {
 }
 
 impl NativeStore {
+    /// Canonical directory owned by this store.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.inner.root
+    }
+
+    /// The single admission and eviction policy for all clones.
+    #[must_use]
+    pub fn managed_space_policy(&self) -> Option<SpacePolicy> {
+        self.inner.space_policy
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn mount_tree_protected(
         &self,
