@@ -85,14 +85,6 @@ impl NativeCacheClient {
         plans
     }
 
-    pub(super) fn probe_sources<'a>(&self, plans: impl IntoIterator<Item = &'a BlobSourcePlan>) {
-        self.routes.probe_routes(plans.into_iter().flat_map(|plan| {
-            plan.sources
-                .iter()
-                .map(|source| (source.peer, Role::Worker, &source.routes))
-        }));
-    }
-
     fn direct_candidates<'a>(
         &self,
         plan: &'a BlobSourcePlan,
