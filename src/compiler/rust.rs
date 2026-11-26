@@ -3852,11 +3852,8 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             // trying to do every single path.
             let mut remapped_disks = HashSet::new();
             for (local_path, dist_path) in get_path_mappings(path_transformer) {
-                if canonical_paths.is_some()
-                    && matches!(
-                        dist_path.as_str(),
-                        "/build" | "/target" | "/cargo" | "/rust"
-                    )
+                if canonical_paths
+                    .is_some_and(|paths| paths.is_canonical_mapping(&local_path, &dist_path))
                 {
                     continue;
                 }
@@ -7422,6 +7419,12 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         {
             let distributed = dist_command.context("distributed Clippy command not generated")?;
             assert_eq!(distributed.executable, "/rust/bin/clippy-driver");
+            assert!(
+                distributed
+                    .arguments
+                    .iter()
+                    .all(|arg| !arg.starts_with("--remap-path-prefix=/clippy-config="))
+            );
             assert_eq!(
                 distributed.env_vars.iter().find_map(|(name, value)| {
                     (name == "CLIPPY_CONF_DIR").then_some(value.trim_end_matches('/'))

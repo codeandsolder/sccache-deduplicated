@@ -750,6 +750,16 @@ mod server {
     fn make_401(short_err: &str) -> Response {
         make_401_with_body(short_err, ClientVisibleMsg(String::new()))
     }
+    fn role_error(request: &Request, role: Role) -> Option<Response> {
+        (request.role() != role).then(|| {
+            make_401(match role {
+                Role::Client => "client_role_required",
+                Role::Worker => "worker_role_required",
+                Role::Scheduler => "scheduler_role_required",
+            })
+        })
+    }
+
     fn bearer_http_auth(request: &Request) -> Option<&str> {
         let header = request.header("Authorization")?;
 
@@ -1083,8 +1093,8 @@ mod server {
                     let handler = &state.handler;
                     let requester = &state.requester;
                     logged(&state.request_count, request, |req_id| {
-                        if request.role() != Role::Client {
-                            return make_401("client_role_required");
+                        if let Some(response) = role_error(request, Role::Client) {
+                            return response;
                         }
                         let toolchain = try_bincode_input!(req_id, request);
                         trace!("Req {req_id}: alloc_job: {toolchain:?}");
@@ -1135,8 +1145,8 @@ mod server {
                     |state: &SchedulerHttp<S>, request, server_id: ServerId| {
                         let requester = &state.requester;
                         logged(&state.request_count, request, |req_id| {
-                            if request.role() != Role::Client {
-                                return make_401("client_role_required");
+                            if let Some(response) = role_error(request, Role::Client) {
+                                return response;
                             }
                             let routes = try_or_500_log!(req_id, requester.addresses(server_id));
                             prepare_response(request, &WorkerRouteHttpResponse { routes })
@@ -1151,8 +1161,8 @@ mod server {
                     |state: &SchedulerHttp<S>, request, server_id: ServerId| {
                         let handler = &state.handler;
                         logged(&state.request_count, request, |req_id| {
-                            if request.role() != Role::Client {
-                                return make_401("client_role_required");
+                            if let Some(response) = role_error(request, Role::Client) {
+                                return response;
                             }
                             let worker_name =
                                 try_or_500_log!(req_id, handler.handle_get_worker_name(server_id));
@@ -1171,7 +1181,7 @@ mod server {
                 let requester = &state.requester;
                 let registry = &state.registry;
                 logged(&state.request_count, request, |req_id| {
-                    if request.role() != Role::Worker { return make_401("worker_role_required"); }
+                    if let Some(response) = role_error(request, Role::Worker) { return response; }
                     let server_id = request.id();
                     let worker_name = request
                         .header("X-Sccache-Worker-Name")
@@ -1220,7 +1230,7 @@ mod server {
             .route("/api/v1/scheduler/job_state/{job_id}", path_route(MethodFilter::POST, |state: &SchedulerHttp<S>, request, job_id: JobId| {
                 let handler = &state.handler;
                 logged(&state.request_count, request, |req_id| {
-                    if request.role() != Role::Worker { return make_401("worker_role_required"); }
+                    if let Some(response) = role_error(request, Role::Worker) { return response; }
                     let server_id = request.id();
                     let job_state = try_bincode_input!(req_id, request);
                     trace!("Req {req_id}: job state: {job_state:?}");
@@ -1264,8 +1274,8 @@ mod server {
                         let handler = &state.handler;
                         let job_authorizer = &state.job_authorizer;
                         logged(&state.request_count, request, |req_id| {
-                            if request.role() != Role::Scheduler {
-                                return make_401("scheduler_role_required");
+                            if let Some(response) = role_error(request, Role::Scheduler) {
+                                return response;
                             }
                             job_auth_or_401!(request, job_authorizer, job_id);
                             let toolchain = try_bincode_input!(req_id, request);
@@ -1289,8 +1299,8 @@ mod server {
                         let requester = &state.requester;
                         let job_authorizer = &state.job_authorizer;
                         logged(&state.request_count, request, |req_id| {
-                            if request.role() != Role::Scheduler {
-                                return make_401("scheduler_role_required");
+                            if let Some(response) = role_error(request, Role::Scheduler) {
+                                return response;
                             }
                             job_auth_or_401!(request, job_authorizer, job_id);
                             let limit = try_or_400_log!(
@@ -1341,8 +1351,8 @@ mod server {
                         let handler = &state.handler;
                         let job_authorizer = &state.job_authorizer;
                         logged(&state.request_count, request, |req_id| {
-                            if request.role() != Role::Client {
-                                return make_401("client_role_required");
+                            if let Some(response) = role_error(request, Role::Client) {
+                                return response;
                             }
                             job_auth_or_401!(request, job_authorizer, job_id);
                             let operation: crate::build_runtime::wire::NativeRunRequest =
@@ -1374,8 +1384,8 @@ mod server {
                         let job_authorizer = &state.job_authorizer;
                         let upload_activity = &state.upload_activity;
                         logged(&state.request_count, request, |req_id| {
-                            if request.role() != Role::Client {
-                                return make_401("client_role_required");
+                            if let Some(response) = role_error(request, Role::Client) {
+                                return response;
                             }
                             job_auth_or_401!(request, job_authorizer, job_id);
                             trace!("Req {req_id}: submit_toolchain({job_id})");
@@ -1414,8 +1424,8 @@ mod server {
                         let job_authorizer = &state.job_authorizer;
                         let running_jobs = &state.running_jobs;
                         logged(&state.request_count, request, |req_id| {
-                            if request.role() != Role::Client {
-                                return make_401("client_role_required");
+                            if let Some(response) = role_error(request, Role::Client) {
+                                return response;
                             }
                             job_auth_or_401!(request, job_authorizer, job_id);
 

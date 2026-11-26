@@ -19,10 +19,10 @@ use axum::{
 };
 use bincode::Options;
 use http::StatusCode;
-use sccache_cluster_identity::{ClusterListener, SchedulerEnrollment};
+use sccache_cluster_identity::{ClusterListener, Role, SchedulerEnrollment};
 use serde::{Serialize, de::DeserializeOwned};
 
-use super::{SchedulerRequester, authenticate_client, authenticate_server};
+use super::{SchedulerRequester, role_error};
 use crate::{
     build_runtime::{
         ActionMode, ArchiveLength, BlobEncoding, BlobRef, Direction, ExecutionSpec,
@@ -461,16 +461,16 @@ fn respond(
     }
     let publisher = match role {
         "client" => {
-            if let Err(response) = authenticate_client(request) {
+            if let Some(response) = role_error(request, Role::Client) {
                 return response;
             }
             Publisher::Client
         }
         "worker" => {
-            let server = match authenticate_server(request) {
-                Ok(server) => server,
-                Err(response) => return response,
-            };
+            if let Some(response) = role_error(request, Role::Worker) {
+                return response;
+            }
+            let server = request.id();
             let Some(job) = request
                 .header("X-Sccache-Native-Job")
                 .and_then(|job| job.parse::<u64>().ok())

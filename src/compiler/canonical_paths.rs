@@ -547,6 +547,16 @@ impl CanonicalRustPaths {
         }
     }
 
+    /// Canonical sandbox paths must never be remapped back into a physical
+    /// checkout, registry alias, or private build lease by a distributed worker.
+    #[cfg(feature = "dist-client")]
+    pub(super) fn is_canonical_mapping(&self, physical: &Path, logical: &str) -> bool {
+        self.roots.iter().any(|root| {
+            root.canonical == Path::new(logical)
+                && root.aliases.iter().any(|alias| alias == physical)
+        })
+    }
+
     pub(crate) fn add_to_transformer(&self, transformer: &mut dist::PathTransformer) {
         for root in &self.roots {
             transformer
@@ -900,6 +910,18 @@ mod tests {
             );
             assert!(roots.root_is_known(&dep));
             assert!(roots.root_is_known(&out_dir));
+            #[cfg(feature = "dist-client")]
+            {
+                let mut transformer = dist::PathTransformer::new();
+                roots.add_to_transformer(&mut transformer);
+                assert!(roots.is_canonical_mapping(&intermediate, "/intermediate"));
+                assert!(
+                    transformer
+                        .path_mappings()
+                        .all(|(physical, logical)| roots.is_canonical_mapping(&physical, &logical))
+                );
+                assert!(!roots.is_canonical_mapping(&lease, "/intermediate"));
+            }
             assert_eq!(
                 roots.to_canonical(&persistent_target.join("release/final.rlib")),
                 Path::new("/target/release/final.rlib"),
