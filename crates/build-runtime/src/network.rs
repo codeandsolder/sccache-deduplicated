@@ -4,7 +4,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, Read},
-    net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
@@ -16,10 +15,53 @@ use std::{
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub enum Peer {
-    Worker(SocketAddr),
-    Client(IpAddr),
+    Worker(crate::PeerId),
+    Client(crate::PeerId),
     Upstream,
     Other,
+    WorkerPath(crate::PeerId, NetworkPath),
+    ClientPath(crate::PeerId, NetworkPath),
+    UpstreamPath(NetworkPath),
+}
+
+pub use sccache_peer_identity::NetworkPath;
+
+impl Peer {
+    /// Actual scheduler-local socket endpoints, when known.
+    #[must_use = "capacity constraints require a concrete path"]
+    pub const fn path(self) -> Option<NetworkPath> {
+        match self {
+            Self::WorkerPath(_, path) | Self::ClientPath(_, path) | Self::UpstreamPath(path) => {
+                Some(path)
+            }
+            _ => None,
+        }
+    }
+
+    /// The stable principal; path changes must not change job ownership.
+    #[must_use = "principal identity groups the same member's outstanding demand"]
+    pub const fn principal(self) -> Self {
+        match self {
+            Self::WorkerPath(id, _) => Self::Worker(id),
+            Self::ClientPath(id, _) => Self::Client(id),
+            Self::UpstreamPath(_) => Self::Upstream,
+            peer => peer,
+        }
+    }
+
+    /// Attribute one observation to a concrete scheduler-relative route.
+    #[must_use = "the route-specific peer keys capacity evidence"]
+    pub const fn on_path(self, path: NetworkPath) -> Self {
+        if !path.valid() {
+            return self.principal();
+        }
+        match self.principal() {
+            Self::Worker(id) => Self::WorkerPath(id, path),
+            Self::Client(id) => Self::ClientPath(id, path),
+            Self::Upstream => Self::UpstreamPath(path),
+            peer => peer,
+        }
+    }
 }
 
 #[derive(
@@ -203,6 +245,7 @@ impl PeerRecord {
             !sustained && (bytes != 0 || current.active != 0 || self.previous.active != 0);
         self.previous = current;
         PeerWindow {
+            bytes,
             rate,
             isolated: self.isolated,
             sustained,
@@ -212,6 +255,7 @@ impl PeerRecord {
 }
 
 struct PeerWindow {
+    bytes: u64,
     rate: u64,
     isolated: u64,
     sustained: bool,
@@ -296,6 +340,7 @@ impl DirectionSnapshot {
 pub struct NetworkSnapshot {
     pub send: DirectionSnapshot,
     pub receive: DirectionSnapshot,
+    pub interfaces: crate::wire::InterfaceReport,
 }
 
 #[derive(Default)]
@@ -315,13 +360,20 @@ impl DirectionMeter {
             .or_insert_with(|| PeerRecord::new(now))
     }
 
-    fn sample(&mut self, now: Instant, elapsed: Duration) {
+    fn sample(
+        &mut self,
+        now: Instant,
+        elapsed: Duration,
+        clean: impl FnOnce(&BTreeMap<Peer, u64>) -> bool,
+    ) {
         let mut sustained = BTreeMap::new();
         let mut partial = elapsed > Duration::from_secs(3);
         let mut current_rates = BTreeMap::new();
+        let mut current_bytes = BTreeMap::new();
         for (&peer, record) in &mut self.peers {
             let window = record.sample(now, elapsed);
-            if window.rate > 0 {
+            if window.bytes > 0 {
+                current_bytes.insert(peer, window.bytes);
                 current_rates.insert(peer, window.rate);
             }
             if window.sustained {
@@ -330,6 +382,7 @@ impl DirectionMeter {
             partial |= window.partial;
         }
 
+        partial |= !clean(&current_bytes);
         self.peers.retain(|_, record| {
             record.previous.active != 0 || now.duration_since(record.last_active) <= MAX_AGE
         });
@@ -521,15 +574,19 @@ impl NetworkMeter {
     }
 
     /// Advance the estimator on synchronized windows from a maintenance thread.
-    pub fn sample(&self) {
+    pub fn sample(&self, mut clean: impl FnMut(Direction, &BTreeMap<Peer, u64>) -> bool) {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let elapsed = now.duration_since(state.last_sample);
         if elapsed < Duration::from_millis(200) {
             return;
         }
-        state.send.sample(now, elapsed);
-        state.receive.sample(now, elapsed);
+        state
+            .send
+            .sample(now, elapsed, |bytes| clean(Direction::Send, bytes));
+        state
+            .receive
+            .sample(now, elapsed, |bytes| clean(Direction::Receive, bytes));
         state.last_sample = now;
     }
 
@@ -539,6 +596,7 @@ impl NetworkMeter {
         NetworkSnapshot {
             send: state.send.snapshot(),
             receive: state.receive.snapshot(),
+            interfaces: crate::wire::InterfaceReport::default(),
         }
     }
 }

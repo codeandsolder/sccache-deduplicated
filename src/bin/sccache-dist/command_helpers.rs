@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use sccache::dist::JobId;
 use std::process::{ChildStdin, Command, Output, Stdio};
 
-pub(super) trait CommandExt {
+pub trait CommandExt {
     fn check_stdout_trim(&mut self) -> Result<String>;
     fn check_piped(&mut self, pipe: &mut dyn FnMut(&mut ChildStdin) -> Result<()>) -> Result<()>;
     fn check_run(&mut self) -> Result<()>;
@@ -67,7 +67,7 @@ impl CommandExt for Command {
 }
 
 /// Append a compiler invocation after a container's clean-environment command.
-pub(super) fn run_with_environment(
+pub fn run_with_environment(
     job_id: JobId,
     command: &mut Command,
     environment: Vec<(String, String)>,

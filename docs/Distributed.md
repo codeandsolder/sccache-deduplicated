@@ -18,11 +18,10 @@ Background:
 ## Managed release native portability
 
 The managed Linux x86-64-v2 release includes distributed worker TLS support.
-Build it with the vendored-openssl Cargo feature so the worker embeds
-OpenSSL rather than depending on a particular host's libssl/libcrypto
-SONAME. The immutable release validator rejects all external OpenSSL
-dependencies and requires GLIBC no newer than 2.39; the release metadata
-records openssl_linkage=vendored-static. The older published protocol-v2
+BoringSSL is statically linked through btls-fast, independent of the host's
+libssl/libcrypto SONAME. The immutable release validator rejects external
+OpenSSL dependencies and requires GLIBC no newer than 2.39; the release
+metadata records `tls_backend=boringssl-static`. The older published protocol-v2
 canary e266a04e demonstrated why both checks matter: it passed GLIBC
 verification but required OpenSSL 4 on an OpenSSL 3 worker host.
 
@@ -117,10 +116,11 @@ The HTTP implementation of sccache has the following API, where all HTTP body co
    - `POST /api/v1/scheduler/alloc_job`
       - Called by a client to submit a compilation request.
       - Returns information on where the job is allocated it should run.
-   - `GET /api/v1/scheduler/server_certificate`
-      - Called by a client to retrieve the (dynamically created) HTTPS
-        certificate for a server, for use in communication with that server.
-      - Returns a digest and PEM for the temporary server HTTPS certificate.
+   - `GET /api/v1/scheduler/worker_route/{peer_id}`
+      - Returns the configured worker endpoint and bounded alternative interface
+        addresses. All routes must authenticate the same enrolled public key.
+   - `GET /api/v1/scheduler/native_routes`
+      - Returns the native CAS listener's candidate addresses.
    - `POST /api/v4/scheduler/heartbeat_server`
       - Called (repeatedly) by servers to register as available for jobs.
       - Every five seconds, advertises fractional effective CPU capacity from
@@ -178,13 +178,12 @@ To protect against this, servers must be authenticated to the scheduler. You hav
 means for doing this, and the scheduler and all servers must use the same mechanism.
 
 Once a server has registered itself using the selected authentication, the scheduler
-will trust the registered server address and use it for builds.
+will trust the enrolled public-key identity and authenticate each candidate route before use.
 
 #### JWT HS256 (preferred)
 
-This method uses secret key to create a per-IP-and-port token for each server.
-Acquiring a token will only allow participation as a server if the attacker can
-additionally impersonate the IP and port the token was generated for.
+This method creates an enrollment token bound to the worker public-key identity.
+The worker must prove possession of the corresponding private key during enrollment.
 
 You *must* keep the secret key safe.
 
@@ -198,13 +197,12 @@ follows:
 server_auth = { type = "jwt_hs256", secret_key = "YOUR_KEY_HERE" }
 ```
 
-Now generate a token for the server, giving the IP and port the scheduler and clients can
-connect to the server on (address `192.168.1.10:10501` here):
+First initialize the persistent worker key on the worker, as its service account. Then generate an enrollment token for its reported public-key ID:
 
 ```
 sccache-dist auth generate-jwt-hs256-server-token \
     --secret-key YOUR_KEY_HERE \
-    --server 192.168.1.10:10501
+    --server "$WORKER_ID"
 ```
 
 *or:*
@@ -212,7 +210,7 @@ sccache-dist auth generate-jwt-hs256-server-token \
 ```
 sccache-dist auth generate-jwt-hs256-server-token \
     --config /path/to/scheduler-config.toml \
-    --server 192.168.1.10:10501
+    --server "$WORKER_ID"
 ```
 
 This will output a token (you can examine it with https://jwt.io if you're
@@ -378,18 +376,53 @@ If third parties can see traffic to the servers, source code can be leaked. If t
 parties can modify traffic to and from the servers or the scheduler, they can cause
 the client to receive malicious compiled objects.
 
-Securing communication with the scheduler is the responsibility of the sccache cluster
-administrator - it is recommended to put a webserver with a HTTPS certificate in front
-of the scheduler and instruct clients to configure their `scheduler_url` with the
-appropriate `https://` address. The scheduler will verify the server's IP in this
-configuration by inspecting the `X-Real-IP` header's value, if present. The webserver
-used in this case should be configured to set this header to the appropriate value.
+Protocol 5 uses native mutual TLS for scheduler RPCs, worker RPCs and the
+native cache. The scheduler acts as the local CA. Bootstrap tokens authorize
+initial enrollment and recovery of expired leaves only; subsequent requests
+authenticate the role-bound leaf. A still-valid persisted identity does not
+require a bootstrap token. Existing clusters refuse to start without their
+durable enrollment registry; restore it from a consistent backup rather than
+creating an empty registry under an established CA.
+Each peer's persistent P-256 public-key SHA-256 digest is its identity, not its
+address or current leaf. Leaves renew with the same key, and TLS contexts reload
+without stopping in-flight transfers. Job and exact-content capabilities still
+authorize individual operations.
 
-Securing communication with the server is performed automatically - HTTPS certificates
-are generated dynamically on server startup and communicated to the scheduler during
-the heartbeat. If a client does not have the appropriate certificate for communicating
-securely with a server (after receiving a job allocation from the scheduler), the
-certificate will be requested from the scheduler.
+Initialize the scheduler directory as the scheduler service account:
+
+```sh
+sccache-dist cluster-init --directory /var/lib/sccache-cluster/scheduler
+```
+
+Distribute only its generated `ca.pem` and the printed scheduler peer ID using
+an independently authenticated provisioning channel. Never distribute the CA
+private key. Members use separate absolute identity directories and the
+provisioned CA and scheduler ID. For key-bound worker JWT enrollment, create the
+worker identity with `sccache-dist cluster-id --directory /var/lib/sccache-cluster/worker`
+before generating the JWT.
+
+The configured scheduler URL and worker public address are reliable fallback
+endpoints. Workers advertise interface candidates in authenticated heartbeats.
+Native CAS similarly advertises its listener interfaces. Candidates are
+validated by mTLS and ranked by measured request latency; unreachable or stale
+candidates fall back to the configured route. There is no mDNS dependency.
+Explicit bind addresses restrict the listener; by default non-loopback workers
+and native cache listeners bind the configured address family on all interfaces.
+
+For offline administration, `sccache-dist cluster-revoke --directory /var/lib/sccache-cluster/scheduler --peer PEER_ID`
+requires the scheduler to be stopped (exclusive registry lock). The scheduler
+rejects revoked peers and distributes permanent revocations in heartbeats.
+Workers reject new peer requests if their scheduler revocation snapshot becomes
+stale, without interrupting authorized transfers already in progress.
+`sccache-dist cluster-status --client-config /path/to/client.toml` provides
+authenticated JSON status for token-configured clients.
+
+Protocol 5 / rollout epoch 6 is incompatible with the previous transport; do
+not mix binaries or use the old HTTP health endpoint. The managed fleet's
+`fleet/prepare-host ROLE CA_PEM SCHEDULER_ID` stages the new trust configuration
+before the coordinated cutover. The scheduler host requires a native bundle
+built with `--scheduler-dashboard`, including the matching WASM/JS/CSS assets.
+The held release timers resume only after all hosts have committed the cutover.
 
 ## Configuration
 
@@ -399,9 +432,9 @@ Use the `--config` argument to pass the path to its configuration file to `sccac
 ### scheduler.toml
 
 ```toml
-# The socket address the scheduler will listen on. It's strongly recommended
-# to listen on localhost and put a HTTPS server in front of it.
+# The scheduler terminates TLS directly on this reliable endpoint.
 public_addr = "127.0.0.1:10600"
+cluster_directory = "/var/lib/sccache-cluster/scheduler"
 
 # Optional maintenance admission gate. While this file exists, the scheduler
 # keeps heartbeats and job-state updates working but refuses new allocations.
@@ -437,7 +470,7 @@ draining). When a worker reduces its advertised width, its existing jobs
 are not cancelled. Consequently available slots need not equal the fleet
 limit minus aggregate in-progress jobs.
 
-Upgrade all clients and the scheduler together for protocol 4, adding the
+Upgrade all clients and the scheduler together for protocol 5, adding the
 required configuration before starting the new scheduler. Remove the former
 scheduler slack environment variables; they no longer participate in admission.
 
@@ -506,11 +539,15 @@ cache_dir = "/tmp/toolchains"
 #toolchain_cache_size = 10737418240
 # A public IP address and port that clients will use to connect to this builder.
 public_addr = "192.168.1.1:10501"
-# The socket address the builder will listen on. Falls back to public_addr.
+# The socket address the builder will listen on. Defaults to a wildcard for non-loopback endpoints.
 #bind_address = "0.0.0.0:10501"
-# The URL used to connect to the scheduler (should use https, given an ideal
-# setup of a HTTPS server in front of the scheduler)
-scheduler_url = "https://192.168.1.1"
+# The reliable native HTTPS scheduler endpoint.
+scheduler_url = "https://192.168.1.1:10600"
+
+[cluster]
+directory = "/var/lib/sccache-cluster/worker"
+ca_certificate = "/etc/sccache/cluster-ca.pem"
+scheduler_id = "<64-digit scheduler peer ID>"
 
 [builder]
 type = "overlay"
@@ -586,3 +623,159 @@ Until these binaries [are included in releases](https://github.com/mozilla/sccac
 ```
 docker run -ti --rm -v $PWD:/sccache luser/sccache-musl-build:0.1 /bin/bash -c "cd /sccache; cargo build --release --target x86_64-unknown-linux-musl --features=dist-server && strip target/x86_64-unknown-linux-musl/release/sccache-dist && cd target/x86_64-unknown-linux-musl/release/ && tar czf sccache-dist.tar.gz sccache-dist"
 ```
+
+## Local scheduler status dashboard
+
+### Live network topology
+
+The dashboard's **Topology** view projects authenticated scheduler, worker,
+client, and observed upstream identities. Enrolled but idle or revoked
+identities remain visible, while candidate routes, verified measured routes,
+and active scheduler transfers have distinct evidence states. The selectable
+host detail exposes all reported interface addresses, nominal wired capacity,
+and total/external RX and TX rates. Directional path rows distinguish encoded
+wire service from verified logical peer delivery. Several addresses belonging
+to one authenticated member do not create several host nodes. Separate
+client and worker identities on one physical machine are not merged without
+evidence. The graph is a logical directed transport graph, not a physical
+traceroute reconstruction.
+
+Host and link upserts/removals share the native revisioned SSE stream with
+workers and jobs; reconnect resets reconstruct the complete topology. The
+WASM graph has deterministic keyed SVG nodes and edges, so traffic changes
+do not recreate the layout. No browser polling or graph-specific HTTP endpoint
+is used. The dashboard remains scheduler-local and read-only.
+
+The optional `scheduler-dashboard` feature adds a read-only Axum listener
+inside the scheduler process. The UI follows rust-web-fullstack: Leptos 0.8
+SSR/WASM hydration, typed Rust server functions, scoped Stylance styles and
+Server-Sent Events. Model-only workspace builds and ordinary worker builds
+do not require the UI dependencies. The distributed wire protocol is unchanged.
+
+Build the native scheduler and matching browser assets from the same revision:
+
+```sh
+rustup target add wasm32-unknown-unknown
+# Linux x86-64: exact lockfile tool versions with upstream checksums.
+scripts/install-scheduler-dashboard-tools.sh target/dashboard-tools
+scripts/build-scheduler-dashboard.sh target/dashboard-tools/wasm-bindgen target/dashboard-tools/stylance
+cargo build --locked --release --no-default-features --features scheduler-dashboard --bin sccache-dist
+```
+
+On other platforms install the versions of wasm-bindgen-cli and stylance-cli
+specified by Cargo.lock and call the build script with their executable paths
+(or put the matching tools on PATH). The generated package is under the Cargo
+target directory at `scheduler-dashboard/pkg`; install the complete directory
+alongside the corresponding scheduler release. Configure its absolute path:
+
+```toml
+[dashboard]
+bind_address = "127.0.0.1:10604"
+assets = "/opt/sccache/dashboard/pkg"
+# Optional Prometheus-compatible data source, e.g. Liberta:
+# metrics_url = "http://127.0.0.1:8428"
+# Exact Certifex virtual host for the ingress panels:
+# metrics_ingress_host = "sccache.example.org"
+```
+
+The dashboard is read-only and loopback-only. Access it locally or through an
+SSH port forward. Do not publish it through an unauthenticated reverse proxy.
+A configured dashboard fails startup for missing assets, invalid addresses or
+invalid metrics URLs. Builds without the feature reject dashboard configuration.
+
+### Live scheduler data
+
+The initial typed SSR snapshot hydrates once. `GET /api/events` then streams
+a full reset followed by ordered deltas. Worker and job rows are keyed by
+identity; unchanged rows are not retransmitted just to update their age.
+Scheduler mutations wake the sampler, coalesced to at most ten projections
+per second. The periodic two-second sample covers time-based state changes
+and CAS/network observations and appends one history point (900 retained).
+History resets with the scheduler. Reconnection and broadcast lag both
+produce a fresh reset; revision gaps cannot be silently ignored.
+
+The UI includes worker heartbeat age, capacity, errors, reservations and
+native phases, job state, input backlog and assignment-time predictions,
+CAS logical accounting, garbage collection and directional network estimates, including shared bottleneck and observed
+concurrent-capacity groups. CAS/network samples have their own cadence and
+are not recomputed in response to scheduler mutations.
+All scheduler-owned reservations, including assignment RPCs in flight, are
+available through a searchable, paginated table. Archive and native admission
+headroom are shown separately; they share compiler capacity and must not be added.
+No thousand-job truncation. Expired workers are excluded without
+mutating scheduling state. Native compiler slots are not legacy allocations;
+logical CAS bytes are not physical filesystem usage; measured transport
+goodput is not physical link capacity.
+
+### Fleet history
+
+If configured, Liberta supplies the existing Grafana dashboard plus cache-tier analytics (42 query
+panels total). Select an exact client or all clients and a range from 15 minutes
+to seven days. Requests use fixed server-side PromQL templates; user labels
+are escaped as literal regular expressions. Linux host-wide panels include monitored Linux hosts rather than claiming all
+are workers. Ingress panels require an explicit Certifex virtual host. Range-dependent resolution is 5–1800 seconds;
+rates span at least five minutes.
+
+`GET /api/metrics/events` has one shared producer for each selected view.
+At most eight active distinct views and four concurrent queries globally
+bound backend load. Inactive views stop querying. Normal queries refresh the trailing five minutes or four buckets, whichever
+is longer; a full reconciliation runs every ten minutes or four buckets,
+whichever is longer. Failed panels retain previous samples inside the range
+and retry a full range at the next grid. Rolling changes and corrections are
+delivered as point-level patches. Stat, time-series, distribution gauge and
+version table presentation are preserved. Both streams expose errors and resynchronize
+after connection loss. Native telemetry works independently of Liberta.
+Liberta's existing retention and data producers are unchanged.
+
+### Native service and CAS pressure
+
+The dashboard reports ticket populations (including unobserved/contended tickets),
+upload slots, manifest-cache usage and result-recovery queue occupancy. Session
+telemetry never renews leases or takes service slots. A contended session or
+resource is explicitly unavailable in that sample; observations do not wait
+behind long-running I/O or trigger eviction. The CAS view shows physical free
+space separately from logical resident bytes, staging reservations and both
+physical and logical budget watermarks. Headroom estimates exclude prospective
+reclamation and are advisory, not admission guarantees.
+
+### Cache analytics
+
+The scheduler and each native worker run a separate five-minute sampler.
+The scheduler GUI reports the distribution of distinct live CAS blobs by size,
+last root touch and cumulative root touches. Shared content is counted once in
+storage; touches are attributed to each distinct referencing action or tree.
+Publications are touches, so the curve is not a request-hit rate. Unknown
+usage is distinct from zero. Cumulative reuse percentiles give bucket bounds
+rather than pretending to know the ordering within a bucket.
+
+Logical/reference, stored-file and allocated-block sizes are distinct.
+Measured ratios use measured bytes only; allocated blocks do not establish
+exclusive space consumption on ZFS (snapshots, clones and compression).
+Eviction distributions use root reuse utility divided by independently
+reclaimable bytes; pinned and shared content cannot be reclaimed by a single
+root. The read-only scan is best effort for concurrent filesystem changes and
+does not invoke eviction. Per-worker summaries accompany existing heartbeats;
+do not sum replicated host content to infer cluster-wide uniqueness.
+
+With direct metrics enabled, the client samples each legacy cache tier every
+five minutes independently of compilation. Disk reports indexed serialized
+objects and LRU modification times; persistent hit frequency is not available.
+Managed S3 reports serialized object sizes, metadata age, decayed milli-hit heat,
+and the age adjusted by eviction policy. One shared lease limits namespace
+scans to a 30-minute cadence; a failed refresh retains the prior timestamped
+report. Its two internal analytics metadata objects are excluded from pruning.
+The fleet metrics UI exposes capacity for all clients, and bounded histogram
+and percentile panels for the selected client. Shared remote tiers can repeat
+across clients. Managed-heat percentiles are heat proxies, not observed hits.
+
+### Portable release package
+
+The CI release workflow additionally publishes
+`sccache-scheduler-dashboard-linux-x86_64-v2.tar.gz` and its SHA-256 file.
+The archive contains the dashboard-enabled scheduler executable, matching
+`pkg/` assets, build revision/protocol metadata and internal SHA-256 checksums.
+It is built from the same revision as the ordinary fleet binaries and subject
+to the same native ABI checks. Worker/client bundles and the existing automatic
+fleet updater continue to use the ordinary binaries; installing the separate
+scheduler package and switching the scheduler service are explicit deployment
+operations, not an automatic protocol rollout.

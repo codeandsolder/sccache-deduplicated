@@ -1072,6 +1072,17 @@ impl Storage for MultiLevelStorage {
         self.aggregate_size(SizeMetric::Maximum).await
     }
 
+    async fn tier_observations(
+        &self,
+        allow_refresh: bool,
+    ) -> Vec<crate::cache::CacheTierObservation> {
+        let mut observations = Vec::new();
+        for level in &self.levels {
+            observations.extend(level.tier_observations(allow_refresh).await);
+        }
+        observations
+    }
+
     fn multilevel_stats(&self) -> Option<crate::cache::multilevel::MultiLevelStats> {
         Some(self.stats())
     }
@@ -1079,8 +1090,7 @@ impl Storage for MultiLevelStorage {
     fn preprocessor_cache_mode_config(&self) -> PreprocessorCacheModeConfig {
         self.levels
             .first()
-            .map(|level| level.preprocessor_cache_mode_config())
-            .unwrap_or_default()
+            .map_or_default(|level| level.preprocessor_cache_mode_config())
     }
 
     fn basedirs(&self) -> &[Vec<u8>] {

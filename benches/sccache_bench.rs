@@ -20,10 +20,11 @@
 //! - LRU cache operations
 
 use divan::{Bencher, black_box};
+use lru::LruCache;
 use sccache::cache::{CacheRead, CacheWrite};
-use sccache::lru_disk_cache::LruCache;
 use sccache::util::{Digest, TimeMacroFinder, strip_basedirs};
 use std::io::Cursor;
+use std::num::NonZeroUsize;
 
 // =============================================================================
 // Helper Functions
@@ -145,13 +146,14 @@ fn lru_cache_insert(bencher: Bencher) {
 
     bencher
         .with_inputs(|| {
-            let cache: LruCache<String, u64> = LruCache::new(num_entries as u64 * 2);
+            let cache: LruCache<String, u64> =
+                LruCache::sparse(NonZeroUsize::new(num_entries * 2).unwrap());
             let keys: Vec<String> = (0..num_entries).map(|i| format!("key_{i:08x}")).collect();
             (cache, keys)
         })
         .bench_values(|(mut cache, keys)| {
             for (i, key) in keys.into_iter().enumerate() {
-                cache.insert(key, i as u64);
+                cache.put(key, i as u64);
             }
             black_box(cache)
         });
@@ -165,9 +167,10 @@ fn lru_cache_get_hit(bencher: Bencher) {
 
     bencher
         .with_inputs(|| {
-            let mut cache: LruCache<String, u64> = LruCache::new(num_entries as u64 * 2);
+            let mut cache: LruCache<String, u64> =
+                LruCache::sparse(NonZeroUsize::new(num_entries * 2).unwrap());
             for (i, key) in keys.iter().enumerate() {
-                cache.insert(key.clone(), i as u64);
+                cache.put(key.clone(), i as u64);
             }
             cache
         })
@@ -186,7 +189,8 @@ fn lru_cache_eviction(bencher: Bencher) {
 
     bencher
         .with_inputs(|| {
-            let cache: LruCache<String, u64> = LruCache::new(cache_size as u64);
+            let cache: LruCache<String, u64> =
+                LruCache::sparse(NonZeroUsize::new(cache_size).unwrap());
             // Generate more keys than cache can hold
             let keys: Vec<String> = (0..cache_size * 3)
                 .map(|i| format!("key_{i:08x}"))
@@ -195,7 +199,7 @@ fn lru_cache_eviction(bencher: Bencher) {
         })
         .bench_values(|(mut cache, keys)| {
             for (i, key) in keys.into_iter().enumerate() {
-                cache.insert(key, i as u64);
+                cache.put(key, i as u64);
             }
             black_box(cache)
         });
@@ -208,14 +212,15 @@ fn lru_cache_mixed_workload(bencher: Bencher) {
 
     bencher
         .with_inputs(|| {
-            let cache: LruCache<String, u64> = LruCache::new(num_ops as u64);
+            let cache: LruCache<String, u64> =
+                LruCache::sparse(NonZeroUsize::new(num_ops).unwrap());
             let keys: Vec<String> = (0..num_ops).map(|i| format!("key_{i:08x}")).collect();
             (cache, keys)
         })
         .bench_values(|(mut cache, keys)| {
             // Insert half
             for (i, key) in keys.iter().take(num_ops / 2).enumerate() {
-                cache.insert(key.clone(), i as u64);
+                cache.put(key.clone(), i as u64);
             }
             // Get some
             for key in keys.iter().take(num_ops / 4) {
@@ -223,11 +228,11 @@ fn lru_cache_mixed_workload(bencher: Bencher) {
             }
             // Remove some
             for key in keys.iter().take(num_ops / 8) {
-                cache.remove(key);
+                cache.pop(key);
             }
             // Insert more
             for (i, key) in keys.iter().skip(num_ops / 2).enumerate() {
-                cache.insert(key.clone(), i as u64);
+                cache.put(key.clone(), i as u64);
             }
             black_box(cache)
         });
@@ -747,10 +752,11 @@ fn lru_hotcold_access_pattern(bencher: Bencher) {
 
     bencher
         .with_inputs(|| {
-            let mut cache: LruCache<String, u64> = LruCache::new((total_keys * 2) as u64);
+            let mut cache: LruCache<String, u64> =
+                LruCache::sparse(NonZeroUsize::new(total_keys * 2).unwrap());
             // Populate cache
             for i in 0..total_keys {
-                cache.insert(format!("key_{i:08x}"), i as u64);
+                cache.put(format!("key_{i:08x}"), i as u64);
             }
             let keys: Vec<String> = (0..total_keys).map(|i| format!("key_{i:08x}")).collect();
             (cache, keys)
@@ -778,9 +784,10 @@ fn lru_sequential_scan_pattern(bencher: Bencher) {
 
     bencher
         .with_inputs(|| {
-            let mut cache: LruCache<String, u64> = LruCache::new((num_keys * 2) as u64);
+            let mut cache: LruCache<String, u64> =
+                LruCache::sparse(NonZeroUsize::new(num_keys * 2).unwrap());
             for i in 0..num_keys {
-                cache.insert(format!("key_{i:08x}"), i as u64);
+                cache.put(format!("key_{i:08x}"), i as u64);
             }
             let keys: Vec<String> = (0..num_keys).map(|i| format!("key_{i:08x}")).collect();
             (cache, keys)
@@ -802,7 +809,8 @@ fn lru_realistic_eviction_pressure(bencher: Bencher) {
 
     bencher
         .with_inputs(|| {
-            let cache: LruCache<String, Vec<u8>> = LruCache::new(cache_capacity as u64);
+            let cache: LruCache<String, Vec<u8>> =
+                LruCache::sparse(NonZeroUsize::new(cache_capacity).unwrap());
             // Simulate realistic cache entry sizes (10KB each)
             let entry_data = vec![0u8; 10 * 1024];
             (cache, entry_data)
@@ -810,7 +818,7 @@ fn lru_realistic_eviction_pressure(bencher: Bencher) {
         .bench_values(|(mut cache, entry_data)| {
             // Insert more than capacity, causing evictions
             for i in 0..num_operations {
-                cache.insert(format!("key_{i:08x}"), entry_data.clone());
+                cache.put(format!("key_{i:08x}"), entry_data.clone());
             }
             black_box(cache)
         });

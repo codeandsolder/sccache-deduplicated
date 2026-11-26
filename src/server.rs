@@ -249,6 +249,7 @@ pub struct DistClientConfig {
 
     // From the static dist configuration
     scheduler_url: Option<config::HTTPUrl>,
+    cluster: Option<sccache_peer_identity::PeerConfig>,
     auth: config::DistAuth,
     cache_dir: PathBuf,
     toolchain_cache_size: u64,
@@ -308,6 +309,7 @@ impl DistClientContainer {
             return Self::new_native(crate::compiler::NativeCompilerClient::new(
                 native.clone(),
                 config.dist.scheduler_url.clone(),
+                config.dist.cluster.clone(),
                 config.dist.auth.clone(),
                 config.dist.toolchains.clone(),
                 &config.dist.native_installation_catalogs,
@@ -317,6 +319,7 @@ impl DistClientContainer {
         let config = DistClientConfig {
             pool: pool.clone(),
             scheduler_url: config.dist.scheduler_url.clone(),
+            cluster: config.dist.cluster.clone(),
             auth: config.dist.auth.clone(),
             cache_dir: config.dist.cache_dir.clone(),
             toolchain_cache_size: config.dist.toolchain_cache_size,
@@ -495,23 +498,29 @@ impl DistClientContainer {
         if let Some(ref addr) = config.scheduler_url {
             let url = addr.to_url();
             info!("Enabling distributed sccache to {url}");
-            let auth_token = match &config.auth {
-                config::DistAuth::Token { token } => Ok(token.to_owned()),
-                config::DistAuth::Oauth2CodeGrantPKCE { auth_url, .. }
-                | config::DistAuth::Oauth2Implicit { auth_url, .. } => {
-                    Self::get_cached_config_auth_token(auth_url)
-                }
-            };
-            let auth_token = try_or_fail_with_message!(
-                auth_token.context("could not load client auth token, run |sccache --dist-auth|")
+            let cluster = try_or_fail_with_message!(
+                config
+                    .cluster
+                    .clone()
+                    .context("distributed cluster trust configuration required")
+            );
+            let address = try_or_retry_later!(sccache_cluster_identity::endpoint(&url));
+            let auth = config.auth.clone();
+            let peer = try_or_retry_later!(
+                sccache_cluster_identity::PeerCredentials::open(
+                    cluster,
+                    address,
+                    sccache_cluster_identity::Role::Client,
+                    move || Self::enrollment_token(&auth),
+                )
+                .await
             );
             let dist_client = dist::http::Client::new(
                 &config.pool,
-                url,
+                Arc::new(peer),
                 &config.cache_dir.join("client"),
                 config.toolchain_cache_size,
                 &config.toolchains,
-                auth_token,
                 config.rewrite_includes_only,
             );
             let dist_client =
@@ -535,7 +544,18 @@ impl DistClientContainer {
         }
     }
 
-    pub(crate) fn get_cached_config_auth_token(auth_url: &str) -> Result<String> {
+    pub(crate) fn enrollment_token(auth: &config::DistAuth) -> Result<String> {
+        match auth {
+            config::DistAuth::Token { token } => Ok(token.clone()),
+            config::DistAuth::Oauth2CodeGrantPKCE { auth_url, .. }
+            | config::DistAuth::Oauth2Implicit { auth_url, .. } => {
+                Self::get_cached_config_auth_token(auth_url)
+                    .context("could not load enrollment token, run |sccache --dist-auth|")
+            }
+        }
+    }
+
+    fn get_cached_config_auth_token(auth_url: &str) -> Result<String> {
         let cached_config = config::CachedConfig::reload()?;
         cached_config
             .with(|c| c.dist.auth_tokens.get(auth_url).map(String::to_owned))?
@@ -1151,7 +1171,9 @@ enum ConnectionRole {
         peer: Arc<shared::Peer>,
     },
     #[cfg(target_os = "linux")]
-    PrivateExecutor,
+    PrivateExecutor {
+        uid: u32,
+    },
 }
 
 impl ConnectionRole {
@@ -1161,6 +1183,7 @@ impl ConnectionRole {
             #[cfg(target_os = "linux")]
             Self::SharedPublic { peer, .. } => match request {
                 Request::Compile(_) | Request::GetStats | Request::DistStatus => true,
+                Request::Transfer(request) if request.is_intermediate() => true,
                 Request::ZeroStats
                 | Request::Shutdown
                 | Request::ActiveCompiles
@@ -1168,7 +1191,7 @@ impl ConnectionRole {
                 _ => false,
             },
             #[cfg(target_os = "linux")]
-            Self::PrivateExecutor => matches!(
+            Self::PrivateExecutor { .. } => matches!(
                 request,
                 Request::StorageHandshake
                     | Request::Transfer(_)
@@ -1354,6 +1377,7 @@ where
                 Box::new(DistClientConfig {
                     pool: rt.clone(),
                     scheduler_url: None,
+                    cluster: None,
                     auth: config::DistAuth::Token {
                         token: String::new(),
                     },
@@ -1390,6 +1414,33 @@ where
             drop(self.tx.clone().start_send(ServerMessage::Request));
             self.stats.lock().await.compile_requests += 1;
             return Ok(Arc::clone(executor).response(self.clone(), Arc::clone(peer), compile));
+        }
+        #[cfg(all(target_os = "linux", feature = "dist-client"))]
+        {
+            let uid = match role {
+                ConnectionRole::SharedPublic { peer, .. } => peer.uid(),
+                ConnectionRole::PrivateExecutor { uid } => *uid,
+                // Ordinary listeners run under the same UID as their clients.
+                ConnectionRole::Ordinary => {
+                    // SAFETY: geteuid only queries process credentials.
+                    unsafe { libc::geteuid() }
+                }
+            };
+            transfers.set_uid(uid);
+            if let Message::WithoutBody(Request::Transfer(ref request)) = req
+                && request.is_intermediate()
+            {
+                drop(self.tx.clone().start_send(ServerMessage::Request));
+                let Message::WithoutBody(Request::Transfer(request)) = req else {
+                    unreachable!()
+                };
+                let result = transfers
+                    .handle_intermediate(request, self.dist_client.native.clone())
+                    .await;
+                return Ok(Message::WithoutBody(Response::Transfer(
+                    result.map_err(|error| format!("{error:#}")),
+                )));
+            }
         }
         let _ = role;
         self.dispatch(req, transfers).await
@@ -1669,6 +1720,11 @@ where
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
     pub(crate) fn native_compiler(&self) -> Option<Arc<crate::compiler::NativeCompilerClient>> {
         self.dist_client.native.clone()
+    }
+
+    #[cfg(feature = "direct-metrics")]
+    pub(crate) fn metrics_storage(&self) -> Arc<dyn Storage> {
+        self.storage.clone()
     }
 
     pub(crate) async fn get_info(&self) -> Result<ServerInfo> {
@@ -2121,7 +2177,7 @@ where
                             stats.non_cacheable_compilations += 1;
                         }
                         CompileResult::CompileFailed(dt, duration) => {
-                            debug!("[{out_pretty}]: compile result: compile failed");
+                            warn!("[{out_pretty}]: compiler exited {}: {}", out.status, String::from_utf8_lossy(&out.stderr));
                             dist_type = dt;
                             stats.compilations += 1;
                             stats.compiler_write_duration += duration;
@@ -2167,7 +2223,7 @@ where
                 Err(err) => {
                     match err.downcast::<ProcessError>() {
                         Ok(ProcessError(output)) => {
-                            debug!("Compilation failed: {output:?}");
+                            warn!("[{out_pretty}]: compiler exited {}: {}", output.status, String::from_utf8_lossy(&output.stderr));
                             stats.compile_fails += 1;
                             // Make sure the write guard has been dropped ASAP.
                             drop(stats);
@@ -3509,6 +3565,7 @@ mod tests {
         let config = DistClientConfig {
             pool: runtime.handle().clone(),
             scheduler_url: None,
+            cluster: None,
             auth: config::DistAuth::Token {
                 token: String::new(),
             },

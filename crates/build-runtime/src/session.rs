@@ -4,7 +4,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::File,
     io::{Read, Seek},
-    net::SocketAddr,
     path::Path,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, Weak,
@@ -22,8 +21,9 @@ use crate::{
     PackageImportLimits, PackageTransferCost, ResultLease, ResultManifest, StagedBlob, TreeId,
     TreeLease, TreeManifest, UploadReservation, VerifiedPackage,
     wire::{
-        ActionRequest, BeginResult, InputDemand, InputPoll, NativeAdmission, NativeStatus,
-        Publisher, ScheduleReply, Ticket, TreeOffer, TreeRead, WorkerAllocation,
+        ActionRequest, BeginResult, ClientDeliveryObservation, DeliverySelection, InputDemand,
+        InputPoll, NativeAdmission, NativeStatus, Publisher, ScheduleReply, Ticket, TreeOffer,
+        TreeRead, WorkerAllocation,
     },
 };
 
@@ -245,7 +245,7 @@ impl Pending {
                 let PendingAction { permit, upload, .. } = *action;
                 let (manifest, transfer) = upload.context("missing result negotiation")?;
                 let result = transfer.publish(|staged| permit.publish_pinned(&manifest, staged));
-                Ok(Ready::Result(Box::new(result?)))
+                Ok(Ready::Result(Arc::new(result?)))
             }
             Self::Tree { manifest, transfer } => Ok(Ready::Tree(Box::new(TreeDelivery::new(
                 transfer.publish(|staged| store.publish_tree_pinned(&manifest, staged))?,
@@ -292,7 +292,7 @@ impl TreeDelivery {
 /// Only the claimed origin uploads; the verified retention lease is shared.
 struct Backfill {
     blob: BlobRef,
-    requester: SocketAddr,
+    requester: crate::PeerId,
     state: Mutex<BackfillState>,
 }
 
@@ -353,13 +353,13 @@ impl PeerInputClaim {
     }
 
     #[must_use = "identifies the worker awaiting recovered content"]
-    pub fn requester(&self) -> SocketAddr {
+    pub fn requester(&self) -> crate::PeerId {
         self.0.flight.requester
     }
 }
 
 enum Ready {
-    Result(Box<ResultLease>),
+    Result(Arc<ResultLease>),
     Tree(Box<TreeDelivery>),
 }
 
@@ -382,7 +382,7 @@ enum Committed {
 
 enum Phase {
     Pending(Box<Pending>),
-    Publishing,
+    Publishing(Option<ResultManifest>),
     Ready(Ready),
     Failed,
 }
@@ -396,6 +396,23 @@ enum Kind {
 struct DelegatedAllocation {
     declaration: [u8; 32],
     worker: WorkerAllocation,
+    requester: crate::PeerId,
+    selection: DeliverySelection,
+    allocation_started: Instant,
+    delivery_reported: bool,
+}
+
+/// An authenticated receipt for a committed remote action. The scheduler
+/// owns the elapsed clock; client timing and byte counts are advisory.
+#[derive(Debug, Clone, Copy)]
+pub struct DeliveryReceipt {
+    pub worker: crate::PeerId,
+    pub job: u64,
+    pub requester: crate::PeerId,
+    pub profile: ContentId,
+    pub result_bytes: u64,
+    pub elapsed: Duration,
+    pub observation: ClientDeliveryObservation,
 }
 
 struct Session {
@@ -404,6 +421,21 @@ struct Session {
     publisher: Publisher,
     kind: Kind,
     phase: Phase,
+}
+
+impl Session {
+    fn negotiated_result(&self) -> Option<&ResultManifest> {
+        // Local execution and trees keep their existing publication semantics.
+        self.allocation.as_ref()?;
+        match &self.phase {
+            Phase::Pending(pending) => match &**pending {
+                Pending::Action(action) => action.upload.as_ref().map(|(manifest, _)| manifest),
+                Pending::Tree { .. } => None,
+            },
+            Phase::Publishing(manifest) => manifest.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 type SharedSession = Arc<Mutex<Session>>;
@@ -416,6 +448,7 @@ pub struct NativeSessions {
     coordinator: BuildCoordinator,
     limits: SessionLimits,
     sessions: Mutex<HashMap<Ticket, SharedSession>>,
+    retained: retention::RetentionGroups,
     active_uploads: Arc<AtomicUsize>,
     backfills: Mutex<HashMap<ContentId, Weak<Backfill>>>,
     peer_wake: Condvar,
@@ -473,6 +506,7 @@ impl NativeSessions {
             coordinator: BuildCoordinator::new(store),
             limits,
             sessions: Mutex::new(HashMap::new()),
+            retained: retention::RetentionGroups::default(),
             active_uploads: Arc::new(AtomicUsize::new(0)),
             backfills: Mutex::new(HashMap::new()),
             peer_wake: Condvar::new(),
@@ -607,7 +641,7 @@ impl NativeSessions {
             // Never wait on another session's I/O while holding the global map.
             map.retain(|_, shared| match shared.try_lock() {
                 Ok(mut state) => {
-                    if state.expires <= now && !matches!(state.phase, Phase::Publishing) {
+                    if state.expires <= now && !matches!(state.phase, Phase::Publishing(_)) {
                         expired.push(std::mem::replace(&mut state.phase, Phase::Failed));
                         false
                     } else {
@@ -629,7 +663,7 @@ impl NativeSessions {
         drop(expired);
         self.reap_backfills(now)?;
         self.recovery.reap()?;
-        Ok(count)
+        Ok(count + self.retained.reap(now)?)
     }
 
     // A canceled origin can leave an upload claim alive in a flight shared
@@ -727,7 +761,7 @@ impl NativeSessions {
                 let ticket = self.register(
                     Kind::Action,
                     publisher,
-                    Phase::Ready(Ready::Result(Box::new(lease))),
+                    Phase::Ready(Ready::Result(Arc::new(lease))),
                 )?;
                 Ok(NativeAdmission::Hit { ticket, manifest })
             }
@@ -803,6 +837,8 @@ impl NativeSessions {
         &self,
         ticket: Ticket,
         request: &ActionRequest,
+        requester: crate::PeerId,
+        selection: DeliverySelection,
         allocate: impl FnOnce(
             BTreeMap<ContentId, u64>,
             Vec<&BTreeMap<ContentId, u64>>,
@@ -810,7 +846,7 @@ impl NativeSessions {
     ) -> Result<ScheduleReply> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
-        if !matches!(state.phase, Phase::Publishing) {
+        if !matches!(state.phase, Phase::Publishing(_)) {
             self.touch(&mut state)?;
         }
         let declaration =
@@ -819,7 +855,9 @@ impl NativeSessions {
         // origin. Replay survives execution, publication and failure.
         if let Some(allocation) = &state.allocation {
             ensure!(
-                allocation.declaration == declaration,
+                allocation.declaration == declaration
+                    && allocation.requester == requester
+                    && allocation.selection == selection,
                 "allocation declaration differs from admission"
             );
             return Ok(ScheduleReply::Assigned(allocation.worker.clone()));
@@ -838,6 +876,14 @@ impl NativeSessions {
         ensure!(
             publisher == Publisher::Client && action.upload.is_none(),
             "native action already has a publisher"
+        );
+        ensure!(
+            selection
+                .outputs
+                .iter()
+                .all(|name| request.required_outputs.contains_key(name)
+                    || request.optional_outputs.contains_key(name)),
+            "undeclared selected output"
         );
         let mut blobs = BTreeMap::new();
         for tree in action.inputs.values() {
@@ -862,14 +908,19 @@ impl NativeSessions {
                     .context("missing admitted input manifest")
             })
             .collect::<Result<Vec<_>>>()?;
+        let allocation_started = Instant::now();
         let reply = allocate(blobs, trees)?;
         if let ScheduleReply::Assigned(allocation) = &reply {
             state.allocation = Some(DelegatedAllocation {
                 declaration,
                 worker: allocation.clone(),
+                requester,
+                selection,
+                allocation_started,
+                delivery_reported: false,
             });
             state.publisher = Publisher::Worker {
-                address: allocation.address,
+                peer: allocation.peer,
                 job: allocation.job,
             };
         }
@@ -912,7 +963,9 @@ impl NativeSessions {
     pub fn renew(&self, ticket: Ticket, publisher: Publisher) -> Result<()> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
-        if matches!(state.phase, Phase::Ready(_)) && publisher == Publisher::Client {
+        if publisher == Publisher::Client
+            && (matches!(state.phase, Phase::Ready(_)) || state.negotiated_result().is_some())
+        {
             self.authorize_reader(&mut state, publisher)
         } else {
             self.authorize(&mut state, publisher)
@@ -1181,7 +1234,9 @@ impl NativeSessions {
                 Phase::Pending(pending) => pending.check_complete()?,
                 _ => bail!("native session cannot commit"),
             }
-            let Phase::Pending(pending) = std::mem::replace(&mut state.phase, Phase::Publishing)
+            let preview = state.negotiated_result().cloned();
+            let Phase::Pending(pending) =
+                std::mem::replace(&mut state.phase, Phase::Publishing(preview))
             else {
                 bail!("native phase changed");
             };
@@ -1233,20 +1288,102 @@ impl NativeSessions {
     /// # Errors
     /// Returns an error for unknown or expired tickets.
     pub fn status(&self, ticket: Ticket) -> Result<NativeStatus> {
+        self.status_with_preview(ticket, false)
+    }
+
+    /// Request a provisional result manifest once the producing worker has
+    /// negotiated it. Ordinary status polling does not resend this metadata.
+    ///
+    /// # Errors
+    /// Returns an error for unknown or expired tickets.
+    pub fn status_with_preview(&self, ticket: Ticket, preview: bool) -> Result<NativeStatus> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         ensure!(state.kind == Kind::Action, "native ticket is not an action");
         if matches!(state.phase, Phase::Ready(_) | Phase::Failed) {
             self.touch(&mut state)?;
-        } else if !matches!(state.phase, Phase::Publishing) {
+        } else if !matches!(state.phase, Phase::Publishing(_)) {
             ensure!(state.expires > Instant::now(), "native ticket expired");
         }
         Ok(match &state.phase {
-            Phase::Pending(_) | Phase::Publishing => NativeStatus::Compiling,
+            Phase::Pending(_) | Phase::Publishing(_) if preview => state
+                .negotiated_result()
+                .map_or(NativeStatus::Compiling, |manifest| {
+                    NativeStatus::Negotiated(manifest.clone())
+                }),
+            Phase::Pending(_) | Phase::Publishing(_) => NativeStatus::Compiling,
             Phase::Ready(Ready::Result(lease)) => NativeStatus::Ready(lease.manifest().clone()),
             Phase::Ready(Ready::Tree(_)) => bail!("native action has a tree result"),
             Phase::Failed => NativeStatus::Failed,
         })
+    }
+
+    /// Authorize exact content delivery under a live result or input-tree
+    /// lease. Return the known producer and current scheduler residency.
+    ///
+    /// # Errors
+    /// Returns an error for expired tickets, invalid leases or undeclared content.
+    pub fn authorize_blob_sources(
+        &self,
+        ticket: Ticket,
+        reader: Publisher,
+        blobs: &[BlobRef],
+    ) -> Result<(Option<crate::PeerId>, Vec<bool>)> {
+        ensure!(
+            !blobs.is_empty() && blobs.len() <= crate::wire::MAX_SOURCE_BATCH,
+            "invalid content source batch"
+        );
+        let session = self.get(ticket)?;
+        let mut state = Self::lock(&session)?;
+        self.authorize_reader(&mut state, reader)?;
+        let declared = |manifest: &BTreeMap<ContentId, u64>| {
+            blobs
+                .iter()
+                .all(|blob| manifest.get(&blob.id) == Some(&blob.size))
+        };
+        let producer = state
+            .allocation
+            .as_ref()
+            .map(|allocation| allocation.worker.peer);
+        let (producer, pinned) = match &state.phase {
+            Phase::Ready(Ready::Result(lease)) => {
+                ensure!(
+                    declared(&lease.manifest().blobs()?),
+                    "undeclared result source"
+                );
+                (producer, true)
+            }
+            Phase::Ready(Ready::Tree(delivery)) => match &delivery.source {
+                TreeSource::Stored(tree) => {
+                    ensure!(declared(tree.blobs()), "undeclared tree source");
+                    (None, true)
+                }
+                TreeSource::Action { input, .. } => {
+                    ensure!(declared(&input.blobs), "undeclared input source");
+                    (None, false)
+                }
+            },
+            _ => {
+                let preview = state
+                    .negotiated_result()
+                    .context("native delivery not ready")?;
+                ensure!(
+                    declared(&preview.blobs()?),
+                    "undeclared negotiated result source"
+                );
+                (producer, false)
+            }
+        };
+        drop(state);
+        let availability = if pinned {
+            vec![true; blobs.len()]
+        } else {
+            blobs
+                .iter()
+                .map(|&blob| Ok(self.store().open_available_physical(blob)?.is_some()))
+                .collect::<Result<Vec<_>>>()?
+        };
+        Ok((producer, availability))
     }
 
     /// Open declared content for transport. Generated raw ZFS files are
@@ -1264,6 +1401,20 @@ impl NativeSessions {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.authorize_reader(&mut state, reader)?;
+        // A negotiated result may already share content with the durable
+        // CAS. Permit reads of those verified files, not staged uploads.
+        if let Some(manifest) = state.negotiated_result() {
+            let size = *manifest
+                .blobs()?
+                .get(&id)
+                .context("undeclared negotiated result blob")?;
+            drop(state);
+            let file = self
+                .store()
+                .open_available_physical(BlobRef { id, size })?
+                .ok_or(NativeContentPending)?;
+            return encode_delivery(file, false);
+        }
         let Phase::Ready(lease) = &mut state.phase else {
             bail!("native content not available");
         };
@@ -1374,7 +1525,7 @@ impl NativeSessions {
         );
         let input = action.inputs.get(&tree).context("undeclared input tree")?;
         let Publisher::Worker {
-            address: requester, ..
+            peer: requester, ..
         } = reader
         else {
             bail!("backfill requires a worker");
@@ -1793,6 +1944,82 @@ impl NativeSessions {
         Ok(())
     }
 
+    /// Record the receiver's successful staging receipt once, while the
+    /// result lease still proves both publication and allocation ownership.
+    ///
+    /// # Errors
+    /// Returns an error for an expired/uncommitted ticket, another requester,
+    /// or counts exceeding the verified manifest.
+    pub fn record_client_delivery(
+        &self,
+        ticket: Ticket,
+        requester: crate::PeerId,
+        observation: ClientDeliveryObservation,
+    ) -> Result<Option<DeliveryReceipt>> {
+        let session = self.get(ticket)?;
+        let mut state = Self::lock(&session)?;
+        self.authorize_reader(&mut state, Publisher::Client)?;
+        let Phase::Ready(Ready::Result(lease)) = &state.phase else {
+            bail!("native delivery is not committed");
+        };
+        let Some(allocation) = state.allocation.as_ref() else {
+            return Ok(None);
+        };
+        ensure!(
+            requester == allocation.requester,
+            "native delivery requester differs from allocation"
+        );
+        let selected = lease
+            .manifest()
+            .selected_blobs(&allocation.selection.outputs)?;
+        let selected_size = selected
+            .values()
+            .copied()
+            .try_fold(0_u64, u64::checked_add)
+            .context("selected size overflow")?;
+        let declared = lease.manifest().blobs()?;
+        let size = declared
+            .values()
+            .copied()
+            .try_fold(0_u64, u64::checked_add)
+            .context("result size overflow")?;
+        let bytes = observation
+            .direct_bytes
+            .checked_add(observation.scheduler_bytes)
+            .context("delivery size overflow")?;
+        ensure!(
+            bytes <= observation.selected_bytes
+                && observation.selected_bytes == selected_size
+                && observation.unique_blobs <= u64::try_from(selected.len())?
+                && (observation.unique_blobs != 0 || bytes == 0),
+            "delivery exceeds result manifest"
+        );
+        let Some(allocation) = state.allocation.as_mut() else {
+            return Ok(None);
+        };
+        if allocation.delivery_reported {
+            return Ok(None);
+        }
+        let elapsed = allocation.allocation_started.elapsed();
+        ensure!(
+            Duration::from_nanos(observation.staging_nanoseconds)
+                <= elapsed.saturating_add(Duration::from_secs(1)),
+            "invalid delivery duration"
+        );
+        allocation.delivery_reported = true;
+        let receipt = DeliveryReceipt {
+            worker: allocation.worker.peer,
+            job: allocation.worker.job,
+            requester,
+            profile: allocation.selection.profile,
+            result_bytes: size,
+            elapsed,
+            observation,
+        };
+        drop(state);
+        Ok(Some(receipt))
+    }
+
     /// Release a delivery ticket, or cancel an unfinished action.
     ///
     /// # Errors
@@ -1803,7 +2030,7 @@ impl NativeSessions {
             let mut state = Self::lock(&session)?;
             self.authorize_reader(&mut state, reader)?;
             ensure!(
-                !matches!(state.phase, Phase::Publishing),
+                !matches!(state.phase, Phase::Publishing(_)),
                 "native publication in progress"
             );
             state.expires = Instant::now();
@@ -1857,6 +2084,9 @@ impl Drop for UploadSlot {
 }
 
 mod recovery;
+mod retention;
+mod telemetry;
+pub use telemetry::{ManifestStatus, RecoveryStatus, SessionStatus, TicketStatus};
 
 #[cfg(test)]
 mod tests;

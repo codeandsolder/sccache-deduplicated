@@ -7,7 +7,7 @@ use std::io;
 use std::process::{Command, Output, Stdio};
 use std::time::Instant;
 
-pub(super) fn identity(command: &CompileCommand) -> (Option<&str>, u64) {
+pub fn identity(command: &CompileCommand) -> (Option<&str>, u64) {
     let crate_name = command
         .arguments
         .iter()
@@ -30,14 +30,14 @@ pub(super) fn identity(command: &CompileCommand) -> (Option<&str>, u64) {
 /// Execute a compilation, logging the *actual* OS process tree while it lives.
 /// All events carry the scheduler job ID, so even a sudden worker OOM leaves
 /// durable PID-to-job mappings in the worker's journal.
-pub(super) fn run(job_id: JobId, command: &mut Command) -> io::Result<Output> {
+pub fn run(job_id: JobId, command: &mut Command) -> io::Result<Output> {
     run_with_scope(job_id, command, true)
 }
 
 /// A container compiler is not a descendant of the Docker/jexec CLI process.
 /// Log the launcher PID and exit, but do not falsely label its memory usage
 /// as the compiler's.
-pub(super) fn run_external_container(job_id: JobId, command: &mut Command) -> io::Result<Output> {
+pub fn run_external_container(job_id: JobId, command: &mut Command) -> io::Result<Output> {
     run_with_scope(job_id, command, false)
 }
 
@@ -80,7 +80,7 @@ fn run_with_scope(
         match (&output, peaks) {
             (Ok(result), Ok(peaks)) => info!(
                 "dist_job_process_exit job_id={job_id} wrapper_pid={wrapper_pid} termination={} elapsed_ms={} sampled_peak_rss_bytes={} sampled_peak_swap_bytes={} sampled_peak_combined_bytes={} observed_processes={}",
-                termination(&result.status),
+                termination(result.status),
                 started.elapsed().as_millis(),
                 peaks.rss,
                 peaks.swap,
@@ -89,7 +89,7 @@ fn run_with_scope(
             ),
             (Ok(result), Err(_)) => info!(
                 "dist_job_process_exit job_id={job_id} wrapper_pid={wrapper_pid} termination={} elapsed_ms={} resource_metrics=unavailable",
-                termination(&result.status),
+                termination(result.status),
                 started.elapsed().as_millis(),
             ),
             (Err(error), Ok(peaks)) => warn!(
@@ -107,7 +107,7 @@ fn run_with_scope(
         match &output {
             Ok(result) => info!(
                 "dist_job_process_exit job_id={job_id} wrapper_pid={wrapper_pid} termination={} elapsed_ms={} resource_metrics=external_container",
-                termination(&result.status),
+                termination(result.status),
                 started.elapsed().as_millis(),
             ),
             Err(error) => warn!(
@@ -121,7 +121,7 @@ fn run_with_scope(
     match &output {
         Ok(result) => info!(
             "dist_job_process_exit job_id={job_id} wrapper_pid={wrapper_pid} termination={} elapsed_ms={} resource_metrics=unavailable",
-            termination(&result.status),
+            termination(result.status),
             started.elapsed().as_millis(),
         ),
         Err(error) => warn!(
@@ -132,7 +132,7 @@ fn run_with_scope(
     output
 }
 
-fn termination(status: &std::process::ExitStatus) -> String {
+fn termination(status: std::process::ExitStatus) -> String {
     if let Some(code) = status.code() {
         return format!("exit:{code}");
     }
@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn distinguishes_nonzero_exit() -> io::Result<()> {
         let status = Command::new("sh").args(["-c", "exit 7"]).status()?;
-        assert_eq!(termination(&status), "exit:7");
+        assert_eq!(termination(status), "exit:7");
         Ok(())
     }
 
@@ -334,7 +334,7 @@ mod tests {
     fn distinguishes_signal_termination() {
         use std::os::unix::process::ExitStatusExt;
         let status = std::process::ExitStatus::from_raw(9);
-        assert_eq!(termination(&status), "signal:9");
+        assert_eq!(termination(status), "signal:9");
     }
 
     #[test]

@@ -6,7 +6,7 @@ trap 'rm -rf -- "$root"' EXIT HUP INT TERM
 mkdir -p "$root/bin"
 : >"$root/rustup.log"
 : >"$root/cargo.log"
-: >"$root/cargo-real.log"
+: >"$root/sccache.log"
 
 cat >"$root/bin/rustup" <<'SH'
 #!/usr/bin/env bash
@@ -19,17 +19,17 @@ printf 'args=' >>"$CARGO_LOG"
 printf '%q ' "$@" >>"$CARGO_LOG"
 printf '\n' >>"$CARGO_LOG"
 SH
-cat >"$root/bin/cargo-real" <<'SH'
+cat >"$root/bin/sccache" <<'SH'
 #!/usr/bin/env bash
-printf 'toolchain=%s wrapper=%s cargo=%s min_jobs=%s args=' "${RUSTUP_TOOLCHAIN:-}" "${EPHEMERAL_CARGO_WRAPPER:-}" "${CARGO:-}" "${SCCACHE_MIN_JOBS:-}" >>"$CARGO_REAL_LOG"
+printf 'args=' >>"$CARGO_REAL_LOG"
 printf '%q ' "$@" >>"$CARGO_REAL_LOG"
 printf '\n' >>"$CARGO_REAL_LOG"
 SH
-chmod +x "$root/bin/rustup" "$root/bin/cargo" "$root/bin/cargo-real"
+chmod +x "$root/bin/rustup" "$root/bin/cargo" "$root/bin/sccache"
 
 export RUSTUP_LOG="$root/rustup.log"
 export CARGO_LOG="$root/cargo.log"
-export CARGO_REAL_LOG="$root/cargo-real.log"
+export CARGO_REAL_LOG="$root/sccache.log"
 export CODEANDSOLDER_REAL_RUSTUP="$root/bin/rustup"
 export CODEANDSOLDER_CARGO_WRAPPER="$root/bin/cargo"
 
@@ -48,14 +48,9 @@ grep -Fxq 'args=+1.99.0 test --locked ' "$CARGO_LOG"
 grep -Fxq 'args=+nightly check ' "$CARGO_LOG"
 [[ "$(wc -l <"$CARGO_LOG")" -eq 2 ]]
 
-env -u SCCACHE_MIN_JOBS CODEANDSOLDER_REAL_CARGO="$root/bin/cargo-real" contrib/codeandsolder/cargo-wrapper +1.99.0 probe
-wrapper_path="$(readlink -f contrib/codeandsolder/cargo-wrapper)"
-expected="toolchain=1.99.0 wrapper=$wrapper_path cargo=$wrapper_path min_jobs=12 args=probe "
-grep -Fxq "$expected" "$CARGO_REAL_LOG"
-
-SCCACHE_MIN_JOBS=24 CODEANDSOLDER_REAL_CARGO="$root/bin/cargo-real" contrib/codeandsolder/cargo-wrapper +1.99.0 probe
-grep -Fxq "${expected/min_jobs=12/min_jobs=24}" "$CARGO_REAL_LOG"
-SCCACHE_MIN_JOBS=0 CODEANDSOLDER_REAL_CARGO="$root/bin/cargo-real" contrib/codeandsolder/cargo-wrapper +1.99.0 probe
-grep -Fxq "${expected/min_jobs=12/min_jobs=0}" "$CARGO_REAL_LOG"
+# shellcheck source=contrib/codeandsolder/cargo-wrapper
+source contrib/codeandsolder/cargo-wrapper
+(cargo_wrapper_main "$root/bin/sccache" +1.99.0 test --locked -- --exact "with spaces")
+grep -Fxq 'args=--cargo-final -- +1.99.0 test --locked -- --exact with\ spaces ' "$CARGO_REAL_LOG"
 
 echo 'codeandsolder wrapper routing tests passed'

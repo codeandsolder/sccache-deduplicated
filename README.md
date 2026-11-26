@@ -291,7 +291,7 @@ By default, `sccache` builds with support for all storage backends, but individu
 
 ### Building portable binaries
 
-When building with the `dist-server` feature, `sccache` will depend on OpenSSL, which can be an annoyance if you want to distribute portable binaries. It is possible to statically link against OpenSSL using the `openssl/vendored` feature.
+Distributed TLS uses statically linked BoringSSL through btls-fast. There is no optional system OpenSSL backend.
 
 #### Linux
 

@@ -60,11 +60,11 @@ impl PhaseCost {
         self.staging_nanoseconds <= 60_000_000_000 && self.publication_nanoseconds <= 60_000_000_000
     }
 
-    pub fn staging(self) -> Duration {
+    pub const fn staging(self) -> Duration {
         Duration::from_nanos(self.staging_nanoseconds)
     }
 
-    pub fn publication(self) -> Duration {
+    pub const fn publication(self) -> Duration {
         Duration::from_nanos(self.publication_nanoseconds)
     }
 }

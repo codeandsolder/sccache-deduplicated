@@ -8,7 +8,7 @@ use sccache::{
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Milestone {
+pub struct Milestone {
     phase: NativeJobPhase,
     reached: Instant,
 }

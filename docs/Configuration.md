@@ -35,7 +35,7 @@ basedirs = ["/home/user/project"]
 
 [dist]
 # where to find the scheduler
-scheduler_url = "http://1.2.3.4:10600"
+scheduler_url = "https://1.2.3.4:10600"
 # a set of prepackaged toolchains
 toolchains = []
 # the maximum size of the toolchain cache in bytes
@@ -45,6 +45,11 @@ cache_dir = "/home/user/.cache/sccache-dist-client"
 [dist.auth]
 type = "token"
 token = "secrettoken"
+
+[dist.cluster]
+directory = "/home/user/.local/state/sccache-cluster"
+ca_certificate = "/etc/sccache/cluster-ca.pem"
+scheduler_id = "<64-digit scheduler peer ID>"
 
 # Multi-level cache configuration
 # Define cache levels in order (fast to slow).
@@ -205,7 +210,7 @@ Note that some env variables may need sccache server restart to take effect.
 * `SCCACHE_CACHED_CONF`
 * `SCCACHE_DIST_CLIENT_CACHE_DIR` distributed toolchain cache directory; overrides `[dist].cache_dir` from the configuration file. Use a distinct directory for clients whose packaged compiler layout differs (for example, different absolute rustup roots).
 * `SCCACHE_DIST_WORKER_NAME` stable distributed worker display name used by client statistics and telemetry. Workers default to their OS hostname. Named workers register this metadata through an additive scheduler side channel; legacy workers remain fully compatible and continue to appear by transport address until upgraded.
-* `SCCACHE_MIN_JOBS` minimum local compiler jobserver capacity, default `12`. Higher detected CPU counts are preserved; `0` disables the floor. Restart an existing daemon to change its capacity. The managed Cargo launcher uses the same setting to enforce its build-job floor; standalone sccache cannot increase the number of requests submitted by an external build tool.
+* `SCCACHE_MIN_JOBS` minimum local compiler jobserver capacity, default `12`. Higher detected CPU counts are preserved; `0` disables the floor. Restart an existing daemon to change its capacity. Set upstream Cargo build.jobs in the managed Cargo configuration to supply sufficient work; sccache cannot increase the number of requests submitted by an external build tool.
 * `SCCACHE_IDLE_TIMEOUT` how long the local daemon process waits for more client requests before exiting, in seconds. Set to `0` to run sccache permanently
 * `SCCACHE_STARTUP_NOTIFY` specify a path to a socket which will be used for server completion notification
 * `SCCACHE_MAX_FRAME_LENGTH` how much data can be transferred between client and server

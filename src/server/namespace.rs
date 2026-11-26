@@ -113,6 +113,12 @@ pub(super) struct TransferSession {
     native: Option<std::sync::Arc<crate::compiler::NativeCompilerClient>>,
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
     native_exchange: Option<crate::dist::native::broker::NativeExchange>,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    intermediate: Option<std::sync::Arc<crate::dist::native::result_session::NativeResultSession>>,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    intermediate_read: Option<(tokio::fs::File, u64)>,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    uid: u32,
 }
 
 impl TransferSession {
@@ -137,6 +143,12 @@ impl TransferSession {
             native: None,
             #[cfg(all(feature = "dist-client", target_os = "linux"))]
             native_exchange: None,
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            intermediate: None,
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            intermediate_read: None,
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            uid: 0,
         }
     }
 
@@ -215,6 +227,66 @@ impl TransferSession {
     }
 
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    pub(super) const fn set_uid(&mut self, uid: u32) {
+        self.uid = uid;
+    }
+
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    pub(super) async fn handle_intermediate(
+        &mut self,
+        request: TransferRequest,
+        client: Option<std::sync::Arc<crate::compiler::NativeCompilerClient>>,
+    ) -> Result<TransferReply> {
+        use tokio::io::AsyncReadExt;
+        let client = client.context("native distribution unavailable")?;
+        let uid = self.uid;
+        match request {
+            TransferRequest::IntermediateOpen => {
+                ensure!(
+                    self.intermediate.is_none(),
+                    "intermediate session already open"
+                );
+                let (token, session) =
+                    tokio::task::spawn_blocking(move || client.open_intermediate(uid)).await??;
+                self.intermediate = Some(session);
+                Ok(TransferReply::IntermediateOpened(token))
+            }
+            TransferRequest::IntermediateAuthorize { session, blob } => {
+                client.intermediate(uid, session)?.authorize(blob)?;
+                Ok(TransferReply::Ack)
+            }
+            TransferRequest::IntermediateRead { session, blob } => {
+                ensure!(
+                    self.intermediate_read.is_none(),
+                    "intermediate read already active"
+                );
+                let group = client.intermediate(uid, session)?;
+                let file = tokio::task::spawn_blocking(move || group.read(blob)).await??;
+                if blob.size != 0 {
+                    self.intermediate_read = Some((tokio::fs::File::from_std(file), blob.size));
+                }
+                Ok(TransferReply::ReadStarted(Some(blob.size)))
+            }
+            TransferRequest::IntermediateChunk => {
+                let (file, remaining) = self
+                    .intermediate_read
+                    .as_mut()
+                    .context("no intermediate read active")?;
+                let size = usize::try_from((*remaining).min(self.chunk_bytes as u64))?;
+                ensure!(size != 0, "invalid intermediate chunk limit");
+                let mut bytes = vec![0; size];
+                file.read_exact(&mut bytes).await?;
+                *remaining -= size as u64;
+                if *remaining == 0 {
+                    self.intermediate_read = None;
+                }
+                Ok(TransferReply::Chunk(bytes))
+            }
+            _ => bail!("invalid intermediate request"),
+        }
+    }
+
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
     async fn handle_native(&mut self, request: TransferRequest) -> Result<TransferReply> {
         use crate::dist::native::broker::NativeExchange;
         use std::time::Duration;
@@ -230,10 +302,11 @@ impl TransferSession {
                     .clone()
                     .context("native namespace handshake required")?;
                 let timeout = Duration::from_secs(client.namespace_policy().build_timeout_secs);
+                let uid = self.uid;
                 self.native_exchange = Some(NativeExchange::start(
                     self.chunk_bytes,
                     timeout,
-                    move |stream| client.serve_namespace(stream),
+                    move |stream| client.serve_namespace(stream, uid),
                 )?);
                 Ok(TransferReply::Ack)
             }
@@ -285,6 +358,7 @@ impl TransferSession {
         #[cfg(all(feature = "dist-client", target_os = "linux"))]
         {
             self.native_exchange = None;
+            self.intermediate_read = None;
         }
         #[cfg(feature = "dist-client")]
         {
@@ -744,6 +818,21 @@ mod tests {
         async fn max_size(&self) -> Result<Option<u64>> {
             Ok(Some(64 * 1024 * 1024))
         }
+    }
+
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    #[tokio::test]
+    async fn abort_releases_intermediate_read_descriptor() -> Result<()> {
+        let mut session = TransferSession::new(4096, Arc::new(ToolchainReservations::default()));
+        session.intermediate_read = Some((tokio::fs::File::from_std(tempfile::tempfile()?), 8));
+        assert!(matches!(
+            session
+                .handle(TransferRequest::Abort, &MemoryStorage::default())
+                .await?,
+            TransferReply::Ack
+        ));
+        assert!(session.intermediate_read.is_none());
+        Ok(())
     }
 
     #[test]

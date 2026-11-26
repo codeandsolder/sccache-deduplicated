@@ -44,9 +44,8 @@ cp "$release/sccache-dist-linux-x86_64-v2" "$root/dist"
 printf '\n# old client\n' >> "$root/live"
 printf '\n# old worker\n' >> "$root/dist"
 chmod +x "$root/bin/"* "$root/live" "$root/dist"
-printf '%s\n' "$old_sha" > "$root/state/client_source_sha"
-sha256sum "$root/dist" | cut -d' ' -f1 > "$root/state/dist_sha256"
-printf '3\n' > "$root/state/dist_protocol"
+jq -n --arg sha "$old_sha" --arg hash "$(sha256sum "$root/dist" | cut -d' ' -f1)" \
+    '{schema:1,source_sha:$sha,dist_binary_sha256:$hash,dist_protocol:"3"}' > "$root/state/release.json"
 cat > "$release/build.txt" <<EOF
 source_sha=$new_sha
 rust_toolchain=nightly-2026-11-20
@@ -94,8 +93,8 @@ cmp -s -- "$updater" <(tr -d '\000' <"$updater") || {
 }
 rg -q '^CLIENT_SERVICES=.*"\$OPENWRT_ROOT_SERVICE"' "$updater"
 rg -q '^OPENWRT_ROOT_PORT=.*SCCACHE_AUTOUPDATE_OPENWRT_ROOT_PORT' "$updater"
-for literal in client_source_sha dist_sha256 current_dist_protocol \
-    'trap rollback EXIT INT TERM' --plan-only SCCACHE_AUTOUPDATE_CLIENT_PORT \
+for literal in release.json dist_binary_sha256 current_dist_protocol \
+    "trap 'rollback \$?' EXIT" --plan-only SCCACHE_AUTOUPDATE_CLIENT_PORT \
     local_client_ready SCCACHE_METRICS_HEARTBEAT_MS '(heartbeat_ms + 999) / 1000 + 15'; do
     rg -Fq -- "$literal" "$updater"
 done
@@ -105,11 +104,11 @@ if rg -Fq 'trap rollback EXIT ERR' "$updater"; then
 fi
 publisher="$(dirname -- "$updater")/../../.github/workflows/publish-ci-client.yml"
 protocol="$(dirname -- "$updater")/release-protocol.env"
-for literal in 'dist_protocol=4' 'rollout_epoch=5' 'glibc_abi_max=2.39'; do
+for literal in 'dist_protocol=6' 'rollout_epoch=7' 'glibc_abi_max=2.39'; do
     rg -Fxq -- "$literal" "$protocol"
 done
-for literal in 'source contrib/codeandsolder/release-protocol.env' 'vendored-openssl' \
-    'openssl_linkage=vendored-static' 'Reject unsupported fleet native shared library ABIs' \
+for literal in 'source contrib/codeandsolder/release-protocol.env' 'direct-metrics' \
+    'tls_backend=boringssl-static' 'Reject unsupported fleet native shared library ABIs' \
     'Reject binaries requiring a newer GNU libc ABI' 'steps.protocol.outputs.dist_protocol' \
     'steps.protocol.outputs.rollout_epoch' 'not current main' \
     'Skipping superseded main release' "sccache-ci-\${{ needs.required-gates.outputs.sha }}"; do

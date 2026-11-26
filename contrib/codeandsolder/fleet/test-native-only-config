@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+root=$(mktemp -d)
+trap 'rm -rf -- "$root"' EXIT
+cat > "$root/worker" <<'TOML'
+cache_dir = "/old/archive"
+toolchain_cache_size = 10737418240
+toolchain_archive_sources = ["/another/archive"]
+public_addr = "127.0.0.1:10501"
+scheduler_url = "https://127.0.0.1:10600"
+
+[builder]
+type = "overlay"
+build_dir = "/old/extracted"
+bwrap_path = "/usr/bin/bwrap"
+
+[cluster]
+directory = "/identity"
+
+[native_worker]
+directory = "/cas"
+scratch = "/scratch"
+bubblewrap = "/usr/bin/bwrap"
+
+[native_worker.space]
+min_available_bytes = 2147483648
+target_available_bytes = 4294967296
+max_resident_bytes = 6442450944
+target_resident_bytes = 5368709120
+TOML
+"$here/native-only-config" worker "$root/worker" 12884901888 10737418240 > "$root/native"
+rg -Fxq 'type = "native"' "$root/native"
+rg -Fxq 'directory = "/cas"' "$root/native"
+rg -Fxq 'directory = "/identity"' "$root/native"
+rg -Fxq 'max_resident_bytes = 12884901888' "$root/native"
+rg -Fxq 'target_resident_bytes = 10737418240' "$root/native"
+rg -Fxq 'min_available_bytes = 2147483648' "$root/native"
+if rg -q 'cache_dir|toolchain_cache_size|toolchain_archive_sources|/old/|/another/archive|type = "overlay"' "$root/native"; then exit 1; fi
+"$here/native-only-config" worker "$root/native" 12884901888 10737418240 > "$root/repeat"
+cmp "$root/native" "$root/repeat"
+cat > "$root/client" <<'TOML'
+basedirs = ["/workspace"]
+
+[cache.disk]
+dir = "/old/l0"
+size = 1073741824
+
+[dist]
+cache_dir = "/old/client"
+toolchain_cache_size = 1073741824
+toolchains = []
+scheduler_url = "https://127.0.0.1:10600"
+native_installation_catalogs = ["/catalog"]
+
+[dist.cluster]
+directory = "/identity"
+
+[dist.native]
+endpoint = "https://127.0.0.1:10602"
+TOML
+"$here/native-only-config" client "$root/client" > "$root/native-client"
+rg -Fxq 'native_installation_catalogs = ["/catalog"]' "$root/native-client"
+rg -Fxq 'directory = "/identity"' "$root/native-client"
+rg -Fxq 'endpoint = "https://127.0.0.1:10602"' "$root/native-client"
+if rg -q 'cache_dir|toolchain_cache_size|/old/|\[cache.disk\]' "$root/native-client"; then exit 1; fi
+"$here/native-only-config" client "$root/native-client" > "$root/repeat"
+cmp "$root/native-client" "$root/repeat"
+echo "Native-only configuration migration passed."

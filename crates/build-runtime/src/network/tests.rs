@@ -1,7 +1,9 @@
 use super::*;
 
 fn worker(port: u16) -> Peer {
-    Peer::Worker(SocketAddr::from(([127, 0, 0, 1], port)))
+    Peer::Worker(crate::PeerId::from_digest(std::array::from_fn(|index| {
+        port.to_le_bytes()[index % 2]
+    })))
 }
 
 fn feed(meter: &mut DirectionMeter, now: Instant, rates: &[(Peer, u64)]) {
@@ -19,7 +21,7 @@ fn feed(meter: &mut DirectionMeter, now: Instant, rates: &[(Peer, u64)]) {
             activity.idle_epoch += 1;
         }
     }
-    meter.sample(now, Duration::from_secs(1));
+    meter.sample(now, Duration::from_secs(1), |_| true);
 }
 
 #[test]
@@ -264,4 +266,104 @@ fn concurrent_capacity_requires_independent_baselines_and_covers_subsets() {
         );
     }
     assert!(!meter.snapshot().overlap_known(&members));
+}
+
+#[test]
+fn route_specific_windows_and_checkpoint_keep_old_cohorts_separate() -> anyhow::Result<()> {
+    let a = worker(1);
+    let b = worker(2);
+    let a_overlay = a.on_path("100.64.0.1,100.64.0.2".parse()?);
+    let b_overlay = b.on_path("100.64.0.1,100.64.0.3".parse()?);
+    let b_lan = b.on_path("192.168.76.2,192.168.76.1".parse()?);
+    let meter = NetworkMeter::default();
+    let start = Instant::now().checked_sub(Duration::from_secs(20)).unwrap();
+    {
+        let mut state = meter.state.lock().unwrap();
+        let send = &mut state.send;
+        for peer in [a_overlay, b_overlay, b_lan] {
+            send.record(peer, start);
+        }
+        for (offset, rates) in [
+            (1, vec![(a_overlay, 100_000_000)]),
+            (4, vec![(b_overlay, 100_000_000)]),
+            (7, vec![(b_lan, 500_000_000)]),
+            (10, vec![(a_overlay, 50_000_000), (b_overlay, 50_000_000)]),
+            (14, vec![(a_overlay, 100_000_000), (b_lan, 500_000_000)]),
+        ] {
+            let windows = if offset >= 10 { 4 } else { 3 };
+            for second in offset..offset + windows {
+                feed(send, start + Duration::from_secs(second), &rates);
+            }
+        }
+    }
+    let snapshot = meter.snapshot();
+    assert_eq!(snapshot.send.shared.len(), 1);
+    assert_eq!(
+        snapshot.send.shared[0].members,
+        BTreeSet::from([a_overlay, b_overlay])
+    );
+    assert!(
+        snapshot
+            .send
+            .overlap_known(&BTreeSet::from([a_overlay, b_lan]))
+    );
+    assert_eq!(
+        snapshot.send.peers[&b_lan].observed_bytes_per_second,
+        500_000_000
+    );
+    let saved = serde_json::to_vec(&meter.checkpoint().unwrap())?;
+    let restored = NetworkMeter::default();
+    restored.restore(serde_json::from_slice(&saved)?);
+    let snapshot = restored.snapshot();
+    assert_eq!(
+        snapshot.send.shared[0].members,
+        BTreeSet::from([a_overlay, b_overlay])
+    );
+    assert_eq!(snapshot.send.peers[&b_lan].active_remaining_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn contaminated_meter_windows_do_not_learn_contention() {
+    let a = worker(1);
+    let b = worker(2);
+    let now = Instant::now();
+    let mut meter = DirectionMeter::default();
+    meter.record(a, now);
+    meter.record(b, now);
+    for second in 1..=3 {
+        feed(
+            &mut meter,
+            now + Duration::from_secs(second),
+            &[(a, 100_000_000)],
+        );
+    }
+    for second in 4..=6 {
+        feed(
+            &mut meter,
+            now + Duration::from_secs(second),
+            &[(b, 100_000_000)],
+        );
+    }
+    for second in 7..=11 {
+        for peer in [a, b] {
+            let counters = &meter.peers[&peer].counters;
+            counters.activity.lock().unwrap().active = 1;
+            counters.bytes.fetch_add(50_000_000, Ordering::Relaxed);
+        }
+        meter.sample(
+            now + Duration::from_secs(second),
+            Duration::from_secs(1),
+            |_| false,
+        );
+    }
+    assert!(meter.snapshot().shared.is_empty());
+    for second in 12..=14 {
+        feed(
+            &mut meter,
+            now + Duration::from_secs(second),
+            &[(a, 50_000_000), (b, 50_000_000)],
+        );
+    }
+    assert_eq!(meter.snapshot().shared.len(), 1);
 }

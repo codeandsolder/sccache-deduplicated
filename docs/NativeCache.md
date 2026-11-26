@@ -73,7 +73,7 @@ serves available blobs directly; a missing blob registers a shared backfill
 flight and returns HTTP 202 while a source is selected. A bounded peer-source
 pool first tries workers whose latest residency summary predicts the blob.
 The peer uses a separate expiring HTTPS capability bound to the exact digest
-and length (not a compilation job token), with its registered certificate.
+and length (not a compilation job token), with its enrolled mTLS identity.
 A short discovery window and bounded source-probe deadlines prevent a stale
 hint or a busy peer service from indefinitely delaying the original client.
 If no peer provides the bytes, the scheduler requests them from an active
@@ -182,12 +182,13 @@ other nondeterministic process behavior are not automatically normalized.
 
 ## Configuration
 
-The native scheduler, worker and compiler client are opt-in. Use an authenticated private transport for
-the dedicated HTTP cache listener (e.g. the managed private network);
-the listener does not terminate TLS itself. Worker assignment and status observation use the
-existing HTTPS job service with the scheduler-provided certificate and job
-capability. The cache listener uses the scheduler's existing client and
-worker authentication. Do not expose it as a public cache endpoint.
+The native scheduler, worker and compiler client are opt-in. All distributed
+RPCs and the dedicated native cache listener use native mutual TLS with the
+scheduler-owned cluster CA (see [Distributed.md](Distributed.md)). Bootstrap
+authorization enrolls a persistent public-key identity. Job and exact-content
+capabilities still scope operations. Configured reliable endpoints are retained
+as fallbacks; authenticated alternate interface addresses are probed and
+selected automatically.
 
 Scheduler configuration example (illustrative resource limits):
 
@@ -228,7 +229,7 @@ protocols, sharing its advertised capacity.
 type = "native"
 
 [native_worker]
-cache_url = "http://127.0.0.1:10502"
+cache_url = "https://127.0.0.1:10502"
 directory = "/var/lib/sccache-native/worker"
 scratch = "/var/lib/sccache-native/scratch"
 bubblewrap = "/usr/bin/bwrap"
@@ -374,14 +375,19 @@ select native mode in the normal sccache configuration:
 
 ```toml
 [dist]
-scheduler_url = "http://127.0.0.1:10500"
+scheduler_url = "https://127.0.0.1:10500"
 
 [dist.auth]
 type = "token"
 token = "<scheduler client token>"
 
+[dist.cluster]
+directory = "/home/user/.local/state/sccache-cluster"
+ca_certificate = "/etc/sccache/cluster-ca.pem"
+scheduler_id = "<64-digit scheduler peer ID>"
+
 [dist.native]
-endpoint = "http://127.0.0.1:10502"
+endpoint = "https://127.0.0.1:10502"
 platform_contract = "site-defined-linux-execution-contract-v1"
 request_timeout_secs = 120
 build_timeout_secs = 600
@@ -1069,15 +1075,37 @@ result limit. Publication pins its local result, then atomically charges only
 additional unique bytes into the grace pool; if actual capacity is exhausted,
 it waits outside the compiler slot with cancellation and lease checks. Existing
 grace leases never expire early. New forecast admission pauses while exact
-publishers are waiting. The persistent history format is version 2.
+publishers are waiting. The persistent history format is version 6.
 
 The opt-in `native_placement_replay` trace target logs JSON assignment records
 with job ID, hashed command family, selected worker, all eligible workers'
 predicted completion and contention-penalized scores, and healthy candidates.
 Assignment records also include the selected worker's contemporaneous host-wide
-prior. Verified completion records contain the original prediction, scheduler
-assignment-to-commit elapsed time, predicted cost, actual execution time,
-total result bytes and negotiated upload measurements. Join by job ID within
+prior. Verified completion records contain the predicted publication timestamp,
+predicted client completion, scheduler assignment-to-commit elapsed time,
+predicted cost, actual execution time, total result bytes and negotiated
+upload measurements. The replay report compares publication against actual
+publication, not against client completion, and uses stable worker public-key
+identities. A successful remote receiver piggybacks a delivery receipt on its
+existing result-lease close. The scheduler validates the original authenticated
+requester, committed manifest bounds, and one receipt per allocation. It logs
+elapsed scheduler-monotonic time from allocation start to receipt (including
+allocation overhead, delivery and the close RPC), staging time, and unique
+logical content bytes split by successful direct or scheduler source. The
+selected unique result closure includes diagnostics; its difference from
+received unique bytes measures local reuse, and its difference from the full
+manifest measures omitted outputs. Source plans are restricted to the selected
+closure in both direct and namespace clients. The allocation carries the selected output names,
+and the receipt is validated against their exact committed unique closure.
+The scheduler learns the selected and remotely delivered fractions of full
+result size per authenticated receiver, command family, and selection.
+Four observations replace the full-result prior; recent reuse estimates
+expire after one hour and are checkpointed with the service history.
+Only the client-side forecast is scaled; publication remains independent.
+The overlap with missing scheduler content is estimated proportionally. Local
+installation after the broker's Done frame is outside this measurement. The
+replay separately evaluates end-to-end delivery forecasts using these receipts;
+missing receipts are not interpreted as zero-duration delivery. Join by job ID within
 the scheduler epoch. This supports evaluating prediction error and selection
 behavior on genuine compilation workloads. Counterfactual worker timings
 are forecasts, not measured speedups; a full causal trace replay requires
@@ -1157,28 +1185,143 @@ Catalogs and forecasts are advisory; no change to content identity.
 
 ### Directional shared-network estimation
 
+### Receiver-directed content transfer
+
+The scheduler authorizes content delivery, but it does not need to relay all
+payloads. Workers and clients negotiate bounded batches of exact digest/length
+pairs against their live input-tree or committed-result lease. The scheduler
+reports whether each blob is already present and advertises likely resident
+workers, their current authenticated routes, and short-lived source capabilities
+bound to the receiving principal and exact content. The same worker CAS
+endpoint serves scheduler recovery, worker-to-worker inputs, and client result
+delivery. Bloom-filter residency is advisory; an opened immutable descriptor
+and successful content verification are what establish a usable source.
+
+Worker heartbeats additionally carry up to 32 recent verified logical
+peer-download service rates, keyed by source principal and actual endpoint
+pair. Only a complete verified peer acquisition supplies this sample.
+Scheduler forecasts intersect these measurements with source residency and
+the exact remaining input union. Package reconstruction is forecast first,
+then direct raw transfers and scheduler raw transfers are accounted separately;
+scheduler shared-link contention does not automatically inflate direct
+transfer time. Per-worker aggregate staging remains serialized in the
+forecast; cross-worker direct-link contention is not yet inferred globally.
+
+Placement also distinguishes learned full unique logical result size from
+missing scheduler upload bytes. The authenticated client sends bounded fresh
+receiver-side scheduler and peer delivery rates during allocation; this
+telemetry is not forwarded to the worker or part of the action identity.
+The forecast overlaps direct delivery and publication, accounts for already
+resident scheduler output separately from missing output, and models
+scheduler fallback using its measured shared-link capacity. Before an exact
+result manifest exists, the full logical size is an advisory estimate
+(independent of selective output materialization or local reuse). Histories
+retain both sizes across scheduler restarts.
+
+### Multi-interface measurement and route selection
+
+The transport tests reachability using authenticated lightweight probes;
+bandwidth exploration uses ordinary required CAS bodies, never a synthetic
+bulk payload. On Linux each directly reachable destination can have several
+source-bound transport candidates, with separate pooled connections per
+source address and destination. Explicit on-link candidates bind both the
+source address and interface; the unbound kernel-policy route remains the
+fallback for routed, VPN, unavailable and unsupported paths. Advertisements
+prioritize interface coverage before additional addresses; hot-plugged
+interfaces enter bounded probing without waiting for a full route refresh.
+
+Local RX/TX counters come from the complete interface, not just sccache.
+Bulk body accounting distinguishes managed bytes from estimated external
+traffic and tracks concurrent streams; completed real transfers are classified
+as clean, busy or unknown using endpoint counter deltas and overlap
+generations. Slow busy/unknown samples do not erase or indefinitely extend
+a recent clean rate. Contemporaneous total load and active reservations
+influence actual path costs. Only known physical full-duplex Ethernet links
+supply nominal line capacity; wireless and virtual interfaces are not
+assumed independent physical resources. Socket-local addresses are used for
+receiver measurements where exposed by the transport; unbound uploads use
+a prior actual upload source as an advisory hint, and a changed source
+invalidates its classification.
+
+Worker heartbeat and client allocation include bounded per-interface
+total/external RX/TX service and address inventory. Verified peer downloads
+also report encoded/logical size ratio. Placement caps measured wire rates
+at available known Ethernet endpoint capacity, translates direct logical
+service using its encoded ratio, and accounts for the combined wire
+demand when concurrent scheduler publication and direct client delivery
+share the worker's same known sender interface. Separate interface addresses
+on one device are grouped. Distinct devices are not proof of independent
+end-to-end paths; shared router, switch and Wi-Fi airtime constraints beyond
+the endpoint are learned from synchronized real body windows at an
+endpoint. A directed path is indexed by its local and remote IP pair plus
+send/receive direction. The learner observes aligned local-monotonic windows,
+requires isolated baselines for both paths and three consistent uncontaminated
+overlap windows, and reports bounded effective aggregate service for that
+exact pair. It expires evidence after ten minutes and invalidates a
+contradicted ceiling. Local route scoring uses it only when the matching
+competing flow is active; the scheduler includes learned sender-side
+publication/direct result overlap even across different interfaces. The
+observation is effective transport service, not a proof of physical topology.
+Unbound outgoing uploads without a known actual source are not used for
+overlap learning. No extra bulk traffic is generated. The scheduler's existing directional
+meter also compares its aggregate body deltas by local interface against
+independently aligned total interface counter deltas. Contaminated windows
+cannot establish isolated service, shared ceilings or independence. Fresh
+scheduler interface capacity and learned same-direction path constraints
+are injected into the placement simulator for both active and predicted
+candidate routes, including the requesting client. Both endpoints cap
+scheduler-path service when known wired headroom is available.
+
+The receiver compares authenticated route latency and directional effective
+goodput, using the scheduler as the durable fallback for committed results.
+An absent scheduler input can be obtained from a reachable worker without
+requesting origin backfill or populating the scheduler solely to relay it.
+Worker-side tree acquisition still verifies and pins all required content
+before compilation. A failed peer attempt falls back to the ordinary scheduler
+download/backfill path. Receivers stage and verify each attempted payload
+before publishing it; partial, corrupt or expired peer responses cannot
+contaminate a subsequent delivery. Loopback candidates are advertised only
+when bound and authenticated just like all other routes.
+
+Result publication retains the existing manifest and unique missing-content
+negotiation: the producing worker only uploads blobs absent from the scheduler
+CAS, then commits the durable result. Once the worker negotiates its validated
+manifest, the client can stage requested blobs concurrently with the scheduler
+upload, from the worker or already verified scheduler CAS files. Missing
+scheduler fallback content waits for commit. No successful result is exposed
+until the scheduler confirms the same complete manifest durably committed;
+the namespace broker withholds its final Done frame until confirmation.
+Cache hits can also use resident workers. Selective output materialization
+is orthogonal to source selection; receivers request only selected content.
+
 The native cache listener meters encoded HTTP payload bytes before delivery
 to the transport or after reception from it; logical lengths are tracked
-separately. Authenticated worker addresses, client source IPs, and upstream
-package traffic have separate counters in each direction. A dedicated
+separately. Authenticated worker and client principals, their actual IP endpoint pairs,
+and upstream package routes have separate counters in each direction. A dedicated
 250 ms sampler aggregates overlapping streams without a global lock in
 the body read path. Long observations include transport backpressure and
 may also reflect endpoint processing or storage limitations: these are
 effective service-rate estimates, not physical interface line rates.
 
-Sustained per-peer observations provide lower bounds on available bandwidth.
+Sustained per-path observations provide lower bounds on available bandwidth.
 A group becomes a shared effective constraint after at least three aligned
 windows in which all members remain active, every member runs below its
 previous sustained rate, and the group total remains near a plateau.
 Unsaturated or nonoverlapping windows do not establish a ceiling. A higher
 subsequent observed group total invalidates the constraint. Peer and group
 evidence expires after 30 minutes; the scheduler atomically checkpoints
-fresh measurements to `network-timing.json` each minute, scoped to the native
+fresh measurements to `network-path-timing.json` each minute, scoped to the native
 listener address. Active requests and their remaining bytes are not restored
-after restart.
+after restart. The directional capacity model attributes sustained
+transfer observations to the actual scheduler/member IP endpoint pair (excluding
+ephemeral ports), not just the member identity. Shared and independent capacity
+cohorts therefore remain specific to the measured routes. Worker heartbeats
+carry the current measured download/upload path and rate; existing demand on
+other paths stays on those paths in forecasts. An unknown path is not assigned
+a historical contention ceiling from a different route.
 
 Native placement converts predicted missing logical bytes to encoded demand
-using measured per-peer compression ratios and uses sustained aggregate
+using measured per-path compression ratios and uses sustained aggregate
 goodput in addition to the worker's per-request estimates. Outstanding
 worker input closures are deduplicated before estimating demand; currently
 active client downloads participate in the same model. Progressive max-min
@@ -1235,3 +1378,32 @@ longer useful measurement windows. No extra files are fetched for it.
 The only learning action is a choice among real placements, or a reordering
 of real input fetches. If there is no useful opportunity, the system simply
 uses the fastest predicted placement. New jobs can always proceed normally.
+
+### Build-scoped Cargo intermediate retention
+
+On Linux, the managed Cargo launcher can use `sccache --cargo-final -- <cargo arguments>`.
+It invokes stock rustup-selected Cargo, with a private per-invocation build directory
+mounted through FUSE (requires access to `/dev/fuse` and `fusermount3`).
+The Cargo target directory is unchanged; durable final outputs are installed normally.
+`sccache --cargo-all -- <cargo arguments>` instead uses the regular Cargo build
+directory and retains materialized intermediates.
+
+The scheduler pins exact committed result manifests in a build-wide lease,
+independent of individual compilation tickets. The launcher holds the lease
+through the managed local daemon connection and its inherited scratch lock.
+Only immutable content references and caller-scoped tokens are exposed to the
+mount; the daemon retains remote credentials. A reference is installed on a
+private staging inode only after the result is committed and retained.
+The compiler's input manifest uses the same content ID as a materialized input,
+so a resident artifact does not need to pass through the launcher or compiler
+client. Locally executed build scripts, linkers, proc macros, and other readers
+receive verified bytes on demand. Mutable operations detach from the immutable
+content, preserving hardlinks and ordinary file metadata; truncation need not
+read the old bytes. Multiple local reads share one verified private spool per
+content identity. Spools and namespace data are temporary, not another cache.
+
+An expired or unavailable lease fails the affected operation rather than
+exposing an empty placeholder or inventing a new content identity. Scratch
+reclamation respects inherited process ownership. The full Cargo graph and
+cross-user/namespace acceptance tests must pass before promoting this mode
+to the managed fleet.

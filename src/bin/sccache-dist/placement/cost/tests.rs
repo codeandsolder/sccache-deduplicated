@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 fn spec(args: &[&str]) -> anyhow::Result<ExecutionSpec> {
     let root = TreeId([0; 32]);
     Ok(ExecutionSpec {
+        compiler_result: None,
         platform: ContentId::of(b"platform"),
         root: ExecutionRoot {
             id: root,
@@ -137,6 +138,7 @@ fn native_cost_history_shrinks_expires_and_bounds_samples() -> anyhow::Result<()
             phase: Default::default(),
             execution_nanoseconds: observation.execution_nanoseconds,
             output_bytes: 0,
+            result_bytes: 752,
             output_requests: 0,
         }
     );

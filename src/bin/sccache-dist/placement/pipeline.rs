@@ -16,7 +16,7 @@ use std::{
 
 use super::{
     ActionCost, AssignedNative, RecentResidency,
-    delivery::{Delivery, DeliveryRates, InputTraffic},
+    delivery::{Delivery, DeliveryRates, DirectInputs, InputTraffic},
 };
 
 pub(super) type Assignments = HashMap<JobId, Option<AssignedNative>>;
@@ -103,6 +103,7 @@ struct StagingTimeline<'a> {
     // Request setup can overlap with the next independent byte transfer.
     wire_free: Duration,
     rates: DeliveryRates,
+    direct: Option<&'a DirectInputs>,
     cost: PackageTransferCost,
     limits: Option<PackageDeliveryLimits>,
     traffic: InputTraffic,
@@ -150,24 +151,31 @@ impl StagingTimeline<'_> {
                 requests = progress.remaining_input_blobs;
             }
         }
-        let delivery = if bytes == exact_bytes
-            && requests == exact_requests
-            && self.limits.is_some()
-            && catalog.is_some_and(|catalog| !catalog.is_empty())
-        {
-            Delivery::plan(new.clone(), catalog, self.limits, self.cost, self.rates)
+        let delivery = if bytes == exact_bytes && requests == exact_requests {
+            Delivery::plan(
+                new.clone(),
+                catalog,
+                self.limits,
+                self.cost,
+                self.rates,
+                self.direct,
+            )
         } else {
             // Progress counts cannot identify which digests remain. Do not
             // invent a smaller package cover for this partial closure.
             Delivery::raw(bytes, requests, self.cost, self.rates)
         };
         self.traffic.extend(delivery.traffic);
-        let wire_done = if delivery.traffic.wire_bytes == 0 {
+        let wire_done = if delivery.traffic.wire_bytes == 0 && delivery.traffic.direct_bytes == 0 {
             start
         } else {
-            self.wire_free = self.wire_free.max(start).saturating_add(duration(
-                delivery.traffic.wire_time.as_secs_f64() * self.rates.contention,
-            ));
+            self.wire_free = self
+                .wire_free
+                .max(start)
+                .saturating_add(duration(
+                    delivery.traffic.wire_time.as_secs_f64() * self.rates.contention,
+                ))
+                .saturating_add(delivery.traffic.direct_time);
             self.wire_free
         };
         let setup = if bytes == 0
@@ -294,7 +302,7 @@ impl Pipeline {
                     .reserve(Duration::ZERO, remaining(output, job.progress));
             }
             NativeJobPhase::AwaitingPublication => {
-                self.publish.push((Duration::ZERO, false, job.id, output))
+                self.publish.push((Duration::ZERO, false, job.id, output));
             }
             NativeJobPhase::Executing => {
                 let done = self
@@ -304,7 +312,7 @@ impl Pipeline {
             }
             NativeJobPhase::Ready => {
                 self.ready
-                    .push((Duration::ZERO, false, job.id, true, execution, output))
+                    .push((Duration::ZERO, false, job.id, true, execution, output));
             }
             NativeJobPhase::Assigned
             | NativeJobPhase::Queued
@@ -347,25 +355,7 @@ pub(super) struct PipelineForecast {
     pub traffic: InputTraffic,
 }
 
-pub(super) fn publication_forecast(
-    forecast: super::WorkerForecast<'_>,
-    requested: &NativeInputBlobs,
-    catalog: Option<&PackageCatalog>,
-    rates: DeliveryRates,
-) -> PipelineForecast {
-    let super::WorkerForecast {
-        capacity,
-        assigned,
-        placement,
-        recent,
-        cost,
-    } = forecast;
-    let jobs = assigned
-        .len()
-        .saturating_add(placement.queue.jobs.len())
-        .saturating_add(1);
-    let mut pipeline = Pipeline::new(capacity, placement, jobs);
-    let mut staging = Vec::new();
+fn pending_jobs<'a>(assigned: &'a Assignments, placement: &'a NativePlacement) -> Vec<Pending<'a>> {
     let mut pending: Vec<_> = placement
         .queue
         .jobs
@@ -386,6 +376,30 @@ pub(super) fn publication_forecast(
                 progress: None,
             }),
     );
+    pending
+}
+
+pub(super) fn publication_forecast(
+    forecast: super::WorkerForecast<'_>,
+    requested: &NativeInputBlobs,
+    catalog: Option<&PackageCatalog>,
+    rates: DeliveryRates,
+    direct: Option<&DirectInputs>,
+) -> PipelineForecast {
+    let super::WorkerForecast {
+        capacity,
+        assigned,
+        placement,
+        recent,
+        cost,
+    } = forecast;
+    let jobs = assigned
+        .len()
+        .saturating_add(placement.queue.jobs.len())
+        .saturating_add(1);
+    let mut pipeline = Pipeline::new(capacity, placement, jobs);
+    let mut staging = Vec::new();
+    let mut pending = pending_jobs(assigned, placement);
     let native_running = pending
         .iter()
         .filter(|job| job.phase() == NativeJobPhase::Executing)
@@ -431,6 +445,7 @@ pub(super) fn publication_forecast(
         slots: Slots::new(placement.queue.staging_slots, jobs),
         wire_free: Duration::ZERO,
         rates,
+        direct,
         cost: placement.timing.transfer,
         limits: placement.package_limits,
         traffic: InputTraffic::default(),

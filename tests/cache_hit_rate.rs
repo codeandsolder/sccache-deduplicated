@@ -1,10 +1,8 @@
 pub mod helpers;
 
-use std::process::Command;
-
 use anyhow::Result;
 use assert_cmd::assert::OutputAssertExt;
-use helpers::{CARGO, CRATE_DIR, SccacheTest, cargo_clean};
+use helpers::{CRATE_DIR, SccacheTest, cargo_clean, test_cargo_command};
 use predicates::{boolean::PredicateBooleanExt, str::PredicateStrExt};
 use serial_test::serial;
 
@@ -13,7 +11,7 @@ use serial_test::serial;
 fn test_cache_hit_rate() -> Result<()> {
     let test_info = SccacheTest::new(None)?;
 
-    Command::new(CARGO.as_os_str())
+    test_cargo_command()
         .args(["build", "--color=never"])
         .envs(test_info.env.iter().cloned())
         .current_dir(CRATE_DIR.as_os_str())
@@ -38,7 +36,7 @@ fn test_cache_hit_rate() -> Result<()> {
     // Clean it so we can build it again.
     cargo_clean(&test_info)?;
 
-    Command::new(CARGO.as_os_str())
+    test_cargo_command()
         .args(["run", "--color=always"])
         .envs(test_info.env.iter().cloned())
         .current_dir(CRATE_DIR.as_os_str())
@@ -68,7 +66,7 @@ fn test_cache_hit_rate() -> Result<()> {
 fn test_adv_cache_hit_rate() -> Result<()> {
     let test_info = SccacheTest::new(None)?;
 
-    Command::new(CARGO.as_os_str())
+    test_cargo_command()
         .args(["build", "--color=never"])
         .envs(test_info.env.iter().cloned())
         .current_dir(CRATE_DIR.as_os_str())
@@ -92,7 +90,7 @@ fn test_adv_cache_hit_rate() -> Result<()> {
 
     cargo_clean(&test_info)?;
 
-    Command::new(CARGO.as_os_str())
+    test_cargo_command()
         .args(["run", "--color=always"])
         .envs(test_info.env.iter().cloned())
         .current_dir(CRATE_DIR.as_os_str())

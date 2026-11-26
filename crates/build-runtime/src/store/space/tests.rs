@@ -788,3 +788,27 @@ fn residency_snapshot_tracks_live_outputs_across_eviction_and_restart() -> Resul
     assert!(!restored.may_contain(removed));
     Ok(())
 }
+
+#[test]
+fn observation_does_not_reclaim_or_wait_for_admission() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open_managed(temp.path(), policy())?;
+    let mut budget = StageBudget::new(&store);
+    budget.grow_to(4096)?;
+    let before = store.stats()?;
+    let observation = store.space_status()?;
+    assert_eq!(observation.reserved_bytes, Some(4096));
+    assert_eq!(observation.policy, Some(policy()));
+    {
+        let _admission = store
+            .inner
+            .space
+            .lock()
+            .map_err(|_| anyhow!("space poisoned"))?;
+        assert_eq!(store.space_status()?.reserved_bytes, None);
+    }
+    drop(budget);
+    assert_eq!(store.space_status()?.reserved_bytes, Some(0));
+    assert_eq!(store.stats()?, before);
+    Ok(())
+}

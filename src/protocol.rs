@@ -81,7 +81,7 @@ pub enum Response {
 /// Maximum application payload in a transfer frame. The framing envelope
 /// stays well below the default 8 MiB IPC frame limit.
 pub const TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
-pub const NAMESPACE_PROTOCOL_VERSION: u32 = 4;
+pub const NAMESPACE_PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum StorageBlob {
@@ -129,6 +129,16 @@ pub enum TransferRequest {
     NativeRead,
     NativeWrite(#[serde(with = "serde_bytes")] Vec<u8>),
     NativeEnd,
+    IntermediateOpen,
+    IntermediateAuthorize {
+        session: crate::build_runtime::wire::Ticket,
+        blob: crate::build_runtime::BlobRef,
+    },
+    IntermediateRead {
+        session: crate::build_runtime::wire::Ticket,
+        blob: crate::build_runtime::BlobRef,
+    },
+    IntermediateChunk,
     WriteChunk(#[serde(with = "serde_bytes")] Vec<u8>),
     FinishWrite,
     ReadChunk,
@@ -151,6 +161,19 @@ pub enum TransferReply {
     Status(SchedulerStatusResult),
     WorkerLabel(String),
     Ack,
+    IntermediateOpened(crate::build_runtime::wire::Ticket),
+}
+
+impl TransferRequest {
+    pub(crate) const fn is_intermediate(&self) -> bool {
+        matches!(
+            self,
+            Self::IntermediateOpen
+                | Self::IntermediateAuthorize { .. }
+                | Self::IntermediateRead { .. }
+                | Self::IntermediateChunk
+        )
+    }
 }
 
 // Transfer frames can carry complete object data; don't dump payload bytes
@@ -171,6 +194,10 @@ impl std::fmt::Debug for TransferRequest {
             Self::NativeRead => "NativeRead",
             Self::NativeWrite(_) => "NativeWrite",
             Self::NativeEnd => "NativeEnd",
+            Self::IntermediateOpen => "IntermediateOpen",
+            Self::IntermediateAuthorize { .. } => "IntermediateAuthorize",
+            Self::IntermediateRead { .. } => "IntermediateRead",
+            Self::IntermediateChunk => "IntermediateChunk",
             Self::WriteChunk(_) => "WriteChunk",
             Self::FinishWrite => "FinishWrite",
             Self::ReadChunk => "ReadChunk",
@@ -193,6 +220,7 @@ impl std::fmt::Debug for TransferReply {
             Self::Status(_) => f.write_str("Status"),
             Self::WorkerLabel(_) => f.write_str("WorkerLabel"),
             Self::Ack => f.write_str("Ack"),
+            Self::IntermediateOpened(_) => f.write_str("IntermediateOpened"),
         }
     }
 }
@@ -228,7 +256,7 @@ pub struct NativeCompileReport {
 pub enum NativeBuildSource {
     Hit,
     Local,
-    Worker(std::net::SocketAddr),
+    Worker(crate::build_runtime::PeerId),
 }
 
 /// Information about a finished compile, either from cache or executed locally.

@@ -597,19 +597,15 @@ where
             // This is the default location in official AMD packages and containers.
             .unwrap_or_else(|| PathBuf::from("/opt/rocm/amdgcn/bitcode"));
 
-        hip_device_lib_path
-            .read_dir()
-            .ok()
-            .map(|f| {
-                let mut device_libs = f
-                    .flatten()
-                    .filter(|f| f.path().extension().is_some_and(|ext| ext == "bc"))
-                    .map(|f| f.path())
-                    .collect::<Vec<_>>();
-                device_libs.sort_unstable();
-                device_libs
-            })
-            .unwrap_or_default()
+        hip_device_lib_path.read_dir().ok().map_or_default(|f| {
+            let mut device_libs = f
+                .flatten()
+                .filter(|f| f.path().extension().is_some_and(|ext| ext == "bc"))
+                .map(|f| f.path())
+                .collect::<Vec<_>>();
+            device_libs.sort_unstable();
+            device_libs
+        })
     }
 }
 
@@ -691,6 +687,10 @@ where
         &mut self,
         context: GenerateHashKeyContext<'_, T>,
     ) -> Result<HashResult<T>> {
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        let native_identity = context.native.is_some();
+        #[cfg(not(all(feature = "dist-client", target_os = "linux")))]
+        let native_identity = false;
         let GenerateHashKeyContext {
             creator,
             cwd,
@@ -700,9 +700,13 @@ where
             rewrite_includes_only,
             storage,
             cache_control,
+            ..
         } = context;
         let start_of_compilation = std::time::SystemTime::now();
         let mut parsed_args = self.parsed_args.clone();
+        if native_identity {
+            parsed_args.suppress_rewrite_includes_only = true;
+        }
         let canonical_native = NativeCargoPaths::discover(
             &env_vars,
             self.compiler.kind(),
@@ -775,7 +779,8 @@ where
             let can_use_preprocessor_cache_mode = preprocessor_cache_mode_config
                 .use_preprocessor_cache_mode
                 && !too_hard_for_preprocessor_cache_mode
-                && canonical_native.is_none();
+                && canonical_native.is_none()
+                && !native_identity;
 
             let mut use_preprocessor_cache_mode = can_use_preprocessor_cache_mode;
 
@@ -1028,7 +1033,7 @@ where
         } else {
             Cow::Borrowed(preprocessor_output.as_slice())
         };
-        let basedirs = if canonical_native.is_some() {
+        let basedirs = if canonical_native.is_some() || native_identity {
             &[][..]
         } else {
             storage.basedirs()
@@ -2142,6 +2147,21 @@ fn include_is_too_new(
 const PREPROCESSING_SKIPPED_COMPILE_POISON: &[u8] = b"([{SCCACHE -*-* INVALID_C_CPP_CODE([{\"";
 
 impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I> {
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    fn native_result_policy(&self) -> super::native::ResultIdentityPolicy {
+        use super::native::ResultIdentityPolicy;
+        if matches!(
+            self.compiler.kind(),
+            CCompilerKind::Gcc | CCompilerKind::Clang
+        ) && !self.parsed_args.profile_generate
+            && !self.parsed_args.language.is_c_like_header()
+        {
+            ResultIdentityPolicy::PreprocessedC
+        } else {
+            ResultIdentityPolicy::Exact
+        }
+    }
+
     fn generate_compile_commands(
         &self,
         path_transformer: &mut dist::PathTransformer,
@@ -2251,7 +2271,7 @@ impl pkg::InputsPackager for CInputsPackager {
 
     #[cfg(target_os = "linux")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        (*self).discover()?.into_native_mapping()
+        (*self).discover()?.into_native_mapping(|_| false)
     }
 }
 
@@ -3067,6 +3087,8 @@ mod test {
                     <CCompilerHasher<Gcc> as CompilerHasher<ProcessCommandCreator>>::generate_hash_key(
                         &mut hasher,
                         GenerateHashKeyContext {
+                            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                            native: None,
                             creator: &creator,
                             cwd: cwd.clone(),
                             env_vars: env,

@@ -16,9 +16,10 @@ use anyhow::{Context, Result, ensure};
 
 use crate::{
     build_runtime::{
-        ActionKey, ActionMode, BuildPath, CommandSpec, ContentId, DescriptorDigestProvider,
-        ExecutionRoot, ExecutionSpec, OutputKind, OutputSpec, PreparedTree, SourceDigestCache,
-        TreeRecipe,
+        ActionKey, ActionMode, BuildPath, CommandSpec, CompilerResultIdentity, ContentId,
+        DescriptorDigestProvider, ExecutionRoot, ExecutionSpec, OutputKind, OutputSpec,
+        PreparedTree, SourceDigestCache, TreeEntry, TreeId, TreeManifest, TreeRecipe,
+        TreeTimestamp,
     },
     cache::FileObjectSource,
     client::{SharedConnection, connection_task},
@@ -40,8 +41,11 @@ use super::{
 struct DirectEndpoint {
     config: NativeClientConfig,
     scheduler: Option<HTTPUrl>,
+    cluster: Option<sccache_peer_identity::PeerConfig>,
+    client: std::sync::Mutex<Option<NativeCacheClient>>,
     auth: DistAuth,
     local: Option<LocalExecutor>,
+    intermediates: crate::dist::native::result_session::Registry,
 }
 
 enum Endpoint {
@@ -79,6 +83,7 @@ impl NativeCompilerClient {
     pub fn new(
         config: NativeClientConfig,
         scheduler: Option<HTTPUrl>,
+        cluster: Option<sccache_peer_identity::PeerConfig>,
         auth: DistAuth,
         toolchains: Vec<DistToolchainConfig>,
         catalogs: &[PathBuf],
@@ -98,8 +103,11 @@ impl NativeCompilerClient {
             endpoint: Endpoint::Direct(Box::new(DirectEndpoint {
                 config,
                 scheduler,
+                cluster,
+                client: std::sync::Mutex::new(None),
                 auth,
                 local,
+                intermediates: crate::dist::native::result_session::Registry::default(),
             })),
             policy,
             toolchains,
@@ -126,6 +134,76 @@ impl NativeCompilerClient {
         }
     }
 
+    pub(crate) fn reference(
+        &self,
+        file: &std::fs::File,
+    ) -> Result<
+        Option<(
+            crate::build_runtime::BlobRef,
+            crate::build_runtime::ReferenceBlobProvider,
+        )>,
+    > {
+        use crate::{
+            build_runtime::intermediate_fs::intermediate_reference,
+            protocol::{TransferReply, TransferRequest},
+        };
+        let Some(reference) = intermediate_reference(file)? else {
+            return Ok(None);
+        };
+        let provider = match &self.endpoint {
+            Endpoint::Direct(endpoint) => {
+                // SAFETY: geteuid only queries process credentials.
+                let group = endpoint
+                    .intermediates
+                    .get(unsafe { libc::geteuid() }, reference.session)?;
+                group.authorize(reference.blob)?;
+                crate::build_runtime::ReferenceBlobProvider::new(move |blob| {
+                    Ok(Box::new(group.read(blob)?))
+                })
+            }
+            Endpoint::Namespace { connection, .. } => {
+                ensure!(
+                    matches!(
+                        connection.blocking_lock().transfer(
+                            TransferRequest::IntermediateAuthorize {
+                                session: reference.session,
+                                blob: reference.blob
+                            }
+                        )?,
+                        TransferReply::Ack
+                    ),
+                    "unexpected intermediate authorization response"
+                );
+                crate::dist::native::intermediate::source(reference)
+            }
+        };
+        log::debug!("using retained CAS input {:?}", reference.blob.id);
+        Ok(Some((reference.blob, provider)))
+    }
+
+    pub(crate) async fn hash_files(
+        self: &Arc<Self>,
+        files: &[PathBuf],
+        pool: &tokio::runtime::Handle,
+    ) -> Result<Vec<String>> {
+        let jobs = files.iter().map(|path| {
+            let client = Arc::clone(self);
+            let path = path.clone();
+            pool.spawn_blocking(move || {
+                let file = std::fs::File::open(path)?;
+                if let Some((blob, _)) = client.reference(&file)? {
+                    Ok(crate::util::hex(&blob.id.0))
+                } else {
+                    crate::util::Digest::reader_sync(file)
+                }
+            })
+        });
+        futures::future::try_join_all(jobs)
+            .await?
+            .into_iter()
+            .collect()
+    }
+
     pub fn toolchain_digests(&self) -> Arc<SourceDigestCache> {
         Arc::clone(&self.toolchain_digests)
     }
@@ -134,15 +212,53 @@ impl NativeCompilerClient {
         &self.policy
     }
 
-    pub fn serve_namespace(&self, stream: broker::DaemonStream) -> Result<()> {
+    pub fn serve_namespace(&self, stream: broker::DaemonStream, uid: u32) -> Result<()> {
         let client = self.connect_http()?;
         let Endpoint::Direct(endpoint) = &self.endpoint else {
             anyhow::bail!("native namespace endpoint cannot serve");
         };
-        broker::serve_action(&client, &self.policy, stream, endpoint.local.as_ref())
+        broker::serve_action(
+            &client,
+            &self.policy,
+            stream,
+            endpoint.local.as_ref(),
+            &endpoint.intermediates,
+            uid,
+        )
     }
 
-    pub async fn status(&self) -> DistInfo {
+    pub(crate) fn open_intermediate(
+        &self,
+        uid: u32,
+    ) -> Result<(
+        crate::build_runtime::wire::Ticket,
+        Arc<crate::dist::native::result_session::NativeResultSession>,
+    )> {
+        let Endpoint::Direct(endpoint) = &self.endpoint else {
+            anyhow::bail!("intermediate registry is daemon-owned");
+        };
+        let session = Arc::new(
+            crate::dist::native::result_session::NativeResultSession::open(
+                self.connect_http()?,
+                Duration::from_secs(self.policy.renewal_interval_secs),
+            )?,
+        );
+        let token = endpoint.intermediates.insert(uid, &session)?;
+        Ok((token, session))
+    }
+
+    pub(crate) fn intermediate(
+        &self,
+        uid: u32,
+        token: crate::build_runtime::wire::Ticket,
+    ) -> Result<Arc<crate::dist::native::result_session::NativeResultSession>> {
+        let Endpoint::Direct(endpoint) = &self.endpoint else {
+            anyhow::bail!("intermediate registry is daemon-owned");
+        };
+        endpoint.intermediates.get(uid, token)
+    }
+
+    pub async fn status(self: &Arc<Self>) -> DistInfo {
         match &self.endpoint {
             Endpoint::Namespace { connection, .. } => {
                 let result = connection_task(Arc::clone(connection), |conn| {
@@ -157,20 +273,14 @@ impl NativeCompilerClient {
                 })
             }
             Endpoint::Direct(endpoint) => {
-                let DirectEndpoint {
-                    config, scheduler, ..
-                } = endpoint.as_ref();
+                let scheduler = &endpoint.scheduler;
+                let client = Arc::clone(self);
                 let result = async {
-                    let scheduler = scheduler.as_ref().context("scheduler URL unavailable")?;
-                    let url = dist::http::urls::scheduler_status(&scheduler.to_url())?;
-                    let client = crate::http_client::new_reqwest_client_builder()?
-                        .timeout(Duration::from_secs(config.request_timeout_secs))
-                        .build()?;
-                    dist::http::transport::send_async(
-                        client.get(url),
-                        dist::http::transport::RequestClass::Control,
-                    )
-                    .await
+                    // Enrollment and credential refresh use the synchronous
+                    // cluster runtime bridge; do not block the async IPC task.
+                    let transport =
+                        tokio::task::spawn_blocking(move || client.connect_http()).await??;
+                    transport.scheduler_status().await
                 }
                 .await;
                 match result {
@@ -201,19 +311,39 @@ impl NativeCompilerClient {
             anyhow::bail!("namespace client cannot authenticate directly with scheduler");
         };
         let DirectEndpoint { config, auth, .. } = endpoint.as_ref();
-        let token = match auth {
-            DistAuth::Token { token } => token.clone(),
-            DistAuth::Oauth2CodeGrantPKCE { auth_url, .. }
-            | DistAuth::Oauth2Implicit { auth_url, .. } => {
-                DistClientContainer::get_cached_config_auth_token(auth_url)?
-            }
-        };
-        NativeCacheClient::new(
-            config.endpoint.to_url(),
-            token,
+        let mut saved = endpoint
+            .client
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native client credentials poisoned"))?;
+        if let Some(client) = saved.as_ref().cloned() {
+            drop(saved);
+            client.refresh_credentials();
+            return Ok(client);
+        }
+        let cluster = endpoint
+            .cluster
+            .clone()
+            .context("native client cluster trust required")?;
+        let scheduler = endpoint
+            .scheduler
+            .as_ref()
+            .context("native client scheduler endpoint required")?;
+        let auth = auth.clone();
+        let peer = crate::dist::cluster::open_peer(
+            cluster,
+            &scheduler.to_url(),
+            sccache_cluster_identity::Role::Client,
+            move || DistClientContainer::enrollment_token(&auth),
+        )?;
+        let client = NativeCacheClient::new(
+            &config.endpoint.to_url(),
+            peer,
             Duration::from_secs(config.request_timeout_secs),
             config.max_metadata_bytes,
-        )
+        )?;
+        *saved = Some(client.clone());
+        drop(saved);
+        Ok(client)
     }
 
     async fn execute(
@@ -222,19 +352,30 @@ impl NativeCompilerClient {
         mode: ActionMode,
         pool: &tokio::runtime::Handle,
     ) -> Result<(NativeBuildResult, crate::build_runtime::ActionKey)> {
-        let key = plan.spec.action_request()?.action_fingerprint()?.key()?;
+        let fingerprint = plan.spec.action_request()?.action_fingerprint()?;
+        let key = fingerprint.key()?;
+        debug!(
+            "native action {key:?}: components={:?}; input trees={:?}",
+            fingerprint.components,
+            plan.inputs.iter().map(PreparedTree::id).collect::<Vec<_>>()
+        );
         let result = match &self.endpoint {
             Endpoint::Direct(_) => {
                 pool.spawn_blocking(crate::server::activity::inherit_blocking(move || {
                     let Endpoint::Direct(endpoint) = &self.endpoint else {
                         unreachable!()
                     };
-                    self.connect_http()?.run_action(
+                    self.connect_http()?.run_action_retained(
                         &plan.spec,
                         &plan.inputs,
                         &plan.destinations,
                         &self.policy.build_policy(mode),
                         endpoint.local.as_ref(),
+                        (
+                            &endpoint.intermediates,
+                            // SAFETY: geteuid only queries process credentials.
+                            unsafe { libc::geteuid() },
+                        ),
                     )
                 }))
                 .await?
@@ -318,6 +459,146 @@ impl NativeOutput {
     }
 }
 
+/// The compiler frontend declares which semantic identity it can establish.
+///
+/// Opaque extensions keep exact execution identity: their code can observe
+/// arbitrary environment values and input metadata outside compiler dep-info.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ResultIdentityPolicy {
+    Exact,
+    PreprocessedC,
+    Rust,
+}
+
+impl ResultIdentityPolicy {
+    fn identity(
+        self,
+        key: &str,
+        command: &CommandSpec,
+        toolchain: TreeId,
+        inputs: &TreeManifest,
+    ) -> Result<Option<CompilerResultIdentity>> {
+        if self == Self::Exact || opaque_compiler_extension(command, inputs) {
+            return Ok(None);
+        }
+        let environment = compiler_environment(command, self);
+        let input_closure = if self == Self::Rust {
+            // Rust's dep-info includes sources and direct externs, but the
+            // packaged search closure also includes transitive dependencies.
+            // Rustc reads these by content; do not make delivery mtimes inputs.
+            let mut manifest = inputs.clone();
+            let stamp = TreeTimestamp {
+                seconds: 0,
+                nanoseconds: 0,
+            };
+            manifest.root.modified = stamp;
+            for entry in manifest.entries.values_mut() {
+                match entry {
+                    TreeEntry::Directory(metadata) | TreeEntry::File { metadata, .. } => {
+                        metadata.modified = stamp;
+                    }
+                    TreeEntry::Symlink { modified, .. } => *modified = stamp,
+                    TreeEntry::Hardlink(_) => {}
+                }
+            }
+            Some(manifest.id()?)
+        } else {
+            None
+        };
+        Ok(Some(CompilerResultIdentity {
+            semantic: ContentId::of(key.as_bytes()),
+            toolchain,
+            input_closure,
+            environment,
+        }))
+    }
+}
+
+/// Retain exact identity for extensions executing arbitrary native code.
+///
+/// Their dependencies lie outside ordinary compiler frontend discovery.
+fn opaque_compiler_extension(command: &CommandSpec, inputs: &TreeManifest) -> bool {
+    command.arguments.iter().any(|arg| {
+        [
+            b"-fplugin".as_slice(),
+            b"-fpass-plugin",
+            b"-load",
+            b"-add-plugin",
+            b"-plugin",
+            b"-wrapper",
+            b"-specs",
+            b"--specs",
+            b"-Zcodegen-backend",
+            b"codegen-backend=",
+        ]
+        .iter()
+        .any(|prefix| arg.starts_with(prefix))
+    }) || inputs
+        .entries
+        .keys()
+        .any(|path| path.as_bytes().ends_with(b".so"))
+}
+
+/// Hash compiler driver/runtime environment dependencies.
+///
+/// Rust source-observed values and Cargo semantic environment are already
+/// included in the frontend digest. Omit job, shell and scheduler bookkeeping.
+fn compiler_environment(command: &CommandSpec, policy: ResultIdentityPolicy) -> ContentId {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"sccache-native-compiler-environment-v1\0");
+    for (name, value) in &command.environment {
+        let name = name.as_slice();
+        let relevant = [
+            b"LANG".as_slice(),
+            b"LANGUAGE",
+            b"TZ",
+            b"TERM",
+            b"SOURCE_DATE_EPOCH",
+            b"PATH",
+        ]
+        .contains(&name)
+            || [b"LC_".as_slice(), b"LD_"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            || match policy {
+                ResultIdentityPolicy::PreprocessedC => {
+                    [b"GCC_".as_slice(), b"CLANG_", b"CCC_"]
+                        .iter()
+                        .any(|prefix| name.starts_with(prefix))
+                        || [
+                            b"COMPILER_PATH".as_slice(),
+                            b"LIBRARY_PATH",
+                            b"CPATH",
+                            b"C_INCLUDE_PATH",
+                            b"CPLUS_INCLUDE_PATH",
+                            b"OBJC_INCLUDE_PATH",
+                            b"DEPENDENCIES_OUTPUT",
+                            b"SUNPRO_DEPENDENCIES",
+                        ]
+                        .contains(&name)
+                }
+                ResultIdentityPolicy::Rust => {
+                    name.starts_with(b"RUSTC_")
+                        || [
+                            b"RUST_MIN_STACK".as_slice(),
+                            b"RUST_BACKTRACE",
+                            b"RUST_LIB_BACKTRACE",
+                            b"RUSTFLAGS",
+                        ]
+                        .contains(&name)
+                }
+                ResultIdentityPolicy::Exact => false,
+            };
+        if relevant {
+            for field in [name, value.as_slice()] {
+                digest.update(&(field.len() as u128).to_le_bytes());
+                digest.update(field);
+            }
+        }
+    }
+    ContentId(*digest.finalize().as_bytes())
+}
+
 struct CompilerPlan {
     spec: ExecutionSpec,
     inputs: Vec<PreparedTree>,
@@ -331,9 +612,11 @@ impl CompilerPlan {
         outputs: Vec<NativeOutput>,
         transformer: dist::PathTransformer,
         packagers: DistPackagers,
-        platform: ContentId,
-        toolchain_digests: &SourceDigestCache,
+        identity: (ContentId, ResultIdentityPolicy, &str),
+        preparation: (&SourceDigestCache, Option<&NativeCompilerClient>),
     ) -> Result<Self> {
+        let (toolchain_digests, native) = preparation;
+        let (platform, result_policy, key) = identity;
         let mut layout = pkg::CompilerInputs::new(transformer);
         layout.directory(cwd)?;
         let mut paths = BTreeMap::new();
@@ -370,8 +653,13 @@ impl CompilerPlan {
             after.0,
             after.1
         );
-        let inputs = inputs.native_mapping()?.prepare()?;
-        let layout = layout.into_native_mapping()?.prepare()?;
+        let mapped = inputs.native_mapping()?;
+        let inputs = if let Some(native) = native {
+            mapped.prepare_with_references(&|file, _| native.reference(file))?
+        } else {
+            mapped.prepare()?
+        };
+        let layout = layout.into_native_mapping(|_| false)?.prepare()?;
         let directories = pkg::native_directory_metadata()?;
         let inputs = vec![toolchain, inputs, layout];
         let recipe = TreeRecipe::union(directories, inputs.iter().map(PreparedTree::id));
@@ -382,27 +670,31 @@ impl CompilerPlan {
                 .map(|tree| (tree.id(), tree.manifest()))
                 .collect(),
         )?;
+        let command = CommandSpec {
+            umask: command
+                .umask
+                .context("native execution requires a known process umask")?,
+            executable: BuildPath::new(command.executable.into_bytes())?,
+            arguments: command
+                .arguments
+                .into_iter()
+                .map(String::into_bytes)
+                .collect(),
+            cwd: BuildPath::new(command.cwd.into_bytes())?,
+            environment: command
+                .env_vars
+                .into_iter()
+                .map(|(name, value)| (name.into_bytes(), value.into_bytes()))
+                .collect(),
+        };
+        let compiler_result =
+            result_policy.identity(key, &command, inputs[0].id(), inputs[1].manifest())?;
         let spec = ExecutionSpec {
+            compiler_result,
             platform,
             root,
             mounts: BTreeMap::new(),
-            command: CommandSpec {
-                umask: command
-                    .umask
-                    .context("native execution requires a known process umask")?,
-                executable: BuildPath::new(command.executable.into_bytes())?,
-                arguments: command
-                    .arguments
-                    .into_iter()
-                    .map(String::into_bytes)
-                    .collect(),
-                cwd: BuildPath::new(command.cwd.into_bytes())?,
-                environment: command
-                    .env_vars
-                    .into_iter()
-                    .map(|(name, value)| (name.into_bytes(), value.into_bytes()))
-                    .collect(),
-            },
+            command,
             outputs: paths,
         };
         spec.validate()?;
@@ -623,10 +915,13 @@ pub(super) async fn compile<T: CommandCreatorSync>(
     creator: T,
     cwd: PathBuf,
     compilation: Box<dyn Compilation<T>>,
-    control: CacheControl,
+    identity: (CacheControl, &str),
     pool: &tokio::runtime::Handle,
 ) -> Result<(CompileResult, process::Output)> {
     let start = Instant::now();
+    let result_policy = compilation.native_result_policy();
+    let (control, key) = identity;
+    let key = key.to_owned();
     crate::server::activity::phase(crate::server::activity::Phase::PlanCompile);
     let mut transformer = dist::PathTransformer::new();
     let (local, remote, cacheable) =
@@ -665,8 +960,11 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                     outputs,
                     layout,
                     packagers,
-                    preparation_client.policy.platform,
-                    &preparation_client.toolchain_digests,
+                    (preparation_client.policy.platform, result_policy, &key),
+                    (
+                        &preparation_client.toolchain_digests,
+                        Some(&preparation_client),
+                    ),
                 )
             }))
         })();
@@ -701,8 +999,10 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                 // an ordinary nonzero exit. Preserve caller semantics by
                 // rerunning locally without writing an archive cache.
                 warn!(
-                    "native compilation failed on {:?}; retrying locally",
-                    result.source
+                    "native compilation failed on {:?} with {}; retrying locally: {}",
+                    result.source,
+                    result.output.status,
+                    String::from_utf8_lossy(&result.output.stderr)
                 );
                 fallback = DistType::Error;
             }
@@ -737,7 +1037,7 @@ mod tests {
     use std::{ffi::OsString, io::Read};
 
     fn config() -> Result<Config> {
-        let endpoint = HTTPUrl::from_url(reqwest::Url::parse("http://127.0.0.1:1/")?);
+        let endpoint = HTTPUrl::from_url(url::Url::parse("http://127.0.0.1:1/")?);
         let mut config = Config::default();
         config.dist.scheduler_url = Some(endpoint.clone());
         config.dist.native = Some(NativeClientConfig {
@@ -792,6 +1092,8 @@ mod tests {
             anyhow::bail!("real compiler arguments are not cacheable");
         };
         let hashed = rt.block_on(hasher.generate_hash_key(GenerateHashKeyContext {
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            native: None,
             creator: &creator,
             cwd: cwd.clone(),
             env_vars: environment.clone(),
@@ -803,6 +1105,7 @@ mod tests {
         }))?;
         assert_eq!(hashed.cache_control, CacheControl::Default);
         let compilation = hashed.compilation;
+        let result_policy = compilation.native_result_policy();
         let mut transformer = dist::PathTransformer::new();
         let (_, remote, cacheable) =
             compilation.generate_compile_commands(&mut transformer, CompileTransport::Native)?;
@@ -852,8 +1155,8 @@ mod tests {
             outputs,
             layout,
             compilation.into_dist_packagers(transformer)?,
-            platform,
-            &SourceDigestCache::default(),
+            (platform, result_policy, &hashed.key),
+            (&SourceDigestCache::default(), None),
         )?;
         let store = NativeStore::open(&cwd.join("native-store"))?;
         let _leases = plan

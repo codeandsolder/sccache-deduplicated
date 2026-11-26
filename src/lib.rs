@@ -17,9 +17,6 @@
 
 #[macro_use]
 extern crate log;
-#[cfg(feature = "rouille")]
-#[macro_use(router)]
-extern crate rouille;
 // To get macros in scope, this has to be first.
 #[cfg(test)]
 #[macro_use]
@@ -30,6 +27,8 @@ pub mod errors;
 
 pub use sccache_build as build_runtime;
 pub mod cache;
+#[cfg(target_os = "linux")]
+mod cargo_launcher;
 mod client;
 mod cmdline;
 mod commands;
@@ -40,7 +39,7 @@ pub use compiler::rust_link;
 pub mod compression;
 pub mod config;
 pub mod dist;
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-client")]
 pub mod http_client;
 mod jobserver;
 pub mod lru_disk_cache;
@@ -101,6 +100,17 @@ pub fn main() {
 
     init_logging();
 
+    #[cfg(target_os = "linux")]
+    if let Some(result) = cargo_launcher::run_if_requested() {
+        std::process::exit(match result {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!("sccache Cargo launcher: {error:#}");
+                2
+            }
+        });
+    }
+
     let command = match cmdline::try_parse() {
         Ok(cmd) => cmd,
         Err(e) => match e.downcast::<clap::error::Error>() {
@@ -129,16 +139,13 @@ pub fn main() {
 }
 
 fn init_logging() {
-    if env::var(LOGGING_ENV).is_ok() {
-        let mut builder = env_logger::Builder::from_env(LOGGING_ENV);
-
-        // Enable millisecond precision timestamps if SCCACHE_LOG_MILLIS is set
-        if env::var("SCCACHE_LOG_MILLIS").is_ok() {
-            builder.format_timestamp_millis();
-        }
-
-        if let Err(error) = builder.try_init() {
-            eprintln!("sccache: failed to initialize logging: {error}");
-        }
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::new().filter_or(LOGGING_ENV, "warn"));
+    // Enable millisecond precision timestamps if SCCACHE_LOG_MILLIS is set.
+    if env::var("SCCACHE_LOG_MILLIS").is_ok() {
+        builder.format_timestamp_millis();
+    }
+    if let Err(error) = builder.try_init() {
+        eprintln!("sccache: failed to initialize logging: {error}");
     }
 }

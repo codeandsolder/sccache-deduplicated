@@ -692,6 +692,18 @@ pub struct NativeStore {
 }
 
 impl NativeStore {
+    /// Canonical directory owned by this store.
+    #[must_use = "the root identifies the store directory"]
+    pub fn root(&self) -> &Path {
+        &self.inner.root
+    }
+
+    /// The single admission and eviction policy for all clones.
+    #[must_use = "the policy controls admission and eviction"]
+    pub fn managed_space_policy(&self) -> Option<SpacePolicy> {
+        self.inner.space_policy
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn mount_tree_protected(
         &self,
@@ -1813,7 +1825,7 @@ impl<L> Seek for LeasedReader<'_, L> {
 mod history;
 mod space;
 use crate::SpacePolicy;
-pub use space::{SpaceReport, StageBudget};
+pub use space::{CacheAnalyticsSampler, SpaceReport, SpaceStatus, StageBudget};
 mod audit;
 pub use audit::{ComponentAudit, NativeIndexAudit, SchemaInventory};
 mod packages;

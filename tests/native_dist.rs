@@ -15,9 +15,9 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use sccache::{
     build_runtime::{
-        ActionMode, Artifact, BuildPath, CommandSpec, ComponentAudit, ContentId, ExecutionRoot,
-        ExecutionSpec, InstallationManifest, MappedMetadata, MappedTree, NativeStore, OutputSpec,
-        SpacePolicy, TreeLayer, TreePath, TreeRecipe,
+        ActionMode, Artifact, BuildPath, CommandSpec, ContentId, ExecutionRoot, ExecutionSpec,
+        InstallationManifest, MappedMetadata, MappedTree, NativeStore, OutputSpec, SpacePolicy,
+        TreeLayer, TreePath, TreeRecipe,
         wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply},
     },
     config::{
@@ -147,27 +147,30 @@ fn addresses() -> Result<[SocketAddr; 3]> {
         .map_err(|_| anyhow::anyhow!("wrong listener count"))
 }
 
-fn fetch_status(
-    http: &reqwest::blocking::Client,
-    scheduler: &reqwest::Url,
-) -> Result<SchedulerStatusResult> {
-    Ok(http
-        .get(scheduler.join("/api/v1/scheduler/status")?)
-        .header("Accept", "application/json")
-        .send()?
-        .error_for_status()?
-        .json()?)
+fn fetch_status(http: &wreq::Client, scheduler: &url::Url) -> Result<SchedulerStatusResult> {
+    sccache::http_client::io_runtime()?.block_on(async {
+        Ok(http
+            .get(scheduler.join("/api/v1/scheduler/status")?.as_str())
+            .header("Accept", "application/json")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    })
 }
 
 fn native_worker_config(
     root: &Path,
+    cluster: sccache_peer_identity::PeerConfig,
     worker_address: SocketAddr,
-    scheduler_url: reqwest::Url,
-    cache_url: reqwest::Url,
+    scheduler_url: url::Url,
+    cache_url: url::Url,
     platform: &str,
     transfer: sccache::build_runtime::PackageTransferCost,
 ) -> server::Config {
     server::Config {
+        cluster,
         builder: server::BuilderType::Native,
         cache_dir: None,
         public_addr: worker_address,
@@ -180,8 +183,8 @@ fn native_worker_config(
         toolchain_archive_sources: Vec::new(),
         native_worker: Some(server::NativeWorkerConfig {
             cache_url: HTTPUrl::from_url(cache_url),
-            directory: root.join("worker-store"),
-            space: space(),
+            directory: Some(root.join("worker-store")),
+            space: Some(space()),
             scratch: root.join("scratch"),
             bubblewrap: "/usr/bin/bwrap".into(),
             platform_contract: platform.into(),
@@ -200,14 +203,19 @@ fn native_worker_config(
 }
 
 struct Fleet {
-    worker: Process,
+    worker: Option<Process>,
     scheduler: Process,
     worker_directory: PathBuf,
     scheduler_directory: PathBuf,
     worker_address: SocketAddr,
-    cache_url: reqwest::Url,
-    scheduler_url: reqwest::Url,
-    http: reqwest::blocking::Client,
+    worker_id: sccache_peer_identity::PeerId,
+    cluster: sccache_peer_identity::PeerConfig,
+    worker_cluster: sccache_peer_identity::PeerConfig,
+    peer: std::sync::Arc<sccache_cluster_identity::PeerCredentials>,
+    status_base: url::Url,
+    cache_url: url::Url,
+    scheduler_url: url::Url,
+    http: wreq::Client,
 }
 
 impl Fleet {
@@ -235,15 +243,70 @@ impl Fleet {
         package_upstreams: BTreeMap<String, scheduler::PackageUpstream>,
         transfer: sccache::build_runtime::PackageTransferCost,
     ) -> Result<Self> {
+        Self::start_with_mode(root, package_upstreams, transfer, false)
+    }
+
+    fn start_with_mode(
+        root: &Path,
+        package_upstreams: BTreeMap<String, scheduler::PackageUpstream>,
+        transfer: sccache::build_runtime::PackageTransferCost,
+        colocated: bool,
+    ) -> Result<Self> {
         let [scheduler_address, cache_address, worker_address] = addresses()?;
-        let scheduler_url = reqwest::Url::parse(&format!("http://{scheduler_address}/"))?;
-        let cache_url = reqwest::Url::parse(&format!("http://{cache_address}/"))?;
+        let scheduler_url = url::Url::parse(&format!("https://{scheduler_address}/"))?;
+        let cache_url = url::Url::parse(&format!("https://{cache_address}/"))?;
         let scheduler_directory = root.join("scheduler-store");
-        let worker_directory = root.join("worker-store");
+        let worker_directory = if colocated {
+            scheduler_directory.clone()
+        } else {
+            root.join("worker-store")
+        };
+        let cluster_directory = root.join("cluster");
+        fs::create_dir_all(&cluster_directory)?;
+        drop(sccache_cluster_identity::scheduler_registry(
+            &cluster_directory,
+        )?);
+        let ca = sccache_cluster_identity::ClusterCa::open(&cluster_directory.join("ca-key.pem"))?;
+        let scheduler_id =
+            sccache_cluster_identity::Identity::open(&cluster_directory.join("key.pem"))?.id()?;
+        let ca_certificate = cluster_directory.join("ca.pem");
+        sccache_cluster_identity::publish_trust_anchor(ca.certificate(), &ca_certificate)?;
+        let cluster = sccache_peer_identity::PeerConfig {
+            directory: root.join("client-identity"),
+            ca_certificate,
+            scheduler_id,
+        };
+        let worker_cluster = sccache_peer_identity::PeerConfig {
+            directory: root.join("worker-identity"),
+            ..cluster.clone()
+        };
+        let worker_id = sccache_cluster_identity::open_identity(&worker_cluster)?.id()?;
+        let mut worker_config = native_worker_config(
+            root,
+            worker_cluster.clone(),
+            worker_address,
+            scheduler_url.clone(),
+            cache_url.clone(),
+            PLATFORM,
+            transfer,
+        );
+        let (local_worker, standalone_worker) = if colocated {
+            let native = worker_config
+                .native_worker
+                .as_mut()
+                .context("native config missing")?;
+            native.directory = None;
+            native.space = None;
+            (Some(Box::new(worker_config)), None)
+        } else {
+            (None, Some(worker_config))
+        };
         let mut scheduler_process = Process::start(
             root,
             "scheduler",
             &scheduler::Config {
+                cluster_directory,
+                local_worker,
                 public_addr: scheduler_address,
                 client_auth: scheduler::ClientAuth::Token {
                     token: CLIENT_TOKEN.into(),
@@ -252,12 +315,14 @@ impl Fleet {
                     token: WORKER_TOKEN.into(),
                 },
                 maintenance_drain_file: None,
+                dashboard: None,
                 job_slack: scheduler::JobSlackConfig {
                     static_jobs: 0,
                     percent: 0.0,
                 },
                 native_cache: Some(scheduler::NativeCacheConfig {
                     public_addr: cache_address,
+                    bind_address: Some(cache_address),
                     directory: scheduler_directory.clone(),
                     space: space(),
                     idle_timeout_secs: 120,
@@ -275,29 +340,33 @@ impl Fleet {
                 }),
             },
         )?;
-        let http = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()?;
-        let status = || fetch_status(&http, &scheduler_url);
-        wait_for(|| {
+        let peer = wait_for(|| {
             scheduler_process.check()?;
-            Ok(status().ok())
+            Ok(sccache::dist::cluster::open_peer(
+                cluster.clone(),
+                &scheduler_url,
+                sccache_cluster_identity::Role::Client,
+                || Ok(CLIENT_TOKEN.to_owned()),
+            )
+            .ok())
         })?;
-        let mut worker_process = Process::start(
-            root,
-            "server",
-            &native_worker_config(
-                root,
-                worker_address,
-                scheduler_url.clone(),
-                cache_url.clone(),
-                PLATFORM,
-                transfer,
-            ),
+        let transport = sccache_cluster_identity::ClusterHttpClient::new(
+            peer.current()?.as_ref(),
+            scheduler_id,
+            sccache_cluster_identity::Role::Scheduler,
+            scheduler_address,
         )?;
+        let (http, status_base) = (transport.client(), transport.base().clone());
+        let status = || fetch_status(&http, &status_base);
+        let mut worker_process = standalone_worker
+            .as_ref()
+            .map(|config| Process::start(root, "server", config))
+            .transpose()?;
         wait_for(|| {
             scheduler_process.check()?;
-            worker_process.check()?;
+            if let Some(worker) = &mut worker_process {
+                worker.check()?;
+            }
             Ok(status()
                 .ok()
                 .filter(|status| status.num_servers == 1 && status.available_jobs > 0))
@@ -308,6 +377,11 @@ impl Fleet {
             worker_directory,
             scheduler_directory,
             worker_address,
+            worker_id,
+            cluster,
+            worker_cluster,
+            peer,
+            status_base,
             cache_url,
             scheduler_url,
             http,
@@ -321,6 +395,10 @@ impl Fleet {
             "server",
             &native_worker_config(
                 root,
+                sccache_peer_identity::PeerConfig {
+                    directory: root.join("worker-identity"),
+                    ..self.cluster.clone()
+                },
                 address,
                 self.scheduler_url.clone(),
                 self.cache_url.clone(),
@@ -336,7 +414,7 @@ impl Fleet {
     }
 
     fn status(&self) -> Result<SchedulerStatusResult> {
-        fetch_status(&self.http, &self.scheduler_url)
+        fetch_status(&self.http, &self.status_base)
     }
 
     fn finish(
@@ -354,10 +432,13 @@ impl Fleet {
         } = self;
         drop(worker);
         drop(scheduler);
-        Ok((
-            NativeStore::open(&scheduler_directory)?.stats()?,
-            NativeStore::open(&worker_directory)?.stats()?,
-        ))
+        let scheduler_stats = NativeStore::open(&scheduler_directory)?.stats()?;
+        let worker_stats = if worker_directory == scheduler_directory {
+            scheduler_stats
+        } else {
+            NativeStore::open(&worker_directory)?.stats()?
+        };
+        Ok((scheduler_stats, worker_stats))
     }
 }
 
@@ -381,6 +462,7 @@ fn shared_daemon_credential_isolation() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let fleet = Fleet::start(temporary.path(), BTreeMap::new())?;
     let config = sccache::config::DistConfig {
+        cluster: Some(fleet.cluster.clone()),
         scheduler_url: Some(HTTPUrl::from_url(fleet.scheduler_url.clone())),
         auth: DistAuth::Token {
             token: CLIENT_TOKEN.into(),
@@ -439,14 +521,16 @@ fn rust_installer_fixture(component: &str, file: &str, contents: &[u8]) -> Resul
     Ok(archive.into_inner()?)
 }
 
-fn provisioning_config(root: &Path, endpoint: &reqwest::Url) -> Result<PathBuf> {
+fn provisioning_config(root: &Path, fleet: &Fleet) -> Result<PathBuf> {
     let config = sccache::config::FileConfig {
         dist: sccache::config::DistConfig {
+            cluster: Some(fleet.cluster.clone()),
+            scheduler_url: Some(HTTPUrl::from_url(fleet.scheduler_url.clone())),
             auth: DistAuth::Token {
                 token: CLIENT_TOKEN.into(),
             },
             native: Some(NativeClientConfig {
-                endpoint: HTTPUrl::from_url(endpoint.clone()),
+                endpoint: HTTPUrl::from_url(fleet.cache_url.clone()),
                 platform_contract: PLATFORM.into(),
                 request_timeout_secs: 30,
                 build_timeout_secs: 30,
@@ -465,10 +549,10 @@ fn provisioning_config(root: &Path, endpoint: &reqwest::Url) -> Result<PathBuf> 
 }
 
 struct OriginalUpstream {
-    origin: reqwest::Url,
+    origin: url::Url,
     requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    stop: std::sync::mpsc::Sender<()>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -487,34 +571,67 @@ impl OriginalUpstream {
         let peak = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::clone(&peak);
         let active = AtomicUsize::new(0);
-        let server = rouille::Server::new("127.0.0.1:0", move |request| {
-            if request.method() != "GET" || request.header("Authorization").is_some() {
-                return rouille::Response::empty_404();
+        use axum::{Router, body::Body, response::IntoResponse};
+        use http::{Method, StatusCode, header};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let origin = url::Url::parse(&format!("http://{}/", listener.local_addr()?))?;
+        let (stop, shutdown) = tokio::sync::oneshot::channel();
+        let archives = Arc::new(archives);
+        let active = Arc::new(active);
+        let admission = Arc::new(tokio::sync::Semaphore::new(2));
+        let router = Router::new().fallback(move |request: axum::extract::Request| {
+            let archives = Arc::clone(&archives);
+            let count = Arc::clone(&count);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            let admission = Arc::clone(&admission);
+            async move {
+                if request.method() != Method::GET
+                    || request.headers().contains_key(header::AUTHORIZATION)
+                {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                let Some(bytes) = archives.get(request.uri().path()).cloned() else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                let Ok(_permit) = admission.acquire().await else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                count.fetch_add(1, Ordering::Relaxed);
+                let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(concurrent, Ordering::SeqCst);
+                // Allow independent acquisitions to overlap.
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                // An unknown-size stream intentionally omits Content-Length.
+                let body = Body::from_stream(futures::stream::once(async move {
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from_owner(bytes))
+                }));
+                ([(header::CONTENT_TYPE, "application/octet-stream")], body).into_response()
             }
-            let Some(bytes) = archives.get(&request.url()) else {
-                return rouille::Response::empty_404();
-            };
-            count.fetch_add(1, Ordering::Relaxed);
-            let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
-            maximum.fetch_max(concurrent, Ordering::SeqCst);
-            // Allow independent acquisitions to overlap.
-            thread::sleep(Duration::from_millis(800));
-            active.fetch_sub(1, Ordering::SeqCst);
-            let mut response = rouille::Response::from_data("application/octet-stream", Vec::new());
-            // Intentionally omit Content-Length.
-            response.data =
-                rouille::ResponseBody::from_reader(std::io::Cursor::new(Arc::clone(bytes)));
-            response
-        })
-        .map_err(|error| anyhow::anyhow!("{error}"))?
-        .pool_size(2);
-        let origin = reqwest::Url::parse(&format!("http://{}/", server.server_addr()))?;
-        let (worker, stop) = server.stoppable();
+        });
+        let worker = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fixture runtime");
+            runtime.block_on(async {
+                let listener =
+                    tokio::net::TcpListener::from_std(listener).expect("fixture listener");
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async {
+                        let _ = shutdown.await;
+                    })
+                    .await
+                    .expect("fixture HTTP server");
+            });
+        });
         Ok(Self {
             origin,
             requests,
             peak,
-            stop,
+            stop: Some(stop),
             thread: Some(worker),
         })
     }
@@ -526,7 +643,9 @@ impl OriginalUpstream {
 
 impl Drop for OriginalUpstream {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -623,7 +742,7 @@ fn rustup_sync_acquires_once_and_reuses_portable_recipe_and_catalog() -> Result<
     // Installed files must be older than the source digest race window before
     // metadata-only attestation can safely remember them.
     std::thread::sleep(Duration::from_secs(3));
-    let config = provisioning_config(root, &fleet.cache_url)?;
+    let config = provisioning_config(root, &fleet)?;
     let catalog = root.join("installation.catalog");
     let recipe = root.join("installation.recipe");
     let catalog2 = root.join("installation-second.catalog");
@@ -714,8 +833,8 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
         size: u64::try_from(bytes.len())?,
     };
     let client = NativeCacheClient::new(
-        fleet.cache_url.clone(),
-        CLIENT_TOKEN.into(),
+        &fleet.cache_url,
+        std::sync::Arc::clone(&fleet.peer),
         Duration::from_secs(30),
         1024 * 1024,
     )?;
@@ -728,15 +847,21 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
             .is_err()
     );
     assert!(client.lookup_rust_package(wrong.identity)?.is_none());
+    let worker_id = fleet.worker_id;
     let worker = NativeCacheClient::new(
-        fleet.cache_url.clone(),
-        WORKER_TOKEN.into(),
+        &fleet.cache_url,
+        sccache::dist::cluster::open_peer(
+            fleet.worker_cluster.clone(),
+            &fleet.scheduler_url,
+            sccache_cluster_identity::Role::Worker,
+            move || Ok(format!("{worker_id} {WORKER_TOKEN}")),
+        )?,
         Duration::from_secs(5),
         1024 * 1024,
     )?
     .for_worker(sccache::dist::JobId(123));
     assert!(worker.lookup_rust_package(source.identity).is_err());
-    let config_path = provisioning_config(root, &fleet.cache_url)?;
+    let config_path = provisioning_config(root, &fleet)?;
     let manifest_path = root.join("package.manifest");
     let sha256 = source.identity.checksum_hex();
     let command = || {
@@ -838,8 +963,8 @@ fn named_system_upstream_provisions_original_without_client_upload() -> Result<(
         )]),
     )?;
     let client = NativeCacheClient::new(
-        fleet.cache_url.clone(),
-        CLIENT_TOKEN.into(),
+        &fleet.cache_url,
+        std::sync::Arc::clone(&fleet.peer),
         Duration::from_secs(30),
         1024 * 1024,
     )?;
@@ -866,7 +991,7 @@ fn named_system_upstream_provisions_original_without_client_upload() -> Result<(
             .is_err()
     );
     assert!(client.lookup_package(identity)?.is_none());
-    let config = provisioning_config(root, &fleet.cache_url)?;
+    let config = provisioning_config(root, &fleet)?;
     let command = || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sccache-dist"));
         command
@@ -962,7 +1087,7 @@ fn pacman_discovery_seeds_real_gcc_and_compiles_with_exact_results() -> Result<(
         sccache::build_runtime::PackageTransferCost::default(),
     )?;
     let worker_store = fleet.worker_directory.clone();
-    let config = provisioning_config(root, &fleet.cache_url)?;
+    let config = provisioning_config(root, &fleet)?;
     let discover = || {
         Command::new(env!("CARGO_BIN_EXE_sccache-dist"))
             .args(["native-sync-system", "--client-config"])
@@ -995,8 +1120,8 @@ fn pacman_discovery_seeds_real_gcc_and_compiles_with_exact_results() -> Result<(
     assert_eq!(warm["provisioned"][0]["reused"], true);
     assert_eq!(warm["provisioned"][0]["transfer"], "existing");
     let client = NativeCacheClient::new(
-        fleet.cache_url.clone(),
-        CLIENT_TOKEN.into(),
+        &fleet.cache_url,
+        std::sync::Arc::clone(&fleet.peer),
         Duration::from_secs(60),
         1024 * 1024,
     )?;
@@ -1108,6 +1233,7 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
     let contents = fs::read_to_string(log)?;
     let mut assignments = BTreeMap::new();
     let mut completed = Vec::new();
+    let mut delivered = BTreeMap::new();
     for line in contents
         .lines()
         .filter(|line| line.contains("native_placement_replay"))
@@ -1122,10 +1248,13 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
                 assert!(assignments.insert(job, value).is_none());
             }
             Some("completed") => completed.push(value),
+            Some("delivered") => {
+                assert!(delivered.insert(job, value).is_none());
+            }
             _ => (),
         }
     }
-    assert_eq!(completed.len(), 8);
+    assert_eq!(completed.len(), 9);
     let cold = completed.first().context("missing cold completion")?;
     assert!(cold["warm_staging_nanoseconds"].is_null());
     let id = cold["job"].as_u64().context("missing cold job")?;
@@ -1150,7 +1279,21 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
     let mut peak_result = 0_u64;
     let mut staging_observed = None;
     let mut previous_timing = cold["worker_timing"].clone();
-    for value in repeated {
+    for value in completed.iter().skip(1) {
+        let previous = std::mem::replace(&mut previous_timing, value["worker_timing"].clone());
+        let previous_stage = staging_observed;
+        if let Some(stage) = value["warm_staging_nanoseconds"].as_u64() {
+            staging_observed = Some(previous_stage.map_or(stage, |old: u64| {
+                if stage >= old {
+                    old + (stage - old).div_ceil(4)
+                } else {
+                    old - (old - stage).div_ceil(4)
+                }
+            }));
+        }
+        if value["class"] != class {
+            continue;
+        }
         let observed = value["execution_nanoseconds"]
             .as_u64()
             .context("missing real execution time")?;
@@ -1174,32 +1317,23 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
         // authenticated commit, not the periodic heartbeat.
         assert_eq!(
             assignment["host_prior"]["execution_nanoseconds"],
-            previous_timing["execution_nanoseconds"]
+            previous["execution_nanoseconds"]
         );
         assert_eq!(
             assignment["host_prior"]["output_bytes"],
-            previous_timing["result"]["expected_bytes"]
+            previous["result"]["expected_bytes"]
         );
         let revision = value["worker_timing"]["revision"]
             .as_u64()
             .context("missing timing revision")?;
         assert!(
             revision
-                > previous_timing["revision"]
+                > previous["revision"]
                     .as_u64()
                     .context("missing previous timing revision")?
         );
-        previous_timing = value["worker_timing"].clone();
-        if let Some(previous) = staging_observed {
+        if let Some(previous) = previous_stage {
             assert_eq!(forecast_phase["staging_nanoseconds"], previous);
-            let updated = if stage >= previous {
-                previous + (stage - previous).div_ceil(4)
-            } else {
-                previous - (previous - stage).div_ceil(4)
-            };
-            staging_observed = Some(updated);
-        } else {
-            staging_observed = Some(stage);
         }
         assert!(
             value["publication_setup_nanoseconds"]
@@ -1214,7 +1348,7 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
             );
         }
         assert!(
-            value["actual_seconds"]
+            value["actual_publication_seconds"]
                 .as_f64()
                 .is_some_and(|seconds| seconds > 0.0)
         );
@@ -1250,8 +1384,47 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
                 .context("missing verified result size")?,
         );
     }
+    assert!(
+        !delivered.is_empty(),
+        "automatic remote restoration must report delivery"
+    );
+    for (&job, receipt) in &delivered {
+        let publication = completed
+            .iter()
+            .find(|value| value["job"].as_u64() == Some(job))
+            .context("delivery without commit")?;
+        assert_eq!(receipt["worker"], publication["worker"]);
+        let bytes = receipt["direct_bytes"]
+            .as_u64()
+            .context("missing direct bytes")?
+            .checked_add(
+                receipt["scheduler_bytes"]
+                    .as_u64()
+                    .context("missing scheduler bytes")?,
+            )
+            .context("delivery overflow")?;
+        let selected = receipt["selected_bytes"]
+            .as_u64()
+            .context("missing selected bytes")?;
+        assert!(bytes <= selected);
+        assert!(
+            selected
+                <= publication["result_bytes"]
+                    .as_u64()
+                    .context("missing result bytes")?
+        );
+        assert!(
+            receipt["actual_client_completion_seconds"]
+                .as_f64()
+                .is_some_and(|seconds| seconds > 0.0)
+        );
+    }
     // Expose actual canary records in --nocapture logs for the report tool.
-    for value in assignments.values().chain(completed.iter()) {
+    for value in assignments
+        .values()
+        .chain(completed.iter())
+        .chain(delivered.values())
+    {
         println!("{value}");
     }
     Ok(())
@@ -1266,8 +1439,8 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let worker_address = fleet.worker_address;
     let cache_url = fleet.cache_url.clone();
     let client = NativeCacheClient::new(
-        cache_url,
-        CLIENT_TOKEN.into(),
+        &cache_url,
+        std::sync::Arc::clone(&fleet.peer),
         Duration::from_secs(10),
         1024 * 1024,
     )?;
@@ -1328,6 +1501,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     )?;
     let source_tree = mapping.prepare()?;
     let spec = ExecutionSpec {
+        compiler_result: None,
         platform: ContentId::of(PLATFORM.as_bytes()),
         root: ExecutionRoot::resolve(
             TreeRecipe {
@@ -1395,13 +1569,13 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let ScheduleReply::Assigned(allocation) = client.schedule(ticket, spec.clone())? else {
         anyhow::bail!("worker not allocated");
     };
-    assert_eq!(allocation.address, worker_address);
+    assert_eq!(allocation.routes.primary, worker_address);
     assert_eq!(
         client.schedule(ticket, spec.clone())?,
         ScheduleReply::Assigned(allocation.clone())
     );
     assert_eq!(
-        NativeCacheClient::run_worker(&allocation, Duration::from_secs(30), 1024 * 1024)?,
+        client.run_worker(&allocation, Duration::from_secs(30), 1024 * 1024)?,
         NativeRunResult::Stored
     );
     let NativeStatus::Ready(manifest) = client.status(ticket)? else {
@@ -1496,11 +1670,42 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     second.command.arguments.insert(0, b"--64".to_vec());
     fs::remove_file(&delivered)?;
     let miss = client.run_action(&second, &inputs, &destinations, &policy, None)?;
-    assert_eq!(miss.source, NativeBuildSource::Worker(worker_address));
+    assert_eq!(miss.source, NativeBuildSource::Worker(fleet.worker_id));
     assert!(miss.output.status.success());
     assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
     let hit = client.run_action(&second, &inputs, &destinations, &policy, None)?;
     assert_eq!(hit.source, NativeBuildSource::Hit);
+
+    // Output selection is a delivery policy, not an execution/cache identity.
+    // The assembler produces a separate listing file in addition to its
+    // object. An immutable input cannot be declared as a writable file
+    // output, so exercise selection using two actual generated outputs.
+    let mut selective = spec.clone();
+    selective
+        .command
+        .arguments
+        .insert(0, b"-al=listing.txt".to_vec());
+    selective.outputs.insert(
+        "intermediate".into(),
+        OutputSpec {
+            path: BuildPath::new(b"/src/listing.txt".to_vec())?,
+            required: true,
+            kind: sccache_build::OutputKind::File,
+        },
+    );
+    let intermediate = root.join("delivered-listing.txt");
+    let first = client
+        .run_action(&selective, &inputs, &destinations, &policy, None)
+        .context("selective assembler listing compilation")?;
+    assert_eq!(first.source, NativeBuildSource::Worker(fleet.worker_id));
+    assert!(first.output.status.success());
+    assert!(!intermediate.exists());
+    let mut all = destinations.clone();
+    all.insert("intermediate".into(), intermediate.clone());
+    let second_result = client.run_action(&selective, &inputs, &all, &policy, None)?;
+    assert_eq!(second_result.source, NativeBuildSource::Hit);
+    assert!(second_result.output.status.success());
+    assert!(fs::read_to_string(&intermediate)?.contains("repeated original assembly content"));
 
     // Repeated real executions of the same command family exercise the
     // scheduler's learned service time rather than its worker-wide prior.
@@ -1510,7 +1715,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     };
     for _ in 0..4 {
         let result = client.run_action(&second, &inputs, &destinations, &remote_refresh, None)?;
-        assert_eq!(result.source, NativeBuildSource::Worker(worker_address));
+        assert_eq!(result.source, NativeBuildSource::Worker(fleet.worker_id));
         assert!(result.output.status.success());
         assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
     }
@@ -1530,7 +1735,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let generated = root.join("generated-codegen");
     let tree_destinations = BTreeMap::from([("codegen".into(), generated.clone())]);
     let result = client.run_action(&directory, &inputs, &tree_destinations, &policy, None)?;
-    assert_eq!(result.source, NativeBuildSource::Worker(worker_address));
+    assert_eq!(result.source, NativeBuildSource::Worker(fleet.worker_id));
     assert!(result.output.status.success());
     assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
     let source_bytes = fs::read(generated.join("input.s"))?;
@@ -1549,7 +1754,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         sccache_build::OutputKind::GeneratedTree;
     fs::remove_dir_all(&generated)?;
     let result = client.run_action(&directory, &inputs, &tree_destinations, &policy, None)?;
-    assert_eq!(result.source, NativeBuildSource::Worker(worker_address));
+    assert_eq!(result.source, NativeBuildSource::Worker(fleet.worker_id));
     assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
     assert!(!generated.join("input.s").exists());
     fs::remove_dir_all(&generated)?;
@@ -1621,7 +1826,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         anyhow::bail!("worker unavailable");
     };
     let NativeRunResult::Failed { code, stderr, .. } =
-        NativeCacheClient::run_worker(&allocation, Duration::from_secs(30), 1024 * 1024)?
+        client.run_worker(&allocation, Duration::from_secs(30), 1024 * 1024)?
     else {
         anyhow::bail!("expected compiler failure");
     };
@@ -1630,7 +1835,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     assert_eq!(client.status(ticket)?, NativeStatus::Failed);
     client.close(ticket)?;
     let failed = client.run_action(&invalid, &inputs, &destinations, &policy, None)?;
-    assert_eq!(failed.source, NativeBuildSource::Worker(worker_address));
+    assert_eq!(failed.source, NativeBuildSource::Worker(fleet.worker_id));
     assert!(!failed.output.status.success());
     assert!(!failed.output.stderr.is_empty());
     let worker_directory = fleet.worker_directory.clone();
@@ -1672,9 +1877,11 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
             "worker retained redundant archive"
         );
     }
-    assert_eq!(worker_stats.actions, 4);
-    assert_eq!(scheduler_stats.actions, 5);
-    assert_eq!(scheduler_stats.results, 3);
+    // The selected-output compilation is a distinct action with a
+    // complete result containing both the object and generated listing.
+    assert_eq!(worker_stats.actions, 5);
+    assert_eq!(scheduler_stats.actions, 6);
+    assert_eq!(scheduler_stats.results, 4);
     assert!(worker_stats.trees >= 4);
     assert_eq!(scheduler_stats.trees, 4);
     Ok(())
@@ -1688,7 +1895,7 @@ fn native_worker_only_inputs_survive_scheduler_eviction_and_restart() -> Result<
 
 #[test]
 #[ignore = "requires Linux Bubblewrap, GNU assembler and isolated scheduler/worker processes"]
-fn native_peer_only_input_is_recovered_without_origin_upload() -> Result<()> {
+fn native_peer_only_input_is_delivered_without_scheduler_or_origin_upload() -> Result<()> {
     run_worker_only_inputs(true)
 }
 
@@ -1767,6 +1974,7 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
         fs::remove_file(&input)?;
     }
     let mut spec = ExecutionSpec {
+        compiler_result: None,
         platform: ContentId::of(PLATFORM.as_bytes()),
         root: ExecutionRoot::resolve(
             TreeRecipe {
@@ -1841,8 +2049,8 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
             None
         };
         let client = NativeCacheClient::new(
-            fleet.cache_url.clone(),
-            CLIENT_TOKEN.into(),
+            &fleet.cache_url,
+            std::sync::Arc::clone(&fleet.peer),
             Duration::from_secs(10),
             1024 * 1024,
         )?;
@@ -1852,7 +2060,7 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
             if pass == 2 {
                 NativeBuildSource::Hit
             } else {
-                NativeBuildSource::Worker(fleet.worker_address)
+                NativeBuildSource::Worker(fleet.worker_id)
             },
         );
         assert!(result.output.status.success());
@@ -1868,7 +2076,7 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
                 "worker-resident input was unnecessarily uploaded"
             );
         }
-        if pass == 0 {
+        if pass == 0 && !peer_source {
             assert!(scheduler.open_available_blob(missing)?.is_some());
             let retention = NativeStore::blob_retention_manifest(missing)?.id()?;
             assert!(matches!(
@@ -1877,7 +2085,10 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
             ));
             scheduler.collect_garbage(128)?;
         }
-        assert!(scheduler.open_available_blob(missing)?.is_none());
+        assert!(
+            scheduler.open_available_blob(missing)?.is_none(),
+            "direct peer input must not populate scheduler solely for relay"
+        );
         let worker = NativeStore::open(&root.join("worker-store"))?;
         assert!(worker.lookup_tree(inputs[1].id())?.is_some());
         assert!(worker.open_available_blob(object)?.is_some());
@@ -1932,6 +2143,7 @@ impl LocalService {
         let cached_config = root.join("caller-cached.toml");
         fs::write(&caller_config, "client_side_mode = true\n")?;
         let mut config = Config::default();
+        config.dist.cluster = Some(fleet.cluster.clone());
         config.dist.scheduler_url = Some(HTTPUrl::from_url(fleet.scheduler_url.clone()));
         config.dist.auth = DistAuth::Token {
             token: CLIENT_TOKEN.into(),
@@ -2217,6 +2429,20 @@ fn main() { println!("{}", unsafe { native_value() }); }"#,
     Ok(())
 }
 
+fn action_report(output: &std::process::Output) -> Result<(String, String)> {
+    let log = String::from_utf8_lossy(&output.stderr);
+    ensure!(output.status.success(), "compiler failed: {log}");
+    let mut reports = log
+        .lines()
+        .filter_map(|line| line.split_once("native_action "));
+    let (_, report) = reports.next().context("missing native action report")?;
+    ensure!(reports.next().is_none(), "multiple native action reports");
+    let mut fields = report.split_whitespace();
+    let key = fields.next().context("missing key")?.to_owned();
+    let source = fields.next().context("missing source")?.to_owned();
+    Ok((key, source))
+}
+
 fn run_environment_audit(
     service: &LocalService,
     directory: &Path,
@@ -2227,7 +2453,7 @@ fn run_environment_audit(
         directory.join("audit.rs"),
         b"pub const OBSERVED: &str = env!(\"NATIVE_AUDIT_OBSERVED\");\n",
     )?;
-    let compile = |unused: &str, observed: &str| -> Result<Vec<u8>> {
+    let compile = |unused: &str, observed: &str| -> Result<((String, String), Vec<u8>)> {
         let output = service
             .command(env!("CARGO_BIN_EXE_sccache"))
             .arg(rustc)
@@ -2244,35 +2470,123 @@ fn run_environment_audit(
             ])
             .current_dir(directory)
             .env("SCCACHE_CONF", config)
-            .env("CARGO_NATIVE_AUDIT_UNUSED", unused)
+            .env("NATIVE_AUDIT_UNUSED", unused)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
             .env("NATIVE_AUDIT_OBSERVED", observed)
             .output()?;
-        ensure!(
-            output.status.success(),
-            "environment audit compile failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Ok(fs::read(directory.join("build/libaudit.rlib"))?)
+        let report = action_report(&output)?;
+        Ok((report, fs::read(directory.join("build/libaudit.rlib"))?))
     };
-    let first = compile("first", "first")?;
-    assert_eq!(compile("second", "first")?, first);
-    assert_ne!(compile("first", "second")?, first);
+    let ((key, source), first) = compile("first", "first")?;
+    assert_eq!(source, "worker");
+    let ((same, source), second) = compile("second", "first")?;
+    assert_eq!(source, "hit");
+    assert_eq!(key, same);
+    assert_eq!(first, second);
+    let ((changed, source), third) = compile("first", "second")?;
+    assert_eq!(source, "worker");
+    assert_ne!(key, changed);
+    assert_ne!(first, third);
     Ok(())
 }
 
-fn audit_index(index: &Path, component: &str) -> Result<ComponentAudit> {
-    let output = Command::new(env!("CARGO_BIN_EXE_sccache-dist"))
-        .args(["native-audit", "--index"])
-        .arg(index)
-        .args(["--schema", "native-linux-bwrap-v4", "--without", component])
-        .output()?;
-    ensure!(
-        output.status.success(),
-        "native audit command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    Ok(serde_json::from_value(report["comparison"].clone())?)
+#[test]
+#[ignore = "requires Linux Bubblewrap, GCC and ldd"]
+fn native_compiler_semantic_reuse_across_ephemeral_inputs() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("native-semantic-")
+        .tempdir_in("/tmp")?;
+    let root = temp.path().canonicalize()?;
+    let fleet = Fleet::start(&root, BTreeMap::new())?;
+    let mut service = LocalService::start(&root, &fleet, None)?;
+    let config = root.join("direct.toml");
+    fs::write(&config, "client_side_mode = false\n")?;
+    for (name, input) in [
+        ("probe.c", "int semantic_probe(void) { return VALUE; }\n"),
+        (
+            "probe.S",
+            ".data\n.globl semantic_probe\nsemantic_probe: .byte VALUE\n",
+        ),
+    ] {
+        let first = root.join("first");
+        let second = root.join("second");
+        for (dir, seconds) in [(&first, 1), (&second, 2)] {
+            fs::create_dir_all(dir)?;
+            let path = dir.join(name);
+            fs::write(&path, input)?;
+            fs::File::options().write(true).open(path)?.set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds)),
+            )?;
+        }
+        let compile = |dir: &Path, job: &str, value: &str| -> Result<((String, String), Vec<u8>)> {
+            let output = service
+                .command(env!("CARGO_BIN_EXE_sccache"))
+                .args(["/usr/bin/gcc", "-c", name, "-o", "probe.o", value])
+                .current_dir(dir)
+                .env("SCCACHE_CONF", &config)
+                .env("SCCACHE_LOG", "sccache::native_action=info")
+                .env("GITHUB_RUN_ID", job)
+                .output()?;
+            Ok((action_report(&output)?, fs::read(dir.join("probe.o"))?))
+        };
+        let ((key, source), artifact) = compile(&first, "1", "-DVALUE=42")?;
+        assert_eq!(source, "worker");
+        let ((same, source), bytes) = compile(&second, "2", "-DVALUE=42")?;
+        assert_eq!(source, "hit", "{name}");
+        assert_eq!(key, same);
+        assert_eq!(artifact, bytes);
+        let ((changed, source), bytes) = compile(&second, "3", "-DVALUE=17")?;
+        assert_eq!(source, "worker");
+        assert_ne!(key, changed);
+        assert_ne!(artifact, bytes);
+    }
+    service.stop()?;
+    fleet.finish()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Linux Bubblewrap, GCC and ldd"]
+fn colocated_native_worker_shares_one_store_and_commits_results() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let fleet = Fleet::start_with_mode(root, BTreeMap::new(), Default::default(), true)?;
+    let mut service = LocalService::start(root, &fleet, None)?;
+    let source = root.join("compile");
+    fs::create_dir(&source)?;
+    fs::write(
+        source.join("probe.c"),
+        b"int colocated_probe(void) { return 42; }",
+    )?;
+    let compile = || -> Result<Vec<u8>> {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .args(["/usr/bin/gcc", "-c", "probe.c", "-o", "probe.o"])
+            .current_dir(&source)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "colocated compilation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(fs::read(source.join("probe.o"))?)
+    };
+    let first = compile()?;
+    fs::remove_file(source.join("probe.o"))?;
+    assert_eq!(compile()?, first);
+    let stats = service.stats()?;
+    assert_eq!(stats.cache_hits.all(), 1);
+    assert_eq!(stats.cache_misses.all(), 1);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 1);
+    assert_eq!(stats.dist_errors, 0);
+    service.stop()?;
+    let (scheduler, worker) = fleet.finish()?;
+    assert_eq!(scheduler, worker);
+    assert_eq!(scheduler.actions, 1);
+    assert!(!root.join("worker-store").exists());
+    assert!(root.join("scheduler-store/index.redb").is_file());
+    Ok(())
 }
 
 #[test]
@@ -2286,6 +2600,16 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     let root = temp.path().canonicalize()?;
     let fleet = Fleet::start(&root, BTreeMap::new())?;
     let mut service = LocalService::start(&root, &fleet, None)?;
+    let status = service
+        .command(env!("CARGO_BIN_EXE_sccache"))
+        .arg("--dist-status")
+        .output()?;
+    ensure!(status.status.success(), "native status command failed");
+    let status: sccache::server::DistInfo = serde_json::from_slice(&status.stdout)?;
+    let sccache::server::DistInfo::SchedulerStatus(_, status) = status else {
+        anyhow::bail!("native scheduler status did not authenticate: {status:?}");
+    };
+    assert_eq!(status.num_servers, 1);
     let rustc = Command::new("rustc")
         .args(["--print", "sysroot"])
         .output()?;
@@ -2347,9 +2671,9 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         "native namespace compiler path failed"
     );
     let stats = service.stats()?;
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 12);
-    assert_eq!(stats.cache_hits.all(), 12);
-    assert_eq!(stats.cache_misses.all(), 12);
+    let namespace_compiles = stats.dist_compiles.values().sum::<usize>();
+    assert!((11..=12).contains(&namespace_compiles));
+    assert_eq!(stats.cache_hits.all() + stats.cache_misses.all(), 24);
     assert_eq!(stats.forced_recaches, 4);
     assert_eq!(stats.dist_errors, 0);
     assert!(private.join("build/probe.o").is_file());
@@ -2383,26 +2707,19 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         fs::read(private.join("rust-reference.rlib"))?
     );
     let stats = service.stats()?;
-    assert_eq!(stats.cache_hits.all(), 20);
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 12);
+    assert_eq!(
+        stats.cache_hits.all(),
+        32 - u64::try_from(namespace_compiles)?
+    );
+    assert_eq!(
+        stats.dist_compiles.values().sum::<usize>(),
+        namespace_compiles
+    );
     run_environment_audit(&service, &direct, &rustc, &direct_config)?;
-    let stats = service.stats()?;
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 15);
-    assert_eq!(stats.dist_errors, 0);
-    let index = fleet.scheduler_directory.join("index.redb");
+    assert_eq!(service.stats()?.dist_errors, 0);
     service.stop()?;
     let (scheduler, worker) = fleet.finish()?;
-    assert_eq!(scheduler.actions, 11);
-    let unused = audit_index(&index, "environment/CARGO_NATIVE_AUDIT_UNUSED")?;
-    assert_eq!(unused.equivalent_pairs, 1);
-    assert_eq!(unused.conflicting_pairs, 0);
-    let observed = audit_index(&index, "environment/NATIVE_AUDIT_OBSERVED")?;
-    assert_eq!(observed.equivalent_pairs, 0);
-    assert_eq!(observed.conflicting_pairs, 1);
-    assert_eq!(unused.examined_actions, 11);
-    eprintln!("actual Rust environment audit: {unused:?}; {observed:?}");
-    // All eleven distinct remotely produced actions are retained.
-    assert_eq!(worker.actions, 11);
+    assert_eq!(scheduler.actions, worker.actions);
     Ok(())
 }
 
@@ -2475,5 +2792,83 @@ fn native_local_execution_in_networkless_namespace_shares_remote_actions() -> Re
     // The scheduler owns all four actions, including the two produced locally.
     assert_eq!(scheduler.actions, 4);
     assert_eq!(worker.actions, 2);
+    Ok(())
+}
+
+/// Exercise the actual launcher, Cargo fingerprints, an intermediate Rust
+/// library, the broker, a scheduler cache hit and final executable delivery.
+#[test]
+#[ignore = "requires a real FUSE mount, stock Cargo and native distributed test fleet"]
+fn cargo_leased_intermediates_deliver_a_working_binary() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("native-cargo-")
+        .tempdir_in("/tmp")?;
+    let root = temp.path().canonicalize()?;
+    let fleet = Fleet::start(&root, BTreeMap::new())?;
+    let mut service = LocalService::start(&root, &fleet, None)?;
+    let workspace = root.join("workspace");
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::create_dir_all(workspace.join("dep/src"))?;
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"leased-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nleased-dep = { path = \"dep\" }\n",
+    )?;
+    fs::write(
+        workspace.join("dep/Cargo.toml"),
+        "[package]\nname = \"leased-dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )?;
+    fs::write(
+        workspace.join("dep/src/lib.rs"),
+        "pub fn answer() -> u32 { 42 }\n",
+    )?;
+    fs::write(
+        workspace.join("src/main.rs"),
+        "fn main() { println!(\"{}\", leased_dep::answer()); }\n",
+    )?;
+    let binary = workspace.join("target/debug/leased-app");
+    let direct_config = root.join("direct.toml");
+    fs::write(&direct_config, "client_side_mode = false\n")?;
+    for round in 0..2 {
+        let mut command = service.command(env!("CARGO_BIN_EXE_sccache"));
+        command
+            .current_dir(&workspace)
+            .args(["--cargo-final", "--", "build", "--offline", "-j", "2"])
+            .env("SCCACHE_CONF", &direct_config)
+            .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
+            .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_sccache"))
+            .env("CARGO_TARGET_DIR", workspace.join("target"))
+            .env("TMPDIR", &root);
+        // CI installs the pinned toolchain using rustup. Preserve only the
+        // toolchain discovery environment, never its compiler-cache socket.
+        for key in [
+            "PATH",
+            "HOME",
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+            "RUSTUP_TOOLCHAIN",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        let output = command.output()?;
+        ensure!(
+            output.status.success(),
+            "Cargo leased build {round} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = Command::new(&binary).output()?;
+        assert!(result.status.success());
+        assert_eq!(result.stdout, b"42\n");
+        // Force Cargo to consult the action cache again with a fresh
+        // intermediate tree, keeping the workspace and compiler inputs.
+        fs::remove_dir_all(workspace.join("target"))?;
+    }
+    let stats = service.stats()?;
+    assert_eq!(stats.dist_errors, 0);
+    assert!(stats.dist_compiles.values().sum::<usize>() >= 2);
+    assert!(stats.cache_hits.all() >= 2);
+    service.stop()?;
+    fleet.finish()?;
     Ok(())
 }

@@ -323,7 +323,7 @@ struct ProvisioningReport {
     downloaded_archive_bytes: u64,
 }
 
-pub(super) fn sync(
+pub fn sync(
     root: &Path,
     config: &Path,
     catalog_path: &Path,

@@ -72,10 +72,18 @@ fn empty_root() -> TreeManifest {
     }
 }
 
+fn selection() -> DeliverySelection {
+    DeliverySelection {
+        profile: ContentId::of(b"test command family"),
+        outputs: BTreeSet::from(["obj".into()]),
+    }
+}
+
 fn request() -> Result<ActionRequest> {
     let root = empty_root();
     let id = root.id()?;
     Ok(ActionRequest {
+        result_fingerprint: None,
         fingerprint: ActionFingerprint {
             schema: "test-native-v1".into(),
             components: BTreeMap::from([("source".into(), ContentId::of(b"input"))]),
@@ -108,15 +116,77 @@ fn manifest(bytes: &[u8]) -> ResultManifest {
 }
 
 #[test]
+fn semantic_reuse_does_not_weaken_execution_verification() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let mut first = request()?;
+    first.result_fingerprint = Some(ActionFingerprint {
+        schema: "compiler-test".into(),
+        components: BTreeMap::from([("source".into(), ContentId::of(b"input"))]),
+    });
+    let mut second = first.clone();
+    second
+        .fingerprint
+        .components
+        .insert("environment/noise".into(), ContentId::of(b"job two"));
+    assert_ne!(first, second);
+    assert_eq!(
+        first.action_fingerprint()?.key()?,
+        second.action_fingerprint()?.key()?
+    );
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
+    let NativeAdmission::Compile { ticket } =
+        service.admit(first.clone(), worker, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("expected compilation")
+    };
+    service.verify_execution(ticket, worker, &first)?;
+    assert!(service.verify_execution(ticket, worker, &second).is_err());
+    assert_eq!(
+        service.admit(
+            second.clone(),
+            Publisher::Client,
+            ActionMode::Reuse,
+            BTreeMap::new()
+        )?,
+        NativeAdmission::InFlight
+    );
+    let output = manifest(b"object");
+    let blob = output.outputs["obj"].test_file_blob();
+    service.begin(ticket, worker, output.clone())?;
+    upload_encoded(&service, ticket, worker, blob, b"object")?;
+    assert_eq!(service.commit(ticket, worker)?, output);
+    let NativeAdmission::Hit {
+        ticket: hit,
+        manifest,
+    } = service.admit(
+        second,
+        Publisher::Client,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
+    else {
+        bail!("expected semantic hit")
+    };
+    assert_eq!(manifest, output);
+    service.close(hit, Publisher::Client)?;
+    service.close(ticket, Publisher::Client)?;
+    Ok(())
+}
+
+#[test]
 fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
     let worker = Publisher::Worker {
-        address: "127.0.0.1:10501".parse()?,
+        peer: test_peer(1),
         job: 42,
     };
     let other_worker = Publisher::Worker {
-        address: "127.0.0.1:10502".parse()?,
+        peer: test_peer(2),
         job: 42,
     };
     let NativeAdmission::Compile { ticket } = service.admit(
@@ -282,36 +352,76 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     else {
         bail!("expected compilation");
     };
-    let worker = "127.0.0.1:10501".parse()?;
+    let worker = test_peer(1);
     let allocation = WorkerAllocation {
-        address: worker,
+        peer: worker,
+        routes: sccache_peer_identity::RouteSet::new("127.0.0.1:10501".parse()?, []),
         job: 42,
         auth: "proof".into(),
-        certificate: vec![1],
     };
     let expected = ScheduleReply::Assigned(allocation);
     assert_eq!(
-        service.schedule(ticket, &request()?, |_, _| Ok(expected.clone()))?,
+        service.schedule(ticket, &request()?, test_peer(9), selection(), |_, _| Ok(
+            expected.clone()
+        ))?,
         expected
     );
     assert_eq!(
-        service.schedule(ticket, &request()?, |_, _| bail!("duplicate allocation"))?,
+        service.schedule(
+            ticket,
+            &request()?,
+            test_peer(9),
+            selection(),
+            |_, _| bail!("duplicate allocation")
+        )?,
         expected
     );
     assert!(service.renew(ticket, Publisher::Client).is_err());
+    assert!(
+        service
+            .schedule(
+                ticket,
+                &request()?,
+                test_peer(9),
+                DeliverySelection {
+                    outputs: BTreeSet::new(),
+                    ..selection()
+                },
+                |_, _| bail!("selection changed")
+            )
+            .is_err()
+    );
+    assert!(
+        service
+            .schedule(
+                ticket,
+                &request()?,
+                test_peer(8),
+                selection(),
+                |_, _| bail!("wrong requester")
+            )
+            .is_err()
+    );
+    assert!(
+        service
+            .record_client_delivery(ticket, test_peer(9), ClientDeliveryObservation::default())
+            .is_err()
+    );
     let mut changed = request()?;
     changed
         .required_outputs
         .insert("other".into(), crate::OutputKind::File);
     assert!(
         service
-            .schedule(ticket, &changed, |_, _| bail!("wrong declaration"))
+            .schedule(ticket, &changed, test_peer(9), selection(), |_, _| bail!(
+                "wrong declaration"
+            ))
             .is_err()
     );
     service.renew(
         ticket,
         Publisher::Worker {
-            address: worker,
+            peer: worker,
             job: 42,
         },
     )?;
@@ -320,13 +430,35 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     assert_eq!(service.status(ticket)?, NativeStatus::Compiling);
     assert_eq!(NativeSessions::lock(&session)?.expires, expiry);
     let publisher = Publisher::Worker {
-        address: worker,
+        peer: worker,
         job: 42,
     };
     let result = manifest(b"object");
     let missing = service.begin(ticket, publisher, result.clone())?.missing;
     assert_eq!(
-        service.schedule(ticket, &request()?, |_, _| bail!("duplicate assignment"))?,
+        service.status_with_preview(ticket, true)?,
+        NativeStatus::Negotiated(result.clone())
+    );
+    assert_eq!(
+        service.authorize_blob_sources(ticket, Publisher::Client, &missing)?,
+        (Some(worker), vec![false])
+    );
+    assert!(
+        service
+            .download(ticket, Publisher::Client, missing[0].id)
+            .unwrap_err()
+            .is::<NativeContentPending>()
+    );
+    service.renew(ticket, Publisher::Client)?;
+
+    assert_eq!(
+        service.schedule(
+            ticket,
+            &request()?,
+            test_peer(9),
+            selection(),
+            |_, _| bail!("duplicate assignment")
+        )?,
         expected
     );
     assert_eq!(missing.len(), 1);
@@ -338,16 +470,75 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
         &b"object"[..],
     )?;
     assert_eq!(service.commit(ticket, publisher)?, result);
+    let delivered = ClientDeliveryObservation {
+        selected_bytes: 6,
+        direct_bytes: 6,
+        scheduler_bytes: 0,
+        unique_blobs: 1,
+        staging_nanoseconds: 0,
+    };
+    assert!(
+        service
+            .record_client_delivery(ticket, test_peer(8), delivered)
+            .is_err()
+    );
+    assert!(
+        service
+            .record_client_delivery(
+                ticket,
+                test_peer(9),
+                ClientDeliveryObservation {
+                    direct_bytes: 7,
+                    ..delivered
+                }
+            )
+            .is_err()
+    );
+    assert!(
+        service
+            .record_client_delivery(
+                ticket,
+                test_peer(9),
+                ClientDeliveryObservation {
+                    selected_bytes: 5,
+                    direct_bytes: 5,
+                    ..delivered
+                }
+            )
+            .is_err()
+    );
+    let receipt = service
+        .record_client_delivery(ticket, test_peer(9), delivered)?
+        .context("missing receipt")?;
+    assert_eq!(
+        (
+            receipt.worker,
+            receipt.job,
+            receipt.requester,
+            receipt.observation
+        ),
+        (worker, 42, test_peer(9), delivered)
+    );
+    assert!(
+        service
+            .record_client_delivery(ticket, test_peer(9), delivered)?
+            .is_none()
+    );
+
     // A worker can finish while the original schedule response is lost.
     assert_eq!(
-        service.schedule(ticket, &request()?, |_, _| bail!(
-            "duplicate assignment after commit"
-        ))?,
+        service.schedule(
+            ticket,
+            &request()?,
+            test_peer(9),
+            selection(),
+            |_, _| bail!("duplicate assignment after commit")
+        )?,
         expected
     );
     assert!(
         service
-            .schedule(ticket, &changed, |_, _| bail!(
+            .schedule(ticket, &changed, test_peer(9), selection(), |_, _| bail!(
                 "wrong declaration after commit"
             ))
             .is_err()
@@ -368,12 +559,36 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
         bail!("expected second compilation");
     };
     assert_eq!(
-        service.schedule(ticket, &failed, |_, _| Ok(expected.clone()))?,
+        service.schedule(ticket, &failed, test_peer(9), selection(), |_, _| Ok(
+            expected.clone()
+        ))?,
         expected
     );
+    // The same bytes are already durable from the previous action. A
+    // negotiated result can read those bytes before commit, but a subsequent
+    // failed publication must never be observable as a ready result.
+    assert!(
+        service
+            .begin(ticket, publisher, result.clone())?
+            .missing
+            .is_empty()
+    );
+    assert_eq!(service.status(ticket)?, NativeStatus::Compiling);
+    assert_eq!(
+        service.status_with_preview(ticket, true)?,
+        NativeStatus::Negotiated(result)
+    );
+    assert_eq!(
+        service.authorize_blob_sources(ticket, Publisher::Client, &missing)?,
+        (Some(worker), vec![true])
+    );
+    let mut bytes = Vec::new();
+    decoded_download(&service, ticket, Publisher::Client, missing[0].id)?
+        .read_to_end(&mut bytes)?;
+    assert_eq!(bytes, b"object");
     service.fail(ticket, publisher)?;
     assert_eq!(
-        service.schedule(ticket, &failed, |_, _| bail!(
+        service.schedule(ticket, &failed, test_peer(9), selection(), |_, _| bail!(
             "duplicate assignment after failure"
         ))?,
         expected
@@ -403,13 +618,13 @@ fn delegation_blocks_early_worker_verification_until_assignment_returns() -> Res
             bail!("expected compilation");
         };
         let worker = WorkerAllocation {
-            address: "127.0.0.1:10501".parse()?,
+            peer: test_peer(1),
+            routes: sccache_peer_identity::RouteSet::new("127.0.0.1:10501".parse()?, []),
             job: u64::from(accepted),
             auth: "proof".into(),
-            certificate: vec![1],
         };
         let publisher = Publisher::Worker {
-            address: worker.address,
+            peer: worker.peer,
             job: worker.job,
         };
         let expected = if accepted {
@@ -431,7 +646,7 @@ fn delegation_blocks_early_worker_verification_until_assignment_returns() -> Res
                 done.send(service.verify_execution(ticket, publisher, action))?;
                 Ok(())
             });
-            let reply = service.schedule(ticket, action, |_, _| {
+            let reply = service.schedule(ticket, action, test_peer(9), selection(), |_, _| {
                 start.send(())?;
                 attempt_rx.recv_timeout(Duration::from_secs(5))?;
                 // The action mutex is still held while assignment returns.
@@ -555,7 +770,7 @@ fn input_manifest_survives_scheduler_eviction_and_worker_fetch_is_scoped() -> Re
     };
     request.input_trees = BTreeSet::from([id]);
     let worker = Publisher::Worker {
-        address: "127.0.0.1:10501".parse()?,
+        peer: test_peer(1),
         job: 42,
     };
     let NativeAdmission::Compile { ticket } = service.admit(
@@ -590,6 +805,29 @@ fn input_manifest_survives_scheduler_eviction_and_worker_fetch_is_scoped() -> Re
     assert!(service.open_tree(id, Publisher::Client, ticket).is_err());
     let read = service.open_tree(id, worker, ticket)?;
     verify_package_plan_authorization(&service, read.ticket, worker, blob)?;
+    assert_eq!(
+        service.authorize_blob_sources(read.ticket, worker, &[blob])?,
+        (None, vec![false])
+    );
+    assert!(
+        service
+            .authorize_blob_sources(read.ticket, Publisher::Client, &[blob])
+            .is_err()
+    );
+    assert!(
+        service
+            .authorize_blob_sources(
+                read.ticket,
+                worker,
+                &[BlobRef {
+                    size: blob.size + 1,
+                    ..blob
+                }]
+            )
+            .is_err()
+    );
+    // Merely discovering a direct source must not trigger origin backfill.
+    assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
     assert!(
         service
             .download(read.ticket, Publisher::Client, blob.id)
@@ -606,6 +844,10 @@ fn input_manifest_survives_scheduler_eviction_and_worker_fetch_is_scoped() -> Re
         InputPoll::Demand(InputDemand { tree: id, blob })
     );
     service.backfill_input(ticket, blob, &b"tree data"[..])?;
+    assert_eq!(
+        service.authorize_blob_sources(read.ticket, worker, &[blob])?,
+        (None, vec![true])
+    );
     let mut contents = Vec::new();
     decoded_download(&service, read.ticket, worker, blob.id)?.read_to_end(&mut contents)?;
     assert_eq!(contents, b"tree data");
@@ -913,11 +1155,11 @@ fn lazy_manifest_admission_and_cross_action_backfill_are_single_flight() -> Resu
         .components
         .insert("second".into(), ContentId::of(b"second"));
     let worker1 = Publisher::Worker {
-        address: "127.0.0.1:10501".parse()?,
+        peer: test_peer(1),
         job: 1,
     };
     let worker2 = Publisher::Worker {
-        address: "127.0.0.1:10502".parse()?,
+        peer: test_peer(2),
         job: 2,
     };
     assert_eq!(
@@ -1049,7 +1291,7 @@ fn exercise_source_release(staged: bool) -> Result<()> {
     };
     spec.input_trees = BTreeSet::from([id]);
     let worker = Publisher::Worker {
-        address: "127.0.0.1:10501".parse()?,
+        peer: test_peer(1),
         job: 1,
     };
     let NativeAdmission::Compile { ticket: a } = service.admit(
@@ -1158,8 +1400,8 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
         recipe: TreeRecipe::union(root, [id]),
     };
     spec.input_trees = BTreeSet::from([id]);
-    let address = "127.0.0.1:10501".parse()?;
-    let worker = Publisher::Worker { address, job: 1 };
+    let peer = test_peer(1);
+    let worker = Publisher::Worker { peer, job: 1 };
     let NativeAdmission::Compile { ticket } = service.admit(
         spec,
         worker,
@@ -1176,7 +1418,7 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
         .claim_peer_input(Duration::ZERO)?
         .context("peer claim missing")?;
     assert_eq!(claim.blob(), first);
-    assert_eq!(claim.requester(), address);
+    assert_eq!(claim.requester(), peer);
     assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
     assert!(service.claim_peer_input(Duration::ZERO)?.is_none());
     service.recover_peer_input(
@@ -1425,5 +1667,113 @@ fn peer_recovery_cannot_consume_last_direct_upload_slot() -> Result<()> {
     assert!(service.upload_slot(UploadSource::Direct).is_err());
     drop(peer);
     assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
+    Ok(())
+}
+
+fn test_peer(value: u8) -> crate::PeerId {
+    crate::PeerId::from_digest([value; 32])
+}
+
+#[test]
+fn session_telemetry_reports_contended_tickets_without_waiting() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let service = service(temp.path())?;
+    let ticket = service.register(Kind::Action, Publisher::Client, Phase::Failed)?;
+    let shared = service.get(ticket)?;
+    let state = NativeSessions::lock(&shared)?;
+    let original_expiry = state.expires;
+    let busy = service
+        .telemetry()?
+        .tickets
+        .context("tickets unavailable")?;
+    assert_eq!((busy.registered, busy.busy, busy.failed), (1, 1, 0));
+    drop(state);
+    let status = service.telemetry()?;
+    assert_eq!(status.max_sessions, 8);
+    assert_eq!(status.max_uploads, 4);
+    let tickets = status.tickets.context("tickets unavailable")?;
+    assert_eq!(
+        (
+            tickets.registered,
+            tickets.action,
+            tickets.failed,
+            tickets.busy
+        ),
+        (1, 1, 1, 0)
+    );
+    assert_eq!(NativeSessions::lock(&shared)?.expires, original_expiry);
+    let _map = service.sessions()?;
+    assert!(service.telemetry()?.tickets.is_none());
+    Ok(())
+}
+
+#[test]
+fn retention_group_survives_action_close_refresh_and_exceeds_action_slots() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let owner = test_peer(1);
+    let other = test_peer(2);
+    let group = service.open_retention(owner)?;
+    let expiring = service.open_retention(owner)?;
+    let mut retained = Vec::new();
+    let key = request()?.action_fingerprint()?.key()?;
+    // More results than the entire action ticket capacity. Repeated refresh
+    // of one action must not replace already-retained immutable output bytes.
+    for value in 0_u8..24 {
+        let bytes = [value; 8];
+        let result = manifest(&bytes);
+        let blob = result.outputs["obj"].test_file_blob();
+        let NativeAdmission::Compile { ticket } = service.admit(
+            request()?,
+            Publisher::Client,
+            ActionMode::Refresh,
+            BTreeMap::new(),
+        )?
+        else {
+            bail!("expected fresh action");
+        };
+        assert!(
+            service
+                .retain_result(group, ticket, result.id()?, owner)
+                .is_err()
+        );
+        service.begin(ticket, Publisher::Client, result.clone())?;
+        upload_encoded(&service, ticket, Publisher::Client, blob, &bytes)?;
+        service.commit(ticket, Publisher::Client)?;
+        assert!(
+            service
+                .retain_result(group, ticket, result.id()?, other)
+                .is_err()
+        );
+        service.retain_result(group, ticket, result.id()?, owner)?;
+        service.retain_result(group, ticket, result.id()?, owner)?;
+        if value == 23 {
+            service.retain_result(expiring, ticket, result.id()?, owner)?;
+        }
+        service.close(ticket, Publisher::Client)?;
+        retained.push((blob, bytes));
+    }
+    assert_eq!(service.store().evict(key)?, Eviction::Pinned);
+    for (blob, bytes) in retained {
+        assert!(service.download_retained(group, other, blob).is_err());
+        let (file, encoding) = service.download_retained(group, owner, blob)?;
+        let mut reader = crate::BlobReader::open(file, encoding)?;
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual)?;
+        assert_eq!(actual, bytes);
+    }
+    assert!(service.renew_retention(group, other).is_err());
+    assert!(service.close_retention(group, other).is_err());
+    service.close_retention(group, owner)?;
+    assert_eq!(service.store().evict(key)?, Eviction::Pinned);
+    // Reaping the remaining group releases its pin without an explicit close.
+    assert_eq!(
+        service
+            .retained
+            .reap(Instant::now() + Duration::from_secs(11))?,
+        1
+    );
+    assert!(service.renew_retention(expiring, owner).is_err());
+    assert!(!matches!(service.store().evict(key)?, Eviction::Pinned));
     Ok(())
 }

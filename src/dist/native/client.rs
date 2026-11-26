@@ -4,9 +4,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{self, Read, Take, Write},
-    net::SocketAddr,
-    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
+    io::{self, Read, Seek, Take, Write},
+    os::unix::{
+        fs::{OpenOptionsExt, PermissionsExt},
+        process::ExitStatusExt,
+    },
     path::{Path, PathBuf},
     process::{ExitStatus, Output},
     sync::{Arc, Mutex},
@@ -19,11 +21,11 @@ use tempfile::NamedTempFile;
 
 use super::{LocalExecutor, NativeCacheClient, copy_verified, retryable_transport_error};
 use crate::build_runtime::{
-    ActionMode, Artifact, BlobRef, CapturedExecution, ExecutionSpec, MaterializedTree,
+    ActionMode, Artifact, BlobRef, CapturedExecution, ContentId, ExecutionSpec, MaterializedTree,
     PreparedTree, ResultManifest, TreeId, TreeManifest, materialize_tree,
     wire::{
-        InputDemand, InputPoll, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply,
-        Ticket,
+        ClientDeliveryObservation, InputDemand, InputPoll, NativeAdmission, NativeRunResult,
+        NativeStatus, ScheduleReply, Ticket, WorkerAllocation,
     },
 };
 
@@ -86,7 +88,10 @@ impl Read for InputBlob {
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) enum NativeProgress {
     Phase(Phase),
-    Assigned { job: u64, worker: SocketAddr },
+    Assigned {
+        job: u64,
+        worker: crate::build_runtime::PeerId,
+    },
 }
 
 impl NativeProgress {
@@ -123,6 +128,12 @@ impl<'a> LocalInputs<'a> {
             "prepared native inputs differ from the action declaration"
         );
         Ok(Self(inputs))
+    }
+
+    fn matching_sources(&self, id: ContentId) -> impl Iterator<Item = Box<dyn Read + Send>> + '_ {
+        self.0
+            .values()
+            .filter_map(move |tree| tree.open_local_blob(id).ok())
     }
 
     pub(super) fn tree(&self, id: TreeId) -> Result<&PreparedTree> {
@@ -179,11 +190,18 @@ impl StagedOutput {
 pub(super) struct Pin<'a> {
     client: &'a NativeCacheClient,
     pub(super) ticket: Ticket,
+    assigned: bool,
+    selected: BTreeSet<String>,
+    delivery: Option<ClientDeliveryObservation>,
 }
 
 impl Drop for Pin<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.client.close(self.ticket) {
+        let result = self.delivery.map_or_else(
+            || self.client.close(self.ticket),
+            |observation| self.client.close_delivered(self.ticket, observation),
+        );
+        if let Err(error) = result {
             debug!("native session could not be closed: {error:#}");
         }
     }
@@ -203,32 +221,149 @@ pub(super) enum Outcome<'a> {
     },
 }
 
-type BlobDownload<'a> = dyn FnMut(BlobRef, &mut dyn Write) -> Result<()> + 'a;
+/// A destination that is either private staging (safe to reset after a
+/// failed verification) or an irreversible framed IPC stream.
+pub(super) enum BlobSink<'a> {
+    File(&'a mut fs::File),
+    Memory(&'a mut Vec<u8>),
+    Stream(&'a mut dyn Write),
+}
+
+impl BlobSink<'_> {
+    pub(super) fn reborrow(&mut self) -> BlobSink<'_> {
+        match self {
+            Self::File(file) => BlobSink::File(file),
+            Self::Memory(bytes) => BlobSink::Memory(bytes),
+            Self::Stream(stream) => BlobSink::Stream(&mut **stream),
+        }
+    }
+
+    pub(super) fn reset(&mut self) -> Result<()> {
+        match self {
+            Self::File(file) => {
+                file.set_len(0)?;
+                file.rewind()?;
+            }
+            Self::Memory(bytes) => bytes.clear(),
+            Self::Stream(_) => bail!("cannot rewind a result stream"),
+        }
+        Ok(())
+    }
+}
+
+impl Write for BlobSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::File(file) => file.write(bytes),
+            Self::Memory(buffer) => buffer.write(bytes),
+            Self::Stream(stream) => stream.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::File(file) => file.flush(),
+            Self::Memory(buffer) => buffer.flush(),
+            Self::Stream(stream) => stream.flush(),
+        }
+    }
+}
+
+type BlobDownload<'a> = dyn FnMut(BlobRef, &mut BlobSink<'_>) -> Result<()> + 'a;
 
 pub(super) enum Delivery<'a> {
-    Scheduler(Pin<'a>),
-    Local(Box<CapturedExecution>),
+    Scheduler(Pin<'a>, Option<Box<Publication>>),
+    Local(Box<CapturedExecution>, Pin<'a>),
+}
+
+pub(super) struct Publication {
+    allocation: WorkerAllocation,
+    manifest: ResultManifest,
+    deadline: Instant,
+    max_result_bytes: u64,
+}
+
+impl Publication {
+    fn confirm(&self, pin: &Pin<'_>) -> Result<()> {
+        let manifest = pin.client.await_result_commit(pin.ticket, self.deadline)?;
+        ensure!(
+            manifest == self.manifest,
+            "native committed result differs from negotiation"
+        );
+        // Durable publication is authoritative. Acknowledge promptly to
+        // release the worker reservation, but do not wait for a lost RPC.
+        let remaining = self
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(250));
+        if !remaining.is_zero() {
+            let _ = pin
+                .client
+                .run_worker(&self.allocation, remaining, self.max_result_bytes);
+        }
+        Ok(())
+    }
 }
 
 impl Delivery<'_> {
+    pub(super) fn retain(
+        &mut self,
+        session: &super::result_session::NativeResultSession,
+        manifest: &ResultManifest,
+        interval: Duration,
+    ) -> Result<()> {
+        match self {
+            Self::Scheduler(pin, publication) => {
+                pin.client.with_renewal(pin.ticket, interval, |check| {
+                    check()?;
+                    if let Some(pending) = publication.take() {
+                        pending.confirm(pin)?;
+                    }
+                    session.retain(pin.ticket, manifest)
+                })
+            }
+            Self::Local(_, pin) => pin.client.with_renewal(pin.ticket, interval, |check| {
+                check()?;
+                session.retain(pin.ticket, manifest)
+            }),
+        }
+    }
+
     pub(super) fn with_download<T>(
-        &self,
+        &mut self,
         renewal_interval: Duration,
+        declared: &BTreeMap<crate::build_runtime::ContentId, u64>,
         operation: impl FnOnce(&mut BlobDownload<'_>) -> Result<T>,
     ) -> Result<T> {
         match self {
-            Self::Scheduler(pin) => {
-                pin.client
-                    .with_renewal(pin.ticket, renewal_interval, |check| {
-                        let result = operation(&mut |blob, output| {
+            Self::Scheduler(pin, publication) => {
+                let started = Instant::now();
+                let (value, observation) =
+                    pin.client
+                        .with_renewal(pin.ticket, renewal_interval, |check| {
+                            let mut delivery = super::peer_delivery::ResultDelivery::new(
+                                pin.client,
+                                pin.ticket,
+                                declared,
+                                publication.as_ref().map(|pending| pending.deadline),
+                            );
+                            let result = operation(&mut |blob, output| {
+                                check()?;
+                                delivery.download(blob, output)
+                            })?;
                             check()?;
-                            pin.client.download(pin.ticket, blob, output)
+                            if let Some(publication) = publication {
+                                publication.confirm(pin)?;
+                            }
+                            Ok((result, delivery.observation(started.elapsed())))
                         })?;
-                        check()?;
-                        Ok(result)
-                    })
+                *publication = None;
+                if pin.assigned {
+                    pin.delivery = Some(observation);
+                }
+                Ok(value)
             }
-            Self::Local(captured) => operation(&mut |blob, output| {
+            Self::Local(captured, _) => operation(&mut |blob, output| {
                 copy_verified(captured.open_blob(blob.id)?, blob, output)
             }),
         }
@@ -237,8 +372,10 @@ impl Delivery<'_> {
 
 impl NativeCacheClient {
     /// Admit an exact native action, supply only absent inputs, and execute
-    /// in the configured exact sandbox when needed. Remote results are read
-    /// from the scheduler; local results use captured descriptors directly.
+    /// in the configured exact sandbox when needed. Remote results use the
+    /// fastest authorized source; local results use captured descriptors directly.
+    /// The caller may select any subset of declared outputs (including none).
+    /// All outputs are still captured and validated under the same action key.
     /// No result is repackaged into the legacy cache.
     ///
     /// # Errors
@@ -252,25 +389,68 @@ impl NativeCacheClient {
         policy: &NativeBuildPolicy,
         local: Option<&LocalExecutor>,
     ) -> Result<NativeBuildResult> {
+        self.run_action_inner(spec, inputs, destinations, policy, local, None)
+    }
+
+    pub(crate) fn run_action_retained(
+        &self,
+        spec: &ExecutionSpec,
+        inputs: &[PreparedTree],
+        destinations: &BTreeMap<String, PathBuf>,
+        policy: &NativeBuildPolicy,
+        local: Option<&LocalExecutor>,
+        retention: (&super::result_session::Registry, u32),
+    ) -> Result<NativeBuildResult> {
+        self.run_action_inner(spec, inputs, destinations, policy, local, Some(retention))
+    }
+
+    fn run_action_inner(
+        &self,
+        spec: &ExecutionSpec,
+        inputs: &[PreparedTree],
+        destinations: &BTreeMap<String, PathBuf>,
+        policy: &NativeBuildPolicy,
+        local: Option<&LocalExecutor>,
+        retention: Option<(&super::result_session::Registry, u32)>,
+    ) -> Result<NativeBuildResult> {
         let mut inputs = LocalInputs::new(spec, inputs)?;
         let destinations = verify_destinations(spec, destinations)?;
-        match self.acquire_action(spec, &mut inputs, policy, local)? {
+        let destinations = super::intermediate::Destinations::new(destinations)?;
+        let groups = destinations
+            .sessions()
+            .into_iter()
+            .map(|token| {
+                let (registry, uid) = retention.context("retention registry unavailable")?;
+                registry.get(uid, token)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let selected = destinations.eager.keys().cloned().collect();
+        match self.acquire_action(spec, &mut inputs, policy, local, &selected)? {
             Outcome::Ready {
-                delivery,
+                mut delivery,
                 source,
                 manifest,
             } => {
                 inputs.progress(NativeProgress::Phase(Phase::RestoreOutputs))?;
-                let staged = delivery.with_download(policy.renewal_interval, |download| {
-                    fetch_result(
-                        spec,
-                        &manifest,
-                        &destinations,
-                        policy.max_result_bytes,
-                        download,
-                    )
-                })?;
+                validate_manifest(spec, &manifest, policy.max_result_bytes)?;
+                let declared = manifest.selected_blobs(&selected)?;
+                let staged =
+                    delivery.with_download(policy.renewal_interval, &declared, |download| {
+                        fetch_result(
+                            spec,
+                            &manifest,
+                            &destinations.eager,
+                            &inputs,
+                            policy.max_result_bytes,
+                            download,
+                        )
+                    })?;
+                for group in groups {
+                    delivery.retain(&group, &manifest, policy.renewal_interval)?;
+                }
+                let references = destinations.stage(&manifest)?;
                 let output = staged.install()?;
+                references.install()?;
                 Ok(NativeBuildResult { source, output })
             }
             Outcome::Failed { source, failure } => Ok(NativeBuildResult {
@@ -286,6 +466,7 @@ impl NativeCacheClient {
         inputs: &mut impl InputProvider,
         policy: &NativeBuildPolicy,
         local: Option<&LocalExecutor>,
+        selected: &BTreeSet<String>,
     ) -> Result<Outcome<'_>> {
         validate_policy(policy)?;
         let request = spec.action_request()?;
@@ -303,9 +484,12 @@ impl NativeCacheClient {
                     let pin = Pin {
                         client: self,
                         ticket,
+                        assigned: false,
+                        selected: selected.clone(),
+                        delivery: None,
                     };
                     return Ok(Outcome::Ready {
-                        delivery: Delivery::Scheduler(pin),
+                        delivery: Delivery::Scheduler(pin, None),
                         source: NativeBuildSource::Hit,
                         manifest,
                     });
@@ -340,6 +524,9 @@ impl NativeCacheClient {
                     let pin = Pin {
                         client: self,
                         ticket,
+                        assigned: false,
+                        selected: selected.clone(),
+                        delivery: None,
                     };
                     return self.run_admitted(pin, spec, inputs, policy, start, local);
                 }
@@ -349,7 +536,7 @@ impl NativeCacheClient {
 
     fn schedule_with_retry(
         &self,
-        ticket: Ticket,
+        pin: &Pin<'_>,
         spec: &ExecutionSpec,
         start: Instant,
         timeout: Duration,
@@ -358,7 +545,7 @@ impl NativeCacheClient {
         loop {
             let remaining = timeout.saturating_sub(start.elapsed());
             ensure!(!remaining.is_zero(), "native allocation deadline exceeded");
-            match self.schedule(ticket, spec.clone()) {
+            match self.schedule_selected(pin.ticket, spec.clone(), pin.selected.clone()) {
                 Ok(reply) => return Ok(reply),
                 Err(error) if retryable_transport_error(&error) => {
                     debug!("retrying native allocation: {error:#}");
@@ -372,7 +559,7 @@ impl NativeCacheClient {
 
     fn run_admitted<'a>(
         &self,
-        pin: Pin<'a>,
+        mut pin: Pin<'a>,
         spec: &ExecutionSpec,
         inputs: &mut impl InputProvider,
         policy: &NativeBuildPolicy,
@@ -383,7 +570,7 @@ impl NativeCacheClient {
             return self.run_local(pin, spec, inputs, policy, start, local);
         }
         inputs.progress(NativeProgress::Phase(Phase::AllocateWorker))?;
-        let reply = self.schedule_with_retry(pin.ticket, spec, start, policy.timeout)?;
+        let reply = self.schedule_with_retry(&pin, spec, start, policy.timeout)?;
         let allocation = match reply {
             ScheduleReply::Assigned(allocation) => allocation,
             ScheduleReply::Unavailable { message } => {
@@ -393,19 +580,29 @@ impl NativeCacheClient {
                 bail!("native worker unavailable: {message}");
             }
         };
+        pin.assigned = true;
         inputs.progress(NativeProgress::Assigned {
             job: allocation.job,
-            worker: allocation.address,
+            worker: allocation.peer,
         })?;
-        let source = NativeBuildSource::Worker(allocation.address);
+        let source = NativeBuildSource::Worker(allocation.peer);
         let request = spec.action_request()?;
         let remaining = policy.timeout.saturating_sub(start.elapsed());
         // Keep the origin connection live while the worker acquires inputs.
         // Only the worker RPC needs a separate thread; the original provider
         // (including the namespace stream) remains owned by this thread.
         let result = thread::scope(|scope| {
-            let worker =
-                scope.spawn(|| Self::run_worker(&allocation, remaining, policy.max_result_bytes));
+            let worker = scope.spawn(|| {
+                self.observe_worker(&allocation, remaining, policy.max_result_bytes, |phase| {
+                    if phase == crate::build_runtime::wire::NativeJobPhase::Publishing
+                        && let Ok(NativeStatus::Negotiated(manifest)) =
+                            self.preview_status(pin.ticket)
+                    {
+                        return Some(manifest);
+                    }
+                    None
+                })
+            });
             let supply = self.supply_until_ready(
                 pin.ticket,
                 &request.input_trees,
@@ -420,8 +617,10 @@ impl NativeCacheClient {
             let terminal = supply.is_err()
                 && (worker.is_finished()
                     || matches!(
-                        self.status(pin.ticket),
-                        Ok(NativeStatus::Ready(_) | NativeStatus::Failed)
+                        self.preview_status(pin.ticket),
+                        Ok(NativeStatus::Negotiated(_)
+                            | NativeStatus::Ready(_)
+                            | NativeStatus::Failed)
                     ));
             if supply.is_err() && !terminal {
                 let _ = self.close(pin.ticket);
@@ -434,6 +633,35 @@ impl NativeCacheClient {
             }
             result
         });
+        let result = match result {
+            Ok(std::ops::ControlFlow::Break(manifest)) => {
+                validate_manifest(spec, &manifest, policy.max_result_bytes)?;
+                let publication = Publication {
+                    allocation,
+                    manifest: manifest.clone(),
+                    deadline: start
+                        .checked_add(policy.timeout)
+                        .context("native publication deadline overflow")?,
+                    max_result_bytes: policy.max_result_bytes,
+                };
+                return Ok(Outcome::Ready {
+                    delivery: Delivery::Scheduler(pin, Some(Box::new(publication))),
+                    source,
+                    manifest,
+                });
+            }
+            Ok(std::ops::ControlFlow::Continue(result)) => Ok(result),
+            Err(error) => Err(error),
+        };
+        self.finish_remote(pin, source, result)
+    }
+
+    fn finish_remote<'a>(
+        &self,
+        pin: Pin<'a>,
+        source: NativeBuildSource,
+        result: Result<NativeRunResult>,
+    ) -> Result<Outcome<'a>> {
         let error = match result {
             Ok(NativeRunResult::Stored) => None,
             Ok(failure @ NativeRunResult::Failed { .. }) => {
@@ -454,7 +682,7 @@ impl NativeCacheClient {
         // terminal response was lost, expired, or the worker restarted.
         match (self.status(pin.ticket), error) {
             (Ok(NativeStatus::Ready(manifest)), _) => Ok(Outcome::Ready {
-                delivery: Delivery::Scheduler(pin),
+                delivery: Delivery::Scheduler(pin, None),
                 source,
                 manifest,
             }),
@@ -525,16 +753,16 @@ impl NativeCacheClient {
                     // prefix of the IPC frame. Realign before another demand.
                     reader.discard_unread()?;
                     let status = error
-                        .downcast_ref::<reqwest::Error>()
-                        .and_then(reqwest::Error::status);
+                        .downcast_ref::<wreq::Error>()
+                        .and_then(wreq::Error::status);
                     if retryable_transport_error(&error)
-                        || status == Some(reqwest::StatusCode::CONFLICT)
+                        || status == Some(http::StatusCode::CONFLICT)
                     {
                         debug!("retrying native input upload after polling: {error:#}");
                         thread::sleep(Duration::from_millis(50));
                         return Ok(());
                     }
-                    if status != Some(reqwest::StatusCode::UNPROCESSABLE_ENTITY) {
+                    if status != Some(http::StatusCode::UNPROCESSABLE_ENTITY) {
                         return Err(error);
                     }
                     // Only a verified content mismatch makes this locator
@@ -569,13 +797,12 @@ impl NativeCacheClient {
     ) -> Result<Outcome<'a>> {
         inputs.progress(NativeProgress::Phase(Phase::LocalCompile))?;
         let captured = local.execute(self, pin.ticket, spec, inputs, policy, start)?;
-        drop(pin);
         let source = NativeBuildSource::Local;
         if let Some(manifest) = captured.successful_result() {
             Ok(Outcome::Ready {
                 manifest: manifest.clone(),
                 source,
-                delivery: Delivery::Local(Box::new(captured)),
+                delivery: Delivery::Local(Box::new(captured), pin),
             })
         } else {
             Ok(Outcome::Failed {
@@ -632,20 +859,148 @@ pub(super) fn validate_manifest(
     Ok(())
 }
 
+/// The result manifest is independent of delivery selection. Reuse verified
+/// bytes already available to this caller, and download each repeated blob
+/// at most once. Anonymous staging files cannot become a second persistent
+/// cache or be modified through an output pathname.
+struct ResultBlobs<'a, D> {
+    inputs: &'a LocalInputs<'a>,
+    repeated: BTreeSet<ContentId>,
+    verified: BTreeMap<ContentId, tempfile::TempPath>,
+    spool: Option<tempfile::TempDir>,
+    download: D,
+}
+
+impl<D: FnMut(BlobRef, &mut BlobSink<'_>) -> Result<()>> ResultBlobs<'_, D> {
+    fn spool_file(&mut self) -> Result<NamedTempFile> {
+        if self.spool.is_none() {
+            self.spool = Some(tempfile::tempdir()?);
+        }
+        Ok(NamedTempFile::new_in(
+            self.spool.as_ref().context("missing result spool")?.path(),
+        )?)
+    }
+
+    fn write(
+        &mut self,
+        blob: BlobRef,
+        existing: Option<&Path>,
+        output: &mut BlobSink<'_>,
+    ) -> Result<()> {
+        if let Some(path) = self.verified.get(&blob.id) {
+            io::copy(&mut fs::File::open(path)?, output)?;
+            return Ok(());
+        }
+
+        // Never consume a local candidate directly into the destination: it
+        // may have changed since discovery. Verify into private staging first.
+        let existing = existing.and_then(|path| {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+                .ok()?;
+            let metadata = file.metadata().ok()?;
+            if crate::build_runtime::intermediate_fs::intermediate_reference(&file)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return None;
+            }
+            (metadata.is_file() && metadata.len() == blob.size)
+                .then(|| Box::new(file) as Box<dyn Read + Send>)
+        });
+        let inputs = self.inputs;
+        let repeated = self.repeated.contains(&blob.id);
+        // Repeated content gets one shared spool. A unique blob can be
+        // verified directly in its private destination and reset on failure.
+        let mut spool = if repeated {
+            Some(self.spool_file()?)
+        } else {
+            None
+        };
+        {
+            let mut target = spool.as_mut().map_or_else(
+                || output.reborrow(),
+                |file| BlobSink::File(file.as_file_mut()),
+            );
+            let mut reused = false;
+            for candidate in existing.into_iter().chain(inputs.matching_sources(blob.id)) {
+                target.reset()?;
+                if copy_verified(candidate, blob, &mut target).is_ok() {
+                    reused = true;
+                    break;
+                }
+            }
+            if !reused {
+                target.reset()?;
+                (self.download)(blob, &mut target)?;
+            }
+        }
+        if let Some(mut file) = spool {
+            file.rewind()?;
+            io::copy(&mut file, output)?;
+            self.verified.insert(blob.id, file.into_temp_path());
+        }
+        Ok(())
+    }
+}
+
+fn repeated_result_blobs(
+    manifest: &ResultManifest,
+    destinations: &BTreeMap<String, PathBuf>,
+) -> BTreeSet<ContentId> {
+    let mut seen = BTreeSet::new();
+    let mut repeated = BTreeSet::new();
+    let mut count = |blob: BlobRef| {
+        if !seen.insert(blob.id) {
+            repeated.insert(blob.id);
+        }
+    };
+    for blob in manifest.stdout.into_iter().chain(manifest.stderr) {
+        count(blob);
+    }
+    for (name, artifact) in &manifest.outputs {
+        if !destinations.contains_key(name) {
+            continue;
+        }
+        match artifact {
+            Artifact::File { blob, .. } => count(*blob),
+            Artifact::Tree(tree) | Artifact::GeneratedTree(tree) => {
+                for entry in tree.entries.values() {
+                    if let crate::build_runtime::TreeEntry::File { blob, .. } = entry {
+                        count(*blob);
+                    }
+                }
+            }
+        }
+    }
+    repeated
+}
+
 /// Result installation is shared by direct HTTP and namespace callers.
 /// All content is verified before any destination is exposed.
 pub(super) fn fetch_result(
     spec: &ExecutionSpec,
     manifest: &ResultManifest,
     destinations: &BTreeMap<String, PathBuf>,
+    inputs: &LocalInputs<'_>,
     max_result_bytes: u64,
-    mut download: impl FnMut(BlobRef, &mut dyn Write) -> Result<()>,
+    download: impl FnMut(BlobRef, &mut BlobSink<'_>) -> Result<()>,
 ) -> Result<StagedResult> {
     validate_manifest(spec, manifest, max_result_bytes)?;
+    let mut blobs = ResultBlobs {
+        inputs,
+        repeated: repeated_result_blobs(manifest, destinations),
+        verified: BTreeMap::new(),
+        spool: None,
+        download,
+    };
     let mut diagnostic = |blob: Option<BlobRef>| -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         if let Some(blob) = blob {
-            download(blob, &mut bytes)?;
+            blobs.write(blob, None, &mut BlobSink::Memory(&mut bytes))?;
         }
         Ok(bytes)
     };
@@ -653,12 +1008,14 @@ pub(super) fn fetch_result(
     let stderr = diagnostic(manifest.stderr)?;
     let mut staged = Vec::new();
     for (name, artifact) in &manifest.outputs {
-        let path = destinations.get(name).context("unexpected native output")?;
+        let Some(path) = destinations.get(name) else {
+            continue;
+        };
         let parent = path.parent().context("native output has no parent")?;
         let temp = match artifact {
             Artifact::File { blob, mode } => {
                 let mut temp = NamedTempFile::new_in(parent)?;
-                download(*blob, &mut temp)?;
+                blobs.write(*blob, Some(path), &mut BlobSink::File(temp.as_file_mut()))?;
                 if let Some(mode) = mode {
                     temp.as_file()
                         .set_permissions(fs::Permissions::from_mode(*mode))?;
@@ -667,12 +1024,15 @@ pub(super) fn fetch_result(
             }
             Artifact::Tree(manifest) | Artifact::GeneratedTree(manifest) => {
                 StagedOutput::Tree(materialize_tree(manifest, parent, |blob, path| {
-                    download(
+                    blobs.write(
                         blob,
-                        &mut fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(path)?,
+                        None,
+                        &mut BlobSink::File(
+                            &mut fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(path)?,
+                        ),
                     )
                 })?)
             }
@@ -684,6 +1044,24 @@ pub(super) fn fetch_result(
         stderr,
         files: staged,
     })
+}
+
+#[derive(Default)]
+pub(super) struct StagedIntermediates(Vec<(StagedOutput, PathBuf)>);
+
+impl StagedIntermediates {
+    pub(super) fn file(&mut self, file: NamedTempFile, destination: PathBuf) {
+        self.0.push((StagedOutput::File(file), destination));
+    }
+    pub(super) fn tree(&mut self, tree: MaterializedTree, destination: PathBuf) {
+        self.0.push((StagedOutput::Tree(tree), destination));
+    }
+    pub(super) fn install(self) -> Result<()> {
+        for (file, path) in self.0 {
+            file.publish(&path)?;
+        }
+        Ok(())
+    }
 }
 
 pub(super) struct StagedResult {
@@ -711,8 +1089,10 @@ pub(super) fn verify_destinations(
     destinations: &BTreeMap<String, PathBuf>,
 ) -> Result<BTreeMap<String, PathBuf>> {
     ensure!(
-        destinations.keys().eq(spec.outputs.keys()),
-        "native output destination contract differs"
+        destinations
+            .keys()
+            .all(|name| spec.outputs.contains_key(name)),
+        "native output destination is not declared"
     );
     let mut seen = BTreeSet::new();
     let mut verified = BTreeMap::new();
@@ -763,6 +1143,239 @@ mod input_blob_tests {
         let mut next = Vec::new();
         reader.get_mut().read_to_end(&mut next)?;
         assert_eq!(next, b"next");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod result_tests {
+    use super::*;
+    use crate::build_runtime::{
+        BuildPath, CommandSpec, ExecutionRoot, MappedTree, OutputKind, OutputSpec, TreeMetadata,
+        TreePath, TreeRecipe, TreeTimestamp,
+    };
+
+    fn metadata(mode: u32) -> TreeMetadata {
+        TreeMetadata {
+            mode,
+            modified: TreeTimestamp {
+                seconds: 1,
+                nanoseconds: 0,
+            },
+        }
+    }
+
+    fn blob(data: &[u8]) -> BlobRef {
+        BlobRef {
+            id: ContentId::of(data),
+            size: data.len() as u64,
+        }
+    }
+
+    fn fixture() -> Result<(ExecutionSpec, PreparedTree, ResultManifest)> {
+        let mut input = MappedTree::new(metadata(0o755));
+        input.add_bytes(
+            TreePath::new(b"input".to_vec())?,
+            b"input".to_vec(),
+            metadata(0o644),
+        )?;
+        let input = input.prepare()?;
+        let mut intermediate = MappedTree::new(metadata(0o755));
+        for (name, data) in [
+            ("input-copy", b"input".as_slice()),
+            ("duplicate-a", b"codegen"),
+            ("duplicate-b", b"codegen"),
+        ] {
+            intermediate.add_bytes(
+                TreePath::new(name.as_bytes().to_vec())?,
+                data.to_vec(),
+                metadata(0o644),
+            )?;
+        }
+        let intermediate = intermediate.prepare()?;
+        let spec = ExecutionSpec {
+            compiler_result: None,
+            platform: ContentId::of(b"platform"),
+            root: ExecutionRoot::resolve(
+                TreeRecipe::union(metadata(0o755), [input.id()]),
+                &BTreeMap::from([(input.id(), input.manifest())]),
+            )?,
+            mounts: BTreeMap::new(),
+            command: CommandSpec {
+                umask: 0o022,
+                executable: BuildPath::new(b"/tool".to_vec())?,
+                arguments: Vec::new(),
+                cwd: BuildPath::new(b"/".to_vec())?,
+                environment: BTreeMap::new(),
+            },
+            outputs: BTreeMap::from([
+                (
+                    "final".into(),
+                    OutputSpec {
+                        path: BuildPath::new(b"/final".to_vec())?,
+                        required: true,
+                        kind: OutputKind::File,
+                    },
+                ),
+                (
+                    "intermediate".into(),
+                    OutputSpec {
+                        path: BuildPath::new(b"/intermediate".to_vec())?,
+                        required: true,
+                        kind: OutputKind::Tree,
+                    },
+                ),
+            ]),
+        };
+        let manifest = ResultManifest {
+            outputs: BTreeMap::from([
+                (
+                    "final".into(),
+                    Artifact::File {
+                        blob: blob(b"final"),
+                        mode: Some(0o755),
+                    },
+                ),
+                (
+                    "intermediate".into(),
+                    Artifact::Tree(intermediate.manifest().clone()),
+                ),
+            ]),
+            stdout: None,
+            stderr: None,
+        };
+        Ok((spec, input, manifest))
+    }
+
+    #[test]
+    fn private_blob_staging_can_retry_after_partial_or_corrupt_delivery() -> Result<()> {
+        let expected = blob(b"correct");
+        let mut file = tempfile::tempfile()?;
+        let mut bytes = Vec::new();
+        for mut sink in [BlobSink::File(&mut file), BlobSink::Memory(&mut bytes)] {
+            assert!(copy_verified(b"corrupt".as_slice(), expected, &mut sink).is_err());
+            sink.reset()?;
+            assert!(copy_verified(b"short".as_slice(), expected, &mut sink).is_err());
+            sink.reset()?;
+            copy_verified(b"correct".as_slice(), expected, &mut sink)?;
+        }
+        file.rewind()?;
+        let mut actual = Vec::new();
+        file.read_to_end(&mut actual)?;
+        assert_eq!(actual, b"correct");
+        assert_eq!(bytes, b"correct");
+        assert!(BlobSink::Stream(&mut io::sink()).reset().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn selected_results_reuse_verified_inputs_and_duplicate_content() -> Result<()> {
+        let (spec, input, manifest) = fixture()?;
+        let inputs = [input];
+        let inputs = LocalInputs::new(&spec, &inputs)?;
+        let root = tempfile::tempdir()?;
+        let final_path = root.path().join("final");
+        let intermediate_path = root.path().join("intermediate");
+        let final_only = verify_destinations(
+            &spec,
+            &BTreeMap::from([("final".into(), final_path.clone())]),
+        )?;
+        let mut requested = Vec::new();
+        fetch_result(
+            &spec,
+            &manifest,
+            &final_only,
+            &inputs,
+            1024,
+            |content, out| {
+                requested.push(content);
+                copy_verified(b"final".as_slice(), content, out)
+            },
+        )?
+        .install()?;
+        assert_eq!(requested, [blob(b"final")]);
+        assert_eq!(fs::read(&final_path)?, b"final");
+        assert!(!intermediate_path.exists());
+
+        let all = verify_destinations(
+            &spec,
+            &BTreeMap::from([
+                ("final".into(), final_path.clone()),
+                ("intermediate".into(), intermediate_path.clone()),
+            ]),
+        )?;
+        requested.clear();
+        fetch_result(&spec, &manifest, &all, &inputs, 1024, |content, out| {
+            requested.push(content);
+            copy_verified(b"codegen".as_slice(), content, out)
+        })?
+        .install()?;
+        assert_eq!(requested, [blob(b"codegen")]);
+        assert_eq!(fs::read(intermediate_path.join("input-copy"))?, b"input");
+        assert_eq!(fs::read(intermediate_path.join("duplicate-a"))?, b"codegen");
+        assert_eq!(fs::read(intermediate_path.join("duplicate-b"))?, b"codegen");
+        assert_eq!(fs::read(&final_path)?, b"final");
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_existing_output_is_replaced_and_unselected_outputs_still_validated() -> Result<()> {
+        let (spec, input, mut manifest) = fixture()?;
+        let inputs = [input];
+        let inputs = LocalInputs::new(&spec, &inputs)?;
+        let root = tempfile::tempdir()?;
+        let output = root.path().join("final");
+        fs::write(&output, b"wrong")?;
+        let selected =
+            verify_destinations(&spec, &BTreeMap::from([("final".into(), output.clone())]))?;
+        assert!(
+            verify_destinations(&spec, &BTreeMap::from([("unknown".into(), output.clone())]),)
+                .is_err()
+        );
+        let mut downloads = 0;
+        fetch_result(
+            &spec,
+            &manifest,
+            &selected,
+            &inputs,
+            1024,
+            |content, out| {
+                downloads += 1;
+                copy_verified(b"final".as_slice(), content, out)
+            },
+        )?
+        .install()?;
+        assert_eq!(downloads, 1);
+        assert_eq!(fs::read(&output)?, b"final");
+        // An unselected tree can be internally valid while contradicting
+        // the length of a digest in a selected file.
+        let mut inconsistent = manifest.clone();
+        let Some(Artifact::Tree(tree)) = inconsistent.outputs.get_mut("intermediate") else {
+            anyhow::bail!("missing intermediate tree");
+        };
+        tree.entries.insert(
+            TreePath::new(b"conflict".to_vec())?,
+            crate::build_runtime::TreeEntry::File {
+                blob: BlobRef {
+                    id: ContentId::of(b"final"),
+                    size: 6,
+                },
+                metadata: metadata(0o644),
+            },
+        );
+        assert!(
+            inconsistent
+                .selected_blobs(&BTreeSet::from(["final".to_owned()]))
+                .is_ok()
+        );
+        assert!(validate_manifest(&spec, &inconsistent, 1024).is_err());
+        manifest.outputs.remove("intermediate");
+        assert!(
+            fetch_result(&spec, &manifest, &selected, &inputs, 1024, |_, _| {
+                anyhow::bail!("invalid complete manifest must not transfer content")
+            })
+            .is_err()
+        );
         Ok(())
     }
 }

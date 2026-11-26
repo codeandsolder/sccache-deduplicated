@@ -8,11 +8,11 @@ use sccache::{
 };
 
 fn id(port: u16) -> ServerId {
-    ServerId::new(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+    ServerId::from_digest(std::array::from_fn(|index| port.to_le_bytes()[index % 2]))
 }
 
 fn peer(port: u16) -> Peer {
-    Peer::Worker(id(port).addr())
+    Peer::Worker(id(port))
 }
 
 fn capacity(remaining: u64) -> PeerCapacity {
@@ -56,6 +56,7 @@ fn network() -> NetworkSnapshot {
             ..DirectionSnapshot::default()
         },
         receive: DirectionSnapshot::default(),
+        interfaces: sccache::build_runtime::wire::InterfaceReport::default(),
     }
 }
 
@@ -68,7 +69,7 @@ fn native_exploration_prefers_a_real_near_equivalent_unanswered_overlap_once() -
     }
     let servers = scheduler.servers.lock().unwrap();
     let network = network();
-    let plan = NativeTransferPlan::new(&network, &servers, None);
+    let plan = NativeTransferPlan::new(&network, &servers, None, None, None);
     let mut history = Exploration::default();
     let now = Instant::now();
     let options = [(id(1), 3.0), (id(2), 3.01)];
@@ -131,7 +132,7 @@ fn native_exploration_never_increases_required_payload_or_exceeds_eta_budget() -
     let options = [(id(1), 3.0), (id(2), 3.01)];
     {
         let servers = scheduler.servers.lock().unwrap();
-        let plan = NativeTransferPlan::new(&network, &servers, None);
+        let plan = NativeTransferPlan::new(&network, &servers, None, None, None);
         assert_eq!(
             choose_worker(
                 &options,
@@ -147,7 +148,7 @@ fn native_exploration_never_increases_required_payload_or_exceeds_eta_budget() -
     }
     register(&scheduler, id(1), dist::NativePlacement::default())?;
     let servers = scheduler.servers.lock().unwrap();
-    let plan = NativeTransferPlan::new(&network, &servers, None);
+    let plan = NativeTransferPlan::new(&network, &servers, None, None, None);
     assert_eq!(
         choose_worker(
             &[(id(1), 3.0), (id(2), 3.03)],
@@ -179,7 +180,7 @@ fn native_exploration_skips_answered_or_unmeasurable_overlap() -> anyhow::Result
         rates: BTreeMap::from([(peer(1), 100_000_000), (peer(2), 100_000_000)]),
     });
     {
-        let plan = NativeTransferPlan::new(&network, &servers, None);
+        let plan = NativeTransferPlan::new(&network, &servers, None, None, None);
         assert_eq!(
             choose_worker(
                 &options,
@@ -199,7 +200,7 @@ fn native_exploration_skips_answered_or_unmeasurable_overlap() -> anyhow::Result
         bytes_per_second: 100_000_000,
     });
     {
-        let plan = NativeTransferPlan::new(&network, &servers, None);
+        let plan = NativeTransferPlan::new(&network, &servers, None, None, None);
         assert_eq!(
             choose_worker(
                 &options,
@@ -220,7 +221,7 @@ fn native_exploration_skips_answered_or_unmeasurable_overlap() -> anyhow::Result
         .get_mut(&peer(1))
         .unwrap()
         .active_remaining_bytes = 0;
-    let plan = NativeTransferPlan::new(&network, &servers, None);
+    let plan = NativeTransferPlan::new(&network, &servers, None, None, None);
     assert_eq!(
         choose_worker(
             &options,

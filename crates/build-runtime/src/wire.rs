@@ -1,9 +1,6 @@
 //! Native cache wire messages, shared by clients and workers.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    net::SocketAddr,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -28,13 +25,17 @@ impl std::fmt::Debug for Ticket {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Publisher {
     Client,
-    Worker { address: SocketAddr, job: u64 },
+    Worker { peer: crate::PeerId, job: u64 },
 }
 
-/// A client request for a complete *native* action, not a legacy cache key.
-/// The output contract is an additional mandatory fingerprint component.
+/// A client request for a complete native execution declaration.
+///
+/// A compiler front end may additionally supply a semantic result fingerprint;
+/// the exact declaration is still compared when assigning and verifying work.
+/// The output contract is a mandatory component of either result identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionRequest {
+    pub(crate) result_fingerprint: Option<ActionFingerprint>,
     pub(crate) fingerprint: ActionFingerprint,
     pub(crate) root: ExecutionRoot,
     pub input_trees: BTreeSet<TreeId>,
@@ -62,7 +63,12 @@ impl ActionRequest {
                 .all(|name| !name.is_empty() && !name.contains('\0')),
             "invalid output name"
         );
-        let mut fingerprint = self.fingerprint.clone();
+        let mut fingerprint = self
+            .result_fingerprint
+            .as_ref()
+            .unwrap_or(&self.fingerprint)
+            .clone();
+        ensure!(!fingerprint.schema.is_empty(), "empty result schema");
         let digest = ContentId(typed_digest(
             b"sccache-output-contract-v2\0",
             &(&self.required_outputs, &self.optional_outputs),
@@ -83,20 +89,23 @@ impl ActionRequest {
                 .all(|layer| self.input_trees.contains(&layer.tree)),
             "native root recipe references an undeclared input"
         );
-        ensure!(
-            fingerprint
-                .components
-                .insert("root/tree".into(), ContentId(self.root.id.0))
-                .is_none(),
-            "reserved root component"
-        );
+        if self.result_fingerprint.is_none() {
+            ensure!(
+                fingerprint
+                    .components
+                    .insert("root/tree".into(), ContentId(self.root.id.0))
+                    .is_none(),
+                "reserved root component"
+            );
+        }
         Ok(fingerprint)
     }
 
     /// Verify a successful result's outputs against the original declaration.
     ///
     /// # Errors
-    /// Returns an error for missing required outputs or unexpected artifacts.
+    /// Returns an error for missing required outputs, unexpected artifacts, invalid metadata,
+    /// or conflicting content lengths anywhere in the result.
     pub fn validate_result(&self, result: &ResultManifest) -> Result<()> {
         ensure!(
             self.required_outputs
@@ -113,8 +122,8 @@ impl ActionRequest {
                 expected == Some(&artifact.kind()),
                 "unexpected output name or kind"
             );
-            artifact.validate()?;
         }
+        result.blobs()?;
         Ok(())
     }
 }
@@ -139,6 +148,8 @@ pub enum NativeAdmission {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeStatus {
     Compiling,
+    /// A worker has negotiated immutable successful output; durable commit is pending.
+    Negotiated(ResultManifest),
     Ready(ResultManifest),
     Failed,
 }
@@ -163,6 +174,44 @@ pub enum InputPoll {
 pub struct BeginResult {
     pub missing: Vec<BlobRef>,
 }
+
+/// Authorization for an exact peer-to-peer content transfer. Scheduler
+/// recovery and member delivery use the same transport but distinct grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlobRecipient {
+    Scheduler,
+    Client(crate::PeerId),
+    Worker(crate::PeerId),
+}
+
+/// A source for one exact content identity. The grant is never logged.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobSource {
+    pub peer: crate::PeerId,
+    pub routes: sccache_peer_identity::RouteSet,
+    pub token: String,
+}
+
+impl std::fmt::Debug for BlobSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobSource")
+            .field("peer", &self.peer)
+            .field("routes", &self.routes)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A receiver-specific offer. Scheduler residency is an observation, not
+/// permission to assume a subsequent transfer will succeed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobSourcePlan {
+    pub blob: BlobRef,
+    pub scheduler_present: bool,
+    pub sources: Vec<BlobSource>,
+}
+
+pub const MAX_SOURCE_BATCH: usize = 32;
+pub const MAX_BLOB_SOURCES: usize = 4;
 
 /// Fixed header of an upload. Physical bytes follow in the declared encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,16 +241,17 @@ pub struct TreeRead {
 /// worker's existing authenticated HTTPS service.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerAllocation {
-    pub address: std::net::SocketAddr,
+    pub peer: crate::PeerId,
+    pub routes: sccache_peer_identity::RouteSet,
     pub job: u64,
     pub auth: String,
-    pub certificate: Vec<u8>,
 }
 
 impl std::fmt::Debug for WorkerAllocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkerAllocation")
-            .field("address", &self.address)
+            .field("peer", &self.peer)
+            .field("routes", &self.routes)
             .field("job", &self.job)
             .finish_non_exhaustive()
     }
@@ -211,6 +261,262 @@ impl std::fmt::Debug for WorkerAllocation {
 pub enum ScheduleReply {
     Assigned(WorkerAllocation),
     Unavailable { message: String },
+}
+
+/// Encoded body goodput measured on a concrete scheduler-relative route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachePathRate {
+    pub path: crate::NetworkPath,
+    pub bytes_per_second: u64,
+}
+
+/// Fresh, authenticated cache-route body goodput, in worker-relative
+/// directions. Absence is not a zero-rate link.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachePathRates {
+    pub download: Option<CachePathRate>,
+    pub upload: Option<CachePathRate>,
+}
+
+impl CachePathRates {
+    #[must_use = "untrusted rate measurements must be validated"]
+    pub fn valid(self) -> bool {
+        [self.download, self.upload]
+            .into_iter()
+            .flatten()
+            .all(|rate| {
+                rate.path.valid()
+                    && (64 * 1024..=1_000_000_000_000).contains(&rate.bytes_per_second)
+            })
+    }
+}
+
+/// Effective verified logical delivery from a worker, including decoding
+/// and staging. Path endpoints are ordered source, receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerDownloadRate {
+    pub source: crate::PeerId,
+    pub path: crate::NetworkPath,
+    pub logical_bytes_per_second: u64,
+    pub wire_per_mille: u64,
+}
+
+pub const MAX_PEER_DOWNLOAD_RATES: usize = 32;
+
+impl PeerDownloadRate {
+    #[must_use = "untrusted delivery telemetry must be validated"]
+    pub fn valid(self) -> bool {
+        self.path.valid()
+            && (64 * 1024..=1_000_000_000_000).contains(&self.logical_bytes_per_second)
+            && (1..=1100).contains(&self.wire_per_mille)
+    }
+}
+
+/// Validate a bounded snapshot, canonically sorted by source principal.
+#[must_use = "untrusted delivery telemetry must be validated"]
+pub fn peer_download_rates_valid(rates: &[PeerDownloadRate]) -> bool {
+    rates.len() <= MAX_PEER_DOWNLOAD_RATES
+        && rates.iter().all(|rate| rate.valid())
+        && rates.windows(2).all(|pair| pair[0].source < pair[1].source)
+}
+
+/// Aggregate interface pressure, including other applications, sampled
+/// on the endpoint itself. Nominal capacity is only set for a known
+/// physical full-duplex Ethernet link.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterfaceDirection {
+    pub total_bytes_per_second: u64,
+    pub external_bytes_per_second: u64,
+    pub active_streams: u32,
+}
+
+impl InterfaceDirection {
+    const fn valid(self) -> bool {
+        self.external_bytes_per_second <= self.total_bytes_per_second
+            && self.total_bytes_per_second <= 1_000_000_000_000
+            && self.active_streams <= 4096
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterfaceTraffic {
+    pub index: u32,
+    pub addresses: Vec<std::net::IpAddr>,
+    pub nominal_capacity: Option<u64>,
+    pub send: InterfaceDirection,
+    pub receive: InterfaceDirection,
+}
+
+/// An endpoint-local directional path. The local address belongs to the
+/// reporting host; remote is the authenticated connection's other endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct EndpointFlow {
+    pub path: crate::NetworkPath,
+    pub direction: crate::Direction,
+}
+
+impl EndpointFlow {
+    const fn valid(self) -> bool {
+        self.path.valid() && !self.path.local.is_loopback() && !self.path.remote.is_loopback()
+    }
+}
+
+/// Observed effective aggregate service under simultaneous real task traffic.
+/// This is not a physical topology assertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointOverlap {
+    pub flows: [EndpointFlow; 2],
+    pub bytes_per_second: u64,
+}
+
+impl EndpointOverlap {
+    fn valid(self) -> bool {
+        self.flows[0] < self.flows[1]
+            && self.flows.iter().all(|flow| flow.valid())
+            && (128 * 1024..=2_000_000_000_000).contains(&self.bytes_per_second)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterfaceReport {
+    pub interfaces: Vec<InterfaceTraffic>,
+    pub overlaps: Vec<EndpointOverlap>,
+}
+
+impl InterfaceReport {
+    #[must_use = "untrusted interface telemetry must be validated"]
+    pub fn valid(&self) -> bool {
+        let mut addresses = BTreeSet::new();
+        self.interfaces.len() <= 16
+            && self
+                .interfaces
+                .windows(2)
+                .all(|pair| pair[0].index < pair[1].index)
+            && self.interfaces.iter().all(|interface| {
+                interface.index != 0
+                    && !interface.addresses.is_empty()
+                    && interface.addresses.len() <= 8
+                    && interface.addresses.windows(2).all(|pair| pair[0] < pair[1])
+                    && interface.addresses.iter().all(|&address| {
+                        sccache_peer_identity::RouteSet::eligible(std::net::SocketAddr::new(
+                            address, 1,
+                        )) && addresses.insert(address)
+                    })
+                    && interface
+                        .nominal_capacity
+                        .is_none_or(|rate| (125_000..=1_000_000_000_000).contains(&rate))
+                    && interface.send.valid()
+                    && interface.receive.valid()
+            })
+            && self.overlaps.len() <= 64
+            && self
+                .overlaps
+                .windows(2)
+                .all(|pair| pair[0].flows < pair[1].flows)
+            && self.overlaps.iter().all(|overlap| {
+                overlap.valid()
+                    && overlap
+                        .flows
+                        .iter()
+                        .all(|flow| self.at(flow.path.local).is_some())
+            })
+    }
+
+    /// Effective aggregate service learned for exactly this pair of flows.
+    #[must_use = "the observed constraint is scoped to the reported endpoint"]
+    pub fn shared_rate(&self, a: EndpointFlow, b: EndpointFlow) -> Option<u64> {
+        let mut flows = [a, b];
+        flows.sort_unstable();
+        self.overlaps
+            .binary_search_by_key(&flows, |overlap| overlap.flows)
+            .ok()
+            .map(|index| self.overlaps[index].bytes_per_second)
+    }
+
+    #[must_use = "the interface is used for endpoint capacity estimates"]
+    pub fn at(&self, address: std::net::IpAddr) -> Option<&InterfaceTraffic> {
+        self.interfaces
+            .iter()
+            .find(|interface| interface.addresses.binary_search(&address).is_ok())
+    }
+}
+
+impl InterfaceTraffic {
+    /// Available wire service on an explicitly known full-duplex wired
+    /// interface. Virtual or wireless routes have no invented ceiling.
+    #[must_use = "available capacity constrains the transfer forecast"]
+    pub fn available(&self, direction: crate::Direction) -> Option<u64> {
+        let capacity = self.nominal_capacity?;
+        let load = match direction {
+            crate::Direction::Send => self.send,
+            crate::Direction::Receive => self.receive,
+        };
+        Some(
+            capacity
+                .saturating_sub(load.external_bytes_per_second)
+                .max(capacity / 8)
+                .max(1),
+        )
+    }
+}
+
+/// Fresh receiver-side service estimates for result delivery. The client
+/// principal is established by the scheduler's authenticated connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientDeliveryRates {
+    pub scheduler: Option<CachePathRate>,
+    pub peers: Vec<PeerDownloadRate>,
+    pub interfaces: InterfaceReport,
+}
+
+impl ClientDeliveryRates {
+    #[must_use = "untrusted receiver telemetry must be validated"]
+    pub fn valid(&self) -> bool {
+        CachePathRates {
+            download: self.scheduler,
+            upload: None,
+        }
+        .valid()
+            && peer_download_rates_valid(&self.peers)
+            && self.interfaces.valid()
+    }
+}
+
+/// Scheduler-derived delivery profile, distinct from the action identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliverySelection {
+    pub profile: ContentId,
+    pub outputs: BTreeSet<String>,
+}
+
+impl DeliverySelection {
+    /// The command-family hash and exact selected names form a stable profile.
+    ///
+    /// # Errors
+    /// Returns an error for undeclared output names or encoding failure.
+    pub fn new(spec: &crate::ExecutionSpec, outputs: BTreeSet<String>) -> Result<Self> {
+        ensure!(
+            outputs.iter().all(|name| spec.outputs.contains_key(name)),
+            "undeclared selected output"
+        );
+        let profile = ContentId(typed_digest(
+            b"sccache-delivery-profile-v1\0",
+            &(spec.placement_class()?, &outputs),
+        )?);
+        Ok(Self { profile, outputs })
+    }
+}
+
+/// Successfully staged unique content, split by the actual delivery source.
+/// Counts exclude failed attempts and repeated reads of the same content.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientDeliveryObservation {
+    /// Unique logical closure selected by the receiver, including local reuse.
+    pub selected_bytes: u64,
+    pub direct_bytes: u64,
+    pub scheduler_bytes: u64,
+    pub unique_blobs: u64,
+    pub staging_nanoseconds: u64,
 }
 
 /// Coherent snapshot of a worker's measured transfer and compiler service.
@@ -323,7 +629,7 @@ pub enum NativeRunRequest {
     Acknowledge,
 }
 
-/// Successful output bytes are retrieved from the scheduler. Failed
+/// Successful output bytes are available under the result lease. Failed
 /// compilations retain replayable diagnostics until acknowledgement or expiry,
 /// without creating a cache hit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,4 +645,57 @@ pub enum NativeRunResult {
         stderr: Vec<u8>,
     },
     JobNotFound,
+}
+
+#[cfg(test)]
+mod endpoint_report_tests {
+    use super::*;
+    use crate::Direction;
+
+    #[test]
+    fn endpoint_report_is_bounded_and_scopes_overlap_to_exact_paths() -> Result<()> {
+        let first = EndpointFlow {
+            path: "192.0.2.1,192.0.2.2".parse()?,
+            direction: Direction::Send,
+        };
+        let second = EndpointFlow {
+            path: "198.51.100.1,198.51.100.2".parse()?,
+            direction: Direction::Receive,
+        };
+        let interface = |index, address| InterfaceTraffic {
+            index,
+            addresses: vec![address],
+            nominal_capacity: None,
+            send: InterfaceDirection::default(),
+            receive: InterfaceDirection::default(),
+        };
+        let mut report = InterfaceReport {
+            interfaces: vec![
+                interface(1, first.path.local),
+                interface(2, second.path.local),
+            ],
+            overlaps: vec![EndpointOverlap {
+                flows: [first, second],
+                bytes_per_second: 100 << 20,
+            }],
+        };
+        assert!(report.valid());
+        assert_eq!(report.shared_rate(second, first), Some(100 << 20));
+        assert_eq!(
+            report.shared_rate(
+                first,
+                EndpointFlow {
+                    direction: Direction::Send,
+                    ..second
+                }
+            ),
+            None
+        );
+        report.overlaps[0].flows.reverse();
+        assert!(!report.valid());
+        report.overlaps[0].flows.reverse();
+        report.interfaces.pop();
+        assert!(!report.valid());
+        Ok(())
+    }
 }

@@ -4,13 +4,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet, BinaryHeap},
     os::unix::fs::MetadataExt,
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, TryLockError, atomic::Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
 use bincode::Options;
-use redb::{ReadOnlyMultimapTable, ReadableDatabase, ReadableTable};
+use redb::{ReadOnlyMultimapTable, ReadableDatabase, ReadableMultimapTable, ReadableTable};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -84,6 +84,16 @@ pub struct SpaceReport {
     pub minimum_satisfied: bool,
 }
 
+/// Read-only filesystem and staging-budget observation. Physical free space
+/// and logical resident bytes are distinct quantities on compressed storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpaceStatus {
+    pub available_bytes: u64,
+    /// None for unmanaged stores or while an admission/eviction pass owns the lock.
+    pub reserved_bytes: Option<u64>,
+    pub policy: Option<SpacePolicy>,
+}
+
 impl NativeStore {
     /// Open a store with a managed resident budget and filesystem admission.
     ///
@@ -99,6 +109,35 @@ impl NativeStore {
         stat.f_bavail
             .checked_mul(stat.f_frsize)
             .context("available filesystem size overflow")
+    }
+
+    /// Observe free filesystem space and pending staging reservations without
+    /// running reclamation or waiting behind a reclaiming admission.
+    ///
+    /// # Errors
+    /// Returns an error for a failed filesystem query or poisoned lock.
+    pub fn space_status(&self) -> Result<SpaceStatus> {
+        let reserved_bytes = if self.inner.space_policy.is_some() {
+            match self.inner.space.try_lock() {
+                Ok(state) => Some(
+                    state
+                        .reserved
+                        .checked_sub(self.inner.space_released.load(Ordering::Acquire))
+                        .context("native staging reservation underflow")?,
+                ),
+                Err(TryLockError::WouldBlock) => None,
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(anyhow!("native space lock poisoned"));
+                }
+            }
+        } else {
+            None
+        };
+        Ok(SpaceStatus {
+            available_bytes: self.available_bytes()?,
+            reserved_bytes,
+            policy: self.inner.space_policy,
+        })
     }
 
     fn resident_bytes(&self) -> Result<u64> {
@@ -605,6 +644,9 @@ impl Drop for StageBudget {
         }
     }
 }
+
+mod analytics;
+pub use analytics::CacheAnalyticsSampler;
 
 #[cfg(test)]
 mod tests;
