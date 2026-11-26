@@ -4333,14 +4333,18 @@ fn test_dist_archive_includes_clippy_config_files_and_empty_directory() -> Resul
 #[cfg(feature = "dist-client")]
 fn rust_dependency_names(
     inputs: &[PathBuf],
+    crate_link_paths: &[PathBuf],
     env_vars: &[(OsString, OsString)],
     reader: Option<&RlibDepReader>,
-) -> Option<HashSet<String>> {
-    let reader = reader?;
+) -> (Option<HashSet<String>>, Vec<PathBuf>) {
+    let Some(reader) = reader else {
+        return (None, Vec::new());
+    };
     if !env_vars.iter().any(|(key, _)| key == "CARGO_PKG_NAME") {
-        return None;
+        return (None, Vec::new());
     }
-    let mut names = HashSet::new();
+    let mut names = Some(HashSet::new());
+    let mut companions = Vec::new();
     for input in inputs {
         if !input.extension().is_some_and(|extension| {
             extension == RLIB_EXTENSION
@@ -4349,19 +4353,127 @@ fn rust_dependency_names(
         }) {
             continue;
         }
-        match reader.discover_rlib_deps(env_vars, input) {
-            Ok(dependencies) => names.extend(dependencies),
-            Err(error) => {
-                debug!(
-                    "Unable to inspect Rust dependencies of {}: {error:#}; including all search-path candidates",
-                    input.display()
-                );
-                return None;
+        let result = dependency_probe_input(input, crate_link_paths).and_then(|probe| {
+            // Retain full metadata even if another input has already forced
+            // conservative discovery of the entire search directory.
+            let probe = match probe {
+                Cow::Borrowed(path) => path,
+                Cow::Owned(companion) => {
+                    companions.push(companion);
+                    companions
+                        .last()
+                        .context("missing metadata companion")?
+                        .as_path()
+                }
+            };
+            if let Some(names) = &mut names {
+                names.extend(reader.discover_rlib_deps(env_vars, probe)?);
             }
+            Ok(())
+        });
+        if let Err(error) = result {
+            warn!(
+                "Unable to inspect Rust dependencies of {}: {error:#}; including all search-path candidates",
+                input.display()
+            );
+            names = None;
         }
     }
     trace!("Identified dependency crate names: {names:?}");
-    Some(names)
+    (names, companions)
+}
+
+/// Rust metadata v12 stores the root and unhashed-root offsets followed by
+/// the 128-bit crate hash. An absent unhashed root denotes a metadata stub.
+/// See `rustc_metadata/src/rmeta/{mod,encoder,decoder}.rs`.
+#[cfg(feature = "dist-client")]
+fn metadata_v12_header(bytes: &[u8]) -> Option<(bool, [u8; 16])> {
+    let header = bytes.get(..40)?;
+    if !header.starts_with(b"rust\0\0\0\x0c") {
+        return None;
+    }
+    let stub = header[16..24] == [0; 8];
+    Some((stub, header[24..40].try_into().ok()?))
+}
+
+/// Read just the fixed metadata header of the archive member, not the
+/// potentially enormous object code or full metadata.
+#[cfg(feature = "dist-client")]
+fn rlib_stub_hash(path: &Path) -> Result<Option<[u8; 16]>> {
+    use object::{
+        Object, ObjectSection,
+        read::{ReadCache, ReadRef, archive::ArchiveFile},
+    };
+    let cache = ReadCache::new(fs::File::open(path)?);
+    let archive = ArchiveFile::parse(&cache).context("read Rust library archive")?;
+    for member in archive.members() {
+        let member = member?;
+        if member.name() != b"lib.rmeta" {
+            continue;
+        }
+        let (offset, size) = member.file_range();
+        let range = cache.range(offset, size);
+        let direct = range
+            .read_bytes_at(0, size.min(40))
+            .map_err(|()| anyhow!("read Rust metadata member header"))?;
+        let header = if direct.starts_with(b"rust") {
+            direct
+        } else {
+            let object = object::File::parse(range).context("read Rust metadata object")?;
+            let Some(section) = object
+                .section_by_name(".rmeta")
+                .or_else(|| object.section_by_name("__rmeta"))
+            else {
+                return Ok(None);
+            };
+            let Some((offset, size)) = section.file_range() else {
+                return Ok(None);
+            };
+            range
+                .read_bytes_at(offset, size.min(40))
+                .map_err(|()| anyhow!("read Rust metadata section header"))?
+        };
+        return Ok(metadata_v12_header(header).and_then(|(stub, hash)| stub.then_some(hash)));
+    }
+    Ok(None)
+}
+
+/// rustc's metadata-listing command cannot decode a stub. Locate its full
+/// companion, checking the embedded SVH rather than trusting its filename.
+#[cfg(feature = "dist-client")]
+fn dependency_probe_input<'a>(input: &'a Path, search_paths: &[PathBuf]) -> Result<Cow<'a, Path>> {
+    if input.extension() != Some(OsStr::new(RLIB_EXTENSION)) {
+        return Ok(Cow::Borrowed(input));
+    }
+    let Some(hash) = rlib_stub_hash(input)? else {
+        return Ok(Cow::Borrowed(input));
+    };
+    let sibling = input.with_extension(RMETA_EXTENSION);
+    let name = sibling
+        .file_name()
+        .context("Rust metadata companion has no filename")?;
+    for candidate in
+        iter::once(sibling.clone()).chain(search_paths.iter().map(|dir| dir.join(name)))
+    {
+        let mut file = match fs::File::open(&candidate) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let mut header = [0; 40];
+        match file.read_exact(&mut header) {
+            Ok(()) if metadata_v12_header(&header) == Some((false, hash)) => {
+                return Ok(Cow::Owned(candidate));
+            }
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!(
+        "no full metadata companion with matching crate hash for {}",
+        input.display()
+    )
 }
 
 #[cfg(feature = "dist-client")]
@@ -4673,12 +4785,16 @@ impl RustInputsPackager {
             input_dirs,
         } = self;
 
-        let dependency_names =
-            rust_dependency_names(&inputs, &env_vars, rlib_dep_reader.as_deref());
+        let (dependency_names, companions) = rust_dependency_names(
+            &inputs,
+            &crate_link_paths,
+            &env_vars,
+            rlib_dep_reader.as_deref(),
+        );
         let crate_libraries =
             rust_dependency_candidates(&crate_link_paths, dependency_names.as_ref())?;
         let mut plan = pkg::CompilerInputs::new(path_transformer);
-        for input_path in inputs.into_iter().chain(crate_libraries) {
+        for input_path in inputs.into_iter().chain(companions).chain(crate_libraries) {
             if !super::CAN_DIST_DYLIBS
                 && input_path
                     .extension()
@@ -5040,7 +5156,11 @@ impl RlibDepReader {
             .context("could not execute Rust dependency probe")?;
 
         if !status.success() {
-            bail!(format!("Failed to list deps of {}", rlib.display()))
+            bail!(
+                "rustc metadata probe for {} exited {status}: {}",
+                rlib.display(),
+                String::from_utf8_lossy(&stderr)
+            );
         }
         if !stderr.is_empty() {
             bail!(
@@ -6507,6 +6627,73 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         reader
             .discover_rlib_deps(&env_vars, &artifact)
             .expect("selected rustc must support rlib dependency reading");
+
+        // New rustc releases can emit a stub in the rlib and full metadata
+        // separately. Invoking -Z ls=root on the stub causes an ICE.
+        let stub_dir = temp.path().join("stub");
+        fs::create_dir(&stub_dir).expect("create stub fixture directory");
+        assert!(
+            process::Command::new(&rustc_path)
+                .args([
+                    "--crate-type=rlib",
+                    "--crate-name=fixture",
+                    "--emit=metadata,link",
+                    "-Zembed-metadata=no",
+                    "--out-dir",
+                ])
+                .arg(&stub_dir)
+                .arg(&source)
+                .env_clear()
+                .envs(env_vars.clone())
+                .env("RUSTC_BOOTSTRAP", "1")
+                .status()
+                .expect("compile metadata stub fixture")
+                .success()
+        );
+        let stub = stub_dir.join("libfixture.rlib");
+        let full = stub_dir.join("libfixture.rmeta");
+        assert!(
+            rlib_stub_hash(&artifact)
+                .expect("read full rlib header")
+                .is_none()
+        );
+        assert!(rlib_stub_hash(&stub).expect("read stub header").is_some());
+        assert_eq!(
+            dependency_probe_input(&stub, &[]).expect("select companion"),
+            Cow::Owned::<Path>(full.clone())
+        );
+        let deps = reader
+            .discover_rlib_deps(&env_vars, &full)
+            .expect("probe full metadata");
+        assert!(!deps.is_empty());
+
+        let search = temp.path().join("search");
+        fs::create_dir(&search).expect("create alternative search directory");
+        let alternate = search.join("libfixture.rmeta");
+        fs::rename(&full, &alternate).expect("move companion into search path");
+        assert!(dependency_probe_input(&stub, &[]).is_err());
+        // A same-named but unrelated metadata file must not be selected.
+        let mut wrong = fs::read(&alternate).expect("read companion");
+        wrong[24] ^= 1;
+        fs::write(&full, wrong).expect("write mismatched metadata");
+        assert!(dependency_probe_input(&stub, &[]).is_err());
+        assert_eq!(
+            dependency_probe_input(&stub, std::slice::from_ref(&search))
+                .expect("find matching companion in search path"),
+            Cow::Owned::<Path>(alternate.clone())
+        );
+        env_vars.push(("CARGO_PKG_NAME".into(), "fixture".into()));
+        let (names, companions) = rust_dependency_names(
+            std::slice::from_ref(&stub),
+            &[search],
+            &env_vars,
+            Some(&reader),
+        );
+        assert_eq!(
+            names.expect("precise discovery"),
+            deps.into_iter().collect()
+        );
+        assert_eq!(companions, vec![alternate]);
     }
 
     #[cfg(feature = "dist-client")]

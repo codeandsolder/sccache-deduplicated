@@ -850,8 +850,10 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                 // an ordinary nonzero exit. Preserve caller semantics by
                 // rerunning locally without writing an archive cache.
                 warn!(
-                    "native compilation failed on {:?}; retrying locally",
-                    result.source
+                    "native compilation failed on {:?} with {}; retrying locally: {}",
+                    result.source,
+                    result.output.status,
+                    String::from_utf8_lossy(&result.output.stderr)
                 );
                 fallback = DistType::Error;
             }

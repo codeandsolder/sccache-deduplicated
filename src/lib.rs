@@ -139,16 +139,13 @@ pub fn main() {
 }
 
 fn init_logging() {
-    if env::var(LOGGING_ENV).is_ok() {
-        let mut builder = env_logger::Builder::from_env(LOGGING_ENV);
-
-        // Enable millisecond precision timestamps if SCCACHE_LOG_MILLIS is set
-        if env::var("SCCACHE_LOG_MILLIS").is_ok() {
-            builder.format_timestamp_millis();
-        }
-
-        if let Err(error) = builder.try_init() {
-            eprintln!("sccache: failed to initialize logging: {error}");
-        }
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::new().filter_or(LOGGING_ENV, "warn"));
+    // Enable millisecond precision timestamps if SCCACHE_LOG_MILLIS is set.
+    if env::var("SCCACHE_LOG_MILLIS").is_ok() {
+        builder.format_timestamp_millis();
+    }
+    if let Err(error) = builder.try_init() {
+        eprintln!("sccache: failed to initialize logging: {error}");
     }
 }
