@@ -1,7 +1,17 @@
 experimental = ["wrapper-scripts"]
 
-# Isolate test processes, not compilation: managed sccache remains active
-# while Cargo builds the test binaries. Compose with cargo-affected's runner.
+# These legacy integration suites intentionally start/stop the same default
+# test daemon. serial_test's in-process lock cannot serialize nextest's
+# separate test executables. Declare the shared resource at the runner.
+# Distributed/native fixtures with private endpoints remain parallel.
+[test-groups.legacy-default-daemon]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "binary(cache_hit_rate) | binary(sccache_args) | binary(sccache_cargo) | binary(sccache_rustc) | binary(system) | binary(logging)"
+test-group = "legacy-default-daemon"
+
+# Test daemons are independent of the managed compiler cache.
 [scripts.wrapper.isolate-cache-daemon]
 command = ["env", "-u", "SCCACHE_SERVER_UDS", "-u", "SCCACHE_SERVER_PORT"]
 target-runner = "within-wrapper"

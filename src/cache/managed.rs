@@ -35,6 +35,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::config::S3CapacityConfig;
+mod analytics;
 
 const META_VERSION: &str = "2";
 const META_VERSION_KEY: &str = "sccache-version";
@@ -45,6 +46,8 @@ const LEASE_EXPIRES_KEY: &str = "sccache-lease-expires";
 const LEASE_OWNER_KEY: &str = "sccache-lease-owner";
 const CAPACITY_STATE_BASENAME: &str = ".capacity-state";
 const PRUNE_LEASE_BASENAME: &str = ".prune-lease";
+const ANALYTICS_LEASE_BASENAME: &str = ".analytics-lease-v1";
+const ANALYTICS_REPORT_BASENAME: &str = ".analytics-report-v1";
 const METADATA_SHARD_DIR: &str = "shards";
 const METADATA_SHARD_FORMAT_VERSION: u8 = 1;
 const METADATA_SHARD_BITS: u32 = 12;
@@ -433,11 +436,10 @@ impl ManagedRemoteCache {
         }
     }
 
-    async fn read_metadata_shard(
-        &self,
-        shard_path: &str,
-    ) -> anyhow::Result<Option<MetadataShardSnapshot>> {
-        let reader = match self.operator.reader(shard_path).await {
+    // Read the contents and their ETag from the same response. A separate
+    // stat could observe a newer object and invalidate optimistic concurrency.
+    async fn read_versioned_object(&self, path: &str) -> anyhow::Result<Option<(Bytes, String)>> {
+        let reader = match self.operator.reader(path).await {
             Ok(reader) => reader,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -447,11 +449,19 @@ impl ManagedRemoteCache {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let Some(metadata) = reader.metadata() else {
-            anyhow::bail!("managed cache metadata shard {shard_path} read returned no metadata");
-        };
-        let Some(etag) = metadata.etag().map(str::to_owned) else {
-            anyhow::bail!("managed cache metadata shard {shard_path} has no ETag");
+        let etag = reader
+            .metadata()
+            .and_then(|metadata| metadata.etag().map(str::to_owned))
+            .ok_or_else(|| anyhow::anyhow!("managed cache object {path} has no ETag"))?;
+        Ok(Some((body, etag)))
+    }
+
+    async fn read_metadata_shard(
+        &self,
+        shard_path: &str,
+    ) -> anyhow::Result<Option<MetadataShardSnapshot>> {
+        let Some((body, etag)) = self.read_versioned_object(shard_path).await? else {
+            return Ok(None);
         };
         let shard = deserialize_metadata_shard(&body)?;
         Ok(Some(MetadataShardSnapshot { etag, shard }))
@@ -612,7 +622,12 @@ impl ManagedRemoteCache {
             if path.starts_with(&metadata_prefix) {
                 if matches!(
                     path.strip_prefix(&metadata_prefix),
-                    Some(PRUNE_LEASE_BASENAME | CAPACITY_STATE_BASENAME)
+                    Some(
+                        PRUNE_LEASE_BASENAME
+                            | CAPACITY_STATE_BASENAME
+                            | ANALYTICS_LEASE_BASENAME
+                            | ANALYTICS_REPORT_BASENAME
+                    )
                 ) {
                     continue;
                 }
@@ -1018,18 +1033,22 @@ impl ManagedRemoteCache {
     }
 
     async fn acquire_prune_lease(&self) -> anyhow::Result<Option<PruneLease>> {
-        let path = self.lease_path();
+        self.acquire_lease_at(&self.lease_path(), self.config.lease_ttl_secs)
+            .await
+    }
+
+    async fn acquire_lease_at(
+        &self,
+        path: &str,
+        ttl_secs: u64,
+    ) -> anyhow::Result<Option<PruneLease>> {
         let now = unix_seconds();
-        let expires = now.saturating_add(self.config.lease_ttl_secs);
-        let owner = format!(
-            "{}-{}-{now}",
-            std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_owned()),
-            std::process::id()
-        );
+        let expires = now.saturating_add(ttl_secs);
+        let owner = format!("{}-{now}", self.writer_id);
         let values = prune_lease_metadata(&owner, expires);
 
         for _ in 0..CAS_ATTEMPTS {
-            match self.operator.stat(&path).await {
+            match self.operator.stat(path).await {
                 Ok(metadata) => {
                     if metadata_u64(&metadata, LEASE_EXPIRES_KEY).unwrap_or(expires) > now {
                         return Ok(None);
@@ -1039,13 +1058,13 @@ impl ManagedRemoteCache {
                     };
                     match self
                         .operator
-                        .write_with(&path, self.mutation_body())
+                        .write_with(path, self.mutation_body())
                         .if_match(etag)
                         .user_metadata(values.clone())
                         .await
                     {
                         Ok(metadata) => {
-                            let etag = self.lease_etag(&path, metadata).await?;
+                            let etag = self.lease_etag(path, metadata).await?;
                             return Ok(Some(PruneLease {
                                 etag,
                                 owner: owner.clone(),
@@ -1058,13 +1077,13 @@ impl ManagedRemoteCache {
                 Err(error) if error.kind() == ErrorKind::NotFound => {
                     match self
                         .operator
-                        .write_with(&path, self.mutation_body())
+                        .write_with(path, self.mutation_body())
                         .if_not_exists(true)
                         .user_metadata(values.clone())
                         .await
                     {
                         Ok(metadata) => {
-                            let etag = self.lease_etag(&path, metadata).await?;
+                            let etag = self.lease_etag(path, metadata).await?;
                             return Ok(Some(PruneLease {
                                 etag,
                                 owner: owner.clone(),
@@ -1079,7 +1098,6 @@ impl ManagedRemoteCache {
         }
         Ok(None)
     }
-
     async fn lease_etag(&self, path: &str, metadata: Metadata) -> anyhow::Result<String> {
         if let Some(etag) = metadata.etag() {
             return Ok(etag.to_owned());

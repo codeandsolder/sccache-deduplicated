@@ -66,7 +66,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 
-use crate::errors::{Context, Error, HttpClientError, ProcessError, Result, anyhow, bail};
+#[cfg(feature = "dist-client")]
+use crate::errors::HttpClientError;
+#[cfg(any(feature = "dist-client", test))]
+use crate::errors::anyhow;
+use crate::errors::{Context, Error, ProcessError, Result, bail};
 
 /// Can dylibs (shared libraries or proc macros) be distributed on this platform?
 #[cfg(all(
@@ -574,6 +578,8 @@ impl<T: CommandCreatorSync> Clone for Box<dyn CompilerProxy<T>> {
 }
 
 pub struct GenerateHashKeyContext<'a, T> {
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    pub native: Option<Arc<super::native::NativeCompilerClient>>,
     pub creator: &'a T,
     pub cwd: PathBuf,
     pub env_vars: Vec<(OsString, OsString)>,
@@ -649,6 +655,8 @@ where
         activity::phase(Phase::HashInputs);
         let result = self
             .generate_hash_key(GenerateHashKeyContext {
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                native: native.clone(),
                 creator: &creator,
                 cwd: cwd.clone(),
                 env_vars: env_vars.clone(),
@@ -667,7 +675,11 @@ where
             Err(e) => {
                 return match e.downcast::<ProcessError>() {
                     Ok(ProcessError(output)) => {
-                        debug!("[{out_pretty}]: process error: {output:?}");
+                        warn!(
+                            "[{out_pretty}]: input discovery failed: {}: {}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
                         Ok((CompileResult::Error, output))
                     }
                     Err(e) => Err(e),
@@ -776,7 +788,7 @@ where
                     Ok(()) => Ok(CacheLookupResult::Success(hit, output)),
                     Err(e) => {
                         if e.downcast_ref::<DecompressionFailure>().is_some() {
-                            debug!("[{out_pretty}]: Failed to decompress object");
+                            warn!("[{out_pretty}]: failed to decompress cached object: {e:#}");
                             Ok(CacheLookupResult::Miss(MissType::CacheReadError))
                         } else {
                             Err(e)
@@ -1173,7 +1185,7 @@ where
                     dist_toolchain.archive_id, job_alloc.job_id
                 );
 
-                activity::job(job_alloc.job_id.0, job_alloc.server_id.addr().to_string());
+                activity::job(job_alloc.job_id.0, job_alloc.server_id.to_string());
                 activity::phase(Phase::UploadToolchain);
                 match dist_client
                     .do_submit_toolchain(job_alloc.clone(), dist_toolchain)
@@ -1200,7 +1212,7 @@ where
         }?;
         let job_id = job_alloc.job_id;
         let server_id = job_alloc.server_id;
-        activity::job(job_id.0, server_id.addr().to_string());
+        activity::job(job_id.0, server_id.to_string());
         let worker_label = dist_client.worker_label(server_id).await;
         activity::job(job_id.0, worker_label.clone());
         activity::phase(Phase::RunDistributed);
@@ -1281,7 +1293,7 @@ where
         if jc.output.code != 0 {
             // Add server info to help diagnose host-specific failures, e.g. due to flaky hardware.
             // Failed builds are not cached so this tampering should not cause too much trouble.
-            let server_addr = server_id.addr();
+            let server_addr = server_id;
             let server_info = if worker_label == server_addr.to_string() {
                 format!("sccache: Job failed on server {server_addr}:\n")
             } else {
@@ -2887,6 +2899,8 @@ LLVM version: 6.0",
                 };
                 hasher
                     .generate_hash_key(GenerateHashKeyContext {
+                        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                        native: None,
                         creator: &creator,
                         cwd: cwd.to_path_buf(),
                         env_vars: vec![],
@@ -2952,6 +2966,8 @@ LLVM version: 6.0",
             };
             Ok(hasher
                 .generate_hash_key(GenerateHashKeyContext {
+                    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                    native: None,
                     creator: &creator,
                     cwd: cwd.to_path_buf(),
                     env_vars: vec![],
@@ -3047,6 +3063,8 @@ LLVM version: 6.0",
             };
             Ok(hasher
                 .generate_hash_key(GenerateHashKeyContext {
+                    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                    native: None,
                     creator: &creator,
                     cwd: cwd.to_path_buf(),
                     env_vars: vec![],
@@ -3129,6 +3147,8 @@ LLVM version: 6.0",
                 };
                 hasher
                     .generate_hash_key(GenerateHashKeyContext {
+                        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                        native: None,
                         creator: &creator,
                         cwd: cwd.to_path_buf(),
                         env_vars: vec![],
@@ -3202,6 +3222,8 @@ LLVM version: 6.0",
                 };
                 hasher
                     .generate_hash_key(GenerateHashKeyContext {
+                        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                        native: None,
                         creator: &creator,
                         cwd: cwd.to_path_buf(),
                         env_vars: vec![],
@@ -4179,7 +4201,7 @@ mod test_dist {
                 job_alloc: JobAlloc {
                     auth: "abcd".to_owned(),
                     job_id: JobId(0),
-                    server_id: ServerId::new(([0, 0, 0, 0], 1).into()),
+                    server_id: ServerId::from_digest([1; 32]),
                 },
                 need_toolchain: true,
             })
@@ -4236,7 +4258,7 @@ mod test_dist {
         async fn worker_label(&self, server_id: ServerId) -> String {
             match &self.outcome {
                 Outcome::Success { worker_label, .. } => worker_label.clone(),
-                Outcome::Failure(_) => server_id.addr().to_string(),
+                Outcome::Failure(_) => server_id.to_string(),
             }
         }
 

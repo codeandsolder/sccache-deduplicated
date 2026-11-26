@@ -5,16 +5,16 @@
 use std::{
     collections::BTreeMap,
     io::{self, BufRead},
-    net::SocketAddr,
 };
 
 use anyhow::{Context, Result, ensure};
-use sccache_build::ContentId;
+use sccache_build::{ContentId, PeerId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct Forecast {
     seconds: f64,
+    publication_at: f64,
     completion_seconds: f64,
     inputs_ready_at: Option<f64>,
     negotiation_at: Option<f64>,
@@ -24,38 +24,53 @@ struct Forecast {
 struct Cost {
     execution_nanoseconds: f64,
     output_bytes: f64,
+    result_bytes: f64,
     output_requests: f64,
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
 struct Assignment {
     job: u64,
-    worker: SocketAddr,
+    worker: PeerId,
     class: ContentId,
-    candidates: BTreeMap<SocketAddr, Forecast>,
-    healthy: Vec<SocketAddr>,
+    candidates: BTreeMap<PeerId, Forecast>,
+    healthy: Vec<PeerId>,
     host_prior: Cost,
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
 struct Completion {
     job: u64,
-    worker: SocketAddr,
+    worker: PeerId,
     class: ContentId,
-    predicted_seconds: Option<f64>,
-    actual_seconds: f64,
+    predicted_publication_seconds: Option<f64>,
+    actual_publication_seconds: f64,
     actual_inputs_ready_seconds: Option<f64>,
     actual_result_negotiation_seconds: Option<f64>,
     execution_nanoseconds: f64,
     upload_bytes: f64,
+    result_bytes: f64,
     upload_requests: f64,
     predicted_cost: Option<Cost>,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct Delivered {
+    job: u64,
+    worker: PeerId,
+    actual_client_completion_seconds: f64,
+    staging_nanoseconds: u64,
+    selected_bytes: u64,
+    direct_bytes: u64,
+    scheduler_bytes: u64,
+    unique_blobs: u64,
 }
 
 #[derive(Default)]
 struct Trace {
     assignments: BTreeMap<u64, Assignment>,
     completions: BTreeMap<u64, Completion>,
+    deliveries: BTreeMap<u64, Delivered>,
 }
 
 fn insert<T: PartialEq>(entries: &mut BTreeMap<u64, T>, job: u64, value: T) -> Result<()> {
@@ -94,6 +109,11 @@ impl Trace {
                     let event: Completion = serde_json::from_value(value)
                         .with_context(|| format!("invalid completion at line {}", index + 1))?;
                     insert(&mut trace.completions, event.job, event)?;
+                }
+                Some("delivered") => {
+                    let event: Delivered = serde_json::from_value(value)
+                        .with_context(|| format!("invalid delivery at line {}", index + 1))?;
+                    insert(&mut trace.deliveries, event.job, event)?;
                 }
                 _ => (),
             }
@@ -159,12 +179,21 @@ impl Errors {
 
 #[derive(Default)]
 struct Metrics {
-    completion_seconds: Errors,
+    publication_seconds: Errors,
+    client_completion_seconds: Errors,
+    selected_delivery_bytes: u128,
+    local_reuse_bytes: u128,
+    direct_delivery_bytes: u128,
+    scheduler_delivery_bytes: u128,
+    delivered_unique_blobs: u128,
+    delivery_staging_nanoseconds: u128,
     inputs_ready_seconds: Errors,
     result_negotiation_seconds: Errors,
     learned_execution_seconds: Errors,
     prior_execution_seconds: Errors,
     learned_upload_bytes: Errors,
+    learned_result_bytes: Errors,
+    prior_result_bytes: Errors,
     prior_upload_bytes: Errors,
     learned_upload_requests: Errors,
     prior_upload_requests: Errors,
@@ -173,12 +202,21 @@ struct Metrics {
 
 #[derive(Serialize)]
 struct MetricSummary {
-    completion_seconds: ErrorSummary,
+    publication_seconds: ErrorSummary,
+    client_completion_seconds: ErrorSummary,
+    selected_delivery_bytes: u128,
+    local_reuse_bytes: u128,
+    direct_delivery_bytes: u128,
+    scheduler_delivery_bytes: u128,
+    delivered_unique_blobs: u128,
+    delivery_staging_nanoseconds: u128,
     inputs_ready_seconds: ErrorSummary,
     result_negotiation_seconds: ErrorSummary,
     learned_execution_seconds: ErrorSummary,
     prior_execution_seconds: ErrorSummary,
     learned_upload_bytes: ErrorSummary,
+    learned_result_bytes: ErrorSummary,
+    prior_result_bytes: ErrorSummary,
     prior_upload_bytes: ErrorSummary,
     learned_upload_requests: ErrorSummary,
     prior_upload_requests: ErrorSummary,
@@ -202,11 +240,13 @@ impl Metrics {
             .as_ref()
             .context("missing assigned cost")?;
         ensure!(
-            completion.predicted_seconds == Some(selected.completion_seconds),
+            completion.predicted_publication_seconds == Some(selected.publication_at),
             "completion forecast differs from assignment"
         );
-        self.completion_seconds
-            .add(selected.completion_seconds, completion.actual_seconds)?;
+        self.publication_seconds.add(
+            selected.publication_at,
+            completion.actual_publication_seconds,
+        )?;
         if let Some((predicted, actual)) = selected
             .inputs_ready_at
             .zip(completion.actual_inputs_ready_seconds)
@@ -227,6 +267,10 @@ impl Metrics {
             prior.execution_nanoseconds / 1e9,
             completion.execution_nanoseconds / 1e9,
         )?;
+        self.learned_result_bytes
+            .add(predicted.result_bytes, completion.result_bytes)?;
+        self.prior_result_bytes
+            .add(prior.result_bytes, completion.result_bytes)?;
         self.learned_upload_bytes
             .add(predicted.output_bytes, completion.upload_bytes)?;
         self.prior_upload_bytes
@@ -249,14 +293,54 @@ impl Metrics {
         Ok(())
     }
 
+    fn add_delivery(&mut self, assignment: &Assignment, delivery: &Delivered) -> Result<()> {
+        ensure!(
+            assignment.worker == delivery.worker,
+            "delivery worker differs from assignment for job {}",
+            delivery.job
+        );
+        let selected = assignment
+            .candidates
+            .get(&assignment.worker)
+            .context("selected worker has no delivery forecast")?;
+        self.client_completion_seconds.add(
+            selected.completion_seconds,
+            delivery.actual_client_completion_seconds,
+        )?;
+        let remote = delivery
+            .direct_bytes
+            .checked_add(delivery.scheduler_bytes)
+            .context("delivery byte count overflow")?;
+        let local = delivery
+            .selected_bytes
+            .checked_sub(remote)
+            .context("delivery exceeds selected closure")?;
+        self.selected_delivery_bytes += u128::from(delivery.selected_bytes);
+        self.local_reuse_bytes += u128::from(local);
+        self.direct_delivery_bytes += u128::from(delivery.direct_bytes);
+        self.scheduler_delivery_bytes += u128::from(delivery.scheduler_bytes);
+        self.delivered_unique_blobs += u128::from(delivery.unique_blobs);
+        self.delivery_staging_nanoseconds += u128::from(delivery.staging_nanoseconds);
+        Ok(())
+    }
+
     fn summarize(self) -> MetricSummary {
         MetricSummary {
-            completion_seconds: self.completion_seconds.summarize(),
+            publication_seconds: self.publication_seconds.summarize(),
+            client_completion_seconds: self.client_completion_seconds.summarize(),
+            selected_delivery_bytes: self.selected_delivery_bytes,
+            local_reuse_bytes: self.local_reuse_bytes,
+            direct_delivery_bytes: self.direct_delivery_bytes,
+            scheduler_delivery_bytes: self.scheduler_delivery_bytes,
+            delivered_unique_blobs: self.delivered_unique_blobs,
+            delivery_staging_nanoseconds: self.delivery_staging_nanoseconds,
             inputs_ready_seconds: self.inputs_ready_seconds.summarize(),
             result_negotiation_seconds: self.result_negotiation_seconds.summarize(),
             learned_execution_seconds: self.learned_execution_seconds.summarize(),
             prior_execution_seconds: self.prior_execution_seconds.summarize(),
             learned_upload_bytes: self.learned_upload_bytes.summarize(),
+            learned_result_bytes: self.learned_result_bytes.summarize(),
+            prior_result_bytes: self.prior_result_bytes.summarize(),
             prior_upload_bytes: self.prior_upload_bytes.summarize(),
             learned_upload_requests: self.learned_upload_requests.summarize(),
             prior_upload_requests: self.prior_upload_requests.summarize(),
@@ -270,15 +354,17 @@ struct Report {
     assignments: usize,
     completions: usize,
     matched: usize,
+    deliveries: usize,
+    matched_deliveries: usize,
     assignments_without_completion: usize,
     completions_without_assignment: usize,
     total: MetricSummary,
-    workers: BTreeMap<SocketAddr, MetricSummary>,
+    workers: BTreeMap<PeerId, MetricSummary>,
 }
 
 fn evaluate(trace: &Trace) -> Result<Report> {
     let mut metrics = Metrics::default();
-    let mut workers = BTreeMap::<SocketAddr, Metrics>::new();
+    let mut workers = BTreeMap::<PeerId, Metrics>::new();
     let mut matched = 0;
     for (&id, completion) in &trace.completions {
         if let Some(assignment) = trace.assignments.get(&id) {
@@ -290,11 +376,27 @@ fn evaluate(trace: &Trace) -> Result<Report> {
             matched += 1;
         }
     }
-    ensure!(matched > 0, "no matched native placement observations");
+    let mut matched_deliveries = 0;
+    for (&id, delivery) in &trace.deliveries {
+        if let Some(assignment) = trace.assignments.get(&id) {
+            metrics.add_delivery(assignment, delivery)?;
+            workers
+                .entry(assignment.worker)
+                .or_default()
+                .add_delivery(assignment, delivery)?;
+            matched_deliveries += 1;
+        }
+    }
+    ensure!(
+        matched > 0 || matched_deliveries > 0,
+        "no matched native placement observations"
+    );
     Ok(Report {
         assignments: trace.assignments.len(),
         completions: trace.completions.len(),
         matched,
+        deliveries: trace.deliveries.len(),
+        matched_deliveries,
         assignments_without_completion: trace.assignments.len() - matched,
         completions_without_assignment: trace.completions.len() - matched,
         total: metrics.summarize(),
@@ -320,26 +422,41 @@ mod tests {
     fn matches_prefixed_logs_and_reports_errors_without_fabricating_counterfactuals() -> Result<()>
     {
         let class = ContentId([7; 32]);
-        let worker = "127.0.0.1:1";
-        let other = "127.0.0.1:2";
+        let worker = PeerId::from_digest([1; 32]).to_string();
+        let other = PeerId::from_digest([2; 32]).to_string();
         let assigned = serde_json::json!({
             "kind": "assigned", "job": 1, "worker": worker, "class": class,
-            "candidates": {(worker): {"seconds": 2.01, "completion_seconds": 1.5, "inputs_ready_at": 0.25, "negotiation_at": 1.25}, (other): {"seconds": 2.0, "completion_seconds": 1.8}},
+            "candidates": {(worker.clone()): {"seconds": 2.01, "publication_at": 1.5, "completion_seconds": 2.0, "inputs_ready_at": 0.25, "negotiation_at": 1.25}, (other.clone()): {"seconds": 2.0, "publication_at": 1.8, "completion_seconds": 1.9}},
             "healthy": [worker, other],
-            "host_prior": {"execution_nanoseconds": 1_000_000_000, "output_bytes": 100, "output_requests": 1},
+            "host_prior": {"execution_nanoseconds": 1_000_000_000, "output_bytes": 100, "result_bytes": 100, "output_requests": 1},
         });
         let completed = serde_json::json!({
             "kind": "completed", "job": 1, "worker": worker, "class": class,
-            "predicted_seconds": 1.5, "actual_seconds": 2.0, "actual_inputs_ready_seconds": 0.5, "actual_result_negotiation_seconds": 1.75, "execution_nanoseconds": 1_500_000_000,
-            "upload_bytes": 0, "upload_requests": 0,
-            "predicted_cost": {"execution_nanoseconds": 1_400_000_000, "output_bytes": 0, "output_requests": 0},
+            "predicted_publication_seconds": 1.5, "actual_publication_seconds": 2.0, "actual_inputs_ready_seconds": 0.5, "actual_result_negotiation_seconds": 1.75, "execution_nanoseconds": 1_500_000_000,
+            "upload_bytes": 0, "result_bytes": 1000, "upload_requests": 0,
+            "predicted_cost": {"execution_nanoseconds": 1_400_000_000, "output_bytes": 0, "result_bytes": 1000, "output_requests": 0},
+        });
+        let delivered = serde_json::json!({
+            "kind": "delivered", "job": 1, "worker": worker, "actual_client_completion_seconds": 2.25,
+            "staging_nanoseconds": 750_000_000, "selected_bytes": 1000, "direct_bytes": 800, "scheduler_bytes": 100, "unique_blobs": 2,
         });
         let mut unmatched = assigned.clone();
         unmatched["job"] = serde_json::json!(2);
-        let lines =
-            format!("other log\n[TRACE] {assigned}\n{unmatched}\n{completed}\n{completed}\n");
+        let lines = format!(
+            "other log\n[TRACE] {assigned}\n{unmatched}\n{completed}\n{completed}\n{delivered}\n{delivered}\n"
+        );
         let report = evaluate(&Trace::read(lines.as_bytes())?)?;
         assert_eq!(report.matched, 1);
+        assert_eq!(report.matched_deliveries, 1);
+        assert_eq!(
+            report.total.client_completion_seconds.mean_absolute_error,
+            Some(0.25)
+        );
+        assert_eq!(report.total.selected_delivery_bytes, 1000);
+        assert_eq!(report.total.local_reuse_bytes, 100);
+        assert_eq!(report.total.direct_delivery_bytes, 800);
+        assert_eq!(report.total.scheduler_delivery_bytes, 100);
+        assert_eq!(report.total.delivered_unique_blobs, 2);
         assert_eq!(
             report.total.inputs_ready_seconds.mean_absolute_error,
             Some(0.25)
@@ -350,7 +467,7 @@ mod tests {
         );
         assert_eq!(report.assignments_without_completion, 1);
         assert_eq!(
-            report.total.completion_seconds.mean_absolute_error,
+            report.total.publication_seconds.mean_absolute_error,
             Some(0.5)
         );
         assert!(
@@ -367,6 +484,14 @@ mod tests {
         assert_eq!(
             report.total.learned_upload_bytes.mean_absolute_error,
             Some(0.0)
+        );
+        assert_eq!(
+            report.total.learned_result_bytes.mean_absolute_error,
+            Some(0.0)
+        );
+        assert_eq!(
+            report.total.prior_result_bytes.mean_absolute_error,
+            Some(900.0)
         );
         assert!(
             report

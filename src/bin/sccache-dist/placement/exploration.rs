@@ -22,7 +22,7 @@ const MAX_ATTEMPTS: usize = 128;
 type Question = (Direction, BTreeSet<Peer>);
 
 #[derive(Default)]
-pub(crate) struct Exploration {
+pub struct Exploration {
     attempts: BTreeMap<Question, Instant>,
 }
 
@@ -65,7 +65,10 @@ fn question(
         return None;
     }
     let remaining = network.remaining_after(&super::active_demands(network), delay);
-    if remaining.contains_key(&peer) {
+    if remaining
+        .keys()
+        .any(|other| other.principal() == peer.principal())
+    {
         // This worker is already contributing to the measured active set.
         return None;
     }
@@ -150,9 +153,19 @@ impl<'a> Opportunity<'a> {
         plan: &NativeTransferPlan<'_>,
     ) -> Self {
         let inputs = additional_inputs(details, requested);
-        let encoded = plan
-            .send
-            .wire_bytes(Peer::Worker(server.addr()), logical_size(&inputs));
+        let peer = plan.path_peer(Peer::Worker(server), Direction::Send);
+        let logical = logical_size(&inputs);
+        let encoded = prediction.map_or_else(
+            || plan.send.wire_bytes(peer, logical),
+            |estimate| {
+                // Never seek a scheduler-link overlap using content forecast to
+                // arrive directly. The prediction includes all reserved input
+                // demand, so keep the opportunity bounded by additional bytes.
+                estimate
+                    .input_wire_bytes
+                    .min(plan.send.wire_bytes(peer, logical))
+            },
+        );
         Self {
             server,
             inputs,
@@ -168,11 +181,11 @@ impl<'a> Opportunity<'a> {
         history: &Exploration,
         now: Instant,
     ) -> Option<Question> {
-        let peer = Peer::Worker(self.server.addr());
+        let peer = Peer::Worker(self.server);
         if let Some(question) = question(
-            plan.send,
+            &plan.send,
             Direction::Send,
-            peer,
+            plan.path_peer(peer, Direction::Send),
             self.encoded,
             ASSIGNMENT_MARGIN,
         ) && history.available(&question, now)
@@ -185,9 +198,9 @@ impl<'a> Opportunity<'a> {
         }
         let estimate = native_estimate(forecast, requested, peer, plan);
         question(
-            plan.receive,
+            &plan.receive,
             Direction::Receive,
-            peer,
+            plan.path_peer(peer, Direction::Receive),
             u128::from(forecast.cost.output_bytes),
             estimate.negotiation_at,
         )
@@ -210,18 +223,18 @@ impl<'a> Opportunity<'a> {
 /// near-equivalent placements with no additional estimated traffic. This
 /// changes *which already admitted worker executes the real job*, not what
 /// data is requested. Never idle an executor or postpone a transfer.
-pub(crate) fn choose_worker(
+pub fn choose_worker(
     candidates: &[(ServerId, f64)],
     servers: &HashMap<ServerId, ServerDetails>,
     requested: &NativeInputBlobs,
-    predictions: &BTreeMap<std::net::SocketAddr, super::PlacementEstimate>,
+    predictions: &BTreeMap<ServerId, super::PlacementEstimate>,
     plan: &NativeTransferPlan<'_>,
     history: &mut Exploration,
     now: Instant,
 ) -> Option<ServerId> {
-    let &(best, best_eta) = candidates.iter().min_by(|(a, left), (b, right)| {
-        left.total_cmp(right).then_with(|| a.addr().cmp(&b.addr()))
-    })?;
+    let &(best, best_eta) = candidates
+        .iter()
+        .min_by(|(a, left), (b, right)| left.total_cmp(right).then_with(|| a.cmp(b)))?;
     let limit = best_eta + (best_eta * 0.01).min(0.020);
     if predictions
         .values()
@@ -249,7 +262,7 @@ pub(crate) fn choose_worker(
         best,
         servers.get(&best)?,
         requested,
-        predictions.get(&best.addr()),
+        predictions.get(&best),
         plan,
     );
     if baseline.question(requested, plan, history, now).is_some() {
@@ -261,22 +274,15 @@ pub(crate) fn choose_worker(
         .iter()
         .filter(|(id, eta)| *id != best && *eta <= limit)
         .filter_map(|&(id, eta)| {
-            let candidate = Opportunity::new(
-                id,
-                servers.get(&id)?,
-                requested,
-                predictions.get(&id.addr()),
-                plan,
-            );
+            let candidate =
+                Opportunity::new(id, servers.get(&id)?, requested, predictions.get(&id), plan);
             if !candidate.no_extra_traffic(&baseline) {
                 return None;
             }
             let question = candidate.question(requested, plan, history, now)?;
             Some((id, eta, question))
         })
-        .min_by(|(a, left, _), (b, right, _)| {
-            left.total_cmp(right).then_with(|| a.addr().cmp(&b.addr()))
-        });
+        .min_by(|(a, left, _), (b, right, _)| left.total_cmp(right).then_with(|| a.cmp(b)));
     if let Some((id, _, question)) = alternative {
         debug!("Native placement learning from demanded transfers: {question:?}");
         history.record(question, now);

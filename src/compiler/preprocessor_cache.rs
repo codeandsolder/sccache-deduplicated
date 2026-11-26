@@ -374,7 +374,8 @@ mod digest_cache {
     use super::{
         Digest, Metadata, MetadataCtimeExt, Path, PathBuf, SystemTime, TimeMacroFinder, Timestamp,
     };
-    use crate::lru_disk_cache::lru_cache::LruCache;
+    use lru::LruCache;
+    use std::num::NonZeroUsize;
     use std::os::unix::fs::MetadataExt;
     use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
@@ -382,10 +383,10 @@ mod digest_cache {
     /// Digests of the files hashed for the preprocessor cache, so that a
     /// direct-mode hit does not re-read and re-hash every header.
     pub(super) static FILE_DIGESTS: LazyLock<Mutex<LruCache<PathBuf, CachedFileDigest>>> =
-        LazyLock::new(|| Mutex::new(LruCache::new(MAX_CACHED_FILE_DIGESTS)));
+        LazyLock::new(|| Mutex::new(LruCache::sparse(MAX_CACHED_FILE_DIGESTS)));
 
     /// Maximum number of memoized paths; cold entries are evicted individually.
-    const MAX_CACHED_FILE_DIGESTS: u64 = 100_000;
+    const MAX_CACHED_FILE_DIGESTS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(99_999);
 
     /// How old a file's mtime and ctime must be for its digest to be remembered.
     /// File timestamps come from a coarse clock, so a file rewritten right after
@@ -489,7 +490,7 @@ mod digest_cache {
             let mut digests = FILE_DIGESTS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            digests.insert(
+            digests.put(
                 path.to_owned(),
                 CachedFileDigest {
                     stat,
@@ -1072,7 +1073,7 @@ mod test {
 
     #[cfg(unix)]
     fn is_digest_cached(path: &Path) -> bool {
-        FILE_DIGESTS.lock().unwrap().contains_key(path)
+        FILE_DIGESTS.lock().unwrap().contains(path)
     }
 
     /// Writes `contents` to `path` until its ctime changes: file timestamps come

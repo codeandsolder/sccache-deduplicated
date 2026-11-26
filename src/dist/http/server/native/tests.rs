@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, io::Cursor};
+use sccache_cluster_identity::{
+    ClusterCa, EnrollmentAuthority, Identity, PeerConfig, PeerCredentials, Registry, Role,
+    TlsCredentials,
+};
+use std::{collections::BTreeMap, io::Cursor, sync::Mutex};
 
 use super::*;
 use crate::{
@@ -10,20 +14,6 @@ use crate::{
     },
     dist::{JobId, ServerId, native::NativeCacheClient},
 };
-
-struct ClientCheck;
-
-impl ClientAuthCheck for ClientCheck {
-    fn check(&self, token: &str) -> std::result::Result<(), super::super::ClientVisibleMsg> {
-        if token == "client-token" {
-            Ok(())
-        } else {
-            Err(super::super::ClientVisibleMsg::from_nonsensitive(
-                "invalid client".into(),
-            ))
-        }
-    }
-}
 
 fn action(root: &TreeManifest) -> Result<ExecutionSpec> {
     let id = root.id()?;
@@ -76,15 +66,52 @@ fn limits() -> SessionLimits {
     }
 }
 
-fn make_client(url: &reqwest::Url, token: &str) -> Result<NativeCacheClient> {
+struct TestEndpoint {
+    url: url::Url,
+    scheduler: ServerId,
+    client: Arc<PeerCredentials>,
+    rejected_config: PeerConfig,
+    worker: Arc<PeerCredentials>,
+    sources: Arc<Mutex<BTreeMap<ContentId, Vec<BlobSource>>>>,
+}
+fn make_client(endpoint: &TestEndpoint, token: &str) -> Result<NativeCacheClient> {
+    let peer = match token {
+        "client-token" => &endpoint.client,
+        "worker-token" => &endpoint.worker,
+        _ => {
+            let token = token.to_owned();
+            return NativeCacheClient::new(
+                &endpoint.url,
+                crate::dist::cluster::open_peer(
+                    endpoint.rejected_config.clone(),
+                    &endpoint.url,
+                    Role::Client,
+                    move || Ok(token.clone()),
+                )?,
+                Duration::from_secs(10),
+                1024 * 1024,
+            );
+        }
+    };
     NativeCacheClient::new(
-        url.clone(),
-        token.into(),
+        &endpoint.url,
+        Arc::clone(peer),
         Duration::from_secs(10),
         1024 * 1024,
     )
 }
-
+impl TestEndpoint {
+    fn raw(&self, peer: &PeerCredentials) -> Result<(wreq::Client, url::Url)> {
+        let credential = peer.current()?;
+        let transport = sccache_cluster_identity::ClusterHttpClient::new(
+            &credential,
+            self.scheduler,
+            Role::Scheduler,
+            sccache_cluster_identity::endpoint(&self.url)?,
+        )?;
+        Ok((transport.client(), transport.base().clone()))
+    }
+}
 #[derive(Debug, PartialEq, Eq)]
 enum Observation {
     Staged,
@@ -95,84 +122,165 @@ enum Observation {
 type Observations = Mutex<Vec<(ServerId, JobId, Observation)>>;
 
 fn with_native_service(
-    operation: impl FnOnce(&reqwest::Url, &NativeSessions, &NetworkMeter, &Observations) -> Result<()>,
+    operation: impl FnOnce(&TestEndpoint, &NativeSessions, &NetworkMeter, &Observations) -> Result<()>,
 ) -> Result<()> {
     let directory = tempfile::tempdir()?;
     let sessions = Arc::new(NativeSessions::new(
         NativeStore::open(directory.path())?,
         limits(),
     )?);
-    let worker: ServerId = "127.0.0.1:10501".parse()?;
+    let cluster = directory.path().join("cluster");
+    std::fs::create_dir_all(&cluster)?;
+    let authority = EnrollmentAuthority::new(
+        ClusterCa::open(&cluster.join("ca-key.pem"))?,
+        Registry::initialize(&cluster.join("registry.bin"))?,
+        7,
+    )?;
+    let identity = Identity::open(&cluster.join("key.pem"))?;
+    let scheduler = identity.id()?;
+    let leaf = authority.scheduler_certificate(&identity)?;
+    let ca_certificate = cluster.join("ca.pem");
+    sccache_cluster_identity::publish_trust_anchor(authority.certificate(), &ca_certificate)?;
+    let credential = TlsCredentials::new(
+        identity,
+        leaf,
+        authority.certificate().clone(),
+        Role::Scheduler,
+    )?;
+    let tls = Arc::new(ClusterListener::new(&credential)?);
+    let client_config = PeerConfig {
+        directory: cluster.join("client"),
+        ca_certificate,
+        scheduler_id: scheduler,
+    };
+    let worker_config = PeerConfig {
+        directory: cluster.join("worker"),
+        ..client_config.clone()
+    };
+    let worker = sccache_cluster_identity::open_identity(&worker_config)?.id()?;
+    let enrollment = Arc::new(SchedulerEnrollment::new(
+        authority,
+        move |role, id, _, token| match role {
+            Role::Client => token == "client-token",
+            Role::Worker => id == worker && token == "worker-token",
+            Role::Scheduler => false,
+        },
+    ));
     let network = Arc::new(NetworkMeter::default());
     let observations = Arc::new(Observations::default());
-    let server = rouille::Server::new("127.0.0.1:0", {
-        let sessions = Arc::clone(&sessions);
-        let network = Arc::clone(&network);
-        let observations = Arc::clone(&observations);
-        move |request| {
-            respond(
-                request,
-                NativeServices {
-                    sessions: &sessions,
-                    packages: None,
-                    network: &network,
-                    observe_result: &|server, job, event| {
-                        let result = match event {
-                            crate::dist::NativeLifecycleEvent::InputsStaged => Observation::Staged,
-                            crate::dist::NativeLifecycleEvent::Negotiated => {
-                                Observation::Negotiated
-                            }
-                            crate::dist::NativeLifecycleEvent::Committed {
-                                manifest,
-                                retained_after_begin,
-                                ..
-                            } => Observation::Committed(manifest.clone(), retained_after_begin),
-                        };
-                        observations.lock().unwrap().push((server, job, result));
+    let sources = Arc::new(Mutex::new(BTreeMap::<ContentId, Vec<BlobSource>>::new()));
+    let server = Listener::bind(
+        "127.0.0.1:0".parse()?,
+        tls,
+        ListenerRole::Scheduler(enrollment),
+        4,
+        {
+            let sessions = Arc::clone(&sessions);
+            let network = Arc::clone(&network);
+            let observations = Arc::clone(&observations);
+            let sources = Arc::clone(&sources);
+            native_router(move |request, role, operation| {
+                respond(
+                    request,
+                    role,
+                    operation,
+                    NativeServices {
+                        sessions: &sessions,
+                        packages: None,
+                        network: &network,
+                        source_plan: &|blob, _, _| {
+                            Ok(sources
+                                .lock()
+                                .unwrap()
+                                .get(&blob.id)
+                                .cloned()
+                                .unwrap_or_default())
+                        },
+                        observe_result: &|server, job, event| {
+                            let result = match event {
+                                crate::dist::NativeLifecycleEvent::Delivered(_) => return,
+                                crate::dist::NativeLifecycleEvent::InputsStaged => {
+                                    Observation::Staged
+                                }
+                                crate::dist::NativeLifecycleEvent::Negotiated => {
+                                    Observation::Negotiated
+                                }
+                                crate::dist::NativeLifecycleEvent::Committed {
+                                    manifest,
+                                    retained_after_begin,
+                                    ..
+                                } => Observation::Committed(manifest.clone(), retained_after_begin),
+                            };
+                            observations.lock().unwrap().push((server, job, result));
+                        },
                     },
-                },
-                &move |_, _, _| {
-                    Ok(ScheduleReply::Assigned(WorkerAllocation {
-                        address: worker.addr(),
-                        job: 42,
-                        auth: "allocation-proof".into(),
-                        certificate: vec![1],
-                    }))
-                },
-                &ClientCheck,
-                &move |token| (token == "worker-token").then_some(worker),
-                1024 * 1024,
-            )
-        }
-    })
-    .map_err(|error| anyhow!("{error}"))?
-    .pool_size(4);
-    let url = reqwest::Url::parse(&format!("http://{}/", server.server_addr()))?;
-    let (handle, stop) = server.stoppable();
-    let outcome = operation(&url, &sessions, &network, &observations);
-    stop.send(()).map_err(|error| anyhow!("{error}"))?;
+                    &move |_, _, _| {
+                        Ok(ScheduleReply::Assigned(WorkerAllocation {
+                            peer: worker,
+                            routes: sccache_peer_identity::RouteSet::new(
+                                "127.0.0.1:10501".parse().unwrap(),
+                                [],
+                            ),
+                            job: 42,
+                            auth: "allocation-proof".into(),
+                        }))
+                    },
+                    1024 * 1024,
+                )
+            })
+        },
+    )?;
+    let url = url::Url::parse(&format!("https://{}/", server.local_addr()?))?;
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let handle = thread::spawn(move || server.run_until(stopped));
+    let outcome = (|| {
+        let rejected_config = PeerConfig {
+            directory: cluster.join("rejected"),
+            ..client_config.clone()
+        };
+        let client = crate::dist::cluster::open_peer(client_config, &url, Role::Client, || {
+            Ok("client-token".into())
+        })?;
+        let worker = crate::dist::cluster::open_peer(worker_config, &url, Role::Worker, || {
+            Ok("worker-token".into())
+        })?;
+        let endpoint = TestEndpoint {
+            url,
+            scheduler,
+            client,
+            rejected_config,
+            worker,
+            sources,
+        };
+        operation(&endpoint, &sessions, &network, &observations)
+    })();
+    let _ = stop.send(());
     handle
         .join()
-        .map_err(|_| anyhow!("native HTTP test server panicked"))?;
+        .map_err(|_| anyhow::anyhow!("native HTTPS test server panicked"))??;
     outcome
 }
 
 fn verify_compressed_download(
-    url: &reqwest::Url,
+    endpoint: &TestEndpoint,
     ticket: crate::build_runtime::wire::Ticket,
     blob: BlobRef,
     bytes: &[u8],
 ) -> Result<()> {
     // Negotiation preserves the authenticated verified-bytes contract.
-    let compressed = reqwest::blocking::Client::new()
-        .post(url.join("/api/v5/native/client/download")?)
-        .bearer_auth("client-token")
-        .header("Content-Type", "application/octet-stream")
-        .body(codec().serialize(&DownloadRequest {
-            ticket,
-            id: blob.id,
-        })?)
-        .send()?
+    let (http, url) = endpoint.raw(&endpoint.client)?;
+    let compressed = crate::http_client::io_runtime()?
+        .block_on(
+            http.post(url.join("/api/v5/native/client/download")?.as_str())
+                .bearer_auth("client-token")
+                .header("Content-Type", "application/octet-stream")
+                .body(codec().serialize(&DownloadRequest {
+                    ticket,
+                    id: blob.id,
+                })?)
+                .timeout(Duration::from_secs(10))
+                .send(),
+        )?
         .error_for_status()?;
     assert_eq!(
         compressed
@@ -184,7 +292,7 @@ fn verify_compressed_download(
     );
     let mut decoded = Vec::new();
     crate::build_runtime::transfer_native_blob(
-        compressed,
+        crate::http_client::ResponseReader::new(compressed)?,
         std::io::sink(),
         &mut decoded,
         blob,
@@ -194,13 +302,160 @@ fn verify_compressed_download(
     Ok(())
 }
 
+fn verify_peer_delivery(
+    endpoint: &TestEndpoint,
+    client: &NativeCacheClient,
+    ticket: crate::build_runtime::wire::Ticket,
+    blob: BlobRef,
+    bytes: &[u8],
+    network: &NetworkMeter,
+    committed: bool,
+) -> Result<()> {
+    use crate::dist::JobAuthorizer;
+    use std::{
+        io::Write,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+    let worker = endpoint.worker.current()?;
+    let worker_id = worker.id()?;
+    let authorizer = super::super::JWTJobAuthorizer::boxed(&[7; super::super::JWT_KEY_LENGTH])?;
+    let recipient = BlobRecipient::Client(endpoint.client.current()?.id()?);
+    let token = authorizer.generate_blob_token(blob, recipient)?;
+    let revocations = Arc::new(super::super::cluster_http::Revocations::default());
+    revocations.update(Vec::new());
+    let bad = Arc::new(AtomicBool::new(false));
+    let server = Listener::bind(
+        "127.0.0.1:0".parse()?,
+        Arc::new(ClusterListener::new(&worker)?),
+        ListenerRole::Worker {
+            scheduler: endpoint.scheduler,
+            revocations,
+        },
+        2,
+        {
+            let bytes = bytes.to_vec();
+            let bad = Arc::clone(&bad);
+            routes(
+                Router::new().route(
+                    "/api/v3/distserver/native_blob",
+                    super::super::cluster_http::route(
+                        MethodFilter::POST,
+                        move |_: &(), request| {
+                            serve_peer_blob(request, &*authorizer, |requested| {
+                                if requested != blob {
+                                    return Ok(None);
+                                }
+                                let mut file = tempfile::tempfile()?;
+                                if bad.load(Ordering::Relaxed) {
+                                    file.write_all(b"corrupt")?;
+                                } else {
+                                    file.write_all(&bytes)?;
+                                }
+                                file.rewind()?;
+                                Ok(Some((file, BlobEncoding::Raw)))
+                            })
+                            .unwrap_or_else(|_| {
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "test peer response failed",
+                                )
+                                    .into_response()
+                            })
+                        },
+                    ),
+                ),
+                (),
+            )
+        },
+    )?;
+    let address = server.local_addr()?;
+    endpoint.sources.lock().unwrap().insert(
+        blob.id,
+        vec![BlobSource {
+            peer: worker_id,
+            routes: sccache_peer_identity::RouteSet::new(address, []),
+            token,
+        }],
+    );
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let handle = thread::spawn(move || server.run_until(stopped));
+    let outcome = (|| {
+        let plans = client.source_plans(ticket, &[blob]);
+        let plan = plans
+            .get(&blob.id)
+            .context("missing authorized result source")?;
+        assert_eq!(plan.scheduler_present, committed);
+        assert_eq!(plan.sources.len(), 1);
+        // The source grant comes from the live scheduler, but the configured
+        // data fallback is deliberately unavailable. The worker must supply
+        // the bytes directly without contacting that data listener.
+        let unavailable = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let base = url::Url::parse(&format!("https://{}/", unavailable.local_addr()?))?;
+        let direct = NativeCacheClient::new(
+            &base,
+            Arc::clone(&endpoint.client),
+            Duration::from_secs(10),
+            1024 * 1024,
+        )?;
+        let before = network
+            .snapshot()
+            .send
+            .peers
+            .values()
+            .map(|peer| peer.body_bytes)
+            .sum::<u64>();
+        let receive = |reader, encoding| {
+            let mut output = Vec::new();
+            crate::build_runtime::transfer_native_blob(
+                reader,
+                std::io::sink(),
+                &mut output,
+                blob,
+                encoding,
+            )?;
+            Ok(output)
+        };
+        assert_eq!(
+            direct
+                .try_peer_blob(plan, receive)
+                .context("direct worker delivery failed")?,
+            bytes
+        );
+        let after = network
+            .snapshot()
+            .send
+            .peers
+            .values()
+            .map(|peer| peer.body_bytes)
+            .sum::<u64>();
+        assert_eq!(before, after);
+        bad.store(true, Ordering::Relaxed);
+        assert!(direct.try_peer_blob(plan, receive).is_none());
+        // The durable scheduler copy still restores the result, without a rerun.
+        if committed {
+            let mut fallback = Vec::new();
+            client.download(ticket, blob, &mut fallback)?;
+            assert_eq!(fallback, bytes);
+        } else {
+            assert!(client.download(ticket, blob, Vec::new()).is_err());
+        }
+        Ok(())
+    })();
+    let _ = stop.send(());
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("peer delivery test listener panicked"))??;
+    endpoint.sources.lock().unwrap().remove(&blob.id);
+    outcome
+}
+
 #[test]
 fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
     with_native_service(|url, sessions, network, observations| {
         let client = make_client(url, "client-token")?;
         let worker_client = make_client(url, "worker-token")?.for_worker(JobId(42));
         let wrong_job = worker_client.clone().for_worker(JobId(43));
-        let unauthorized = make_client(url, "bad-token")?;
+        let unauthorized = make_client(url, "bad-token");
         let root = TreeManifest {
             root: TreeMetadata {
                 mode: 0o755,
@@ -216,15 +471,7 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         assert_eq!(client.commit_tree(offer.ticket)?, root.id()?);
         let spec = action(&root)?;
 
-        assert!(
-            unauthorized
-                .admit(
-                    &spec,
-                    crate::build_runtime::ActionMode::Reuse,
-                    &BTreeMap::new()
-                )
-                .is_err()
-        );
+        assert!(unauthorized.is_err());
 
         let NativeAdmission::Compile { ticket } = client.admit(
             &spec,
@@ -278,6 +525,33 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
             worker_client.begin(ticket, output.clone())?.missing,
             vec![blob]
         );
+        assert_eq!(client.status(ticket)?, NativeStatus::Compiling);
+        assert_eq!(
+            sessions.status_with_preview(ticket, true)?,
+            NativeStatus::Negotiated(output.clone())
+        );
+        assert_eq!(
+            sessions.authorize_blob_sources(ticket, Publisher::Client, &[blob])?,
+            (Some(url.worker.current()?.id()?), vec![false])
+        );
+        assert!(
+            sessions
+                .download(ticket, Publisher::Client, blob.id)
+                .unwrap_err()
+                .is::<NativeContentPending>()
+        );
+        assert!(
+            sessions
+                .authorize_blob_sources(
+                    ticket,
+                    Publisher::Client,
+                    &[BlobRef {
+                        size: blob.size + 1,
+                        ..blob
+                    }]
+                )
+                .is_err()
+        );
         assert!(
             worker_client
                 .commit(ticket, Duration::from_secs(300), None)
@@ -288,7 +562,7 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
                 .commit(ticket, Duration::from_secs(300), None)
                 .is_err()
         );
-        let owner: ServerId = "127.0.0.1:10501".parse()?;
+        let owner = url.worker.current()?.id()?;
         assert_eq!(
             *observations.lock().unwrap(),
             vec![(owner, JobId(42), Observation::Negotiated)]
@@ -303,9 +577,50 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
                 .upload(ticket, blob, Cursor::new(vec![0; bytes.len()]))
                 .is_err()
         );
+        verify_peer_delivery(url, &client, ticket, blob, &bytes, network, false)?;
         worker_client.upload(ticket, blob, Cursor::new(bytes.clone()))?;
         let retention = Duration::from_millis(299_123);
         assert_eq!(worker_client.commit(ticket, retention, None)?, output);
+        assert_eq!(
+            sessions.authorize_blob_sources(ticket, Publisher::Client, &[blob])?,
+            (Some(owner), vec![true])
+        );
+        assert!(
+            sessions
+                .authorize_blob_sources(
+                    ticket,
+                    Publisher::Client,
+                    &[BlobRef {
+                        size: blob.size + 1,
+                        ..blob
+                    }]
+                )
+                .is_err()
+        );
+        assert!(
+            sessions
+                .authorize_blob_sources(ticket, Publisher::Client, &[])
+                .is_err()
+        );
+        let (http, base) = url.raw(&url.client)?;
+        let source_request = |blobs: Vec<BlobRef>| -> Result<wreq::Response> {
+            Ok(crate::http_client::io_runtime()?.block_on(
+                http.post(base.join("/api/v5/native/client/blob_sources")?.as_str())
+                    .header("Content-Type", "application/octet-stream")
+                    .body(codec().serialize(&BlobSourceRequest { ticket, blobs })?)
+                    .timeout(Duration::from_secs(10))
+                    .send(),
+            )?)
+        };
+        assert_eq!(source_request(vec![blob])?.status(), http::StatusCode::OK);
+        assert!(
+            !source_request(vec![BlobRef {
+                size: blob.size + 1,
+                ..blob
+            }])?
+            .status()
+            .is_success()
+        );
         assert_eq!(
             *observations.lock().unwrap(),
             vec![
@@ -318,13 +633,16 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
             ]
         );
         assert_eq!(client.status(ticket)?, NativeStatus::Ready(output.clone()));
+        verify_peer_delivery(url, &client, ticket, blob, &bytes, network, true)?;
         let mut downloaded = Vec::new();
         client.download(ticket, blob, &mut downloaded)?;
         assert_eq!(downloaded, bytes);
         verify_compressed_download(url, ticket, blob, &bytes)?;
         let measured = network.snapshot();
-        let worker = Peer::Worker("127.0.0.1:10501".parse()?);
-        let client_peer = Peer::Client("127.0.0.1".parse()?);
+        let ip = std::net::Ipv4Addr::LOCALHOST.into();
+        let path = crate::build_runtime::NetworkPath::new(ip, ip);
+        let worker = Peer::Worker(url.worker.current()?.id()?).on_path(path);
+        let client_peer = Peer::Client(url.client.current()?.id()?).on_path(path);
         assert!(measured.receive.peers[&worker].body_bytes > 0);
         assert_eq!(measured.receive.peers[&worker].active_remaining_bytes, 0);
         assert!(measured.send.peers[&client_peer].body_bytes > 0);
@@ -426,20 +744,22 @@ fn raw_physical_transport_preserves_original_magic_prefixed_bytes() -> Result<()
 
 #[test]
 fn metadata_is_bounded_and_rejects_trailing_bytes() -> Result<()> {
-    let request = Request::fake_http(
+    let request = Request::fake_http_from(
+        "127.0.0.1:0".parse()?,
         "POST",
         "/api/v5/native/client/status",
         Vec::new(),
-        vec![0; 33],
+        vec![0; 34],
     );
-    assert!(metadata::<crate::build_runtime::wire::Ticket>(&request, 32).is_err());
-    let request = Request::fake_http(
+    assert!(metadata::<StatusRequest>(&request, 33).is_err());
+    let request = Request::fake_http_from(
+        "127.0.0.1:0".parse()?,
         "POST",
         "/api/v5/native/client/status",
         Vec::new(),
-        vec![0; 33],
+        vec![0; 34],
     );
-    assert!(metadata::<crate::build_runtime::wire::Ticket>(&request, 64).is_err());
+    assert!(metadata::<StatusRequest>(&request, 64).is_err());
     let header = UploadHeader {
         ticket: crate::build_runtime::wire::Ticket([7; 32]),
         blob: BlobRef {
@@ -609,8 +929,8 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
     })
 }
 
-#[test]
-fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> Result<()> {
+#[tokio::test]
+async fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> Result<()> {
     use std::io::{Seek as _, Write as _};
     let compressible = vec![b'Z'; 256 * 1024];
     let noise: Vec<u8> = (0..8192_u64)
@@ -625,13 +945,13 @@ fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> Result
         raw.write_all(&original)?;
         raw.rewind()?;
         let response = physical_blob_response(raw, BlobEncoding::Raw)?;
-        assert!(
-            response
-                .headers
-                .iter()
-                .any(|(name, value)| name == "X-Sccache-CAS-Encoding" && value == "zstd-chunks")
-        );
-        let (stream, size) = response.data.into_reader_and_size();
+        assert_eq!(response.headers()["X-Sccache-CAS-Encoding"], "zstd-chunks");
+        let size = response.headers()[http::header::CONTENT_LENGTH]
+            .to_str()?
+            .parse::<u64>()?;
+        let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024).await?;
+        assert_eq!(u64::try_from(bytes.len())?, size);
+        let stream = std::io::Cursor::new(bytes);
         let mut encoded = tempfile::tempfile()?;
         let mut decoded = Vec::new();
         crate::build_runtime::transfer_native_blob(
@@ -643,10 +963,14 @@ fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> Result
         )?;
         assert_eq!(decoded, original);
         encoded.rewind()?;
-        let (stream, reused_size) = physical_blob_response(encoded, BlobEncoding::ZstdChunks)?
-            .data
-            .into_reader_and_size();
+        let response = physical_blob_response(encoded, BlobEncoding::ZstdChunks)?;
+        let reused_size = response.headers()[http::header::CONTENT_LENGTH]
+            .to_str()?
+            .parse::<u64>()?;
         assert_eq!(size, reused_size);
+        let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024).await?;
+        assert_eq!(u64::try_from(bytes.len())?, reused_size);
+        let stream = std::io::Cursor::new(bytes);
         let mut decoded = Vec::new();
         crate::build_runtime::transfer_native_blob(
             stream,
@@ -717,30 +1041,37 @@ fn lazy_admission_prefetch_and_origin_backfill_over_http() -> Result<()> {
             ScheduleReply::Assigned(_)
         ));
         let read = worker.open_tree(ticket, id)?;
-        let request = reqwest::blocking::Client::new();
+        let (request, base) = url.raw(&url.worker)?;
         let prefetch = InputPrefetchRequest {
             ticket: read.ticket,
             missing: vec![missing],
         };
-        request
-            .post(url.join("/api/v5/native/worker/input_prefetch")?)
-            .bearer_auth("worker-token")
-            .header("Content-Type", "application/octet-stream")
-            .header("X-Sccache-Native-Job", "42")
-            .body(codec().serialize(&prefetch)?)
-            .send()?
+        crate::http_client::io_runtime()?
+            .block_on(
+                request
+                    .post(base.join("/api/v5/native/worker/input_prefetch")?.as_str())
+                    .bearer_auth("worker-token")
+                    .header("Content-Type", "application/octet-stream")
+                    .header("X-Sccache-Native-Job", "42")
+                    .body(codec().serialize(&prefetch)?)
+                    .timeout(Duration::from_secs(10))
+                    .send(),
+            )?
             .error_for_status()?;
-        let pending = request
-            .post(url.join("/api/v5/native/worker/download")?)
-            .bearer_auth("worker-token")
-            .header("Content-Type", "application/octet-stream")
-            .header("X-Sccache-Native-Job", "42")
-            .body(codec().serialize(&DownloadRequest {
-                ticket: read.ticket,
-                id: missing.id,
-            })?)
-            .send()?;
-        assert_eq!(pending.status(), reqwest::StatusCode::ACCEPTED);
+        let pending = crate::http_client::io_runtime()?.block_on(
+            request
+                .post(base.join("/api/v5/native/worker/download")?.as_str())
+                .bearer_auth("worker-token")
+                .header("Content-Type", "application/octet-stream")
+                .header("X-Sccache-Native-Job", "42")
+                .body(codec().serialize(&DownloadRequest {
+                    ticket: read.ticket,
+                    id: missing.id,
+                })?)
+                .timeout(Duration::from_secs(10))
+                .send(),
+        )?;
+        assert_eq!(pending.status(), http::StatusCode::ACCEPTED);
         assert_eq!(
             client.poll_input(ticket)?,
             InputPoll::Demand(InputDemand {
@@ -766,7 +1097,7 @@ fn lazy_admission_prefetch_and_origin_backfill_over_http() -> Result<()> {
         assert!(observations.lock().unwrap().is_empty());
         worker.inputs_staged(ticket)?;
         worker.inputs_staged(ticket)?;
-        let owner: ServerId = "127.0.0.1:10501".parse()?;
+        let owner = url.worker.current()?.id()?;
         assert_eq!(
             *observations.lock().unwrap(),
             vec![

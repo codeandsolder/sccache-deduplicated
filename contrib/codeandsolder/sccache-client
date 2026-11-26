@@ -38,10 +38,12 @@ sccache_wrapper_main() {
 
     if [[ "$mode" == compiler ]]; then
         # A strict compiler wrapper invoked by sccache itself is already
-        # inside a managed compilation. Resubmission would deadlock.
+        # inside a managed compilation. Rustc's native linker driver is
+        # likewise a nested operation, not an independent cacheable compile.
+        # The canonical compilation namespace cannot reach the host daemon.
         parent_exe="$(readlink "/proc/$PPID/exe" 2>/dev/null || true)"
         parent_exe="${parent_exe% (deleted)}"
-        if [[ "$parent_exe" == */sccache ]]; then
+        if [[ "$parent_exe" == */sccache || "$parent_exe" == */rustc ]]; then
             exec "$@"
         fi
     fi
@@ -65,7 +67,7 @@ sccache_wrapper_main() {
     fi
     readiness_seconds=$((10#$readiness_seconds))
 
-    if [[ "$mode" == compiler || (${1:-} != -* && $# -gt 0) ]]; then
+    if [[ "$mode" == compiler || ${1:-} == --cargo-final || (${1:-} != -* && $# -gt 0) ]]; then
         local deadline=$((SECONDS + readiness_seconds))
         while [[ -e "$drain" || -e "$fleet_guard" ]]; do
             if [[ -e "$fleet_guard" ]]; then
@@ -112,7 +114,7 @@ sccache_wrapper_main() {
             *) printf 'sccache: invalid managed endpoint %s\n' "$endpoint" >&2; return 78 ;;
         esac
         # Do not wait for an explicitly requested administrative command.
-        if [[ "$mode" == compiler || (${1:-} != -* && $# -gt 0) ]]; then
+        if [[ "$mode" == compiler || ${1:-} == --cargo-final || (${1:-} != -* && $# -gt 0) ]]; then
             sccache_wait_endpoint "$endpoint" "$service" "$readiness_seconds" || return "$?"
         fi
     fi
@@ -121,7 +123,7 @@ sccache_wrapper_main() {
     export SCCACHE_NO_AUTO_START_SERVER=1
     local -a args=("$@")
     if [[ "$mode" == compiler ]]; then
-        if [[ -n "${SCCACHE_CANONICAL_TARGET_ROOT:-}" || -n "${CARGO_TARGET_DIR:-}" || -n "${OUT_DIR:-}" ]]; then
+        if [[ -n "${SCCACHE_CANONICAL_TARGET_ROOT:-}" || -n "${CARGO_TARGET_DIR:-}" || -n "${CARGO_BUILD_BUILD_DIR:-}" || -n "${CARGO_MANIFEST_DIR:-}" || -n "${OUT_DIR:-}" ]]; then
             export SCCACHE_EXPERIMENTAL_CANONICAL_RUST=1
         else
             unset SCCACHE_EXPERIMENTAL_CANONICAL_RUST

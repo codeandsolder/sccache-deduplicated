@@ -7,6 +7,7 @@ license = "Apache-2.0"
 description = "Content-addressed storage and execution environments for build infrastructure"
 
 [dependencies]
+sccache-peer-identity = { path = "../peer-identity" }
 anyhow = "1"
 bincode = "1"
 blake3 = "1"
@@ -14,7 +15,7 @@ serde = { version = "1", features = ["derive"] }
 zstd = { version = "0.14", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-flate2 = { version = "1", optional = true }
+flate2 = { version = "1", optional = true, default-features = false, features = ["zlib-rs"] }
 log = { version = "0.4", optional = true }
 rand = { version = "0.10", optional = true }
 lzma-rust2 = { version = "0.25.0", default-features = false, features = ["std", "xz"], optional = true }
@@ -23,7 +24,7 @@ tar = { version = "0.4", default-features = false, optional = true }
 redb = { version = "5.0", optional = true }
 tempfile = { version = "3", optional = true }
 
-rustix = { version = "1", features = ["fs", "time", "process"], optional = true }
+rustix = { version = "1", features = ["fs", "time", "process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.19", default-features = false, optional = true }
@@ -35,7 +36,7 @@ serde_json = ">=1.0, <1.0.155"
 
 [features]
 default = ["store"]
-mapping = ["dep:rustix", "dep:tempfile", "dep:log"]
+mapping = ["dep:tempfile", "dep:log"]
 store = ["mapping", "dep:rand", "dep:redb", "dep:flate2", "dep:lzma-rust2", "dep:sha2", "dep:tar", "dep:zstd", "dep:fuser", "dep:libc"]
 
 [lints]

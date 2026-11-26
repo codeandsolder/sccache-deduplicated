@@ -5,14 +5,14 @@ use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 
 use crate::build_runtime::wire::Ticket;
 
-use super::NativeCacheClient;
+use super::{NativeCacheClient, retryable_transport_error};
 
 #[derive(Default)]
 struct State {
@@ -28,12 +28,20 @@ pub(super) struct Renewals {
 
 impl Renewals {
     pub(super) fn start(client: NativeCacheClient, interval: Duration) -> Result<Self> {
-        Self::spawn(interval, move |ticket| client.renew(ticket))
+        Self::spawn(interval, move |ticket, timeout| {
+            client.control_with_timeout("renew", &ticket, timeout)
+        })
+    }
+
+    pub(super) fn start_retention(client: NativeCacheClient, interval: Duration) -> Result<Self> {
+        Self::spawn(interval, move |group, timeout| {
+            client.control_with_timeout("retain_renew", &group, timeout)
+        })
     }
 
     fn spawn(
         interval: Duration,
-        renew: impl Fn(Ticket) -> Result<()> + Send + 'static,
+        renew: impl Fn(Ticket, Duration) -> Result<()> + Send + 'static,
     ) -> Result<Self> {
         ensure!(
             !interval.is_zero(),
@@ -51,17 +59,50 @@ impl Renewals {
                         .map_err(|_| anyhow!("native renewal state poisoned"))?
                         .tickets
                         .clone();
-                    for ticket in tickets {
-                        if let Err(error) = renew(ticket) {
-                            let mut state = shared
-                                .lock()
-                                .map_err(|_| anyhow!("native renewal state poisoned"))?;
-                            // A caller may release ownership while an HTTP
-                            // request is in flight. That failure is irrelevant.
-                            if state.tickets.contains(&ticket) {
-                                state.failure = Some(format!("{error:#}"));
+                    // Retry transient failures within one renewal period, in
+                    // rounds so one unreachable ticket cannot monopolize the
+                    // other members. The server remains authoritative: an
+                    // expired or rejected lease is never resurrected here.
+                    let deadline = Instant::now()
+                        .checked_add(interval)
+                        .context("native renewal deadline overflow")?;
+                    let mut pending = tickets;
+                    let mut delay = Duration::from_millis(25);
+                    while !pending.is_empty() {
+                        let mut retry = BTreeSet::new();
+                        for ticket in pending {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            let timeout = remaining.min(Duration::from_secs(2));
+                            let result = if timeout.is_zero() {
+                                Err(anyhow!("native renewal retry budget exhausted"))
+                            } else {
+                                renew(ticket, timeout)
+                            };
+                            if let Err(error) = result {
+                                let mut state = shared
+                                    .lock()
+                                    .map_err(|_| anyhow!("native renewal state poisoned"))?;
+                                if !state.tickets.contains(&ticket) {
+                                    continue;
+                                }
+                                if retryable_transport_error(&error) && Instant::now() < deadline {
+                                    debug!("retrying native lease renewal: {error:#}");
+                                    retry.insert(ticket);
+                                } else {
+                                    state.failure = Some(format!("{error:#}"));
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        pending = retry;
+                        if !pending.is_empty() {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            if stop_rx.recv_timeout(delay.min(remaining))
+                                != Err(mpsc::RecvTimeoutError::Timeout)
+                            {
                                 return Ok(());
                             }
+                            delay = (delay * 2).min(Duration::from_millis(250));
                         }
                     }
                 }
@@ -137,7 +178,7 @@ mod tests {
     #[test]
     fn renews_all_members_until_released() -> Result<()> {
         let (observed, events) = mpsc::channel();
-        let renewals = Renewals::spawn(Duration::from_millis(5), move |ticket| {
+        let renewals = Renewals::spawn(Duration::from_millis(100), move |ticket, _| {
             observed.send(ticket)?;
             Ok(())
         })?;
@@ -157,9 +198,32 @@ mod tests {
     }
 
     #[test]
+    fn transient_renewal_failure_recovers_without_losing_other_tickets() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let first = Ticket([1; 32]);
+        let second = Ticket([2; 32]);
+        let failed = AtomicBool::new(false);
+        let (observed, events) = mpsc::channel();
+        let renewals = Renewals::spawn(Duration::from_millis(200), move |ticket, _| {
+            if ticket == first && !failed.swap(true, Ordering::SeqCst) {
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into());
+            }
+            observed.send(ticket)?;
+            Ok(())
+        })?;
+        renewals.add(first)?;
+        renewals.add(second)?;
+        assert_eq!(events.recv_timeout(Duration::from_secs(2))?, second);
+        assert_eq!(events.recv_timeout(Duration::from_secs(2))?, first);
+        renewals.check()?;
+        renewals.finish()?;
+        Ok(())
+    }
+
+    #[test]
     fn renewal_error_survives_shutdown() -> Result<()> {
         let (observed, events) = mpsc::channel();
-        let renewals = Renewals::spawn(Duration::from_millis(5), move |_| {
+        let renewals = Renewals::spawn(Duration::from_millis(100), move |_, _| {
             observed.send(())?;
             anyhow::bail!("lost lease")
         })?;

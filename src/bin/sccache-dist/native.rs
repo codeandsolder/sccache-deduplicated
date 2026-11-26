@@ -23,7 +23,7 @@ use sccache::{
     },
 };
 
-pub(super) struct NativeWorker {
+pub struct NativeWorker {
     store: NativeStore,
     client: NativeCacheClient,
     pub(super) policy: ExecutionPolicy,
@@ -37,7 +37,10 @@ pub(super) struct NativeWorker {
 }
 
 impl NativeWorker {
-    pub(super) fn new(config: NativeWorkerConfig, auth: String) -> Result<Self> {
+    pub(super) fn new(
+        config: NativeWorkerConfig,
+        peer: std::sync::Arc<sccache_cluster_identity::PeerCredentials>,
+    ) -> Result<Self> {
         ensure!(
             config.directory.is_absolute()
                 && config.scratch.is_absolute()
@@ -82,16 +85,17 @@ impl NativeWorker {
             )
             .as_bytes(),
         );
-        let (placement, timing) = PlacementCache::open(
+        let (mut placement, timing) = PlacementCache::open(
             config.directory.join("worker-timing.json"),
             scope,
             config.package_transfer,
         );
+        placement.analytics = Some(store.analytics_sampler()?);
         let package_transfer = PackageTransportTracker::new(timing)?;
         let _ = store.can_clone_into(&config.scratch)?;
         let client = NativeCacheClient::new(
-            config.cache_url.to_url(),
-            auth,
+            &config.cache_url.to_url(),
+            peer,
             Duration::from_secs(config.request_timeout_secs),
             config.max_metadata_bytes,
         )?;
@@ -132,7 +136,7 @@ impl NativeWorker {
         }
         Ok(super::NativeInputPins {
             _trees: trees,
-            _blobs: blobs,
+            blobs,
         })
     }
 
@@ -152,6 +156,9 @@ impl NativeWorker {
             .unwrap_or_else(PoisonError::into_inner);
         let mut placement = cache.refresh(&self.store, timing, queue);
         drop(cache);
+        placement.cache_path_rates = self.client.path_rates();
+        placement.peer_download_rates = self.client.peer_download_rates();
+        placement.interfaces = sccache::dist::cluster::interface_report();
         placement.package_limits =
             self.package_import
                 .map(|limits| sccache::build_runtime::PackageDeliveryLimits {
@@ -167,7 +174,7 @@ impl NativeWorker {
         self.package_transfer.parallelism().get()
     }
 
-    fn delivery<'a>(
+    const fn delivery<'a>(
         &'a self,
         queue: &'a sccache::dist::execution_queue::ExecutionQueue,
     ) -> WorkerDelivery<'a> {
@@ -224,6 +231,8 @@ struct PlacementCache {
     last_saved: WorkerTiming,
     checkpoint: Instant,
     inventory: Option<(Instant, Option<BlobResidency>)>,
+    analytics: Option<sccache::build_runtime::CacheAnalyticsSampler>,
+    latest_analytics: Option<sccache::build_runtime::analytics::CacheSiteSummary>,
 }
 
 fn unix_seconds() -> u64 {
@@ -270,6 +279,8 @@ impl PlacementCache {
                 last_saved: timing,
                 checkpoint: Instant::now(),
                 inventory: None,
+                analytics: None,
+                latest_analytics: None,
             },
             timing,
         )
@@ -302,13 +313,24 @@ impl PlacementCache {
                 }
             }
         }
+        if let Some(sample) = self
+            .analytics
+            .as_ref()
+            .and_then(sccache::build_runtime::CacheAnalyticsSampler::poll)
+        {
+            self.latest_analytics = Some(sample.site_summary());
+        }
         NativePlacement {
+            cache_analytics: self.latest_analytics.clone(),
             package_limits: None,
             residency: self
                 .inventory
                 .as_ref()
                 .and_then(|(_, summary)| summary.clone()),
             timing,
+            cache_path_rates: sccache::build_runtime::wire::CachePathRates::default(),
+            peer_download_rates: Vec::new(),
+            interfaces: sccache::build_runtime::wire::InterfaceReport::default(),
             queue,
         }
     }

@@ -27,7 +27,7 @@ impl PackageLocator {
     /// # Errors
     /// Returns an error for an invalid distribution URL or path.
     pub fn from_rust_url(identity: PackageIdentity, url: &str) -> Result<Self> {
-        let url = reqwest::Url::parse(url)?;
+        let url = url::Url::parse(url)?;
         ensure!(
             matches!(url.scheme(), "https" | "http")
                 && url.host_str().is_some()
@@ -79,7 +79,7 @@ impl PackageLocator {
     /// reference resolution, escapes, redirects or caller-controlled hosts.
     /// # Errors
     /// Returns an error for invalid base or locator.
-    pub fn resolve(&self, base: &reqwest::Url) -> Result<reqwest::Url> {
+    pub fn resolve(&self, base: &url::Url) -> Result<url::Url> {
         self.validate()?;
         validate_upstream_base(base)?;
         let mut url = base.clone();
@@ -113,7 +113,7 @@ pub fn validate_upstream_name(name: &str) -> Result<()> {
 /// Validate a repository base URL, including its immutable path prefix.
 /// # Errors
 /// Returns an error for unsupported or ambiguous base URLs.
-pub fn validate_upstream_base(url: &reqwest::Url) -> Result<()> {
+pub fn validate_upstream_base(url: &url::Url) -> Result<()> {
     ensure!(
         matches!(url.scheme(), "http" | "https")
             && url.host_str().is_some()
@@ -234,7 +234,7 @@ mod tests {
         )?;
         assert_eq!(locator.upstream, "rust");
         assert_eq!(locator.path, "dist/2026-11-22/rustc-nightly.tar.xz");
-        let base = reqwest::Url::parse("https://configured.example/repository/")?;
+        let base = url::Url::parse("https://configured.example/repository/")?;
         assert_eq!(
             locator.resolve(&base)?.as_str(),
             "https://configured.example/repository/dist/2026-11-22/rustc-nightly.tar.xz"
@@ -280,7 +280,7 @@ mod tests {
             .validate()
             .is_err()
         );
-        assert!(validate_upstream_base(&reqwest::Url::parse("https://host/repository")?).is_err());
+        assert!(validate_upstream_base(&url::Url::parse("https://host/repository")?).is_err());
         Ok(())
     }
 }

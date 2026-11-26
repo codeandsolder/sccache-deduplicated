@@ -22,8 +22,21 @@ pub use parse::try_parse_from;
 #[derive(Debug)]
 pub enum Command {
     Auth(AuthSubcommand),
-    Scheduler(config::scheduler::Config),
-    Server(config::server::Config),
+    ClusterInit {
+        directory: std::path::PathBuf,
+    },
+    ClusterId {
+        directory: std::path::PathBuf,
+    },
+    ClusterRevoke {
+        directory: std::path::PathBuf,
+        peer: ServerId,
+    },
+    ClusterStatus {
+        client_config: std::path::PathBuf,
+    },
+    Scheduler(Box<config::scheduler::Config>),
+    Server(Box<config::server::Config>),
     NativeAudit {
         index: std::path::PathBuf,
         schema: Option<String>,

@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const VERSION: u32 = 3;
+const VERSION: u32 = 6;
 const LIMIT: u64 = 16 << 20;
 const INTERVAL: Duration = Duration::from_secs(60);
 
@@ -70,11 +70,21 @@ struct SavedWorker {
 }
 
 #[derive(Serialize, Deserialize)]
+struct SavedDelivery {
+    key: super::receiver::Key,
+    selected: u64,
+    remote: u64,
+    count: u64,
+    age_millis: u64,
+}
+
+#[derive(Serialize, Deserialize)]
 struct Snapshot {
     version: u32,
     listener: SocketAddr,
     saved_at_millis: u64,
     workers: Vec<SavedWorker>,
+    deliveries: Vec<SavedDelivery>,
 }
 
 fn unix_millis() -> Result<u64> {
@@ -123,6 +133,21 @@ impl Snapshot {
             listener,
             saved_at_millis: wall,
             workers,
+            deliveries: book
+                .receivers
+                .samples
+                .iter()
+                .filter_map(|(&key, sample)| {
+                    let age = now.saturating_duration_since(sample.seen);
+                    (age < super::receiver::TTL).then(|| SavedDelivery {
+                        key,
+                        selected: sample.selected,
+                        remote: sample.remote,
+                        count: sample.count,
+                        age_millis: u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -155,7 +180,7 @@ impl Snapshot {
                     || sample.observations == 0
                     || !sample.cost.valid()
                     || sample.result_peak_bytes > 1 << 40
-                    || sample.cost.output_bytes > sample.result_peak_bytes
+                    || sample.cost.result_bytes > sample.result_peak_bytes
                 {
                     continue;
                 }
@@ -198,6 +223,31 @@ impl Snapshot {
                 );
             }
         }
+        ensure!(
+            self.deliveries.len() <= super::receiver::LIMIT,
+            "too many receiver histories"
+        );
+        for saved in self.deliveries {
+            let age = Duration::from_millis(elapsed.saturating_add(saved.age_millis));
+            if age >= super::receiver::TTL {
+                continue;
+            }
+            let Some(seen) = now.checked_sub(age) else {
+                continue;
+            };
+            let sample = super::receiver::Sample {
+                selected: saved.selected,
+                remote: saved.remote,
+                count: saved.count,
+                seen,
+            };
+            if sample.valid() {
+                ensure!(
+                    book.receivers.samples.insert(saved.key, sample).is_none(),
+                    "duplicate receiver history in checkpoint"
+                );
+            }
+        }
         Ok(book)
     }
 }
@@ -233,11 +283,7 @@ fn save(path: &Path, snapshot: &Snapshot) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn start(
-    book: &Arc<Mutex<CostBook>>,
-    path: PathBuf,
-    listener: SocketAddr,
-) -> Result<()> {
+pub fn start(book: &Arc<Mutex<CostBook>>, path: PathBuf, listener: SocketAddr) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -301,7 +347,7 @@ mod tests {
         let path = dir.path().join("action-costs.bin");
         let listener = SocketAddr::from(([127, 0, 0, 1], 1001));
         let scope = WorkerScope {
-            address: SocketAddr::from(([127, 0, 0, 1], 1002)),
+            peer: sccache::dist::ServerId::from_digest([2; 32]),
             platform: ContentId::of(b"platform"),
         };
         let class = ActionClass(ContentId::of(b"command"));
@@ -325,6 +371,25 @@ mod tests {
                 now,
             );
         }
+        let profile = ContentId::of(b"final-only");
+        let receipt = sccache::build_runtime::DeliveryReceipt {
+            worker: scope.peer,
+            job: 1,
+            requester: scope.peer,
+            profile,
+            result_bytes: 1000,
+            elapsed: Duration::from_secs(1),
+            observation: sccache::build_runtime::wire::ClientDeliveryObservation {
+                selected_bytes: 500,
+                direct_bytes: 100,
+                scheduler_bytes: 0,
+                unique_blobs: 1,
+                staging_nanoseconds: 0,
+            },
+        };
+        for _ in 0..4 {
+            book.observe_delivery(receipt, now);
+        }
         save(&path, &Snapshot::capture(&book, listener, now, wall))?;
         let restored = load(
             &path,
@@ -338,6 +403,14 @@ mod tests {
                 .predict(scope, class, &placement, now + Duration::from_secs(60))
                 .execution_nanoseconds,
             123_000_000
+        );
+        let restored_cost =
+            restored.predict(scope, class, &placement, now + Duration::from_secs(60));
+        assert_eq!(restored_cost.output_bytes, 100);
+        assert_eq!(restored_cost.result_bytes, 752);
+        assert_eq!(
+            restored.delivery_fraction(scope.peer, profile, now + Duration::from_secs(60)),
+            100_000
         );
         assert_eq!(
             restored
@@ -355,7 +428,7 @@ mod tests {
                 .is_empty()
         );
         assert!(load(&path, listener, now, wall - 1)?.workers.is_empty());
-        assert!(load(&path, scope.address, now, wall).is_err());
+        assert!(load(&path, SocketAddr::from(([127, 0, 0, 1], 1002)), now, wall).is_err());
         fs::write(&path, b"invalid data")?;
         assert!(load(&path, listener, now, wall).is_err());
         Ok(())

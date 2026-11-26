@@ -19,7 +19,7 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
-pub(crate) const CAPABILITY: &str = "direct-metrics";
+pub const CAPABILITY: &str = "direct-metrics";
 
 const URL_ENV: &str = "SCCACHE_METRICS_URL";
 const INSTANCE_ENV: &str = "SCCACHE_METRICS_INSTANCE";
@@ -141,6 +141,154 @@ impl Publisher {
         V: Into<String>,
     {
         self.set(name, prometheus_u64(value), labels)
+    }
+
+    fn update_tiers(&mut self, tiers: &[crate::cache::CacheTierObservation]) -> Result<(), String> {
+        for (index, tier) in tiers.iter().enumerate() {
+            let level = index.to_string();
+            let base = [("level", level.as_str()), ("backend", tier.backend)];
+            for (kind, value) in [("current", tier.current_bytes), ("max", tier.maximum_bytes)] {
+                if let Some(value) = value {
+                    self.set_u64(
+                        "sccache_cache_tier_size_bytes",
+                        value,
+                        [base[0], base[1], ("kind", kind)],
+                    )?;
+                }
+            }
+            let Some(report) = &tier.report else { continue };
+            self.set_u64(
+                "sccache_cache_tier_snapshot_timestamp_seconds",
+                report.sampled_at,
+                base,
+            )?;
+            self.update_tier_distributions(report, base)?;
+            if report.managed_heat {
+                let total = &report.distribution.total;
+                for target in [50_u128, 90, 95, 99] {
+                    let threshold =
+                        total.touches / 100 * target + (total.touches % 100 * target).div_ceil(100);
+                    let mut touches = 0_u128;
+                    let mut bytes = 0_u64;
+                    let mut range = None;
+                    if total.touches != 0 && total.logical_bytes != 0 {
+                        for bucket in report.distribution.frequency.iter().rev() {
+                            let lower = bytes;
+                            touches = touches.saturating_add(bucket.weight.touches);
+                            bytes = bytes.saturating_add(bucket.weight.logical_bytes);
+                            if touches >= threshold {
+                                range = Some((lower, bytes));
+                                break;
+                            }
+                        }
+                    }
+                    let percentile = target.to_string();
+                    for (bound, value) in
+                        [("lower", range.map(|r| r.0)), ("upper", range.map(|r| r.1))]
+                    {
+                        let value = value.map_or(f64::NAN, |bytes| {
+                            100.0 * prometheus_u64(bytes) / prometheus_u64(total.logical_bytes)
+                        });
+                        self.set(
+                            "sccache_cache_tier_heat_storage_share_percent",
+                            value,
+                            [
+                                base[0],
+                                base[1],
+                                ("percentile", percentile.as_str()),
+                                ("bound", bound),
+                            ],
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn update_tier_distributions(
+        &mut self,
+        report: &crate::build_runtime::analytics::TierCacheReport,
+        base: [(&str, &str); 2],
+    ) -> Result<(), String> {
+        use crate::build_runtime::analytics::{AGE_UPPER_BOUNDS, CacheBucket, CacheWeight};
+        type Distribution<'a> = (&'a str, &'a [CacheBucket], &'a [Option<u64>]);
+        let log_bounds = std::iter::once(Some(0))
+            .chain((1..=16).map(|n| Some(u64::MAX >> (64 - n * 4))))
+            .collect::<Vec<_>>();
+        let age_bounds = std::iter::once(None)
+            .chain(AGE_UPPER_BOUNDS.into_iter().map(Some))
+            .collect::<Vec<_>>();
+        let mut distributions: Vec<Distribution<'_>> = vec![
+            ("size", &report.distribution.size, &log_bounds),
+            ("age", &report.distribution.age_seconds, &age_bounds),
+        ];
+        let heat_bounds = std::iter::once(None)
+            .chain(log_bounds.iter().copied())
+            .collect::<Vec<_>>();
+        if report.managed_heat {
+            distributions.extend([
+                (
+                    "heat",
+                    report.distribution.frequency.as_slice(),
+                    heat_bounds.as_slice(),
+                ),
+                (
+                    "policy_age",
+                    report.policy_age.as_slice(),
+                    age_bounds.as_slice(),
+                ),
+            ]);
+        }
+        for (dimension, buckets, bounds) in distributions {
+            let mut lower = None;
+            for bound in bounds {
+                let label = match bound {
+                    None => "unknown".to_owned(),
+                    Some(value) if matches!(dimension, "age" | "policy_age") => match value {
+                        3600 => "1h".to_owned(),
+                        86_400 => "1d".to_owned(),
+                        604_800 => "7d".to_owned(),
+                        2_592_000 => "30d".to_owned(),
+                        7_776_000 => "90d".to_owned(),
+                        31_536_000 => "365d".to_owned(),
+                        _ => ">365d".to_owned(),
+                    },
+                    Some(value) => value.to_string(),
+                };
+                let mut weight = CacheWeight::default();
+                for bucket in buckets
+                    .iter()
+                    .filter(|bucket| match (bucket.upper, *bound) {
+                        (None, None) => true,
+                        (Some(value), Some(upper)) => {
+                            value <= upper && lower.is_none_or(|lower| value > lower)
+                        }
+                        _ => false,
+                    })
+                {
+                    weight.add(&bucket.weight);
+                }
+                lower = *bound;
+                let labels = [
+                    base[0],
+                    base[1],
+                    ("dimension", dimension),
+                    ("upper", label.as_str()),
+                ];
+                self.set_u64(
+                    "sccache_cache_tier_distribution_bytes",
+                    weight.logical_bytes,
+                    labels,
+                )?;
+                self.set_u64(
+                    "sccache_cache_tier_distribution_objects",
+                    weight.objects,
+                    labels,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn update(
@@ -402,6 +550,18 @@ where
     };
 
     Some(handle.spawn(async move {
+        let storage = service.metrics_storage();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let _sampler = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            loop {
+                let observations = storage.tier_observations(true).await;
+                if sender.send(observations).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(300)).await;
+            }
+        }));
+        let mut tiers = Vec::new();
         let mut interval = tokio::time::interval(interval_duration);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut next_heartbeat = Instant::now();
@@ -432,6 +592,15 @@ where
             }
             if let Err(error) = publisher.update(&info, dist.as_ref(), force_heartbeat) {
                 warn!("direct metrics update failed: {error}");
+            }
+            let changed = receiver.try_recv().is_ok_and(|observations| {
+                tiers = observations;
+                true
+            });
+            if (changed || force_heartbeat)
+                && let Err(error) = publisher.update_tiers(&tiers)
+            {
+                warn!("cache tier metrics update failed: {error}");
             }
         }
     }))

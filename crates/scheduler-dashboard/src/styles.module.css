@@ -1,0 +1,85 @@
+:root {
+    color-scheme: dark light;
+    --bg: #10141c;
+    --panel: #181f2b;
+    --line: #344052;
+    --fg: #e6ebf2;
+    --muted: #a2afbf;
+    --accent: #78c6f2;
+    --warning: #ffc477;
+    --good: #78dfb0;
+    font-family: system-ui, sans-serif;
+    font-size: 14px;
+}
+@media (prefers-color-scheme: light) {
+    :root {
+        --bg: #f4f6f8;
+        --panel: #fff;
+        --line: #cbd5e1;
+        --fg: #1b2430;
+        --muted: #4a596c;
+        --accent: #045c92;
+        --warning: #915000;
+        --good: #166746;
+    }
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); margin: 0; font-variant-numeric: tabular-nums; }
+.top { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; padding: 1.2rem 2rem; background: var(--panel); border-bottom: 1px solid var(--line); }
+h1 { margin: .2rem 0; font-size: 1.7rem; }
+h2 { font-size: 1.2rem; margin: 0 0 .8rem; }
+h3 { font-size: 1rem; margin: 0 0 .7rem; }
+small, .muted, .axis { color: var(--muted); }
+small { display: block; }
+nav { display: flex; gap: 1rem; flex-wrap: wrap; }
+a { color: var(--accent); }
+main { max-width: 1800px; margin: auto; padding: 1.2rem 2rem; }
+.subhead, .axis, .controls { display: flex; justify-content: space-between; gap: .8rem; flex-wrap: wrap; align-items: center; }
+.controls { justify-content: flex-start; margin: .8rem 0; }
+.controls label { display: flex; align-items: center; gap: .5rem; }
+.controls input, .controls select, .controls button, .subhead button { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: .4rem .65rem; }
+.controls button:not(:disabled), .subhead button { cursor: pointer; }
+.controls button:disabled { opacity: .5; }
+.healthy { color: var(--good); font-weight: 700; }
+.warning { color: var(--warning); font-weight: 600; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: .7rem; margin: 1rem 0; }
+.stat, article, section { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 1rem; }
+.stat strong { display: block; font-size: 1.65rem; margin-top: .35rem; }
+section { margin: 1rem 0; scroll-margin-top: 1rem; }
+.tablewrap { overflow: auto; }
+table { width: 100%; border-collapse: collapse; text-align: left; }
+td, th { padding: .65rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-size: .82rem; white-space: nowrap; }
+td { min-width: 5rem; }
+td small { margin-top: .2rem; }
+.panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); gap: .7rem; }
+.panels article { min-width: 0; }
+.chart { width: 100%; height: 160px; color: var(--muted); display: block; }
+.axis { font-size: .78rem; }
+.legend { max-height: 12rem; overflow: auto; margin-top: .5rem; }
+.legend > div { display: flex; align-items: center; gap: .3rem; border-bottom: 1px solid var(--line); padding: .25rem 0; overflow-wrap: anywhere; }
+.legend b { margin-left: auto; white-space: nowrap; }
+.legend span { flex: none; }
+@media (max-width: 640px) {
+    main, .top { padding: 1rem; }
+    .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .stat strong { font-size: 1.35rem; }
+}
+.metricstats { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: .65rem; }
+.metricstat { padding: .65rem; border-left: 2px solid var(--accent); background: var(--bg); }
+.metricstat strong { display: block; font-size: 1.7rem; margin-top: .3rem; }
+.gauges { display: grid; gap: .7rem; }
+.gauges meter { width: 100%; height: 1.2rem; accent-color: var(--accent); }
+
+.topology_scroll { overflow: auto; max-height: 640px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
+.topology_svg { display: block; min-width: 760px; width: 100%; }
+.topology_node { cursor: pointer; }
+.topology_node rect { fill: var(--panel); stroke: var(--line); stroke-width: 1.5; }
+.topology_node:hover rect { stroke: var(--accent); }
+.topology_node text { fill: var(--fg); font-size: 12px; font-weight: 600; }
+.topology_node .topology_caption { fill: var(--muted); font-size: 10px; font-weight: 400; }
+.topology_advertised, .topology_measured, .topology_active { fill: none; stroke-width: 1.6; }
+.topology_advertised { stroke: var(--muted); stroke-dasharray: 5 5; }
+.topology_measured { stroke: var(--accent); }
+.topology_active { stroke: var(--good); stroke-width: 3; }
+.topology_details { margin: .7rem 0; overflow-wrap: anywhere; }

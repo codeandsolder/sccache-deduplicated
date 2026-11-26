@@ -116,7 +116,7 @@ fn require_server_start_authority() -> Result<()> {
 }
 
 /// Get the port on which the server should listen.
-fn get_addr() -> crate::net::SocketAddr {
+pub fn get_addr() -> crate::net::SocketAddr {
     #[cfg(unix)]
     if let Ok(addr) = env::var("SCCACHE_SERVER_UDS")
         && let Ok(uds) = crate::net::SocketAddr::parse_uds(&addr)

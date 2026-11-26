@@ -1,15 +1,20 @@
+use axum::{
+    Router,
+    body::Body,
+    extract::State,
+    response::Response,
+    routing::{get, post},
+};
 use bytes::Bytes;
 use futures::channel::oneshot;
 use http::HeaderValue;
 use http::StatusCode;
+use http::Uri;
 use http::header::CONTENT_TYPE;
-use http_body_util::Full;
-use hyper::{Method, Response, Uri};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::io;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -37,12 +42,8 @@ fn query_pairs(url: &str) -> Result<HashMap<String, String>> {
         .collect())
 }
 
-fn response(
-    status: StatusCode,
-    content_type: &'static str,
-    body: impl Into<Bytes>,
-) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(body.into()));
+fn response(status: StatusCode, content_type: &'static str, body: impl Into<Bytes>) -> Response {
+    let mut response = Response::new(Body::from(body.into()));
     *response.status_mut() = status;
     response
         .headers_mut()
@@ -50,11 +51,11 @@ fn response(
     response
 }
 
-fn html_response(body: &'static str) -> Response<Full<Bytes>> {
+fn html_response(body: &'static str) -> Response {
     response(StatusCode::OK, "text/html; charset=utf-8", body)
 }
 
-fn json_response<T: Serialize + ?Sized>(data: &T) -> Result<Response<Full<Bytes>>> {
+fn json_response<T: Serialize + ?Sized>(data: &T) -> Result<Response> {
     let body = serde_json::to_vec(data).context("Failed to serialize to JSON")?;
     Ok(response(StatusCode::OK, "application/json", body))
 }
@@ -88,7 +89,7 @@ const REDIRECT_WITH_AUTH_JSON: &str = r#"<!doctype html>
 
 mod code_grant_pkce {
     use super::warn_if_short_lived;
-    use crate::http_client::{self, new_reqwest_blocking_client};
+    use crate::http_client::{self, new_http_client_builder};
     use crate::util::BASE64_URL_SAFE_ENGINE;
     use base64::Engine;
     use serde::{Deserialize, Serialize};
@@ -205,12 +206,14 @@ mod code_grant_pkce {
             grant_type: GRANT_TYPE_PARAM_VALUE,
             redirect_uri,
         };
-        let client = new_reqwest_blocking_client()?;
-        let res = client
-            .post(token_url)
-            .timeout(http_client::AUTH_REQUEST_TIMEOUT)
-            .json(&token_request)
-            .send()?;
+        let client = new_http_client_builder().build()?;
+        let res = http_client::io_runtime()?.block_on(
+            client
+                .post(token_url)
+                .timeout(http_client::AUTH_REQUEST_TIMEOUT)
+                .json(&token_request)
+                .send(),
+        )?;
         if !res.status().is_success() {
             bail!(
                 "Sending code to {token_url} failed, HTTP error: {}",
@@ -219,7 +222,11 @@ mod code_grant_pkce {
         }
 
         let (token, expires_at) = handle_token_response(
-            http_client::read_bounded_json(res, http_client::TOKEN_JSON_LIMIT)
+            http_client::io_runtime()?
+                .block_on(http_client::read_bounded_json_async(
+                    res,
+                    http_client::TOKEN_JSON_LIMIT,
+                ))
                 .context("Failed to parse token response as JSON")?,
         )?;
         warn_if_short_lived(expires_at);
@@ -352,126 +359,109 @@ impl CallbackSession {
             .send(value)
             .map_err(|_| anyhow!("OAuth callback receiver was dropped"))
     }
+}
 
-    fn handle(&self, method: &Method, uri: &Uri) -> Result<Response<Full<Bytes>>> {
-        debug!("Handling {method} {}", safe_request_path(uri));
-        match (self.flow, method, uri.path()) {
-            (_, &Method::GET, "/") => Ok(html_response(REDIRECT_WITH_AUTH_JSON)),
-            (_, &Method::GET, "/auth_detail.json") => json_response(self.auth_url.as_str()),
-            (CallbackFlow::Code, &Method::GET, "/redirect") => {
+fn auth_details(State(session): State<Arc<CallbackSession>>) -> impl Future<Output = Response> {
+    std::future::ready(
+        json_response(session.auth_url.as_str()).unwrap_or_else(|error| {
+            error_code_response(&Uri::from_static("/auth_detail.json"), error)
+        }),
+    )
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Axum extracts the owned request URI for its synchronous handler adapter"
+)]
+fn redirect(
+    State(session): State<Arc<CallbackSession>>,
+    uri: Uri,
+) -> impl Future<Output = Response> {
+    let outcome = (|| -> Result<Response> {
+        match session.flow {
+            CallbackFlow::Code => {
                 let params = query_pairs(&uri.to_string())?;
                 let (code, state) = code_grant_pkce::handle_code_response(&params)
                     .context("Failed to handle response from redirect")?;
-                self.complete(&state, code)?;
+                session.complete(&state, code)?;
                 Ok(html_response(code_grant_pkce::SUCCESS_AFTER_REDIRECT))
             }
-            (CallbackFlow::Implicit, &Method::GET, "/redirect") => {
-                Ok(html_response(implicit::SAVE_AUTH_AFTER_REDIRECT))
-            }
-            (CallbackFlow::Implicit, &Method::POST, "/save_auth") => {
-                let params = query_pairs(&uri.to_string())?;
-                let (token, expires_at, state) = implicit::handle_response(&params)
-                    .context("Failed to save auth after redirect")?;
-                self.complete(&state, token)?;
-                warn_if_short_lived(expires_at);
-                json_response(&"")
-            }
-            _ => {
-                warn!("Route not found");
-                Ok(response(
-                    StatusCode::NOT_FOUND,
-                    "text/plain; charset=utf-8",
-                    "",
-                ))
-            }
+            CallbackFlow::Implicit => Ok(html_response(implicit::SAVE_AUTH_AFTER_REDIRECT)),
         }
-    }
+    })();
+    std::future::ready(outcome.unwrap_or_else(|error| error_code_response(&uri, error)))
 }
 
-struct HyperBuilderWrap {
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Axum extracts the owned request URI for its synchronous handler adapter"
+)]
+fn save_auth(
+    State(session): State<Arc<CallbackSession>>,
+    uri: Uri,
+) -> impl Future<Output = Response> {
+    let outcome = (|| -> Result<Response> {
+        let params = query_pairs(&uri.to_string())?;
+        let (token, expires_at, state) =
+            implicit::handle_response(&params).context("Failed to save auth after redirect")?;
+        session.complete(&state, token)?;
+        warn_if_short_lived(expires_at);
+        json_response(&"")
+    })();
+    std::future::ready(outcome.unwrap_or_else(|error| error_code_response(&uri, error)))
+}
+
+fn callback_router(session: Arc<CallbackSession>) -> Router {
+    // Axum normally maps HEAD to GET. The OAuth redirect consumes a one-use
+    // credential, so HEAD must never run that handler.
+    let not_found = || std::future::ready(StatusCode::NOT_FOUND);
+    let mut router = Router::new()
+        .route(
+            "/",
+            get(|| std::future::ready(html_response(REDIRECT_WITH_AUTH_JSON))).head(not_found),
+        )
+        .route("/auth_detail.json", get(auth_details).head(not_found))
+        .route("/redirect", get(redirect).head(not_found));
+    if matches!(session.flow, CallbackFlow::Implicit) {
+        router = router.route("/save_auth", post(save_auth));
+    }
+    router
+        .method_not_allowed_fallback(not_found)
+        .with_state(session)
+}
+
+async fn serve_callback(
     listener: TcpListener,
+    session: Arc<CallbackSession>,
+    result: oneshot::Receiver<String>,
+) -> Result<String> {
+    let shutdown = CancellationToken::new();
+    let server = axum::serve(listener, callback_router(session))
+        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+        .into_future();
+    tokio::pin!(server);
+    let value = tokio::select! {
+        biased;
+        value = result => value.context("OAuth callback result was dropped"),
+        outcome = &mut server => {
+            outcome.context("OAuth client auth web server failed")?;
+            bail!("OAuth callback listener stopped before authentication completed");
+        }
+    };
+    // Flush the callback response before dropping the current-thread runtime.
+    // A peer that never finishes reading must not block authentication indefinitely.
+    shutdown.cancel();
+    if let Ok(Err(error)) = tokio::time::timeout(Duration::from_secs(2), &mut server).await {
+        warn!("OAuth client auth web server failed during shutdown: {error}");
+    }
+    value
 }
 
-impl HyperBuilderWrap {
-    pub async fn try_bind(addr: SocketAddr) -> io::Result<Self> {
-        let listener = TcpListener::bind(addr).await?;
-
-        Ok(Self { listener })
-    }
-
-    async fn serve(
-        &self,
-        session: Arc<CallbackSession>,
-        mut result: oneshot::Receiver<String>,
-    ) -> Result<String> {
-        use hyper::server::conn::http1;
-        use hyper_util::rt::tokio::TokioIo;
-
-        let shutdown = CancellationToken::new();
-        let mut connections = tokio::task::JoinSet::new();
-        let value = loop {
-            tokio::select! {
-                biased;
-                value = &mut result => break value.context("OAuth callback result was dropped"),
-                completed = connections.join_next(), if !connections.is_empty() => {
-                    completed.context("missing OAuth connection task")??;
-                }
-                accepted = self.listener.accept() => {
-                    let (tcp, _) = accepted.context("OAuth client auth web server failed")?;
-                    let session = Arc::clone(&session);
-                    let shutdown = shutdown.clone();
-                    connections.spawn(async move {
-                        let connection = http1::Builder::new().serve_connection(
-                            TokioIo::new(tcp),
-                            hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                                let session = Arc::clone(&session);
-                                async move {
-                                    let response = session
-                                        .handle(req.method(), req.uri())
-                                        .unwrap_or_else(|error| error_code_response(req.uri(), error));
-                                    Ok::<_, Infallible>(response)
-                                }
-                            }),
-                        );
-                        tokio::pin!(connection);
-                        let outcome = tokio::select! {
-                            outcome = &mut connection => outcome,
-                            () = shutdown.cancelled() => {
-                                connection.as_mut().graceful_shutdown();
-                                connection.await
-                            }
-                        };
-                        if let Err(error) = outcome {
-                            warn!("OAuth client connection failed: {error}");
-                        }
-                    });
-                }
-            }
-        };
-        // Flush the callback response before dropping the current-thread runtime.
-        // A peer that never finishes reading must not block authentication indefinitely.
-        shutdown.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(2), async {
-            while let Some(completed) = connections.join_next().await {
-                if let Err(error) = completed {
-                    warn!("OAuth client connection task failed: {error}");
-                }
-            }
-        })
-        .await;
-        value
-    }
-
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
-    }
-}
-
-fn safe_request_path(uri: &hyper::Uri) -> &str {
+fn safe_request_path(uri: &Uri) -> &str {
     uri.path()
 }
 
-fn error_code_response<E>(uri: &hyper::Uri, e: E) -> Response<Full<Bytes>>
+fn error_code_response<E>(uri: &Uri, e: E) -> Response
 where
     E: std::fmt::Debug,
 {
@@ -486,7 +476,7 @@ where
 }
 
 /// Try to bind a TCP stream to any of the available port out of [`VALID_PORTS`].
-async fn try_bind() -> Result<HyperBuilderWrap> {
+async fn try_bind() -> Result<TcpListener> {
     // Try all the valid ports
     for &port in VALID_PORTS {
         let mut addrs = ("localhost", port)
@@ -496,7 +486,7 @@ async fn try_bind() -> Result<HyperBuilderWrap> {
             .next()
             .with_context(|| format!("localhost:{port} resolved to no addresses"))?;
 
-        // Hyper binds with reuseaddr and reuseport so binding won't fail as you'd expect on Linux
+        // Avoid taking a port already occupied by a listening callback server.
         match TcpStream::connect(addr) {
             // Already open
             Ok(_) => continue,
@@ -508,7 +498,7 @@ async fn try_bind() -> Result<HyperBuilderWrap> {
             }
         }
 
-        match HyperBuilderWrap::try_bind(addr).await {
+        match TcpListener::bind(addr).await {
             Ok(s) => return Ok(s),
             Err(ref error) if error.kind() == io::ErrorKind::AddrInUse => {}
             Err(e) => return Err(e).with_context(|| format!("Failed to bind to {addr}")),
@@ -538,7 +528,7 @@ fn run_callback(
     });
     info!("Listening on http://localhost:{port} with 1 thread.");
     println!("sccache: Please visit http://localhost:{port} in your browser");
-    let value = runtime.block_on(server.serve(session, receiver))?;
+    let value = runtime.block_on(serve_callback(server, session, receiver))?;
     Ok((value, redirect_uri))
 }
 
@@ -584,8 +574,10 @@ pub fn get_token_oauth2_implicit(client_id: &str, auth_url: Url) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::BodyExt as _;
+    use axum::body::to_bytes;
+    use http::{Method, Request};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tower::ServiceExt as _;
 
     fn session(
         flow: CallbackFlow,
@@ -603,35 +595,66 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn callbacks_are_isolated_and_single_use() -> Result<()> {
+    async fn request(
+        session: &Arc<CallbackSession>,
+        method: Method,
+        uri: &str,
+    ) -> Result<Response> {
+        Ok(callback_router(Arc::clone(session))
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())?,
+            )
+            .await?)
+    }
+
+    #[tokio::test]
+    async fn callbacks_are_isolated_and_single_use() -> Result<()> {
         let (first, mut first_result) = session(CallbackFlow::Code, "first")?;
         let (second, mut second_result) = session(CallbackFlow::Code, "second")?;
-        let wrong = "/redirect?code=wrong&state=second".parse()?;
-        assert!(first.handle(&Method::GET, &wrong).is_err());
+        let wrong = "/redirect?code=wrong&state=second";
+        assert_eq!(
+            request(&first, Method::GET, wrong).await?.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
         assert_eq!(first_result.try_recv()?, None);
 
-        let valid = "/redirect?code=one&state=first".parse()?;
-        assert_eq!(first.handle(&Method::GET, &valid)?.status(), StatusCode::OK);
+        let valid = "/redirect?code=one&state=first";
+        for method in [Method::HEAD, Method::POST] {
+            assert_eq!(
+                request(&first, method, valid).await?.status(),
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(first_result.try_recv()?, None);
+        }
+        assert_eq!(
+            request(&first, Method::GET, valid).await?.status(),
+            StatusCode::OK
+        );
         assert_eq!(first_result.try_recv()?.as_deref(), Some("one"));
-        assert!(first.handle(&Method::GET, &valid).is_err());
+        assert_eq!(
+            request(&first, Method::GET, valid).await?.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
         assert_eq!(second_result.try_recv()?, None);
 
-        let valid = "/redirect?code=two&state=second".parse()?;
+        let valid = "/redirect?code=two&state=second";
         assert_eq!(
-            second.handle(&Method::GET, &valid)?.status(),
+            request(&second, Method::GET, valid).await?.status(),
             StatusCode::OK
         );
         assert_eq!(second_result.try_recv()?.as_deref(), Some("two"));
         Ok(())
     }
 
-    #[test]
-    fn implicit_callback_validates_token_and_state() -> Result<()> {
+    #[tokio::test]
+    async fn implicit_callback_validates_token_and_state() -> Result<()> {
         let (session, mut result) = session(CallbackFlow::Implicit, "expected")?;
-        let redirect = "/redirect".parse()?;
+        let redirect = "/redirect";
         assert_eq!(
-            session.handle(&Method::GET, &redirect)?.status(),
+            request(&session, Method::GET, redirect).await?.status(),
             StatusCode::OK
         );
         assert_eq!(result.try_recv()?, None);
@@ -641,28 +664,33 @@ mod tests {
             "/save_auth?access_token=token&token_type=bearer&expires_in=invalid&state=expected",
             "/save_auth?access_token=token&token_type=bearer&expires_in=999999&state=wrong",
         ] {
-            assert!(session.handle(&Method::POST, &callback.parse()?).is_err());
+            assert_eq!(
+                request(&session, Method::POST, callback).await?.status(),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
             assert_eq!(result.try_recv()?, None);
         }
         let valid =
-            "/save_auth?access_token=token&token_type=Bearer&expires_in=999999&state=expected"
-                .parse()?;
+            "/save_auth?access_token=token&token_type=Bearer&expires_in=999999&state=expected";
         assert_eq!(
-            session.handle(&Method::GET, &valid)?.status(),
+            request(&session, Method::GET, valid).await?.status(),
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            session.handle(&Method::POST, &valid)?.status(),
+            request(&session, Method::POST, valid).await?.status(),
             StatusCode::OK
         );
         assert_eq!(result.try_recv()?.as_deref(), Some("token"));
-        assert!(session.handle(&Method::POST, &valid).is_err());
+        assert_eq!(
+            request(&session, Method::POST, valid).await?.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
         Ok(())
     }
 
     #[tokio::test]
     async fn callback_server_delivers_response_before_shutdown() -> Result<()> {
-        let server = HyperBuilderWrap::try_bind("127.0.0.1:0".parse()?).await?;
+        let server = TcpListener::bind("127.0.0.1:0").await?;
         let address = server.local_addr()?;
         let (session, result) = session(CallbackFlow::Code, "expected")?;
 
@@ -680,7 +708,7 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         };
         let (code, ()) = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::try_join!(server.serve(session, result), request)
+            tokio::try_join!(serve_callback(server, session, result), request)
         })
         .await??;
         assert_eq!(code, "abc");
@@ -690,8 +718,8 @@ mod tests {
     #[tokio::test]
     async fn auth_details_belong_to_the_session() -> Result<()> {
         let (session, _) = session(CallbackFlow::Code, "expected")?;
-        let response = session.handle(&Method::GET, &"/auth_detail.json".parse()?)?;
-        let body = response.into_body().collect().await?.to_bytes();
+        let response = request(&session, Method::GET, "/auth_detail.json").await?;
+        let body = to_bytes(response.into_body(), 4096).await?;
         assert_eq!(
             serde_json::from_slice::<String>(&body)?,
             "https://example.invalid/authorize"
@@ -712,7 +740,7 @@ mod tests {
 
     #[test]
     fn oauth_log_path_excludes_query_secrets() -> anyhow::Result<()> {
-        let uri: hyper::Uri = "/save_auth?access_token=super-secret&state=also-secret".parse()?;
+        let uri: Uri = "/save_auth?access_token=super-secret&state=also-secret".parse()?;
         assert_eq!(safe_request_path(&uri), "/save_auth");
         Ok(())
     }

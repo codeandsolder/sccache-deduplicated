@@ -165,7 +165,7 @@ impl Client for NamespaceClient {
     async fn worker_label(&self, server: ServerId) -> String {
         match self.request(TransferRequest::WorkerLabel { server }).await {
             Ok(TransferReply::WorkerLabel(label)) => label,
-            _ => server.addr().to_string(),
+            _ => server.to_string(),
         }
     }
 

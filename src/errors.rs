@@ -18,13 +18,9 @@ use std::process;
 // We use `anyhow` for error handling.
 // - Use `context()`/`with_context()` to annotate errors.
 // - Use `anyhow!` with a string to create a new `anyhow::Error`.
-// - The error types below (`BadHttpStatusError`, etc.) are internal ones that
+// - The error types below (`HttpClientError`, etc.) are internal ones that
 //   need to be checked at points other than the outermost error-checking
 //   layer.
-
-#[cfg(feature = "hyper")]
-#[derive(Debug)]
-pub struct BadHttpStatusError(pub hyper::StatusCode);
 
 #[derive(Debug)]
 pub struct HttpClientError(pub String);
@@ -32,19 +28,9 @@ pub struct HttpClientError(pub String);
 #[derive(Debug)]
 pub struct ProcessError(pub process::Output);
 
-#[cfg(feature = "hyper")]
-impl std::error::Error for BadHttpStatusError {}
-
 impl std::error::Error for HttpClientError {}
 
 impl std::error::Error for ProcessError {}
-
-#[cfg(feature = "hyper")]
-impl std::fmt::Display for BadHttpStatusError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "didn't get a successful HTTP status, got `{}`", self.0)
-    }
-}
 
 impl std::fmt::Display for HttpClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

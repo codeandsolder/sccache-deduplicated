@@ -204,6 +204,37 @@ impl Storage for DiskCache {
             .map_err(|_| anyhow!("disk cache mutex poisoned"))?;
         Ok(Some(guard.capacity()))
     }
+    async fn tier_observations(
+        &self,
+        _allow_refresh: bool,
+    ) -> Vec<crate::cache::CacheTierObservation> {
+        use crate::build_runtime::analytics::TierCacheReport;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let mut observation = crate::cache::CacheTierObservation::observe(self).await;
+        let lru = self.lru.clone();
+        let report = self
+            .pool
+            .spawn_blocking(move || {
+                let entries = lru.lock().ok()?.get()?.analytics_entries();
+                let now = SystemTime::now();
+                let mut report = TierCacheReport {
+                    sampled_at: now.duration_since(UNIX_EPOCH).ok()?.as_secs(),
+                    ..Default::default()
+                };
+                for (path, size) in entries {
+                    let age = std::fs::metadata(path)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .map(|time| now.duration_since(time).unwrap_or_default().as_secs());
+                    report.distribution.record(size, None, 1, None, age);
+                }
+                Some(report)
+            })
+            .await;
+        observation.report = report.ok().flatten();
+        vec![observation]
+    }
+
     fn preprocessor_cache_mode_config(&self) -> PreprocessorCacheModeConfig {
         self.preprocessor_cache_mode_config
     }

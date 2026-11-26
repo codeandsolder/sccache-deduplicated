@@ -597,19 +597,15 @@ where
             // This is the default location in official AMD packages and containers.
             .unwrap_or_else(|| PathBuf::from("/opt/rocm/amdgcn/bitcode"));
 
-        hip_device_lib_path
-            .read_dir()
-            .ok()
-            .map(|f| {
-                let mut device_libs = f
-                    .flatten()
-                    .filter(|f| f.path().extension().is_some_and(|ext| ext == "bc"))
-                    .map(|f| f.path())
-                    .collect::<Vec<_>>();
-                device_libs.sort_unstable();
-                device_libs
-            })
-            .unwrap_or_default()
+        hip_device_lib_path.read_dir().ok().map_or_default(|f| {
+            let mut device_libs = f
+                .flatten()
+                .filter(|f| f.path().extension().is_some_and(|ext| ext == "bc"))
+                .map(|f| f.path())
+                .collect::<Vec<_>>();
+            device_libs.sort_unstable();
+            device_libs
+        })
     }
 }
 
@@ -700,6 +696,7 @@ where
             rewrite_includes_only,
             storage,
             cache_control,
+            ..
         } = context;
         let start_of_compilation = std::time::SystemTime::now();
         let mut parsed_args = self.parsed_args.clone();
@@ -2251,7 +2248,7 @@ impl pkg::InputsPackager for CInputsPackager {
 
     #[cfg(target_os = "linux")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        (*self).discover()?.into_native_mapping()
+        (*self).discover()?.into_native_mapping(|_| false)
     }
 }
 
@@ -3067,6 +3064,8 @@ mod test {
                     <CCompilerHasher<Gcc> as CompilerHasher<ProcessCommandCreator>>::generate_hash_key(
                         &mut hasher,
                         GenerateHashKeyContext {
+                            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                            native: None,
                             creator: &creator,
                             cwd: cwd.clone(),
                             env_vars: env,

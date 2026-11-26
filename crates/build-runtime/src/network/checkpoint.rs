@@ -239,13 +239,13 @@ impl NetworkMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::BTreeSet, net::SocketAddr, sync::atomic::Ordering};
+    use std::{collections::BTreeSet, sync::atomic::Ordering};
 
     #[test]
     fn checkpoint_preserves_fresh_directional_rates_not_pending_transfers() -> anyhow::Result<()> {
         let meter = NetworkMeter::default();
-        let a = Peer::Worker(SocketAddr::from(([127, 0, 0, 1], 1)));
-        let b = Peer::Worker(SocketAddr::from(([127, 0, 0, 1], 2)));
+        let a = Peer::Worker(crate::PeerId::from_digest([1; 32]));
+        let b = Peer::Worker(crate::PeerId::from_digest([2; 32]));
         let now = Instant::now();
         {
             let mut state = meter.state.lock().unwrap();

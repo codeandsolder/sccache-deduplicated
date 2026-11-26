@@ -12,7 +12,6 @@ use crate::harness::{
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use anyhow::ensure;
 use assert_cmd::prelude::*;
-use sccache::config::HTTPUrl;
 use sccache::dist::{
     AssignJobResult, CompileCommand, InputsReader, JobId, JobState, OutputRequest, RunJobResult,
     ServerIncoming, ServerOutgoing, SubmitToolchainResult, Toolchain, ToolchainReader,
@@ -26,6 +25,12 @@ use std::process::Output;
 use sccache::errors::*;
 
 pub mod harness;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[path = "dist/transport_stall.rs"]
+mod transport_stall;
 
 /// One worker per compatible group, with independent client-result caches.
 /// Keeping the worker alive also retains verified extracted toolchains. The
@@ -58,6 +63,7 @@ impl RustDistFixture {
         let path = root.path();
         let mut cfg = harness::sccache_client_cfg(path, false);
         cfg.dist.scheduler_url = Some(self.system.scheduler_url());
+        cfg.dist.cluster = Some(self.system.cluster_config());
         cfg.dist.cache_dir = self.root.path().join("client-toolchains");
         let config = path.join("sccache-cfg.json");
         let cached_config = path.join("sccache-cached-cfg");
@@ -155,11 +161,12 @@ fn rust_compile(tmpdir: &Path, sccache_cfg_path: &Path, sccache_cached_cfg_path:
 
 pub fn dist_test_sccache_client_cfg(
     tmpdir: &Path,
-    scheduler_url: HTTPUrl,
+    system: &harness::DistSystem,
 ) -> sccache::config::FileConfig {
     let mut sccache_cfg = harness::sccache_client_cfg(tmpdir, false);
     sccache_cfg.cache.disk.as_mut().unwrap().size = 0;
-    sccache_cfg.dist.scheduler_url = Some(scheduler_url);
+    sccache_cfg.dist.scheduler_url = Some(system.scheduler_url());
+    sccache_cfg.dist.cluster = Some(system.cluster_config());
     sccache_cfg
 }
 
@@ -177,7 +184,7 @@ fn test_dist_basic() {
     system.add_scheduler();
     system.add_server(&[]);
 
-    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
+    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, &system);
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
@@ -211,7 +218,7 @@ fn test_dist_c_debug_compilation_directory_is_cache_identity() -> Result<()> {
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
     system.add_scheduler();
     system.add_server(&[]);
-    let mut config = dist_test_sccache_client_cfg(root, system.scheduler_url());
+    let mut config = dist_test_sccache_client_cfg(root, &system);
     config
         .cache
         .disk
@@ -355,7 +362,7 @@ fn test_dist_c_native_target_codegen_and_cache() -> Result<()> {
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
     system.add_scheduler();
     system.add_server(&[]);
-    let mut config = dist_test_sccache_client_cfg(root, system.scheduler_url());
+    let mut config = dist_test_sccache_client_cfg(root, &system);
     // Unlike the minimal distribution smoke test, retain objects for the
     // repeat-request cache verification.
     config
@@ -481,6 +488,7 @@ fn test_dist_namespace_broker() -> Result<()> {
     let _worker = system.add_server(&[]);
     let mut cfg = harness::sccache_client_cfg(&root, false);
     cfg.dist.scheduler_url = Some(system.scheduler_url());
+    cfg.dist.cluster = Some(system.cluster_config());
     let config = root.join("sccache-cfg.json");
     write_json_cfg(&root, "sccache-cfg.json", &cfg);
     let cached_config = root.join("sccache-cached-cfg");
@@ -598,6 +606,7 @@ fn test_dist_c_compiler_aliases() -> Result<()> {
     let _worker = system.add_server(&[]);
     let mut cfg = harness::sccache_client_cfg(&root, false);
     cfg.dist.scheduler_url = Some(system.scheduler_url());
+    cfg.dist.cluster = Some(system.cluster_config());
     cfg.compiler_aliases.0.insert(
         transparent.clone(),
         sccache::config::CompilerAlias {
@@ -679,6 +688,7 @@ fn test_dist_c_success_without_object() -> Result<()> {
     let _worker = system.add_server(&[]);
     let mut cfg = harness::sccache_client_cfg(&root, false);
     cfg.dist.scheduler_url = Some(system.scheduler_url());
+    cfg.dist.cluster = Some(system.cluster_config());
     let config = root.join("sccache-cfg.json");
     write_json_cfg(&root, "sccache-cfg.json", &cfg);
     let cached_config = root.join("sccache-cached-cfg");
@@ -755,7 +765,7 @@ fn test_dist_restartedserver() {
     system.add_scheduler();
     let server_handle = system.add_server(&[]);
 
-    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
+    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, &system);
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
@@ -790,7 +800,7 @@ fn test_dist_nobuilder() {
     let mut system = harness::DistSystem::new(&sccache_dist, tmpdir);
     system.add_scheduler();
 
-    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
+    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, &system);
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
@@ -899,15 +909,21 @@ fn failing_server_process() -> Result<()> {
     let server = sccache::dist::http::Server::new(
         server_addr,
         Some(SocketAddr::from(([0, 0, 0, 0], server_addr.port()))),
-        reqwest::Url::parse(&scheduler_url)
-            .context("custom server scheduler URL should be valid")?,
-        token,
+        sccache::dist::cluster::open_peer(
+            serde_json::from_str(&env::var(harness::CUSTOM_SERVER_CLUSTER_ENV)?)?,
+            &url::Url::parse(&scheduler_url)?,
+            sccache_cluster_identity::Role::Worker,
+            move || Ok(token.clone()),
+        )?,
+        None,
         FailingServer,
     )
     .context("custom failing server should initialize")?;
     env_logger::try_init().ok();
-    server.start().context("custom failing server should run")?;
-    Ok(())
+    server
+        .start()
+        .context("custom failing server should run")
+        .map(|never| match never {})
 }
 
 #[test]
@@ -924,7 +940,7 @@ fn test_dist_failingserver() {
     system.add_scheduler();
     system.add_custom_server_process("failing_server_process");
 
-    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
+    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, &system);
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
@@ -957,7 +973,7 @@ fn test_dist_cargo_build() {
     system.add_scheduler();
     let _server_handle = system.add_server(&[]);
 
-    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
+    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, &system);
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
@@ -1391,7 +1407,7 @@ fn test_dist_cargo_makeflags() {
     system.add_scheduler();
     let _server_handle = system.add_server(&[]);
 
-    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
+    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, &system);
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
@@ -1433,7 +1449,7 @@ fn test_dist_preprocesspr_cache_bug_2173() {
     system.add_scheduler();
     let _server_handle = system.add_server(&[]);
 
-    let mut sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
+    let mut sccache_cfg = dist_test_sccache_client_cfg(tmpdir, &system);
     let disk_cache = sccache_cfg.cache.disk.as_mut().unwrap();
     disk_cache
         .preprocessor_cache_mode
@@ -1489,7 +1505,7 @@ fn test_dist_toolchain() {
     let mut system = harness::DistSystem::new(&sccache_dist, tmpdir);
     system.add_scheduler();
     let server_handle = system.add_server(&[]);
-    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
+    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, &system);
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");

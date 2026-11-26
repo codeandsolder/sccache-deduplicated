@@ -13,7 +13,10 @@ use std::{
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::build_runtime::{NetworkCheckpoint, NetworkMeter};
+use crate::{
+    build_runtime::{NetworkCheckpoint, NetworkMeter},
+    dist::cluster_routes::interface::MeterSampler,
+};
 
 const CHECKPOINT_LIMIT: u64 = 4 << 20;
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
@@ -66,12 +69,13 @@ pub(super) fn start(meter: &Arc<NetworkMeter>, path: PathBuf, listener: SocketAd
         .name("native-network-meter".into())
         .spawn(move || {
             let mut checkpoint = Instant::now();
+            let mut interfaces = MeterSampler::default();
             loop {
                 thread::sleep(Duration::from_millis(250));
                 let Some(meter) = meter.upgrade() else {
                     break;
                 };
-                meter.sample();
+                meter.sample(interfaces.sample());
                 if checkpoint.elapsed() >= CHECKPOINT_INTERVAL {
                     checkpoint = Instant::now();
                     if let Err(error) = save(&path, listener, &meter) {

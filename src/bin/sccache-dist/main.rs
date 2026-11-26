@@ -32,6 +32,8 @@ mod build;
 
 mod cmdline;
 mod command_helpers;
+#[cfg(feature = "scheduler-dashboard")]
+mod dashboard;
 mod job_telemetry;
 mod placement;
 use placement::{Exploration, NativeTransferPlan, choose_worker, native_estimate};
@@ -104,18 +106,17 @@ fn main() {
     init_logging();
 
     let incr_env_strs = ["CARGO_BUILD_INCREMENTAL", "CARGO_INCREMENTAL"];
-    incr_env_strs
-        .iter()
-        .for_each(|incr_str| match env::var(incr_str) {
+    for incr_str in incr_env_strs {
+        match env::var(incr_str) {
             Ok(incr_val) if incr_val == "1" => {
                 println!(
-                    "sccache: incremental compilation is prohibited: Unset {} to continue.",
-                    incr_str
+                    "sccache: incremental compilation is prohibited: Unset {incr_str} to continue."
                 );
                 std::process::exit(1);
             }
             _ => (),
-        });
+        }
+    }
 
     let command = match cmdline::try_parse_from(env::args()) {
         Ok(cmd) => cmd,
@@ -134,10 +135,10 @@ fn main() {
     std::process::exit(match run(command) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sccache-dist: error: {}", e);
+            eprintln!("sccache-dist: error: {e}");
 
             for e in e.chain().skip(1) {
-                eprintln!("sccache-dist: caused by: {}", e);
+                eprintln!("sccache-dist: caused by: {e}");
             }
             2
         }
@@ -145,13 +146,13 @@ fn main() {
 }
 
 fn create_server_token(server_id: ServerId, auth_token: &str) -> String {
-    format!("{} {}", server_id.addr(), auth_token)
+    format!("{server_id} {auth_token}")
 }
 fn check_server_token(server_token: &str, auth_token: &str) -> Option<ServerId> {
     let mut split = server_token.splitn(2, ' ');
-    let server_addr = split.next().and_then(|addr| addr.parse().ok())?;
+    let server_id = split.next().and_then(|id| id.parse().ok())?;
     match split.next() {
-        Some(t) if t == auth_token => Some(ServerId::new(server_addr)),
+        Some(t) if t == auth_token => Some(server_id),
         Some(_) | None => None,
     }
 }
@@ -167,6 +168,7 @@ fn create_jwt_server_token(
     header: &jwt::Header,
     key: &[u8],
 ) -> Result<String> {
+    jsonwebtoken_btls::install()?;
     anyhow::ensure!(key.len() == 256 / 8, "Size of secret key incorrect");
     let key = jwt::EncodingKey::from_secret(key)?;
     jwt::encode(header, &ServerJwt { exp: 0, server_id }, &key).map_err(Into::into)
@@ -181,6 +183,7 @@ fn check_jwt_server_token(
     key: &jwt::DecodingKey,
     validation: &jwt::Validation,
 ) -> Option<ServerId> {
+    jsonwebtoken_btls::install().ok()?;
     jwt::decode::<ServerJwt>(server_token, key, validation)
         .map(|res| res.claims.server_id)
         .ok()
@@ -217,9 +220,22 @@ fn package_client(client_config: &Path) -> Result<sccache::dist::native::NativeC
     let DistAuth::Token { token } = config.dist.auth else {
         bail!("original-package provisioning requires token authentication");
     };
+    let peer = dist::cluster::open_peer(
+        config
+            .dist
+            .cluster
+            .context("cluster trust configuration required")?,
+        &config
+            .dist
+            .scheduler_url
+            .context("scheduler endpoint required")?
+            .to_url(),
+        sccache_cluster_identity::Role::Client,
+        move || Ok(token.clone()),
+    )?;
     NativeCacheClient::new(
-        native.endpoint.to_url(),
-        token,
+        &native.endpoint.to_url(),
+        peer,
         Duration::from_secs(native.request_timeout_secs),
         native.max_metadata_bytes,
     )
@@ -293,40 +309,7 @@ fn run(command: Command) -> Result<i32> {
             identity,
             expected_size,
             locator,
-        } => {
-            use sccache::build_runtime::PackageSource;
-            let client = package_client(&client_config)?;
-            let (receipt, reused) = if let Some(receipt) = client.lookup_package(identity)? {
-                (receipt, true)
-            } else if let Some(locator) = locator {
-                let acquired = client.acquire_package(&locator)?;
-                (acquired.package, acquired.reused)
-            } else {
-                let archive = std::fs::File::open(archive.context(
-                    "upstream package unavailable; supply --archive or --upstream and --path",
-                )?)?;
-                let size = archive.metadata()?.len();
-                anyhow::ensure!(
-                    expected_size.is_none_or(|expected| expected == size),
-                    "original package length differs from supplied size"
-                );
-                (
-                    client.import_package(PackageSource { identity, size }, archive)?,
-                    false,
-                )
-            };
-            anyhow::ensure!(
-                expected_size.is_none_or(|expected| expected == receipt.source.size),
-                "original package length differs from supplied size"
-            );
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "source": receipt.source, "package": receipt.tree, "reused_original_package": reused,
-                }))?
-            );
-            Ok(0)
-        }
+        } => provision_package(&client_config, archive, identity, expected_size, locator),
         Command::NativeProvisionRust {
             client_config,
             archive,
@@ -349,57 +332,15 @@ fn run(command: Command) -> Result<i32> {
             max_expanded_bytes,
             max_tar_bytes,
             manifest_output,
-        } => {
-            use sccache::build_runtime::{ArchiveLength, NativeStore, PackagePolicy};
-            let mut policy = PackagePolicy::normalized_archive(
-                max_entries,
-                max_expanded_bytes,
-                max_tar_bytes,
-                64 * 1024 * 1024,
-            )?;
-            policy.retain_original = true;
-            let store = NativeStore::open(&store)?;
-            let (package, reused) = if let Some(existing) =
-                store.lookup_package(source.identity, policy)?
-            {
-                anyhow::ensure!(
-                    existing.source() == source,
-                    "original package length differs from verified source"
-                );
-                (existing, true)
-            } else {
-                let archive = archive.context("upstream package unavailable; supply --archive")?;
-                (
-                    store.import_package(
-                        source.identity,
-                        ArchiveLength::Exact(source.size),
-                        policy,
-                        std::fs::File::open(archive)?,
-                        sccache::build_runtime::PackageDecoder::Isolated {
-                            executable: &std::env::current_exe()?,
-                            memory_bytes: 512 * 1024 * 1024,
-                            timeout: Duration::from_secs(600),
-                        },
-                    )?,
-                    false,
-                )
-            };
-            let before = store.stats()?;
-            let manifest = store.publish_rust_installer(&package, policy.directory)?;
-            if let Some(path) = manifest_output {
-                write_installation_metadata(&path, |file| manifest.write(file))?;
-            }
-            let after = store.stats()?;
-            anyhow::ensure!(
-                before.logical_bytes == after.logical_bytes && before.blobs == after.blobs,
-                "installer projection unexpectedly created content"
-            );
-            let mut report = package_report(source, &manifest, reused)?;
-            report["logical_bytes"] = after.logical_bytes.into();
-            report["blobs"] = after.blobs.into();
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            Ok(0)
-        }
+        } => import_rust_package(
+            &store,
+            archive,
+            source,
+            max_entries,
+            max_expanded_bytes,
+            max_tar_bytes,
+            manifest_output,
+        ),
         #[cfg(target_os = "linux")]
         Command::NativeSyncSystem {
             client_config,
@@ -429,278 +370,474 @@ fn run(command: Command) -> Result<i32> {
             manifests,
             recipe,
             output,
-        } => {
-            use sccache::build_runtime::{
-                InstallationCatalog, InstallationManifest, InstallationRecipe,
-            };
-            let manifests = if let Some(recipe) = recipe {
-                InstallationRecipe::read(std::fs::File::open(recipe)?)?.selected_manifests()?
-            } else {
-                manifests
-                    .iter()
-                    .map(|path| InstallationManifest::read(std::fs::File::open(path)?))
-                    .collect::<Result<Vec<_>>>()?
-            };
-            let (catalog, report) = InstallationCatalog::attest(&root, &manifests, Some(&output))?;
-            write_installation_metadata(&output, |file| catalog.write(file))?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            Ok(0)
-        }
+        } => attest_installation(&root, &manifests, recipe, &output),
         Command::NativeAudit {
             index,
             schema,
             without,
-        } => {
-            let audit = sccache::build_runtime::NativeIndexAudit::open(&index)?;
-            if let Some(schema) = schema {
-                let comparison = audit.compare(&schema, &without)?;
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "schema": schema,
-                        "without": without,
-                        "comparison": comparison,
-                    }))?
-                );
-            } else {
-                println!("{}", serde_json::to_string_pretty(&audit.inventory()?)?);
-            }
-            Ok(0)
-        }
-        Command::Auth(AuthSubcommand::Base64 { num_bytes }) => {
+        } => audit_index(&index, schema.as_deref(), &without),
+        Command::ClusterInit { directory } => cluster_init(&directory),
+        Command::ClusterId { directory } => cluster_id(&directory),
+        Command::ClusterRevoke { directory, peer } => cluster_revoke(&directory, peer),
+        Command::ClusterStatus { client_config } => cluster_status(&client_config),
+
+        Command::Auth(auth) => run_auth(auth),
+        Command::Scheduler(config) => start_scheduler(*config),
+        Command::Server(config) => start_worker(*config),
+    }
+}
+
+fn cluster_id(directory: &Path) -> Result<i32> {
+    anyhow::ensure!(directory.is_absolute(), "member directory must be absolute");
+    std::fs::create_dir_all(directory)?;
+    println!(
+        "{}",
+        sccache_cluster_identity::Identity::open(&directory.join("key.pem"))?.id()?
+    );
+    Ok(0)
+}
+
+fn cluster_revoke(directory: &Path, peer: ServerId) -> Result<i32> {
+    anyhow::ensure!(
+        directory.is_absolute(),
+        "cluster directory must be absolute"
+    );
+    let registry = sccache_cluster_identity::Registry::open(&directory.join("registry.bin"))?;
+    registry.revoke(peer)?;
+    Ok(0)
+}
+
+fn run_auth(auth: AuthSubcommand) -> Result<i32> {
+    match auth {
+        AuthSubcommand::Base64 { num_bytes } => {
             let mut bytes = vec![0; num_bytes];
             rand::fill(&mut bytes);
             // As long as it can be copied, it doesn't matter if this is base64 or hex etc
             println!("{}", BASE64_URL_SAFE_ENGINE.encode(bytes));
-            Ok(0)
         }
-        Command::Auth(AuthSubcommand::JwtHS256ServerToken {
+        AuthSubcommand::JwtHS256ServerToken {
             secret_key,
             server_id,
-        }) => {
+        } => {
             let header = jwt::Header::new(jwt::Algorithm::HS256);
             let secret_key = BASE64_URL_SAFE_ENGINE.decode(secret_key)?;
             let token = create_jwt_server_token(server_id, &header, &secret_key)
                 .context("Failed to create server token")?;
-            println!("{}", token);
-            Ok(0)
-        }
-
-        Command::Scheduler(scheduler_config::Config {
-            public_addr,
-            client_auth,
-            server_auth,
-            maintenance_drain_file,
-            job_slack,
-            native_cache,
-        }) => {
-            let check_client_auth: Box<dyn dist::http::ClientAuthCheck> = match client_auth {
-                scheduler_config::ClientAuth::Insecure => Box::new(token_check::EqCheck::new(
-                    INSECURE_DIST_CLIENT_TOKEN.to_owned(),
-                )),
-                scheduler_config::ClientAuth::Token { token } => {
-                    Box::new(token_check::EqCheck::new(token))
-                }
-                scheduler_config::ClientAuth::JwtValidate {
-                    audience,
-                    issuer,
-                    jwks_url,
-                } => Box::new(
-                    token_check::ValidJWTCheck::new(audience, issuer, &jwks_url)
-                        .context("Failed to create a checker for valid JWTs")?,
-                ),
-                scheduler_config::ClientAuth::ProxyToken { url, cache_secs } => {
-                    Box::new(token_check::ProxyTokenCheck::new(url, cache_secs)?)
-                }
-            };
-
-            let check_server_auth: dist::http::ServerAuthCheck = match server_auth {
-                scheduler_config::ServerAuth::Insecure => {
-                    warn!("Scheduler starting with DANGEROUSLY_INSECURE server authentication");
-                    let token = INSECURE_DIST_SERVER_TOKEN;
-                    Box::new(move |server_token| check_server_token(server_token, token))
-                }
-                scheduler_config::ServerAuth::Token { token } => {
-                    Box::new(move |server_token| check_server_token(server_token, &token))
-                }
-                scheduler_config::ServerAuth::JwtHS256 { secret_key } => {
-                    let secret_key = BASE64_URL_SAFE_ENGINE
-                        .decode(secret_key)
-                        .context("Secret key base64 invalid")?;
-                    if secret_key.len() != 256 / 8 {
-                        bail!("Size of secret key incorrect")
-                    }
-                    let key = jwt::DecodingKey::from_secret(&secret_key)
-                        .context("Invalid JWT verification key")?;
-                    let validation = {
-                        let mut validation = jwt::Validation::new(jwt::Algorithm::HS256);
-                        validation.leeway = 0;
-                        validation.validate_exp = false;
-                        validation.validate_nbf = false;
-                        validation
-                    };
-                    Box::new(move |server_token| {
-                        check_jwt_server_token(server_token, &key, &validation)
-                    })
-                }
-            };
-
-            if maintenance_drain_file
-                .as_deref()
-                .is_some_and(|path| !path.is_absolute())
-            {
-                bail!("scheduler maintenance_drain_file must be absolute")
-            }
-            daemonize(&[])?;
-            info!(
-                "Distributed scheduler job slack: static={} percent={}%",
-                job_slack.static_jobs, job_slack.percent
-            );
-            let scheduler =
-                Scheduler::new_with_job_slack_and_drain(job_slack, maintenance_drain_file);
-            if let Some(config) = &native_cache {
-                config.session_limits()?;
-                placement::start_checkpoint(
-                    &scheduler.cost_book,
-                    config.directory.join("action-costs.bin"),
-                    config.public_addr,
-                )?;
-            }
-            let http_scheduler = dist::http::Scheduler::new(
-                public_addr,
-                scheduler,
-                check_client_auth,
-                check_server_auth,
-                native_cache,
-            );
-            // A running server never exits successfully (Result<Infallible>).
-            match http_scheduler.start()? {}
-        }
-
-        Command::Server(server_config::Config {
-            builder,
-            cache_dir,
-            public_addr,
-            bind_address,
-            scheduler_url,
-            scheduler_auth,
-            toolchain_cache_size,
-            toolchain_archive_sources,
-            native_worker,
-        }) => {
-            let builder: Option<Box<dyn dist::BuilderIncoming>> = match builder {
-                server_config::BuilderType::Native => None,
-                #[cfg(not(target_os = "freebsd"))]
-                server_config::BuilderType::Docker => Some(Box::new(
-                    build::DockerBuilder::new().context("Docker builder failed to start")?,
-                )),
-                #[cfg(not(target_os = "freebsd"))]
-                server_config::BuilderType::Overlay {
-                    bwrap_path,
-                    build_dir,
-                    extracted_toolchain_cache_size,
-                } => Some(Box::new(
-                    build::OverlayBuilder::new(
-                        bwrap_path,
-                        build_dir,
-                        extracted_toolchain_cache_size,
-                    )
-                    .context("Overlay builder failed to start")?,
-                )),
-                #[cfg(target_os = "freebsd")]
-                server_config::BuilderType::Pot {
-                    pot_fs_root,
-                    clone_from,
-                    pot_cmd,
-                    pot_clone_args,
-                } => Some(Box::new(
-                    build::PotBuilder::new(pot_fs_root, clone_from, pot_cmd, pot_clone_args)
-                        .context("Pot builder failed to start")?,
-                )),
-                _ => bail!("Builder type not supported on this platform: {builder:?}"),
-            };
-            if builder.is_none() {
-                anyhow::ensure!(
-                    native_worker.is_some(),
-                    "native builder requires native_worker configuration"
-                );
-                anyhow::ensure!(
-                    cache_dir.is_none() && toolchain_archive_sources.is_empty(),
-                    "native-only worker cannot configure archive cache paths"
-                );
-            }
-            let archive = builder
-                .map(|builder| {
-                    ArchiveWorker::new(
-                        builder,
-                        cache_dir
-                            .as_deref()
-                            .context("archive builder requires cache_dir")?,
-                        toolchain_cache_size,
-                        toolchain_archive_sources,
-                    )
-                })
-                .transpose()?;
-
-            let server_id = ServerId::new(public_addr);
-            let scheduler_auth = match scheduler_auth {
-                server_config::SchedulerAuth::Insecure => {
-                    warn!("Server starting with DANGEROUSLY_INSECURE scheduler authentication");
-                    create_server_token(server_id, INSECURE_DIST_SERVER_TOKEN)
-                }
-                server_config::SchedulerAuth::Token { token } => {
-                    create_server_token(server_id, &token)
-                }
-                server_config::SchedulerAuth::JwtToken { token } => {
-                    let token_server_id: ServerId =
-                        dangerous_insecure_extract_jwt_server_token(&token)
-                            .context("Could not decode scheduler auth jwt")?;
-                    if token_server_id != server_id {
-                        bail!(
-                            "JWT server id ({:?}) did not match configured server id ({:?})",
-                            token_server_id,
-                            server_id
-                        )
-                    }
-                    token
-                }
-            };
-
-            #[cfg(target_os = "linux")]
-            let native_worker = native_worker
-                .map(|config| NativeWorker::new(config, scheduler_auth.clone()))
-                .transpose()?;
-            #[cfg(not(target_os = "linux"))]
-            if native_worker.is_some() {
-                bail!("native worker requires Linux");
-            }
-            let server = Server::new(archive);
-            #[cfg(target_os = "linux")]
-            let server = Server {
-                native_worker: native_worker
-                    .map(|worker| {
-                        NativeDispatcher::new(
-                            worker,
-                            std::sync::Arc::clone(&server.execution_queue),
-                        )
-                    })
-                    .transpose()?,
-                ..server
-            };
-            let worker_name = dist_worker_name()?;
-            let http_server = dist::http::Server::new_with_worker_name(
-                public_addr,
-                bind_address,
-                scheduler_url.to_url(),
-                scheduler_auth,
-                worker_name,
-                server,
-            )
-            .context("Failed to create sccache HTTP server instance")?;
-            // A running server never exits successfully (Result<Infallible>).
-            match http_server.start()? {}
+            println!("{token}");
         }
     }
+    Ok(0)
+}
+
+fn provision_package(
+    client_config: &Path,
+    archive: Option<PathBuf>,
+    identity: sccache::build_runtime::PackageIdentity,
+    expected_size: Option<u64>,
+    locator: Option<dist::native::PackageLocator>,
+) -> Result<i32> {
+    use sccache::build_runtime::PackageSource;
+    let client = package_client(client_config)?;
+    let (receipt, reused) = if let Some(receipt) = client.lookup_package(identity)? {
+        (receipt, true)
+    } else if let Some(locator) = locator {
+        let acquired = client.acquire_package(&locator)?;
+        (acquired.package, acquired.reused)
+    } else {
+        let archive =
+            std::fs::File::open(archive.context(
+                "upstream package unavailable; supply --archive or --upstream and --path",
+            )?)?;
+        let size = archive.metadata()?.len();
+        anyhow::ensure!(
+            expected_size.is_none_or(|expected| expected == size),
+            "original package length differs from supplied size"
+        );
+        (
+            client.import_package(PackageSource { identity, size }, archive)?,
+            false,
+        )
+    };
+    anyhow::ensure!(
+        expected_size.is_none_or(|expected| expected == receipt.source.size),
+        "original package length differs from supplied size"
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "source": receipt.source, "package": receipt.tree, "reused_original_package": reused,
+        }))?
+    );
+    Ok(0)
+}
+
+fn import_rust_package(
+    store: &Path,
+    archive: Option<PathBuf>,
+    source: sccache::build_runtime::PackageSource,
+    max_entries: usize,
+    max_expanded_bytes: u64,
+    max_tar_bytes: u64,
+    manifest_output: Option<PathBuf>,
+) -> Result<i32> {
+    use sccache::build_runtime::{ArchiveLength, NativeStore, PackagePolicy};
+    let mut policy = PackagePolicy::normalized_archive(
+        max_entries,
+        max_expanded_bytes,
+        max_tar_bytes,
+        64 * 1024 * 1024,
+    )?;
+    policy.retain_original = true;
+    let store = NativeStore::open(store)?;
+    let (package, reused) = if let Some(existing) = store.lookup_package(source.identity, policy)? {
+        anyhow::ensure!(
+            existing.source() == source,
+            "original package length differs from verified source"
+        );
+        (existing, true)
+    } else {
+        let archive = archive.context("upstream package unavailable; supply --archive")?;
+        (
+            store.import_package(
+                source.identity,
+                ArchiveLength::Exact(source.size),
+                policy,
+                std::fs::File::open(archive)?,
+                sccache::build_runtime::PackageDecoder::Isolated {
+                    executable: &std::env::current_exe()?,
+                    memory_bytes: 512 * 1024 * 1024,
+                    timeout: Duration::from_secs(600),
+                },
+            )?,
+            false,
+        )
+    };
+    let before = store.stats()?;
+    let manifest = store.publish_rust_installer(&package, policy.directory)?;
+    if let Some(path) = manifest_output {
+        write_installation_metadata(&path, |file| manifest.write(file))?;
+    }
+    let after = store.stats()?;
+    anyhow::ensure!(
+        before.logical_bytes == after.logical_bytes && before.blobs == after.blobs,
+        "installer projection unexpectedly created content"
+    );
+    let mut report = package_report(source, &manifest, reused)?;
+    report["logical_bytes"] = after.logical_bytes.into();
+    report["blobs"] = after.blobs.into();
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(0)
+}
+
+#[cfg(target_os = "linux")]
+fn attest_installation(
+    root: &Path,
+    manifests: &[PathBuf],
+    recipe: Option<PathBuf>,
+    output: &Path,
+) -> Result<i32> {
+    use sccache::build_runtime::{InstallationCatalog, InstallationManifest, InstallationRecipe};
+    let manifests = if let Some(recipe) = recipe {
+        InstallationRecipe::read(std::fs::File::open(recipe)?)?.selected_manifests()?
+    } else {
+        manifests
+            .iter()
+            .map(|path| InstallationManifest::read(std::fs::File::open(path)?))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let (catalog, report) = InstallationCatalog::attest(root, &manifests, Some(output))?;
+    write_installation_metadata(output, |file| catalog.write(file))?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(0)
+}
+
+fn audit_index(index: &Path, schema: Option<&str>, without: &[String]) -> Result<i32> {
+    let audit = sccache::build_runtime::NativeIndexAudit::open(index)?;
+    if let Some(schema) = schema {
+        let comparison = audit.compare(schema, without)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": schema,
+                "without": without,
+                "comparison": comparison,
+            }))?
+        );
+    } else {
+        println!("{}", serde_json::to_string_pretty(&audit.inventory()?)?);
+    }
+    Ok(0)
+}
+
+fn cluster_status(client_config: &Path) -> Result<i32> {
+    use sccache::config::{DistAuth, FileConfig, try_read_config_file};
+    use sccache_cluster_identity::Role;
+    let config: FileConfig =
+        try_read_config_file(client_config)?.context("client configuration unavailable")?;
+    let DistAuth::Token { token } = config.dist.auth else {
+        bail!("cluster status requires token authentication")
+    };
+    let peer = dist::cluster::open_peer(
+        config.dist.cluster.context("cluster trust required")?,
+        &config
+            .dist
+            .scheduler_url
+            .context("scheduler endpoint required")?
+            .to_url(),
+        Role::Client,
+        move || Ok(token.clone()),
+    )?;
+    let routes = dist::cluster::ClusterRoutes::for_peer(std::sync::Arc::clone(&peer));
+    let (http, base) = routes.endpoint(
+        peer.scheduler_id(),
+        Role::Scheduler,
+        sccache::dist::cluster::Route::unbound(peer.scheduler_address()),
+    )?;
+    let status: dist::SchedulerStatusResult =
+        sccache::http_client::io_runtime()?.block_on(async {
+            let response = http
+                .get(dist::http::urls::scheduler_status(&base)?.as_str())
+                .header("Accept", "application/json")
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await?
+                .error_for_status()?;
+            let body = sccache::http_client::read_bounded_bytes_async(
+                response,
+                dist::http::CONTROL_RESPONSE_LIMIT,
+            )
+            .await?;
+            serde_json::from_slice(&body).context("decode scheduler status")
+        })?;
+    println!("{}", serde_json::to_string(&status)?);
+    Ok(0)
+}
+
+fn cluster_init(directory: &Path) -> Result<i32> {
+    anyhow::ensure!(
+        directory.is_absolute(),
+        "cluster directory must be absolute"
+    );
+    std::fs::create_dir_all(directory)?;
+    let _registry = sccache_cluster_identity::scheduler_registry(directory)?;
+    let ca = sccache_cluster_identity::ClusterCa::open(&directory.join("ca-key.pem"))?;
+    let identity = sccache_cluster_identity::Identity::open(&directory.join("key.pem"))?;
+    sccache_cluster_identity::publish_trust_anchor(ca.certificate(), &directory.join("ca.pem"))?;
+    println!("{}", identity.id()?);
+    Ok(0)
+}
+
+fn start_scheduler(config: scheduler_config::Config) -> Result<i32> {
+    let scheduler_config::Config {
+        cluster_directory,
+        dashboard,
+        public_addr,
+        client_auth,
+        server_auth,
+        maintenance_drain_file,
+        job_slack,
+        native_cache,
+    } = config;
+
+    let check_client_auth: Box<dyn dist::http::ClientAuthCheck> = match client_auth {
+        scheduler_config::ClientAuth::Insecure => Box::new(token_check::EqCheck::new(
+            INSECURE_DIST_CLIENT_TOKEN.to_owned(),
+        )),
+        scheduler_config::ClientAuth::Token { token } => Box::new(token_check::EqCheck::new(token)),
+        scheduler_config::ClientAuth::JwtValidate {
+            audience,
+            issuer,
+            jwks_url,
+        } => Box::new(
+            token_check::ValidJWTCheck::new(audience, issuer, &jwks_url)
+                .context("Failed to create a checker for valid JWTs")?,
+        ),
+        scheduler_config::ClientAuth::ProxyToken { url, cache_secs } => {
+            Box::new(token_check::ProxyTokenCheck::new(&url, cache_secs)?)
+        }
+    };
+
+    let check_server_auth: dist::http::ServerAuthCheck = match server_auth {
+        scheduler_config::ServerAuth::Insecure => {
+            warn!("Scheduler starting with DANGEROUSLY_INSECURE server authentication");
+            let token = INSECURE_DIST_SERVER_TOKEN;
+            Box::new(move |server_token| check_server_token(server_token, token))
+        }
+        scheduler_config::ServerAuth::Token { token } => {
+            Box::new(move |server_token| check_server_token(server_token, &token))
+        }
+        scheduler_config::ServerAuth::JwtHS256 { secret_key } => {
+            let secret_key = BASE64_URL_SAFE_ENGINE
+                .decode(secret_key)
+                .context("Secret key base64 invalid")?;
+            if secret_key.len() != 256 / 8 {
+                bail!("Size of secret key incorrect")
+            }
+            let key = jwt::DecodingKey::from_secret(&secret_key)
+                .context("Invalid JWT verification key")?;
+            let validation = {
+                let mut validation = jwt::Validation::new(jwt::Algorithm::HS256);
+                validation.leeway = 0;
+                validation.validate_exp = false;
+                validation.validate_nbf = false;
+                validation
+            };
+            Box::new(move |server_token| check_jwt_server_token(server_token, &key, &validation))
+        }
+    };
+
+    if maintenance_drain_file
+        .as_deref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        bail!("scheduler maintenance_drain_file must be absolute")
+    }
+    daemonize(&[])?;
+    info!(
+        "Distributed scheduler job slack: static={} percent={}%",
+        job_slack.static_jobs, job_slack.percent
+    );
+    let scheduler = Scheduler::new_with_job_slack_and_drain(job_slack, maintenance_drain_file);
+    if let Some(config) = &native_cache {
+        config.session_limits()?;
+        placement::start_checkpoint(
+            &scheduler.cost_book,
+            config.directory.join("action-costs.bin"),
+            config.public_addr,
+        )?;
+    }
+    let http_scheduler = dist::http::Scheduler::new(
+        cluster_directory,
+        public_addr,
+        scheduler,
+        check_client_auth,
+        check_server_auth,
+        native_cache,
+        dashboard,
+    );
+    // A running server never exits successfully (Result<Infallible>).
+    match http_scheduler.start()? {}
+}
+
+fn worker_bootstrap_token(
+    server_id: ServerId,
+    scheduler_auth: &server_config::SchedulerAuth,
+) -> Result<String> {
+    Ok(match scheduler_auth {
+        server_config::SchedulerAuth::Insecure => {
+            warn!("Server starting with DANGEROUSLY_INSECURE scheduler authentication");
+            create_server_token(server_id, INSECURE_DIST_SERVER_TOKEN)
+        }
+        server_config::SchedulerAuth::Token { token } => create_server_token(server_id, token),
+        server_config::SchedulerAuth::JwtToken { token } => {
+            let token_server_id: ServerId = dangerous_insecure_extract_jwt_server_token(token)
+                .context("Could not decode scheduler auth jwt")?;
+            if token_server_id != server_id {
+                bail!(
+                    "JWT server id ({token_server_id:?}) did not match configured server id ({server_id:?})"
+                )
+            }
+            token.clone()
+        }
+    })
+}
+
+fn start_worker(config: server_config::Config) -> Result<i32> {
+    let server_config::Config {
+        cluster,
+        builder,
+        cache_dir,
+        public_addr,
+        bind_address,
+        scheduler_url,
+        scheduler_auth,
+        toolchain_cache_size,
+        toolchain_archive_sources,
+        native_worker,
+    } = config;
+
+    let builder: Option<Box<dyn dist::BuilderIncoming>> = match builder {
+        server_config::BuilderType::Native => None,
+        #[cfg(not(target_os = "freebsd"))]
+        server_config::BuilderType::Docker => Some(Box::new(
+            build::DockerBuilder::new().context("Docker builder failed to start")?,
+        )),
+        #[cfg(not(target_os = "freebsd"))]
+        server_config::BuilderType::Overlay {
+            bwrap_path,
+            build_dir,
+            extracted_toolchain_cache_size,
+        } => Some(Box::new(
+            build::OverlayBuilder::new(bwrap_path, build_dir, extracted_toolchain_cache_size)
+                .context("Overlay builder failed to start")?,
+        )),
+        #[cfg(target_os = "freebsd")]
+        server_config::BuilderType::Pot {
+            pot_fs_root,
+            clone_from,
+            pot_cmd,
+            pot_clone_args,
+        } => Some(Box::new(
+            build::PotBuilder::new(pot_fs_root, clone_from, pot_cmd, pot_clone_args)
+                .context("Pot builder failed to start")?,
+        )),
+        _ => bail!("Builder type not supported on this platform: {builder:?}"),
+    };
+    if builder.is_none() {
+        anyhow::ensure!(
+            native_worker.is_some(),
+            "native builder requires native_worker configuration"
+        );
+        anyhow::ensure!(
+            cache_dir.is_none() && toolchain_archive_sources.is_empty(),
+            "native-only worker cannot configure archive cache paths"
+        );
+    }
+    let archive = builder
+        .map(|builder| {
+            ArchiveWorker::new(
+                builder,
+                cache_dir
+                    .as_deref()
+                    .context("archive builder requires cache_dir")?,
+                toolchain_cache_size,
+                toolchain_archive_sources,
+            )
+        })
+        .transpose()?;
+
+    let server_id = sccache_cluster_identity::open_identity(&cluster)?.id()?;
+
+    let peer = dist::cluster::open_peer(
+        cluster,
+        &scheduler_url.to_url(),
+        sccache_cluster_identity::Role::Worker,
+        move || worker_bootstrap_token(server_id, &scheduler_auth),
+    )?;
+    #[cfg(target_os = "linux")]
+    let native_worker = native_worker
+        .map(|config| NativeWorker::new(config, std::sync::Arc::clone(&peer)))
+        .transpose()?;
+    #[cfg(not(target_os = "linux"))]
+    if native_worker.is_some() {
+        bail!("native worker requires Linux");
+    }
+    let server = Server::new(archive);
+    #[cfg(target_os = "linux")]
+    let server = Server {
+        native_worker: native_worker
+            .map(|worker| {
+                NativeDispatcher::new(worker, std::sync::Arc::clone(&server.execution_queue))
+            })
+            .transpose()?,
+        ..server
+    };
+    let worker_name = dist_worker_name()?;
+    let http_server =
+        dist::http::Server::new(public_addr, bind_address, peer, Some(worker_name), server)
+            .context("Failed to create sccache HTTP server instance")?;
+    // A running server never exits successfully (Result<Infallible>).
+    match http_server.start()? {}
 }
 
 fn init_logging() {
@@ -726,7 +863,7 @@ fn init_logging() {
 const SERVER_REMEMBER_ERROR_TIMEOUT: Duration = Duration::from_secs(300);
 // Temporary fleet relief for slow input staging and toolchain uploads.
 // Track progress explicitly instead of holding unclaimed reservations in #333.
-const UNCLAIMED_PENDING_TIMEOUT: Duration = Duration::from_secs(900);
+const UNCLAIMED_PENDING_TIMEOUT: Duration = Duration::from_mins(15);
 const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Copy, Clone)]
@@ -744,6 +881,13 @@ struct JobDetail {
     observed_result: bool,
 }
 
+fn log_lost_job(job_id: JobId, server_id: ServerId, reason: &str, detail: Option<&JobDetail>) {
+    let previous_state = detail.map(|detail| detail.state);
+    warn!(
+        "dist_job_lost job_id={job_id} worker={server_id} reason={reason} previous_state={previous_state:?}"
+    );
+}
+
 impl JobDetail {
     fn is_stale_unclaimed(self, now: Instant) -> bool {
         let age = now.duration_since(self.state_since);
@@ -755,7 +899,7 @@ impl JobDetail {
         }
     }
 
-    fn transition_to(&mut self, state: JobState, now: Instant) {
+    const fn transition_to(&mut self, state: JobState, now: Instant) {
         self.state = state;
         self.state_since = now;
         self.missing_since = None;
@@ -827,6 +971,11 @@ pub struct Scheduler {
     // scheduler must not begin again at JobId(0).
     job_id_base: u64,
     job_count: AtomicUsize,
+    #[cfg(feature = "scheduler-dashboard")]
+    dashboard_waker: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>>,
+    #[cfg(feature = "scheduler-dashboard")]
+    dashboard_clients:
+        Mutex<BTreeMap<ServerId, (Instant, sccache::build_runtime::wire::ClientDeliveryRates)>>,
     job_slack: JobSlackConfig,
     maintenance_drain_file: Option<PathBuf>,
 
@@ -836,6 +985,16 @@ pub struct Scheduler {
     completed_acks: Mutex<CompletedJobAcks>,
     exploration: Mutex<Exploration>,
     cost_book: std::sync::Arc<Mutex<placement::CostBook>>,
+}
+
+#[cfg(feature = "scheduler-dashboard")]
+struct DashboardChange<'a>(&'a Scheduler);
+
+#[cfg(feature = "scheduler-dashboard")]
+impl Drop for DashboardChange<'_> {
+    fn drop(&mut self) {
+        self.0.dashboard_changed();
+    }
 }
 
 struct ServerDetails {
@@ -855,6 +1014,11 @@ struct ServerDetails {
 }
 
 impl ServerDetails {
+    fn reserve(&mut self, job_id: JobId, assigned: Option<placement::AssignedNative>) {
+        assert!(self.jobs_assigned.insert(job_id, assigned).is_none());
+        assert!(self.jobs_assigning.insert(job_id, Instant::now()).is_none());
+    }
+
     fn apply_milestones(&mut self, now: Instant) {
         if let Some(placement) = &mut self.capabilities.native_placement {
             for (&id, assigned) in &self.jobs_assigned {
@@ -882,20 +1046,23 @@ impl ServerDetails {
     }
 
     fn compiler_demand(&self) -> usize {
-        self.capabilities.native_placement.as_ref().map_or_else(
-            || self.jobs_assigned.len(),
-            |placement| {
+        self.capabilities
+            .native_placement
+            .as_ref()
+            .map_or(self.jobs_assigned.len(), |placement| {
                 placement
                     .queue
                     .compiler_demand(self.jobs_assigned.keys().copied())
-            },
-        )
+            })
+    }
+
+    fn admission_slots(&self, job_slack: JobSlackConfig) -> usize {
+        job_slack
+            .max_jobs(self.cpu_capacity)
+            .saturating_sub(self.compiler_demand())
     }
 
     fn native_headroom(&self) -> usize {
-        if self.capabilities.archive {
-            return usize::MAX;
-        }
         self.capabilities
             .native_placement
             .as_ref()
@@ -910,6 +1077,14 @@ impl ServerDetails {
 }
 
 impl Scheduler {
+    #[cfg(feature = "scheduler-dashboard")]
+    fn dashboard_changed(&self) {
+        if let Some(sender) = self.dashboard_waker.get() {
+            let _ = sender.try_send(());
+        }
+    }
+
+    #[must_use = "the scheduler owns its worker and job state"]
     pub fn new() -> Self {
         Self::new_with_job_slack(JobSlackConfig::default())
     }
@@ -946,9 +1121,13 @@ impl Scheduler {
         job_slack: JobSlackConfig,
         maintenance_drain_file: Option<PathBuf>,
     ) -> Self {
-        Scheduler {
+        Self {
             job_id_base,
             job_count: AtomicUsize::new(0),
+            #[cfg(feature = "scheduler-dashboard")]
+            dashboard_waker: std::sync::OnceLock::new(),
+            #[cfg(feature = "scheduler-dashboard")]
+            dashboard_clients: Mutex::default(),
             job_slack,
             maintenance_drain_file,
             jobs: Mutex::new(BTreeMap::new()),
@@ -981,7 +1160,6 @@ impl Scheduler {
     }
 
     fn prune_servers(
-        &self,
         servers: &mut MutexGuard<HashMap<ServerId, ServerDetails>>,
         jobs: &mut MutexGuard<BTreeMap<JobId, JobDetail>>,
     ) {
@@ -996,27 +1174,17 @@ impl Scheduler {
         }
 
         for server_id in dead_servers {
-            warn!(
-                "Server {} appears to be dead, pruning it in the scheduler",
-                server_id.addr()
-            );
+            warn!("Server {server_id} appears to be dead, pruning it in the scheduler");
             let Some(server_details) = servers.remove(&server_id) else {
                 error!("server {server_id:?} disappeared while pruning");
                 continue;
             };
             for job_id in server_details.jobs_assigned.into_keys() {
-                warn!(
-                    "dist_job_lost job_id={job_id} worker={} reason=heartbeat_timeout previous_state={:?}",
-                    server_id.addr(),
-                    jobs.get(&job_id).map(|detail| detail.state)
-                );
+                log_lost_job(job_id, server_id, "heartbeat_timeout", jobs.get(&job_id));
                 // A job may be missing here if it failed to allocate
                 // initially, so just warn if it's not present.
                 if jobs.remove(&job_id).is_none() {
-                    warn!(
-                        "Non-terminated job {} assignment originally failed.",
-                        job_id
-                    );
+                    warn!("Non-terminated job {job_id} assignment originally failed.");
                 }
             }
         }
@@ -1029,6 +1197,10 @@ impl Default for Scheduler {
     }
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Worker admission weights are approximate floating-point CPU capacity estimates"
+)]
 fn admission_weight(job_count: usize, cpu_capacity: f64, job_slack: JobSlackConfig) -> Option<f64> {
     (job_count < job_slack.max_jobs(cpu_capacity))
         .then_some((cpu_capacity - job_count as f64).max(0.0) + 0.5)
@@ -1052,20 +1224,141 @@ fn weighted_server(candidates: &[(ServerId, f64)], draw: f64) -> Option<ServerId
         .map(|(id, _)| *id)
 }
 
-impl Scheduler {
-    fn allocate_job(
-        &self,
-        requester: &dyn SchedulerOutgoing,
-        mut assignment: JobAssignment,
-        network: &NetworkSnapshot,
-        packages: std::sync::Arc<sccache::build_runtime::PackageCatalog>,
-    ) -> Result<AllocJobResult> {
-        if self.is_draining() {
-            return Ok(AllocJobResult::Fail {
-                msg: "scheduler is draining for maintenance".to_owned(),
-            });
+struct Reservation {
+    job_id: JobId,
+    server_id: ServerId,
+    auth: String,
+    prediction: Option<placement::PlacementEstimate>,
+    estimated_result_bytes: Option<u64>,
+}
+
+struct NoCapacity(usize);
+
+struct CandidateSet {
+    healthy: Vec<(ServerId, f64)>,
+    retry: Vec<(ServerId, f64)>,
+    predictions: BTreeMap<ServerId, placement::PlacementEstimate>,
+}
+
+fn collect_candidates(
+    servers: &mut HashMap<ServerId, ServerDetails>,
+    native: Option<&NativeAssignment>,
+    class: Option<placement::ActionClass>,
+    transfer_plan: Option<&NativeTransferPlan<'_>>,
+    cost_book: &placement::CostBook,
+    job_slack: JobSlackConfig,
+    now: Instant,
+) -> CandidateSet {
+    let native_platform = native.map(|assignment| assignment.spec.platform);
+    let native_inputs = native.map(|assignment| &assignment.input_blobs);
+    let mut healthy = Vec::new();
+    let mut retry = Vec::new();
+    let mut predictions = BTreeMap::new();
+    for (&server_id, details) in servers {
+        let compatible = match native_platform {
+            Some(platform) => details.capabilities.native_platform == Some(platform),
+            None => details.capabilities.archive,
+        };
+        if !compatible {
+            continue;
         }
-        let native = match &assignment {
+        let Some(weight) =
+            admission_weight(details.compiler_demand(), details.cpu_capacity, job_slack)
+        else {
+            continue;
+        };
+        let weight = if let (Some(inputs), Some(plan)) = (native_inputs, transfer_plan) {
+            let Some(placement) = details.capabilities.native_placement.as_ref() else {
+                continue;
+            };
+            if !placement.queue.has_capacity(
+                details
+                    .jobs_assigned
+                    .iter()
+                    .filter_map(|(&id, inputs)| inputs.is_some().then_some(id)),
+            ) {
+                continue;
+            }
+            let learned = class.zip(native_platform).map(|(class, platform)| {
+                cost_book.predict(
+                    placement::WorkerScope {
+                        peer: server_id,
+                        platform,
+                    },
+                    class,
+                    placement,
+                    now,
+                )
+            });
+            let Some(forecast) = placement::WorkerForecast::new(details, learned) else {
+                continue;
+            };
+            let estimate = native_estimate(forecast, inputs, Peer::Worker(server_id), plan);
+            predictions.insert(server_id, estimate);
+            estimate.seconds
+        } else {
+            weight
+        };
+        if details
+            .last_error
+            .is_some_and(|when| now.duration_since(when) > SERVER_REMEMBER_ERROR_TIMEOUT)
+        {
+            details.last_error = None;
+        }
+        if details.last_error.is_some() {
+            retry.push((server_id, weight));
+        } else {
+            healthy.push((server_id, weight));
+        }
+    }
+
+    CandidateSet {
+        healthy,
+        retry,
+        predictions,
+    }
+}
+
+impl Scheduler {
+    fn select_candidate(
+        &self,
+        native_inputs: Option<&dist::NativeInputBlobs>,
+        transfer_plan: Option<&NativeTransferPlan<'_>>,
+        servers: &HashMap<ServerId, ServerDetails>,
+        candidates: &CandidateSet,
+        now: Instant,
+    ) -> Option<ServerId> {
+        [&candidates.healthy, &candidates.retry]
+            .into_iter()
+            .find_map(|group| {
+                if let (Some(inputs), Some(plan)) = (native_inputs, transfer_plan) {
+                    let mut history = self
+                        .exploration
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    choose_worker(
+                        group,
+                        servers,
+                        inputs,
+                        &candidates.predictions,
+                        plan,
+                        &mut history,
+                        now,
+                    )
+                } else {
+                    weighted_server(group, rand::random::<f64>())
+                }
+            })
+    }
+
+    fn reserve_job(
+        &self,
+        assignment: &JobAssignment,
+        network: &NetworkSnapshot,
+        packages: &std::sync::Arc<sccache::build_runtime::PackageCatalog>,
+        assigned_at: Instant,
+    ) -> Result<std::result::Result<Reservation, NoCapacity>> {
+        let native = match assignment {
             JobAssignment::Archive(_) => None,
             JobAssignment::Native(native) => Some(native.as_ref()),
         };
@@ -1074,196 +1367,150 @@ impl Scheduler {
         let class = native
             .map(|assignment| placement::ActionClass::from_spec(&assignment.spec))
             .transpose()?;
+        // LOCKS
+        let mut servers = self
+            .servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
+
+        let cost_book = self
+            .cost_book
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transfer_plan = native_inputs.map(|inputs| {
+            NativeTransferPlan::new(
+                network,
+                &servers,
+                Some(packages),
+                Some(inputs),
+                native.and_then(|assignment| assignment.receiver.as_ref()),
+            )
+            .with_remote_fraction(
+                native
+                    .and_then(|assignment| {
+                        let (requester, _) = assignment.receiver.as_ref()?;
+                        let profile = assignment.delivery_profile?;
+                        Some(cost_book.delivery_fraction(*requester, profile, assigned_at))
+                    })
+                    .unwrap_or(1_000_000),
+            )
+        });
+        let now = Instant::now();
+        let candidates = collect_candidates(
+            &mut servers,
+            native,
+            class,
+            transfer_plan.as_ref(),
+            &cost_book,
+            self.job_slack,
+            now,
+        );
+        let estimated_result_bytes = class
+            .zip(native_platform)
+            .and_then(|(class, platform)| cost_book.result_reservation(platform, class, now));
+        drop(cost_book);
+        let selected = self.select_candidate(
+            native_inputs,
+            transfer_plan.as_ref(),
+            &servers,
+            &candidates,
+            now,
+        );
+        let CandidateSet {
+            healthy,
+            predictions,
+            ..
+        } = candidates;
+        let Some(server_id) = selected else {
+            return Ok(Err(NoCapacity(servers.len())));
+        };
+        let server_details = servers.get_mut(&server_id).ok_or_else(|| {
+            anyhow::anyhow!("selected worker disappeared while scheduler lock held")
+        })?;
+        let job_id = self.next_job_id();
+        // Unique while holding the servers lock: every allocation
+        // advances job_count, including assignments that later fail.
+        // Token generation may fail. Never reserve worker capacity
+        // until an auth token is ready to send.
+        let auth = server_details
+            .job_authorizer
+            .generate_token(job_id)
+            .context("Could not create an auth token for this job")?;
+        let prediction = predictions.get(&server_id).copied();
+        if let Some(class) = class {
+            trace!(target: "native_placement_replay", "{}", serde_json::json!({
+                "kind": "assigned", "job": job_id.0, "worker": server_id, "class": class,
+                "candidates": predictions,
+                "estimated_result_bytes": estimated_result_bytes,
+                "host_prior": server_details.capabilities.native_placement.as_ref().map(placement::ActionCost::baseline),
+                "healthy": healthy.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            }));
+        }
+        let assigned = native_inputs.map(|inputs| placement::AssignedNative {
+            packages: std::sync::Arc::clone(packages),
+            inputs: inputs.clone(),
+            class,
+            cost: predictions.get(&server_id).map(|estimate| estimate.cost),
+            milestone: None,
+        });
+        server_details.reserve(job_id, assigned);
+        drop(servers);
+        info!("Job {job_id} created and will be assigned to server {server_id:?}");
+        Ok(Ok(Reservation {
+            job_id,
+            server_id,
+            auth,
+            prediction,
+            estimated_result_bytes,
+        }))
+    }
+}
+
+impl Scheduler {
+    fn allocate_job(
+        &self,
+        requester: &dyn SchedulerOutgoing,
+        mut assignment: JobAssignment,
+        network: &NetworkSnapshot,
+        packages: &std::sync::Arc<sccache::build_runtime::PackageCatalog>,
+    ) -> Result<AllocJobResult> {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
+        if self.is_draining() {
+            return Ok(AllocJobResult::Fail {
+                msg: "scheduler is draining for maintenance".to_owned(),
+            });
+        }
         let assigned_at = Instant::now();
-        let (job_id, server_id, auth, prediction, estimated_result_bytes) = {
-            // LOCKS
-            let mut servers = self
-                .servers
-                .lock()
-                .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
-
-            let cost_book = self
-                .cost_book
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let transfer_plan = native_inputs
-                .as_ref()
-                .map(|_| NativeTransferPlan::new(network, &servers, Some(&packages)));
-            let res = {
-                let mut healthy = Vec::new();
-                let mut retry = Vec::new();
-                let mut predictions = BTreeMap::new();
-                let now = Instant::now();
-                for (&server_id, details) in servers.iter_mut() {
-                    let compatible = match native_platform {
-                        Some(platform) => details.capabilities.native_platform == Some(platform),
-                        None => details.capabilities.archive,
-                    };
-                    if !compatible {
-                        continue;
-                    }
-                    let Some(weight) = admission_weight(
-                        details.compiler_demand(),
-                        details.cpu_capacity,
-                        self.job_slack,
-                    ) else {
-                        continue;
-                    };
-                    let weight = if let (Some(inputs), Some(plan)) =
-                        (native_inputs, transfer_plan.as_ref())
-                    {
-                        let Some(placement) = details.capabilities.native_placement.as_ref() else {
-                            continue;
-                        };
-                        if !placement.queue.has_capacity(
-                            details
-                                .jobs_assigned
-                                .iter()
-                                .filter_map(|(&id, inputs)| inputs.is_some().then_some(id)),
-                        ) {
-                            continue;
-                        }
-                        let learned = class.zip(native_platform).map(|(class, platform)| {
-                            cost_book.predict(
-                                placement::WorkerScope {
-                                    address: server_id.addr(),
-                                    platform,
-                                },
-                                class,
-                                placement,
-                                now,
-                            )
-                        });
-                        let Some(forecast) = placement::WorkerForecast::new(details, learned)
-                        else {
-                            continue;
-                        };
-                        let estimate =
-                            native_estimate(forecast, inputs, Peer::Worker(server_id.addr()), plan);
-                        predictions.insert(server_id.addr(), estimate);
-                        estimate.seconds
-                    } else {
-                        weight
-                    };
-                    if details.last_error.is_some_and(|when| {
-                        now.duration_since(when) > SERVER_REMEMBER_ERROR_TIMEOUT
-                    }) {
-                        details.last_error = None;
-                    }
-                    if details.last_error.is_some() {
-                        retry.push((server_id, weight));
-                    } else {
-                        healthy.push((server_id, weight));
-                    }
-                }
-                let estimated_result_bytes =
-                    class.zip(native_platform).and_then(|(class, platform)| {
-                        cost_book.result_reservation(platform, class, now)
-                    });
-                drop(cost_book);
-                let selected = [&healthy, &retry].into_iter().find_map(|candidates| {
-                    if let (Some(inputs), Some(plan)) =
-                        (native_inputs.as_ref(), transfer_plan.as_ref())
-                    {
-                        let mut history = self
-                            .exploration
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        choose_worker(
-                            candidates,
-                            &servers,
-                            inputs,
-                            &predictions,
-                            plan,
-                            &mut history,
-                            now,
-                        )
-                    } else {
-                        weighted_server(candidates, rand::random::<f64>())
-                    }
+        let reservation = match self.reserve_job(&assignment, network, packages, assigned_at)? {
+            Ok(reservation) => reservation,
+            Err(NoCapacity(count)) => {
+                return Ok(AllocJobResult::Fail {
+                    msg: format!("Insufficient capacity across {count} available servers"),
                 });
-                if let Some(server_id) = selected {
-                    let server_details = servers.get_mut(&server_id).ok_or_else(|| {
-                        anyhow::anyhow!("selected worker disappeared while scheduler lock held")
-                    })?;
-                    let job_id = self.next_job_id();
-                    // Unique while holding the servers lock: every allocation
-                    // advances job_count, including assignments that later fail.
-                    // Token generation may fail. Never reserve worker capacity
-                    // until an auth token is ready to send.
-                    let auth = server_details
-                        .job_authorizer
-                        .generate_token(job_id)
-                        .context("Could not create an auth token for this job")?;
-                    let prediction = predictions.get(&server_id.addr()).copied();
-                    if let Some(class) = class {
-                        trace!(target: "native_placement_replay", "{}", serde_json::json!({
-                            "kind": "assigned", "job": job_id.0, "worker": server_id.addr(), "class": class,
-                            "candidates": predictions,
-                            "estimated_result_bytes": estimated_result_bytes,
-                            "host_prior": server_details.capabilities.native_placement.as_ref().map(placement::ActionCost::baseline),
-                            "healthy": healthy.iter().map(|(id, _)| id.addr()).collect::<Vec<_>>(),
-                        }));
-                    }
-                    let assigned = native_inputs.map(|inputs| placement::AssignedNative {
-                        packages: std::sync::Arc::clone(&packages),
-                        inputs: inputs.clone(),
-                        class,
-                        cost: predictions
-                            .get(&server_id.addr())
-                            .map(|estimate| estimate.cost),
-                        milestone: None,
-                    });
-                    assert!(
-                        server_details
-                            .jobs_assigned
-                            .insert(job_id, assigned)
-                            .is_none()
-                    );
-                    assert!(
-                        server_details
-                            .jobs_assigning
-                            .insert(job_id, Instant::now())
-                            .is_none()
-                    );
-
-                    info!(
-                        "Job {} created and will be assigned to server {:?}",
-                        job_id, server_id
-                    );
-                    Some((job_id, server_id, auth, prediction, estimated_result_bytes))
-                } else {
-                    None
-                }
-            };
-
-            if let Some(res) = res {
-                res
-            } else {
-                let msg = format!(
-                    "Insufficient capacity across {} available servers",
-                    servers.len()
-                );
-                return Ok(AllocJobResult::Fail { msg });
             }
         };
+        #[cfg(feature = "scheduler-dashboard")]
+        self.dashboard_changed();
         if let JobAssignment::Native(native) = &mut assignment {
-            native.estimated_result_bytes = estimated_result_bytes;
+            native.estimated_result_bytes = reservation.estimated_result_bytes;
         }
-        let AssignJobResult {
-            state,
-            need_toolchain,
-        } = requester
-            .do_assign_job(server_id, job_id, assignment, auth.clone())
+        let result = requester
+            .do_assign_job(
+                reservation.server_id,
+                reservation.job_id,
+                assignment,
+                reservation.auth.clone(),
+            )
             .with_context(|| {
                 // LOCKS
                 let Ok(mut servers) = self.servers.lock() else {
                     return "assign job failed and server state mutex is poisoned";
                 };
-                if let Some(entry) = servers.get_mut(&server_id) {
+                if let Some(entry) = servers.get_mut(&reservation.server_id) {
                     entry.last_error = Some(Instant::now());
-                    entry.jobs_assigning.remove(&job_id);
-                    if entry.jobs_assigned.remove(&job_id).is_none() {
+                    entry.jobs_assigning.remove(&reservation.job_id);
+                    if entry.jobs_assigned.remove(&reservation.job_id).is_none() {
                         "assign job failed and job not known to the server"
                     } else {
                         "assign job failed, job un-assigned from the server"
@@ -1272,6 +1519,26 @@ impl Scheduler {
                     "assign job failed and server not known"
                 }
             })?;
+        self.complete_reservation(reservation, &result, assigned_at)
+    }
+
+    fn complete_reservation(
+        &self,
+        reservation: Reservation,
+        result: &AssignJobResult,
+        assigned_at: Instant,
+    ) -> Result<AllocJobResult> {
+        let Reservation {
+            job_id,
+            server_id,
+            auth,
+            prediction,
+            ..
+        } = reservation;
+        let AssignJobResult {
+            state,
+            need_toolchain,
+        } = *result;
         {
             // LOCKS
             let mut jobs = self
@@ -1318,10 +1585,9 @@ impl Scheduler {
                 .is_none()
             );
             details.jobs_assigning.remove(&job_id);
-            info!(
-                "Job {} successfully assigned and saved with state {:?}",
-                job_id, state
-            );
+            drop(servers);
+            drop(jobs);
+            info!("Job {job_id} successfully assigned and saved with state {state:?}");
         }
         let job_alloc = JobAlloc {
             auth,
@@ -1335,6 +1601,197 @@ impl Scheduler {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CommitObservation<'a> {
+    manifest: &'a sccache::build_runtime::ResultManifest,
+    retained_after_begin: Duration,
+    observation: Option<sccache::build_runtime::wire::ActionObservation>,
+}
+
+impl Scheduler {
+    fn observe_commit(
+        &self,
+        server: &mut ServerDetails,
+        detail: &mut JobDetail,
+        job: JobId,
+        commit: CommitObservation<'_>,
+        now: Instant,
+    ) {
+        use sccache::build_runtime::wire::NativeJobPhase;
+        let CommitObservation {
+            manifest,
+            retained_after_begin,
+            observation,
+        } = commit;
+        let server_id = detail.server_id;
+        if let Some(anchor) = detail.publication_began_at
+            && let Err(error) =
+                server
+                    .recent_residency
+                    .record(manifest, anchor, retained_after_begin, now)
+        {
+            warn!("Native output locality update failed: {error:#}");
+        }
+        if !detail.observed_result && detail.publication_began_at.is_some() {
+            detail.observed_result = true;
+            server.native_milestone(job, NativeJobPhase::Terminal, now);
+            let Some(assigned) = server.jobs_assigned.get(&job).and_then(Option::as_ref) else {
+                return;
+            };
+            server.recent_residency.record_inputs(&assigned.inputs, now);
+            let Ok(blobs) = manifest.blobs() else {
+                return;
+            };
+            let result_bytes = blobs.values().copied().fold(0_u64, u64::saturating_add);
+            if let (Some(class), Some(observed)) = (
+                assigned.class,
+                observation.filter(|sample| {
+                    sample.valid()
+                        && sample.upload_bytes <= result_bytes
+                        && sample.upload_requests <= u64::try_from(blobs.len()).unwrap_or(u64::MAX)
+                }),
+            ) {
+                if let Some(timing) = observed.worker_timing
+                    && let Some(placement) = server.capabilities.native_placement.as_mut()
+                {
+                    placement.timing.adopt(timing);
+                }
+                if let Some(platform) = server.capabilities.native_platform {
+                    self.cost_book
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .observe(
+                            placement::WorkerScope {
+                                peer: server_id,
+                                platform,
+                            },
+                            class,
+                            observed,
+                            result_bytes,
+                            now,
+                        );
+                }
+                trace!(target: "native_placement_replay", "{}", serde_json::json!({
+                    "kind": "completed", "job": job.0, "worker": server_id,
+                    "class": class, "predicted_publication_seconds": detail.prediction.map(|prediction| prediction.publication_at),
+                    "predicted_client_completion_seconds": detail.prediction.map(|prediction| prediction.completion_seconds),
+                    "actual_inputs_ready_seconds": detail.inputs_staged_at.map(|staged| staged.saturating_duration_since(detail.assigned_at).as_secs_f64()),
+                    "actual_result_negotiation_seconds": detail.publication_began_at.map(|began| began.saturating_duration_since(detail.assigned_at).as_secs_f64()),
+                    "actual_staging_start_seconds": (detail.state == JobState::Started).then(|| detail.state_since.saturating_duration_since(detail.assigned_at).as_secs_f64()),
+                    "actual_publication_seconds": now.saturating_duration_since(detail.assigned_at).as_secs_f64(),
+                    "result_bytes": result_bytes,
+                    "execution_nanoseconds": observed.execution_nanoseconds,
+                    "worker_timing": observed.worker_timing,
+                    "warm_staging_nanoseconds": observed.warm_staging_nanoseconds,
+                    "publication_setup_nanoseconds": observed.publication_setup_nanoseconds,
+                    "upload_bytes": observed.upload_bytes, "upload_requests": observed.upload_requests,
+                    "upload_nanoseconds": observed.upload_nanoseconds, "predicted_cost": assigned.cost,
+                }));
+            }
+        }
+    }
+}
+
+fn reconcile_stale_assignments(
+    details: &mut ServerDetails,
+    jobs: &mut BTreeMap<JobId, JobDetail>,
+    server_id: ServerId,
+    active_job_ids: &[JobId],
+    now: Instant,
+) {
+    // Executing jobs and transfers with recent byte progress have
+    // live request owners. A Started job missing from one heartbeat
+    // can be an in-flight snapshot; require a full timeout of absence.
+    let active: HashSet<JobId> = active_job_ids.iter().copied().collect();
+    let stale_jobs: Vec<_> = details
+        .jobs_assigned
+        .keys()
+        .copied()
+        .filter(|job_id| match jobs.get_mut(job_id) {
+            Some(detail) if detail.server_id == server_id => {
+                if detail.state == JobState::Started {
+                    if active.contains(job_id) {
+                        detail.missing_since = None;
+                        false
+                    } else {
+                        let since = detail.missing_since.get_or_insert(now);
+                        now.duration_since(*since) >= dist::http::HEARTBEAT_TIMEOUT
+                    }
+                } else if active.contains(job_id) {
+                    // Renew the inactivity lease, not the maximum
+                    // duration of a progressing toolchain transfer.
+                    detail.state_since = now;
+                    false
+                } else {
+                    detail.is_stale_unclaimed(now)
+                }
+            }
+            Some(_) => false,
+            None => details
+                .jobs_assigning
+                .get(job_id)
+                .is_some_and(|&since| now.duration_since(since) > UNCLAIMED_PENDING_TIMEOUT),
+        })
+        .collect();
+
+    if !stale_jobs.is_empty() {
+        warn!("The following stale jobs will be de-allocated: {stale_jobs:?}");
+        for job_id in stale_jobs {
+            log_lost_job(job_id, server_id, "stale_assignment", jobs.get(&job_id));
+            if details.jobs_assigned.remove(&job_id).is_none() {
+                warn!("Stale job for server {server_id} not assigned: {job_id}");
+            }
+            details.jobs_assigning.remove(&job_id);
+            jobs.remove(&job_id);
+        }
+    }
+}
+
+fn validate_heartbeat(
+    server_id: ServerId,
+    cpu_capacity: f64,
+    capabilities: &dist::WorkerCapabilities,
+) -> Result<()> {
+    if !cpu_capacity.is_finite() || cpu_capacity < 0.0 {
+        bail!("invalid worker CPU capacity {cpu_capacity}");
+    }
+    anyhow::ensure!(
+        capabilities.archive || capabilities.native_platform.is_some(),
+        "worker advertises no build engine"
+    );
+    anyhow::ensure!(
+        capabilities.native_platform.is_some() == capabilities.native_placement.is_some(),
+        "native worker telemetry must match advertised engine"
+    );
+    if let Some(placement) = &capabilities.native_placement {
+        anyhow::ensure!(
+            placement.timing.valid()
+                && placement.cache_path_rates.valid()
+                && placement.interfaces.valid()
+                && sccache::build_runtime::wire::peer_download_rates_valid(
+                    &placement.peer_download_rates
+                )
+                && placement
+                    .peer_download_rates
+                    .iter()
+                    .all(|rate| rate.source != server_id)
+                && placement.queue.valid()
+                && placement
+                    .package_limits
+                    .is_none_or(sccache::build_runtime::PackageDeliveryLimits::valid),
+            "invalid native result or queue telemetry"
+        );
+        anyhow::ensure!(
+            placement
+                .residency
+                .as_ref()
+                .is_none_or(sccache::build_runtime::BlobResidency::valid),
+            "invalid native placement telemetry"
+        );
+    }
+    Ok(())
+}
+
 impl SchedulerIncoming for Scheduler {
     fn handle_alloc_job(
         &self,
@@ -1345,7 +1802,7 @@ impl SchedulerIncoming for Scheduler {
             requester,
             JobAssignment::Archive(tc),
             &NetworkSnapshot::default(),
-            Default::default(),
+            &std::sync::Arc::default(),
         )
     }
 
@@ -1356,12 +1813,27 @@ impl SchedulerIncoming for Scheduler {
         network: &NetworkSnapshot,
         packages: std::sync::Arc<sccache::build_runtime::PackageCatalog>,
     ) -> Result<AllocJobResult> {
+        #[cfg(feature = "scheduler-dashboard")]
+        if let Some((id, rates)) = &assignment.receiver {
+            let mut clients = self
+                .dashboard_clients
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = Instant::now();
+            clients.retain(|_, (seen, _)| {
+                now.saturating_duration_since(*seen) <= dist::http::HEARTBEAT_TIMEOUT
+            });
+            clients.insert(*id, (now, rates.clone()));
+            drop(clients);
+            self.dashboard_changed();
+        }
+
         assignment.spec.validate()?;
         self.allocate_job(
             requester,
             JobAssignment::Native(Box::new(assignment)),
             network,
-            packages,
+            &packages,
         )
     }
 
@@ -1371,7 +1843,19 @@ impl SchedulerIncoming for Scheduler {
         job: JobId,
         event: dist::NativeLifecycleEvent<'_>,
     ) {
+        use sccache::build_runtime::wire::NativeJobPhase;
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         let now = Instant::now();
+        // Delivery receipts outlive the worker's job record. The session
+        // authenticated the original requester and validated the exact closure.
+        if let dist::NativeLifecycleEvent::Delivered(receipt) = event {
+            self.cost_book
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observe_delivery(receipt, now);
+            return;
+        }
         // Same lock order as assignment and heartbeat processing. The
         // scheduler-epoch job ID ties the receipt to the current worker
         // incarnation even if the address is reused after a restart.
@@ -1390,8 +1874,8 @@ impl SchedulerIncoming for Scheduler {
         {
             return;
         }
-        use sccache::build_runtime::wire::NativeJobPhase;
         match event {
+            dist::NativeLifecycleEvent::Delivered(_) => (),
             dist::NativeLifecycleEvent::InputsStaged => {
                 detail.inputs_staged_at.get_or_insert(now);
                 server.native_milestone(job, NativeJobPhase::Ready, now);
@@ -1411,74 +1895,17 @@ impl SchedulerIncoming for Scheduler {
                 retained_after_begin,
                 observation,
             } => {
-                if let Some(anchor) = detail.publication_began_at
-                    && let Err(error) =
-                        server
-                            .recent_residency
-                            .record(manifest, anchor, retained_after_begin, now)
-                {
-                    warn!("Native output locality update failed: {error:#}");
-                }
-                if !detail.observed_result && detail.publication_began_at.is_some() {
-                    detail.observed_result = true;
-                    server.native_milestone(job, NativeJobPhase::Terminal, now);
-                    if let Some(assigned) = server.jobs_assigned.get(&job).and_then(Option::as_ref)
-                    {
-                        server.recent_residency.record_inputs(&assigned.inputs, now);
-                    }
-                    if let Some(assigned) = server.jobs_assigned.get(&job).and_then(Option::as_ref)
-                        && let (Some(class), Some(observed)) = (
-                            assigned.class,
-                            observation.filter(|sample| {
-                                sample.valid()
-                                    && manifest.blobs().is_ok_and(|blobs| {
-                                        sample.upload_bytes
-                                            <= blobs.values().copied().fold(0, u64::saturating_add)
-                                            && sample.upload_requests
-                                                <= u64::try_from(blobs.len()).unwrap_or(u64::MAX)
-                                    })
-                            }),
-                        )
-                    {
-                        if let Some(timing) = observed.worker_timing
-                            && let Some(placement) = server.capabilities.native_placement.as_mut()
-                        {
-                            placement.timing.adopt(timing);
-                        }
-                        if let Some(platform) = server.capabilities.native_platform {
-                            self.cost_book
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .observe(
-                                    placement::WorkerScope {
-                                        address: server_id.addr(),
-                                        platform,
-                                    },
-                                    class,
-                                    observed,
-                                    manifest.blobs().map_or(0, |blobs| {
-                                        blobs.values().copied().fold(0, u64::saturating_add)
-                                    }),
-                                    now,
-                                );
-                        }
-                        trace!(target: "native_placement_replay", "{}", serde_json::json!({
-                            "kind": "completed", "job": job.0, "worker": server_id.addr(),
-                            "class": class, "predicted_seconds": detail.prediction.map(|prediction| prediction.completion_seconds),
-                            "actual_inputs_ready_seconds": detail.inputs_staged_at.map(|staged| staged.saturating_duration_since(detail.assigned_at).as_secs_f64()),
-                            "actual_result_negotiation_seconds": detail.publication_began_at.map(|began| began.saturating_duration_since(detail.assigned_at).as_secs_f64()),
-                            "actual_staging_start_seconds": (detail.state == JobState::Started).then(|| detail.state_since.saturating_duration_since(detail.assigned_at).as_secs_f64()),
-                            "actual_seconds": now.saturating_duration_since(detail.assigned_at).as_secs_f64(),
-                            "result_bytes": manifest.blobs().ok().map(|blobs| blobs.values().copied().fold(0_u64, u64::saturating_add)),
-                            "execution_nanoseconds": observed.execution_nanoseconds,
-                            "worker_timing": observed.worker_timing,
-                            "warm_staging_nanoseconds": observed.warm_staging_nanoseconds,
-                            "publication_setup_nanoseconds": observed.publication_setup_nanoseconds,
-                            "upload_bytes": observed.upload_bytes, "upload_requests": observed.upload_requests,
-                            "upload_nanoseconds": observed.upload_nanoseconds, "predicted_cost": assigned.cost,
-                        }));
-                    }
-                }
+                self.observe_commit(
+                    server,
+                    detail,
+                    job,
+                    CommitObservation {
+                        manifest,
+                        retained_after_begin,
+                        observation,
+                    },
+                    now,
+                );
             }
         }
         drop(servers);
@@ -1488,7 +1915,10 @@ impl SchedulerIncoming for Scheduler {
     fn native_blob_sources(
         &self,
         blob: sccache::build_runtime::BlobRef,
-        requester: Option<std::net::SocketAddr>,
+        requester: Option<ServerId>,
+        recipient: sccache::build_runtime::wire::BlobRecipient,
+        producer: Option<ServerId>,
+        recovery_network: Option<&NetworkSnapshot>,
     ) -> Result<Vec<dist::NativeBlobSource>> {
         let servers = self
             .servers
@@ -1497,6 +1927,18 @@ impl SchedulerIncoming for Scheduler {
         // Result receipts may name a just-produced blob that has not yet
         // appeared in a heartbeat. For result recovery prefer positive
         // inventory hints, but allow other native workers to answer exactly.
+        let receiver_rates = requester
+            .and_then(|id| servers.get(&id))
+            .and_then(|details| details.capabilities.native_placement.as_ref())
+            .map_or_default(|placement| placement.peer_download_rates.as_slice());
+        let rate = |source: ServerId| {
+            receiver_rates
+                .binary_search_by_key(&source, |rate| rate.source)
+                .ok()
+                .map_or(0, |index| receiver_rates[index].logical_bytes_per_second)
+        };
+        let recovery =
+            recovery_network.map(|network| placement::PeerRecoveryPlan::new(network, &servers));
         let mut candidates = servers
             .iter()
             .filter_map(|(id, details)| {
@@ -1512,41 +1954,68 @@ impl SchedulerIncoming for Scheduler {
                             .as_ref()
                             .is_some_and(|job| job.inputs.get(&blob.id) == Some(&blob.size))
                 });
-                let locality =
-                    if pinned || details.recent_residency.retained(blob.id, blob.size, now) {
-                        3_u8
-                    } else if details.recent_residency.contains(blob.id, blob.size, now) {
-                        2_u8
-                    } else {
-                        u8::from(
-                            placement
-                                .residency
-                                .as_ref()
-                                .is_some_and(|residency| residency.may_contain(blob.id)),
-                        )
-                    };
-                (Some(id.addr()) != requester
+                let locality = if producer == Some(*id) {
+                    4_u8
+                } else if pinned || details.recent_residency.retained(blob.id, blob.size, now) {
+                    3_u8
+                } else if details.recent_residency.contains(blob.id, blob.size, now) {
+                    2_u8
+                } else {
+                    u8::from(
+                        placement
+                            .residency
+                            .as_ref()
+                            .is_some_and(|residency| residency.may_contain(blob.id)),
+                    )
+                };
+                (Some(*id) != requester
                     && details.last_seen.elapsed() < Duration::from_secs(20)
                     && details.last_error.is_none()
-                    && (requester.is_none() || locality > 0))
-                    .then_some((id, details, locality))
+                    && (matches!(
+                        recipient,
+                        sccache::build_runtime::wire::BlobRecipient::Scheduler
+                    ) && requester.is_none()
+                        || locality > 0))
+                    .then(|| {
+                        let score = recovery.as_ref().map_or(0.0, |plan| {
+                            plan.score(*id, blob.size, placement.timing.result)
+                        });
+                        (id, details, locality, score)
+                    })
             })
             .collect::<Vec<_>>();
-        candidates.sort_unstable_by(|(a, left, left_predicted), (b, right, right_predicted)| {
-            right_predicted
-                .cmp(left_predicted)
-                .then_with(|| right.last_seen.cmp(&left.last_seen))
-                .then_with(|| a.addr().cmp(&b.addr()))
-        });
-        candidates
+        candidates.sort_unstable_by(
+            |(a, left, left_predicted, left_score), (b, right, right_predicted, right_score)| {
+                right_predicted
+                    .cmp(left_predicted)
+                    .then_with(|| left_score.total_cmp(right_score))
+                    .then_with(|| rate(**b).cmp(&rate(**a)))
+                    .then_with(|| right.last_seen.cmp(&left.last_seen))
+                    .then_with(|| a.cmp(b))
+            },
+        );
+        let limit = if matches!(
+            recipient,
+            sccache::build_runtime::wire::BlobRecipient::Scheduler
+        ) {
+            usize::MAX
+        } else {
+            sccache::build_runtime::wire::MAX_BLOB_SOURCES
+        };
+        let sources = candidates
             .into_iter()
-            .map(|(&server, details, _)| {
+            .take(limit)
+            .map(|(&server, details, _, _)| {
                 Ok(dist::NativeBlobSource {
                     server,
-                    token: details.job_authorizer.generate_blob_token(blob)?,
+                    token: details
+                        .job_authorizer
+                        .generate_blob_token(blob, recipient)?,
                 })
             })
-            .collect()
+            .collect();
+        drop(servers);
+        sources
     }
 
     fn handle_heartbeat_server(
@@ -1558,6 +2027,9 @@ impl SchedulerIncoming for Scheduler {
         job_authorizer: Box<dyn JobAuthorizer>,
         mut capabilities: dist::WorkerCapabilities,
     ) -> Result<HeartbeatServerResult> {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
+        validate_heartbeat(server_id, cpu_capacity, &capabilities)?;
         // LOCKS
         let mut jobs = self
             .jobs
@@ -1568,36 +2040,8 @@ impl SchedulerIncoming for Scheduler {
             .lock()
             .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
-        self.prune_servers(&mut servers, &mut jobs);
+        Self::prune_servers(&mut servers, &mut jobs);
 
-        if !cpu_capacity.is_finite() || cpu_capacity < 0.0 {
-            bail!("invalid worker CPU capacity {cpu_capacity}");
-        }
-        anyhow::ensure!(
-            capabilities.archive || capabilities.native_platform.is_some(),
-            "worker advertises no build engine"
-        );
-        anyhow::ensure!(
-            capabilities.native_platform.is_some() == capabilities.native_placement.is_some(),
-            "native worker telemetry must match advertised engine"
-        );
-        if let Some(placement) = &capabilities.native_placement {
-            anyhow::ensure!(
-                placement.timing.valid()
-                    && placement.queue.valid()
-                    && placement
-                        .package_limits
-                        .is_none_or(sccache::build_runtime::PackageDeliveryLimits::valid),
-                "invalid native result or queue telemetry"
-            );
-            anyhow::ensure!(
-                placement
-                    .residency
-                    .as_ref()
-                    .is_none_or(sccache::build_runtime::BlobResidency::valid),
-                "invalid native placement telemetry"
-            );
-        }
         match servers.get_mut(&server_id) {
             Some(ref mut details) if details.server_nonce == server_nonce => {
                 let now = Instant::now();
@@ -1621,63 +2065,7 @@ impl SchedulerIncoming for Scheduler {
                 }
                 details.recent_residency.reap(now);
 
-                // Executing jobs and transfers with recent byte progress have
-                // live request owners. A Started job missing from one heartbeat
-                // can be an in-flight snapshot; require a full timeout of absence.
-                let active: HashSet<JobId> = active_job_ids.iter().copied().collect();
-                let stale_jobs: Vec<_> = details
-                    .jobs_assigned
-                    .keys()
-                    .copied()
-                    .filter(|job_id| match jobs.get_mut(job_id) {
-                        Some(detail) if detail.server_id == server_id => {
-                            if detail.state == JobState::Started {
-                                if active.contains(job_id) {
-                                    detail.missing_since = None;
-                                    false
-                                } else {
-                                    let since = detail.missing_since.get_or_insert(now);
-                                    now.duration_since(*since) >= dist::http::HEARTBEAT_TIMEOUT
-                                }
-                            } else if active.contains(job_id) {
-                                // Renew the inactivity lease, not the maximum
-                                // duration of a progressing toolchain transfer.
-                                detail.state_since = now;
-                                false
-                            } else {
-                                detail.is_stale_unclaimed(now)
-                            }
-                        }
-                        Some(_) => false,
-                        None => details.jobs_assigning.get(job_id).is_some_and(|&since| {
-                            now.duration_since(since) > UNCLAIMED_PENDING_TIMEOUT
-                        }),
-                    })
-                    .collect();
-
-                if !stale_jobs.is_empty() {
-                    warn!(
-                        "The following stale jobs will be de-allocated: {:?}",
-                        stale_jobs
-                    );
-                    for job_id in stale_jobs {
-                        warn!(
-                            "dist_job_lost job_id={job_id} worker={} reason=stale_assignment previous_state={:?}",
-                            server_id.addr(),
-                            jobs.get(&job_id).map(|detail| detail.state)
-                        );
-                        if details.jobs_assigned.remove(&job_id).is_none() {
-                            warn!(
-                                "Stale job for server {} not assigned: {}",
-                                server_id.addr(),
-                                job_id
-                            );
-                        }
-                        details.jobs_assigning.remove(&job_id);
-                        jobs.remove(&job_id);
-                    }
-                }
-
+                reconcile_stale_assignments(details, &mut jobs, server_id, active_job_ids, now);
                 let mut assigned_job_ids: Vec<_> = details.jobs_assigned.keys().copied().collect();
                 assigned_job_ids.sort_unstable();
                 return Ok(HeartbeatServerResult {
@@ -1687,23 +2075,15 @@ impl SchedulerIncoming for Scheduler {
             }
             Some(ref mut details) if details.server_nonce != server_nonce => {
                 for job_id in details.jobs_assigned.keys() {
-                    warn!(
-                        "dist_job_lost job_id={job_id} worker={} reason=worker_restarted previous_state={:?}",
-                        server_id.addr(),
-                        jobs.get(job_id).map(|detail| detail.state)
-                    );
+                    log_lost_job(*job_id, server_id, "worker_restarted", jobs.get(job_id));
                     if jobs.remove(job_id).is_none() {
-                        warn!(
-                            "Unknown job found when replacing server {}: {}",
-                            server_id.addr(),
-                            job_id
-                        );
+                        warn!("Unknown job found when replacing server {server_id}: {job_id}");
                     }
                 }
             }
             _ => (),
         }
-        info!("Registered new server {:?}", server_id);
+        info!("Registered new server {server_id:?}");
         servers.insert(
             server_id,
             ServerDetails {
@@ -1719,6 +2099,8 @@ impl SchedulerIncoming for Scheduler {
                 job_authorizer,
             },
         );
+        drop(servers);
+        drop(jobs);
         Ok(HeartbeatServerResult {
             is_new: true,
             assigned_job_ids: Vec::new(),
@@ -1731,6 +2113,8 @@ impl SchedulerIncoming for Scheduler {
         server_nonce: ServerNonce,
         worker_name: String,
     ) -> Result<()> {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         let worker_name = validate_worker_name(worker_name)?;
         // Match heartbeat lock ordering so a stale named worker cannot reserve
         // a display name after it has stopped heartbeating.
@@ -1742,29 +2126,20 @@ impl SchedulerIncoming for Scheduler {
             .servers
             .lock()
             .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
-        self.prune_servers(&mut servers, &mut jobs);
+        Self::prune_servers(&mut servers, &mut jobs);
         drop(jobs);
-        let details = servers.get(&server_id).ok_or_else(|| {
-            anyhow::anyhow!(
-                "worker name update from unknown server {}",
-                server_id.addr()
-            )
-        })?;
+        let details = servers
+            .get(&server_id)
+            .ok_or_else(|| anyhow::anyhow!("worker name update from unknown server {server_id}"))?;
         if details.server_nonce != server_nonce {
-            bail!(
-                "worker name update from stale server epoch {}",
-                server_id.addr()
-            )
+            bail!("worker name update from stale server epoch {server_id}")
         }
         if let Some(existing) = details.worker_name.as_ref() {
             if existing == &worker_name {
                 return Ok(());
             }
             bail!(
-                "distributed worker {} changed name from {:?} to {:?} without restarting",
-                server_id.addr(),
-                existing,
-                worker_name
+                "distributed worker {server_id} changed name from {existing:?} to {worker_name:?} without restarting"
             )
         }
         if servers.iter().any(|(&id, details)| {
@@ -1778,10 +2153,8 @@ impl SchedulerIncoming for Scheduler {
             .get_mut(&server_id)
             .ok_or_else(|| anyhow::anyhow!("server disappeared while scheduler lock held"))?
             .worker_name = Some(worker_name.clone());
-        info!(
-            "Server {:?} registered worker name {:?}",
-            server_id, worker_name
-        );
+        drop(servers);
+        info!("Server {server_id:?} registered worker name {worker_name:?}");
         Ok(())
     }
 
@@ -1800,6 +2173,8 @@ impl SchedulerIncoming for Scheduler {
         server_id: ServerId,
         job_state: JobState,
     ) -> Result<UpdateJobStateResult> {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         // LOCKS
         let mut jobs = self
             .jobs
@@ -1813,11 +2188,7 @@ impl SchedulerIncoming for Scheduler {
         if let btree_map::Entry::Occupied(mut entry) = jobs.entry(job_id) {
             let job_detail = entry.get();
             if job_detail.server_id != server_id {
-                bail!(
-                    "Job id {} is not registered on server {:?}",
-                    job_id,
-                    server_id
-                )
+                bail!("Job id {job_id} is not registered on server {server_id:?}")
             }
 
             let details = servers.get_mut(&server_id).ok_or_else(|| {
@@ -1865,9 +2236,9 @@ impl SchedulerIncoming for Scheduler {
                     entry.remove_entry();
                     acks.record(job_id, server_id, now);
                 }
-                (from, to) => bail!("Invalid job state transition from {} to {}", from, to),
+                (from, to) => bail!("Invalid job state transition from {from} to {to}"),
             }
-            info!("Job {} updated state to {:?}", job_id, job_state);
+            info!("Job {job_id} updated state to {job_state:?}");
         } else if job_state == JobState::Complete
             && self
                 .completed_acks
@@ -1880,6 +2251,8 @@ impl SchedulerIncoming for Scheduler {
         } else {
             bail!("Unknown job {job_id} for server {server_id:?}")
         }
+        drop(servers);
+        drop(jobs);
         Ok(UpdateJobStateResult::Success)
     }
 
@@ -1887,7 +2260,29 @@ impl SchedulerIncoming for Scheduler {
         self.is_draining()
     }
 
+    #[cfg(feature = "scheduler-dashboard")]
+    fn install_dashboard_waker(&self, sender: std::sync::mpsc::SyncSender<()>) -> Result<()> {
+        self.dashboard_waker
+            .set(sender)
+            .map_err(|_| anyhow::anyhow!("dashboard waker already installed"))
+    }
+
+    #[cfg(feature = "scheduler-dashboard")]
+    fn handle_dashboard_snapshot(&self) -> Result<sccache_dashboard::Snapshot> {
+        dashboard::snapshot(self)
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Status reports whole CPU slots, rounded upward from validated capacity"
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "Heartbeat admission rejects negative CPU capacity"
+    )]
     fn handle_status(&self) -> Result<SchedulerStatusResult> {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         // LOCKS
         let mut jobs = self
             .jobs
@@ -1898,7 +2293,7 @@ impl SchedulerIncoming for Scheduler {
             .lock()
             .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
-        self.prune_servers(&mut servers, &mut jobs);
+        Self::prune_servers(&mut servers, &mut jobs);
 
         Ok(SchedulerStatusResult {
             num_servers: servers.len(),
@@ -1919,10 +2314,12 @@ impl SchedulerIncoming for Scheduler {
                 servers
                     .values()
                     .map(|v| {
-                        self.job_slack
-                            .max_jobs(v.cpu_capacity)
-                            .saturating_sub(v.compiler_demand())
-                            .min(v.native_headroom())
+                        let slots = v.admission_slots(self.job_slack);
+                        if v.capabilities.archive {
+                            slots
+                        } else {
+                            slots.min(v.native_headroom())
+                        }
                     })
                     .fold(0, usize::saturating_add)
             },
@@ -1939,7 +2336,7 @@ struct LocalAssignment {
 #[cfg(target_os = "linux")]
 struct NativeInputPins {
     _trees: Vec<sccache::build_runtime::TreeLease>,
-    _blobs: sccache::build_runtime::UploadReservation,
+    blobs: sccache::build_runtime::UploadReservation,
 }
 
 struct ArchiveWorker {
@@ -2065,7 +2462,7 @@ impl Server {
                 .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
             match jobs.entry(job_id) {
                 std::collections::hash_map::Entry::Occupied(entry) => Some(entry.remove()),
-                _ => None,
+                std::collections::hash_map::Entry::Vacant(_) => None,
             }
         };
         let Some(assigned) = assigned else {
@@ -2087,6 +2484,7 @@ impl Server {
             if jobs.insert(job_id, assigned).is_some() {
                 bail!("job {job_id} reappeared while restoring failed start transition");
             }
+            drop(jobs);
             return Err(error).context("Updating job state failed");
         }
         Ok(Some(assigned))
@@ -2268,8 +2666,7 @@ impl ServerIncoming for Server {
                 assignment: JobAssignment::Archive(tc),
                 ..
             }) => tc.clone(),
-            Some(_) => return Ok(SubmitToolchainResult::JobNotFound),
-            None => return Ok(SubmitToolchainResult::JobNotFound),
+            Some(_) | None => return Ok(SubmitToolchainResult::JobNotFound),
         };
         // Streaming and hashing large archives must not hold the cache mutex:
         // other toolchains still need to be assigned while uploads are slow.
@@ -2326,20 +2723,23 @@ impl ServerIncoming for Server {
 
         let (crate_name, command_fingerprint) = job_telemetry::identity(&command);
         info!(
-            "dist_job_start job_id={job_id} compiler={:?} crate_name={:?} command_fingerprint={command_fingerprint:016x} argument_count={}",
+            "dist_job_start job_id={job_id} compiler={:?} crate_name={crate_name:?} command_fingerprint={command_fingerprint:016x} argument_count={}",
             command.executable,
-            crate_name,
             command.arguments.len()
         );
         let started = Instant::now();
         let archive = self.archive.as_ref().context("archive worker disabled")?;
-        let res = self
-            .execution_queue
-            .acquire(|| Ok(()))
-            .and_then(|_permit| {
+        // Receiving input must not depend on toolchain extraction or compiler
+        // admission. In particular, a cold extraction can keep a TCP receive
+        // window closed long enough for the client to abandon a healthy upload.
+        let res = inputs_rdr
+            .stage(&archive.staging_dir)
+            .context("Receiving compiler inputs failed")
+            .and_then(|inputs| {
+                let _permit = self.execution_queue.acquire(|| Ok(()))?;
                 archive
                     .builder
-                    .run_build(job_id, toolchain, command, outputs, inputs_rdr, &archive.cache)
+                    .run_build(job_id, toolchain, command, outputs, inputs, &archive.cache)
             })
             .map(|res| {
                 info!(
@@ -2426,9 +2826,9 @@ mod scheduler_tests {
         assert_eq!(admission_weight(0, 0.0, slack), Some(0.5));
         assert!(admission_weight(1, 0.0, slack).is_none());
         assert!(admission_weight(0, f64::NAN, slack).is_none());
-        let a: ServerId = "127.0.0.1:10501".parse().unwrap();
-        let b: ServerId = "127.0.0.2:10501".parse().unwrap();
-        let c: ServerId = "127.0.0.3:10501".parse().unwrap();
+        let a: ServerId = ServerId::from_digest([1; 32]);
+        let b: ServerId = ServerId::from_digest([2; 32]);
+        let c: ServerId = ServerId::from_digest([3; 32]);
         let choices = [(a, 1.5), (b, 3.5), (c, 0.5)];
         assert_eq!(weighted_server(&choices, 0.0), Some(a));
         assert_eq!(weighted_server(&choices, 0.27), Some(a));
@@ -2448,13 +2848,18 @@ mod scheduler_tests {
             Ok(())
         }
 
-        fn generate_blob_token(&self, _blob: sccache::build_runtime::BlobRef) -> Result<String> {
+        fn generate_blob_token(
+            &self,
+            _blob: sccache::build_runtime::BlobRef,
+            _recipient: sccache::build_runtime::wire::BlobRecipient,
+        ) -> Result<String> {
             Ok(String::new())
         }
 
         fn verify_blob_token(
             &self,
             _blob: sccache::build_runtime::BlobRef,
+            _recipient: sccache::build_runtime::wire::BlobRecipient,
             _token: &str,
         ) -> Result<()> {
             Ok(())
@@ -2512,8 +2917,8 @@ mod scheduler_tests {
         let inputs = BTreeMap::from([(a, 100_000_000), (b, 1_000_000)]);
         let empty = HashMap::new();
         let network = NetworkSnapshot::default();
-        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None);
-        let peer = Peer::Worker("127.0.0.1:10501".parse().unwrap());
+        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None, None);
+        let peer = Peer::Worker(ServerId::from_digest([1; 32]));
         let eta = |capacity, assigned: &HashMap<_, _>, placement: &dist::NativePlacement| {
             native_estimate(
                 placement::WorkerForecast {
@@ -2564,9 +2969,9 @@ mod scheduler_tests {
     fn peer_blob_sources_exclude_requester_and_do_not_reserve_jobs() -> Result<()> {
         use sccache::build_runtime::{BlobRef, BlobResidency, ContentId};
         let scheduler = Scheduler::new();
-        let requester: ServerId = "127.0.0.1:10501".parse()?;
-        let peer: ServerId = "127.0.0.2:10501".parse()?;
-        let empty: ServerId = "127.0.0.3:10501".parse()?;
+        let requester: ServerId = ServerId::from_digest([1; 32]);
+        let peer: ServerId = ServerId::from_digest([2; 32]);
+        let empty: ServerId = ServerId::from_digest([3; 32]);
         let blob = BlobRef {
             id: ContentId::of(b"shared"),
             size: 6,
@@ -2588,17 +2993,68 @@ mod scheduler_tests {
                 Box::new(TestJobAuthorizer),
                 dist::WorkerCapabilities {
                     archive: false,
-                    native_platform: Some(ContentId::of(server.addr().to_string().as_bytes())),
+                    native_platform: Some(ContentId::of(server.to_string().as_bytes())),
                     native_placement: Some(placement),
                 },
             )?;
         }
-        let sources = scheduler.native_blob_sources(blob, Some(requester.addr()))?;
+        let sources = scheduler.native_blob_sources(
+            blob,
+            Some(requester),
+            sccache::build_runtime::wire::BlobRecipient::Scheduler,
+            None,
+            None,
+        )?;
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].server, peer);
-        let recovery = scheduler.native_blob_sources(blob, None)?;
+        let recovery = scheduler.native_blob_sources(
+            blob,
+            None,
+            sccache::build_runtime::wire::BlobRecipient::Scheduler,
+            None,
+            None,
+        )?;
         assert_eq!(recovery.len(), 3);
         assert_eq!(recovery[2].server, empty);
+        let mut network = NetworkSnapshot::default();
+        for (id, rate, remaining) in [(requester, 100 << 20, 100 << 20), (peer, 10 << 20, 0)] {
+            network.receive.peers.insert(
+                Peer::Worker(id),
+                sccache::build_runtime::PeerCapacity {
+                    observed_bytes_per_second: rate,
+                    isolated_bytes_per_second: rate,
+                    wire_per_mille: 1000,
+                    active_remaining_bytes: remaining,
+                    body_bytes: 0,
+                },
+            );
+        }
+        let ranked = scheduler.native_blob_sources(
+            blob,
+            None,
+            sccache::build_runtime::wire::BlobRecipient::Scheduler,
+            None,
+            Some(&network),
+        )?;
+        assert_eq!(ranked[0].server, peer);
+        assert_eq!(ranked[2].server, empty);
+        let direct = scheduler.native_blob_sources(
+            blob,
+            None,
+            sccache::build_runtime::wire::BlobRecipient::Client(ServerId::from_digest([4; 32])),
+            Some(empty),
+            None,
+        )?;
+        assert_eq!(direct[0].server, empty);
+        assert_eq!(direct.len(), 3);
+        let direct = scheduler.native_blob_sources(
+            blob,
+            None,
+            sccache::build_runtime::wire::BlobRecipient::Client(ServerId::from_digest([4; 32])),
+            None,
+            None,
+        )?;
+        assert_eq!(direct.len(), 2);
         for server in [requester, peer, empty] {
             assert_no_assigned_jobs(&scheduler, &server);
         }
@@ -2617,6 +3073,8 @@ mod scheduler_tests {
             ticket: Ticket([42; 32]),
             input_blobs,
             estimated_result_bytes: None,
+            receiver: None,
+            delivery_profile: None,
             spec: ExecutionSpec {
                 platform,
                 root: ExecutionRoot {
@@ -2649,8 +3107,8 @@ mod scheduler_tests {
     fn native_staged_closure_survives_stale_heartbeat_and_failed_compilation() -> Result<()> {
         use sccache::build_runtime::{BlobRef, ContentId, wire::NativeJobPhase};
         let scheduler = Scheduler::new();
-        let worker: ServerId = "127.0.0.1:10501".parse()?;
-        let peer: ServerId = "127.0.0.2:10501".parse()?;
+        let worker: ServerId = ServerId::from_digest([1; 32]);
+        let peer: ServerId = ServerId::from_digest([2; 32]);
         let platform = ContentId::of(b"native-staging-test");
         let nonce = ServerNonce::new();
         let capabilities = dist::WorkerCapabilities {
@@ -2685,20 +3143,38 @@ mod scheduler_tests {
         let id = job_alloc.job_id;
         assert!(
             scheduler
-                .native_blob_sources(blob, Some(peer.addr()))?
+                .native_blob_sources(
+                    blob,
+                    Some(peer),
+                    sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None,
+                    None
+                )?
                 .is_empty()
         );
         scheduler.observe_native_lifecycle(peer, id, dist::NativeLifecycleEvent::InputsStaged);
         assert!(
             scheduler
-                .native_blob_sources(blob, Some(peer.addr()))?
+                .native_blob_sources(
+                    blob,
+                    Some(peer),
+                    sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None,
+                    None
+                )?
                 .is_empty()
         );
         scheduler.observe_native_lifecycle(worker, id, dist::NativeLifecycleEvent::InputsStaged);
         heartbeat(&[id])?;
         assert_eq!(
             scheduler
-                .native_blob_sources(blob, Some(peer.addr()))?
+                .native_blob_sources(
+                    blob,
+                    Some(peer),
+                    sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None,
+                    None
+                )?
                 .len(),
             1
         );
@@ -2717,7 +3193,13 @@ mod scheduler_tests {
         scheduler.handle_update_job_state(id, worker, JobState::Complete)?;
         assert_eq!(
             scheduler
-                .native_blob_sources(blob, Some(peer.addr()))?
+                .native_blob_sources(
+                    blob,
+                    Some(peer),
+                    sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None,
+                    None
+                )?
                 .len(),
             1
         );
@@ -2778,7 +3260,7 @@ mod scheduler_tests {
             wire::{ActionObservation, WorkerTiming},
         };
         let scheduler = Scheduler::new();
-        let worker: ServerId = "127.0.0.1:10501".parse()?;
+        let worker: ServerId = ServerId::from_digest([1; 32]);
         let platform = ContentId::of(b"timing-platform");
         let nonce = ServerNonce::new();
         let capabilities = dist::WorkerCapabilities {
@@ -2869,8 +3351,8 @@ mod scheduler_tests {
     fn native_producer_receipt_places_consumer_before_next_heartbeat() -> Result<()> {
         use sccache::build_runtime::{Artifact, BlobRef, ContentId, ResultManifest};
         let scheduler = Scheduler::new();
-        let producer: ServerId = "127.0.0.1:10501".parse()?;
-        let other: ServerId = "127.0.0.2:10501".parse()?;
+        let producer: ServerId = ServerId::from_digest([1; 32]);
+        let other: ServerId = ServerId::from_digest([2; 32]);
         let platform = ContentId::of(b"test");
         let register = |id, execution_nanoseconds| {
             scheduler.handle_heartbeat_server(
@@ -2923,18 +3405,36 @@ mod scheduler_tests {
         scheduler.observe_native_lifecycle(producer, job, committed());
         assert!(
             scheduler
-                .native_blob_sources(blob, Some(other.addr()))?
+                .native_blob_sources(
+                    blob,
+                    Some(other),
+                    sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None,
+                    None
+                )?
                 .is_empty()
         );
         scheduler.observe_native_lifecycle(producer, job, dist::NativeLifecycleEvent::Negotiated);
         scheduler.observe_native_lifecycle(other, job, committed());
         assert!(
             scheduler
-                .native_blob_sources(blob, Some(other.addr()))?
+                .native_blob_sources(
+                    blob,
+                    Some(other),
+                    sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None,
+                    None
+                )?
                 .is_empty()
         );
         scheduler.observe_native_lifecycle(producer, job, committed());
-        let sources = scheduler.native_blob_sources(blob, Some(other.addr()))?;
+        let sources = scheduler.native_blob_sources(
+            blob,
+            Some(other),
+            sccache::build_runtime::wire::BlobRecipient::Scheduler,
+            None,
+            None,
+        )?;
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].server, producer);
         scheduler.handle_update_job_state(job, producer, JobState::Complete)?;
@@ -2955,7 +3455,13 @@ mod scheduler_tests {
         scheduler.observe_native_lifecycle(producer, job, committed());
         assert!(
             scheduler
-                .native_blob_sources(blob, Some(other.addr()))?
+                .native_blob_sources(
+                    blob,
+                    Some(other),
+                    sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None,
+                    None
+                )?
                 .is_empty()
         );
         let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
@@ -2978,8 +3484,8 @@ mod scheduler_tests {
             static_jobs: 0,
             percent: 0.0,
         });
-        let a: ServerId = "127.0.0.1:10501".parse()?;
-        let b: ServerId = "127.0.0.2:10501".parse()?;
+        let a: ServerId = ServerId::from_digest([1; 32]);
+        let b: ServerId = ServerId::from_digest([2; 32]);
         let nonce_a = ServerNonce::new();
         let nonce_b = ServerNonce::new();
         let platform = ContentId::of(b"native-test");
@@ -3050,9 +3556,9 @@ mod scheduler_tests {
             percent: 200.0,
         });
         let ids: [ServerId; 3] = [
-            "127.0.0.1:10501".parse().unwrap(),
-            "127.0.0.1:10502".parse().unwrap(),
-            "127.0.0.1:10503".parse().unwrap(),
+            ServerId::from_digest([1; 32]),
+            ServerId::from_digest([2; 32]),
+            ServerId::from_digest([3; 32]),
         ];
         let nonce = ServerNonce::new();
         for (id, cpus) in ids.into_iter().zip([1.0, 3.0, 0.0]) {
@@ -3072,6 +3578,15 @@ mod scheduler_tests {
             (status.num_cpus, status.max_jobs, status.available_jobs),
             (4, 13, 13)
         );
+        #[cfg(feature = "scheduler-dashboard")]
+        {
+            let snapshot = scheduler.handle_dashboard_snapshot().unwrap();
+            assert_eq!(snapshot.totals.workers, 3);
+            assert_eq!(snapshot.totals.available, status.available_jobs);
+            assert_eq!(snapshot.totals.max_jobs, status.max_jobs);
+            assert_eq!(snapshot.totals.cpu_capacity, 4.0);
+            assert_eq!(snapshot.workers.len(), 3);
+        }
         for _ in 0..13 {
             assert!(matches!(
                 scheduler
@@ -3126,14 +3641,24 @@ mod scheduler_tests {
         fn do_assign_job(
             &self,
             _server_id: ServerId,
-            _job_id: JobId,
+            job_id: JobId,
             _assignment: JobAssignment,
             _auth: String,
         ) -> Result<AssignJobResult> {
+            let _ = job_id;
             // Status must include reservations even before a JobDetail exists.
             let status = self.0.handle_status()?;
             assert_eq!(status.in_progress, 1);
             assert_eq!(status.available_jobs, status.max_jobs - 1);
+            #[cfg(feature = "scheduler-dashboard")]
+            {
+                let snapshot = self.0.handle_dashboard_snapshot()?;
+                assert_eq!(snapshot.totals.assigned, 1);
+                assert_eq!(snapshot.totals.assigning, 1);
+                assert_eq!(snapshot.jobs.len(), 1);
+                assert_eq!(snapshot.jobs[0].id, job_id.to_string());
+                assert_eq!(snapshot.jobs[0].state, "Assigning");
+            }
             Ok(AssignJobResult {
                 state: JobState::Pending,
                 need_toolchain: false,
@@ -3173,7 +3698,7 @@ mod scheduler_tests {
     #[test]
     fn heartbeat_reports_inflight_and_accepted_assignments() -> Result<()> {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse()?;
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
         let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_job(
@@ -3213,7 +3738,7 @@ mod scheduler_tests {
     #[test]
     fn status_counts_assignment_rpc_reservations() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         register_test_server(&scheduler, server_id, ServerNonce::new());
         let AllocJobResult::Success { job_alloc, .. } = scheduler
             .handle_alloc_job(&StatusDuringAssign(&scheduler), test_toolchain('c'))
@@ -3233,9 +3758,9 @@ mod scheduler_tests {
     #[test]
     fn idle_workers_receive_jobs_proportional_to_cpu_capacity() {
         let scheduler = Scheduler::new();
-        let ids: Vec<ServerId> = ["127.0.0.1:10501", "127.0.0.2:10501", "127.0.0.3:10501"]
+        let ids: Vec<ServerId> = [1, 2, 3]
             .into_iter()
-            .map(|s| s.parse().unwrap())
+            .map(|i| ServerId::from_digest([i; 32]))
             .collect();
 
         for (&id, capacity) in ids.iter().zip([1.0, 3.0, 0.0]) {
@@ -3291,7 +3816,7 @@ mod scheduler_tests {
         let drain = dir.path().join("scheduler-drain");
         let scheduler =
             Scheduler::new_with_job_slack_and_drain(JobSlackConfig::default(), Some(drain.clone()));
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         register_test_server(&scheduler, server_id, ServerNonce::new());
 
         std::fs::write(&drain, b"drain").unwrap();
@@ -3368,7 +3893,7 @@ mod scheduler_tests {
     #[test]
     fn ready_transition_starts_its_own_unclaimed_timeout() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
 
@@ -3425,7 +3950,7 @@ mod scheduler_tests {
     #[test]
     fn progressing_pending_upload_renews_lease_but_inactive_upload_expires() -> Result<()> {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse()?;
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
         let AllocJobResult::Success { job_alloc, .. } =
@@ -3480,7 +4005,7 @@ mod scheduler_tests {
     #[test]
     fn pending_jobs_expire_but_started_jobs_remain_owned_by_execution() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
 
@@ -3562,13 +4087,18 @@ mod scheduler_tests {
             Ok(())
         }
 
-        fn generate_blob_token(&self, _blob: sccache::build_runtime::BlobRef) -> Result<String> {
+        fn generate_blob_token(
+            &self,
+            _blob: sccache::build_runtime::BlobRef,
+            _recipient: sccache::build_runtime::wire::BlobRecipient,
+        ) -> Result<String> {
             bail!("synthetic authorization failure")
         }
 
         fn verify_blob_token(
             &self,
             _blob: sccache::build_runtime::BlobRef,
+            _recipient: sccache::build_runtime::wire::BlobRecipient,
             _token: &str,
         ) -> Result<()> {
             Ok(())
@@ -3578,7 +4108,7 @@ mod scheduler_tests {
     #[test]
     fn failed_token_generation_never_reserves_capacity() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         scheduler
             .handle_heartbeat_server(
                 server_id,
@@ -3600,7 +4130,7 @@ mod scheduler_tests {
     #[test]
     fn completion_without_assignment_does_not_discard_job() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         register_test_server(&scheduler, server_id, ServerNonce::new());
         let AllocJobResult::Success { job_alloc, .. } = scheduler
             .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
@@ -3653,7 +4183,7 @@ mod scheduler_tests {
     #[test]
     fn started_jobs_reconcile_against_worker_running_inventory() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
         let AllocJobResult::Success { job_alloc, .. } = scheduler
@@ -3730,8 +4260,8 @@ mod scheduler_tests {
     #[test]
     fn only_the_completing_worker_can_retry_a_known_completion() -> Result<()> {
         let scheduler = Scheduler::new();
-        let owner: ServerId = "127.0.0.1:10501".parse()?;
-        let other: ServerId = "127.0.0.1:10502".parse()?;
+        let owner: ServerId = ServerId::from_digest([1; 32]);
+        let other: ServerId = ServerId::from_digest([2; 32]);
         register_test_server(&scheduler, owner, ServerNonce::new());
         let AllocJobResult::Success { job_alloc, .. } =
             scheduler.handle_alloc_job(&AcceptAssign, test_toolchain('f'))?
@@ -3769,7 +4299,7 @@ mod scheduler_tests {
     #[test]
     fn recent_completion_acknowledgments_expire_and_are_bounded() -> Result<()> {
         let now = Instant::now();
-        let owner: ServerId = "127.0.0.1:10501".parse()?;
+        let owner: ServerId = ServerId::from_digest([1; 32]);
         let mut acks = CompletedJobAcks::default();
         for id in 0..MAX_COMPLETION_ACKS as u64 {
             acks.record(JobId(id), owner, now);
@@ -3789,7 +4319,7 @@ mod scheduler_tests {
     #[test]
     fn returned_running_job_resets_missing_heartbeat_grace() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
         let AllocJobResult::Success { job_alloc, .. } = scheduler
@@ -3864,7 +4394,7 @@ mod scheduler_tests {
     #[test]
     fn state_acknowledgments_are_idempotent() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         register_test_server(&scheduler, server_id, ServerNonce::new());
         let AllocJobResult::Success { job_alloc, .. } = scheduler
             .handle_alloc_job(&AcceptAssign, test_toolchain('d'))
@@ -3893,7 +4423,7 @@ mod scheduler_tests {
     #[test]
     fn worker_name_side_channel_is_optional_and_epoch_bound() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         scheduler
             .handle_heartbeat_server(
@@ -3939,8 +4469,8 @@ mod scheduler_tests {
     #[test]
     fn duplicate_active_worker_names_are_rejected() {
         let scheduler = Scheduler::new();
-        let first: ServerId = "127.0.0.1:10501".parse().unwrap();
-        let second: ServerId = "127.0.0.2:10501".parse().unwrap();
+        let first: ServerId = ServerId::from_digest([1; 32]);
+        let second: ServerId = ServerId::from_digest([2; 32]);
         let first_nonce = ServerNonce::new();
         let second_nonce = ServerNonce::new();
         for (server_id, nonce) in [(first, first_nonce.clone()), (second, second_nonce.clone())] {
@@ -3967,7 +4497,7 @@ mod scheduler_tests {
     #[test]
     fn worker_name_is_stable_within_server_epoch() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         scheduler
             .handle_heartbeat_server(
@@ -3991,7 +4521,7 @@ mod scheduler_tests {
     #[test]
     fn allocation_fails_if_assignment_is_cleaned_up() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let server_nonce = ServerNonce::new();
 
         register_test_server(&scheduler, server_id, server_nonce.clone());
@@ -4173,6 +4703,61 @@ mod server_upload_tests {
         )?;
         assert!(matches!(result, RunJobResult::JobNotFound));
         assert!(requester.0.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn archive_input_failure_finishes_without_waiting_for_execution_capacity() -> Result<()> {
+        struct FailedUpload;
+
+        impl Read for FailedUpload {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "input disconnected",
+                ))
+            }
+        }
+
+        let (_dir, server) = test_server()?;
+        let job_id = JobId(81);
+        server.handle_assign_job(job_id, tc(b"cold toolchain")?)?;
+        // Saturate the shared execution queue without any build running. The
+        // upload must still be consumed and failed, without entering the builder.
+        let permits = (0..server.execution_queue.width().get())
+            .map(|_| server.execution_queue.acquire(|| Ok(())))
+            .collect::<Result<Vec<_>>>()?;
+        let uploader = Arc::clone(&server);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let upload = thread::spawn(move || {
+            let requester = RecordingRequester(Mutex::new(Vec::new()));
+            let result = uploader.handle_run_job(
+                &requester,
+                job_id,
+                CompileCommand {
+                    umask: Some(0o022),
+                    executable: "cc".to_owned(),
+                    arguments: Vec::new(),
+                    env_vars: Vec::new(),
+                    cwd: "/tmp".to_owned(),
+                },
+                OutputRequest {
+                    paths: Vec::new(),
+                    compression_level: 3,
+                },
+                InputsReader::new(Box::new(FailedUpload)),
+            );
+            let states = requester.0.lock().unwrap().clone();
+            finished_tx.send((result, states)).unwrap();
+        });
+        let finished = finished_rx.recv_timeout(Duration::from_secs(5));
+        drop(permits);
+        upload.join().unwrap();
+        let (result, states) = finished.context("upload was blocked by compiler admission")?;
+        let error = result.err().context("disconnected input must fail")?;
+        assert!(format!("{error:#}").contains("input disconnected"));
+        assert_eq!(states, vec![JobState::Started, JobState::Complete]);
+        assert_eq!(server.execution_queue.active(), 0);
         Ok(())
     }
 

@@ -2,7 +2,7 @@
 # Should match .rustfmt.toml
 edition = "2024"
 name = "sccache"
-rust-version = "1.91.0"
+rust-version = "1.100"
 version = "0.18.0"
 
 categories = ["command-line-utilities", "development-tools::build-utils"]
@@ -42,6 +42,7 @@ strip = true
 anyhow = { version = "1.0", features = ["backtrace"] }
 ar = "0.9"
 async-trait = "0.1"
+axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "tokio", "json"] }
 backon = { version = "1", default-features = false, features = [
   "std-blocking-sleep",
 ] }
@@ -58,39 +59,30 @@ fs-err = "3"
 futures = "0.3"
 hostname = { version = "0.4", optional = true }
 http = "1.0"
-http-body-util = { version = "0.1", optional = true }
-hyper = { version = "1.1", optional = true, features = ["server", "http1"] }
-hyper-util = { version = "0.1.3", optional = true, features = [
-  "tokio",
-  "server",
-] }
 itertools = "0.15"
 jobserver = "0.1"
-jwt = { package = "jsonwebtoken", version = "12", optional = true, features = [
-  "aws_lc_rs",
-] }
+jwt = { package = "jsonwebtoken", version = "12", optional = true, default-features = false }
+jsonwebtoken-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d", optional = true }
 libc = "0.2.153"
-linked-hash-map = "0.5"
+lru = "0.19"
 log = "0.4"
-lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "68a4a057a9b32e4a45fe7530a2fbd0fdf2566f43", optional = true }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "e58a7abdb5a0f47a969771fc0b6837c5103863ee", optional = true }
 memchr = "2"
 mime = "0.3"
-object = "0.41"
+object = { version = "0.41", default-features = false, features = ["read", "std"] }
 opendal = { version = "0.59.0", optional = true, default-features = false }
-opendal-http-transport-reqwest = { version = "0.59.0", optional = true }
+http-body = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+wreq = { workspace = true, optional = true }
 opendal-layer-logging = { version = "0.59.0", optional = true }
-openssl = { version = "0.10.75", optional = true }
 rand = "0.10.0"
 regex = "1.10.3"
 percent-encoding = "2.3"
-reqwest = { version = "0.13", features = [
-  "json",
-  "blocking",
-  "stream",
-  "rustls",
-], optional = true }
 semver = "1.0"
+sccache-peer-identity = { path = "crates/peer-identity" }
+sccache-cluster-identity = { path = "crates/cluster-identity", optional = true }
 sccache-build = { path = "crates/build-runtime", default-features = false }
+sccache-dashboard = { path = "crates/scheduler-dashboard", optional = true, features = ["ssr"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11.19"
 serde_json = ">=1.0, <1.0.155" # zmij (used in 1.0.147+) requires Rust 1.84+
@@ -114,29 +106,18 @@ typed-path = "0.13.0"
 url = { version = "2", optional = true }
 uuid = { version = "1.9", features = ["v4"] }
 walkdir = "2"
-webpki-root-certs = { version = "1", optional = true }
 # by default which pulls in an outdated failure version
 which = { version = "8", default-features = false, features = ["real-sys"] }
 zip = { version = "9", default-features = false }
 zstd = "0.14"
-zlib-rs-fast = { package = "zlib-rs", git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "98f76b3a242099f2229b048360eeb4707246a68f", optional = true, default-features = false, features = ["std"] }
+zlib-rs-fast = { package = "zlib-rs", version = "=0.6.8", optional = true, default-features = false, features = ["std"] }
 
 # dist-server only
-nix = { version = "0.32.0", optional = true, features = [
-  "mount",
-  "fs",
-  "user",
-  "sched",
-  "signal",
-  "process",
-] }
-rouille = { version = "3.6", optional = true, default-features = false, features = [
-  "ssl",
-] }
+socket2 = { version = "0.6", optional = true }
 syslog = { version = "7", optional = true }
-version-compare = { version = "0.2.0", optional = true }
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["test-util"] }
 assert_cmd = "2.0.13"
 cc = "1.0"
@@ -152,11 +133,16 @@ thirtyfour = "0.38"
 rustix = { version = "1", features = ["net"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
+nix = { version = "0.32.0", optional = true, features = [
+  "mount",
+  "net",
+  "fs",
+  "user",
+  "sched",
+  "signal",
+  "process",
+] }
 daemonix = "0.1"
-
-[target.'cfg(not(target_os = "freebsd"))'.dependencies.libmount]
-optional = true
-version = "0.1.15"
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 features = [
@@ -185,94 +171,116 @@ all = [
 azure = [
   "opendal/services-azblob",
   "opendal-layer-logging",
-  "opendal-http-transport-reqwest",
-  "reqwest",
+  "dep:wreq",
+  "dep:http-body",
+  "dep:http-body-util",
+  "dep:url",
+  "http-client",
 ]
 cos = [
   "opendal/services-cos",
   "opendal-layer-logging",
-  "opendal-http-transport-reqwest",
-  "reqwest",
+  "dep:wreq",
+  "dep:http-body",
+  "dep:http-body-util",
+  "dep:url",
+  "http-client",
 ]
 default = ["all"]
 direct-metrics = ["dep:hostname", "dep:lurkmoar"]
 gcs = [
   "opendal/services-gcs",
   "opendal-layer-logging",
-  "opendal-http-transport-reqwest",
-  "url",
-  "reqwest",
+  "dep:wreq",
+  "dep:http-body",
+  "dep:http-body-util",
+  "dep:url",
+  "http-client",
 ]
 gha = [
   "opendal/services-ghac",
   "opendal-layer-logging",
-  "opendal-http-transport-reqwest",
-  "reqwest",
+  "dep:wreq",
+  "dep:http-body",
+  "dep:http-body-util",
+  "dep:url",
+  "http-client",
 ]
 memcached = ["opendal/services-memcached", "opendal-layer-logging"]
-native-zlib = []
 native-store = ["sccache-build/store"]
 oss = [
   "opendal/services-oss",
   "opendal-layer-logging",
-  "opendal-http-transport-reqwest",
-  "reqwest",
+  "dep:wreq",
+  "dep:http-body",
+  "dep:http-body-util",
+  "dep:url",
+  "http-client",
 ]
-redis = ["url", "opendal/services-redis", "opendal-layer-logging"]
-reqwest = ["dep:reqwest", "dep:webpki-root-certs"]
+redis = ["dep:url", "opendal/services-redis", "opendal-layer-logging"]
+http-client = ["dep:wreq", "dep:url"]
 s3 = [
   "opendal/services-s3",
   "opendal-layer-logging",
-  "opendal-http-transport-reqwest",
-  "reqwest",
+  "dep:wreq",
+  "dep:http-body",
+  "dep:http-body-util",
+  "dep:url",
+  "http-client",
 ]
 webdav = [
   "opendal/services-webdav",
   "opendal-layer-logging",
-  "opendal-http-transport-reqwest",
-  "reqwest",
+  "dep:wreq",
+  "dep:http-body",
+  "dep:http-body-util",
+  "dep:url",
+  "http-client",
 ]
-# Enable features that will build a vendored version of openssl and
-# statically linked with it, instead of linking against the system-wide openssl
-# dynamically or statically.
-vendored-openssl = ["openssl?/vendored", "reqwest?/native-tls-vendored"]
 # Enable features that require unstable features of Nightly Rust.
 unstable = []
 # Enables distributed support in the sccache client
 dist-client = [
+  "dep:nix",
+  "dep:sccache-cluster-identity",
   "dep:rustix",
   "native-store",
   "zlib-rs-fast",
   "zlib-rs-fast/parallel",
-  "hyper",
-  "http-body-util",
-  "hyper-util",
-  "reqwest",
-  "url",
+  "axum",
+  "http-client",
+  "dep:url",
   "sha2",
 ]
 # Enables the sccache-dist binary
 dist-server = [
+  "dep:socket2",
+  "dep:sccache-cluster-identity",
+  "tokio-util/io-util",
   "native-store",
-  "sha2",
   "url/serde",
   "jwt",
+  "dep:jsonwebtoken-btls",
   "zlib-rs-fast",
-  "libmount",
-  "nix",
-  "openssl",
-  "reqwest",
-  "rouille",
+  "dep:nix",
+  "http-client",
+  "axum",
   "syslog",
-  "version-compare",
   "dep:hostname",
 ]
+# Opt-in local status UI; worker-only builds do not need the web stack.
+scheduler-dashboard = ["dist-server", "dep:sccache-dashboard"]
 # Enables dist tests with external requirements
 dist-tests = ["dist-client", "dist-server"]
 
 [workspace]
-exclude = ["tests/test-crate", "vendor/tiny_http"]
-members = ["crates/build-runtime", "tests/integration/randomize_readdir"]
+exclude = ["tests/test-crate"]
+members = ["crates/build-runtime", "crates/cluster-identity", "crates/peer-identity", "crates/scheduler-dashboard", "tests/integration/randomize_readdir"]
+
+[workspace.dependencies]
+btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d" }
+tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d" }
+wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "af3924b6d06039a49b0f1cd2b6eac688d49f5a23", default-features = false, features = ["tokio-rt", "native-roots", "webpki-roots", "stream", "json", "form", "query", "system-proxy", "http2"] }
 
 [[bench]]
 harness = false
@@ -298,5 +306,9 @@ ref_option = "warn"
 semicolon_if_nothing_returned = "warn"
 unnecessary_semicolon = "warn"
 
+# One source identity for direct streams and all Flate2 consumers.
 [patch.crates-io]
-tiny_http = { path = "vendor/tiny_http" }
+zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "98f76b3a242099f2229b048360eeb4707246a68f" }
+reqsign-core = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "792158bc847448dd4436504f647fec2a59f02be6" }
+reqsign-azure-storage = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "792158bc847448dd4436504f647fec2a59f02be6" }
+reqsign-google = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "792158bc847448dd4436504f647fec2a59f02be6" }

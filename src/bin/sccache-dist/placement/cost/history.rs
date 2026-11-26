@@ -4,9 +4,9 @@
 use super::{ActionClass, ActionCost, ActionCosts, MAX_AGE};
 use sccache::{
     build_runtime::{ContentId, wire::ActionObservation},
-    dist::NativePlacement,
+    dist::{NativePlacement, ServerId},
 };
-use std::{collections::BTreeMap, net::SocketAddr, time::Instant};
+use std::{collections::BTreeMap, time::Instant};
 
 pub(super) const MAX_WORKERS: usize = 32;
 const RATIO_SCALE: u128 = 1_000_000;
@@ -15,15 +15,16 @@ const MAX_CALIBRATION_CLASSES: usize = 32;
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
-pub(crate) struct WorkerScope {
-    pub address: SocketAddr,
+pub struct WorkerScope {
+    pub peer: ServerId,
     pub platform: ContentId,
 }
 
 #[derive(Default)]
-pub(crate) struct CostBook {
+pub struct CostBook {
     pub(super) workers: BTreeMap<WorkerScope, ActionCosts>,
     pub(super) revision: u64,
+    pub(super) receivers: super::receiver::DeliveryHistory,
 }
 
 fn median(mut values: Vec<u64>) -> Option<u64> {
@@ -88,7 +89,7 @@ impl CostBook {
     ) -> ActionCost {
         let baseline = ActionCost::baseline(placement);
         let target = self.workers.get(&scope);
-        let phase = target.map_or(super::PhaseCost::default(), |history| {
+        let phase = target.map_or_else(super::PhaseCost::default, |history| {
             history.overhead.estimate(now)
         });
         if let Some(sample) = target.and_then(|history| history.fresh(class, now))
@@ -102,6 +103,7 @@ impl CostBook {
         let mut calibrated = Vec::new();
         let mut uncalibrated = Vec::new();
         let mut bytes = Vec::new();
+        let mut results = Vec::new();
         let mut requests = Vec::new();
         for (&other, history) in &self.workers {
             if other == scope || other.platform != scope.platform {
@@ -111,6 +113,7 @@ impl CostBook {
                 continue;
             };
             bytes.push(sample.cost.output_bytes);
+            results.push(sample.cost.result_bytes);
             requests.push(sample.cost.output_requests);
             if let Some(ratio) = calibration(target, history, class, now) {
                 let predicted =
@@ -136,6 +139,9 @@ impl CostBook {
             execution_nanoseconds: execution,
             output_bytes: median(bytes).map_or(baseline.output_bytes, |value| {
                 blend(baseline.output_bytes, value, 2)
+            }),
+            result_bytes: median(results).map_or(baseline.result_bytes, |value| {
+                blend(baseline.result_bytes, value, 2)
             }),
             output_requests: median(requests).map_or(baseline.output_requests, |value| {
                 blend(baseline.output_requests, value, 2)
@@ -203,7 +209,7 @@ mod tests {
 
     fn scope(port: u16) -> WorkerScope {
         WorkerScope {
-            address: SocketAddr::from(([127, 0, 0, 1], port)),
+            peer: ServerId::from_digest(std::array::from_fn(|index| port.to_le_bytes()[index % 2])),
             platform: ContentId::of(b"platform"),
         }
     }
@@ -292,6 +298,12 @@ mod tests {
         book.observe(first, class, measured, 4 << 20, now);
         book.observe(second, class, measured, 8 << 20, now);
         book.observe(second, class, measured, 1 << 20, now);
+        for _ in 0..3 {
+            book.observe(first, class, measured, 4 << 20, now);
+        }
+        let prediction = book.predict(first, class, &NativePlacement::default(), now);
+        assert_eq!(prediction.output_bytes, 0);
+        assert_eq!(prediction.result_bytes, 4 << 20);
         assert_eq!(
             book.result_reservation(first.platform, class, now),
             Some((10 << 20) + (64 << 10))

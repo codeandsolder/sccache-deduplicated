@@ -14,13 +14,16 @@ permissions:
 
 jobs:
   strict-rust:
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@f2b37a67bfe379e8db96731f97ad3c345065b168 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@343303848026ed142e48a6a82e7a889080b99b26 # Last unprivileged reusable workflow
     with:
       command: ":"
       rustflags: ""
+      rust-targets: wasm32-unknown-unknown
       python-ci-paths: tools
       strict-suites: |
         [
           {"name":"workspace","allow-test-panics":true},
-          {"name":"cpu-target-profile","directory":"tools/cpu-target-profile"}
+          {"name":"cpu-target-profile","directory":"tools/cpu-target-profile"},
+          {"name":"dashboard-ssr","cargo":["--locked","-p","sccache","-p","sccache-dashboard","--no-default-features","--features","sccache/s3,sccache/gha,sccache/dist-client,sccache/dist-server,sccache/direct-metrics,sccache/scheduler-dashboard,sccache-dashboard/ssr","--lib","--bins"],"allow-test-panics":true},
+          {"name":"dashboard-wasm","cargo":["--locked","-p","sccache-dashboard","--no-default-features","--features","hydrate","--target","wasm32-unknown-unknown","--lib"]}
         ]

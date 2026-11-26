@@ -469,7 +469,7 @@ impl NativeCacheClient {
                     Ok(TimedDownload {
                         reader: {
                             let (response, encoding) =
-                                self.download_response(ticket, offer.blob.id)?;
+                                self.download_response(ticket, offer.blob)?;
                             ensure!(
                                 encoding == crate::build_runtime::BlobEncoding::Raw,
                                 "package must be original bytes"

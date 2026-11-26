@@ -40,8 +40,11 @@ use super::{
 struct DirectEndpoint {
     config: NativeClientConfig,
     scheduler: Option<HTTPUrl>,
+    cluster: Option<sccache_peer_identity::PeerConfig>,
+    client: std::sync::Mutex<Option<NativeCacheClient>>,
     auth: DistAuth,
     local: Option<LocalExecutor>,
+    intermediates: crate::dist::native::result_session::Registry,
 }
 
 enum Endpoint {
@@ -79,6 +82,7 @@ impl NativeCompilerClient {
     pub fn new(
         config: NativeClientConfig,
         scheduler: Option<HTTPUrl>,
+        cluster: Option<sccache_peer_identity::PeerConfig>,
         auth: DistAuth,
         toolchains: Vec<DistToolchainConfig>,
         catalogs: &[PathBuf],
@@ -98,8 +102,11 @@ impl NativeCompilerClient {
             endpoint: Endpoint::Direct(Box::new(DirectEndpoint {
                 config,
                 scheduler,
+                cluster,
+                client: std::sync::Mutex::new(None),
                 auth,
                 local,
+                intermediates: crate::dist::native::result_session::Registry::default(),
             })),
             policy,
             toolchains,
@@ -126,6 +133,76 @@ impl NativeCompilerClient {
         }
     }
 
+    pub(crate) fn reference(
+        &self,
+        file: &std::fs::File,
+    ) -> Result<
+        Option<(
+            crate::build_runtime::BlobRef,
+            crate::build_runtime::ReferenceBlobProvider,
+        )>,
+    > {
+        use crate::{
+            build_runtime::intermediate_fs::intermediate_reference,
+            protocol::{TransferReply, TransferRequest},
+        };
+        let Some(reference) = intermediate_reference(file)? else {
+            return Ok(None);
+        };
+        let provider = match &self.endpoint {
+            Endpoint::Direct(endpoint) => {
+                // SAFETY: geteuid only queries process credentials.
+                let group = endpoint
+                    .intermediates
+                    .get(unsafe { libc::geteuid() }, reference.session)?;
+                group.authorize(reference.blob)?;
+                crate::build_runtime::ReferenceBlobProvider::new(move |blob| {
+                    Ok(Box::new(group.read(blob)?))
+                })
+            }
+            Endpoint::Namespace { connection, .. } => {
+                ensure!(
+                    matches!(
+                        connection.blocking_lock().transfer(
+                            TransferRequest::IntermediateAuthorize {
+                                session: reference.session,
+                                blob: reference.blob
+                            }
+                        )?,
+                        TransferReply::Ack
+                    ),
+                    "unexpected intermediate authorization response"
+                );
+                crate::dist::native::intermediate::source(reference)
+            }
+        };
+        log::debug!("using retained CAS input {:?}", reference.blob.id);
+        Ok(Some((reference.blob, provider)))
+    }
+
+    pub(crate) async fn hash_files(
+        self: &Arc<Self>,
+        files: &[PathBuf],
+        pool: &tokio::runtime::Handle,
+    ) -> Result<Vec<String>> {
+        let jobs = files.iter().map(|path| {
+            let client = Arc::clone(self);
+            let path = path.clone();
+            pool.spawn_blocking(move || {
+                let file = std::fs::File::open(path)?;
+                if let Some((blob, _)) = client.reference(&file)? {
+                    Ok(crate::util::hex(&blob.id.0))
+                } else {
+                    crate::util::Digest::reader_sync(file)
+                }
+            })
+        });
+        futures::future::try_join_all(jobs)
+            .await?
+            .into_iter()
+            .collect()
+    }
+
     pub fn toolchain_digests(&self) -> Arc<SourceDigestCache> {
         Arc::clone(&self.toolchain_digests)
     }
@@ -134,15 +211,53 @@ impl NativeCompilerClient {
         &self.policy
     }
 
-    pub fn serve_namespace(&self, stream: broker::DaemonStream) -> Result<()> {
+    pub fn serve_namespace(&self, stream: broker::DaemonStream, uid: u32) -> Result<()> {
         let client = self.connect_http()?;
         let Endpoint::Direct(endpoint) = &self.endpoint else {
             anyhow::bail!("native namespace endpoint cannot serve");
         };
-        broker::serve_action(&client, &self.policy, stream, endpoint.local.as_ref())
+        broker::serve_action(
+            &client,
+            &self.policy,
+            stream,
+            endpoint.local.as_ref(),
+            &endpoint.intermediates,
+            uid,
+        )
     }
 
-    pub async fn status(&self) -> DistInfo {
+    pub(crate) fn open_intermediate(
+        &self,
+        uid: u32,
+    ) -> Result<(
+        crate::build_runtime::wire::Ticket,
+        Arc<crate::dist::native::result_session::NativeResultSession>,
+    )> {
+        let Endpoint::Direct(endpoint) = &self.endpoint else {
+            anyhow::bail!("intermediate registry is daemon-owned");
+        };
+        let session = Arc::new(
+            crate::dist::native::result_session::NativeResultSession::open(
+                self.connect_http()?,
+                Duration::from_secs(self.policy.renewal_interval_secs),
+            )?,
+        );
+        let token = endpoint.intermediates.insert(uid, &session)?;
+        Ok((token, session))
+    }
+
+    pub(crate) fn intermediate(
+        &self,
+        uid: u32,
+        token: crate::build_runtime::wire::Ticket,
+    ) -> Result<Arc<crate::dist::native::result_session::NativeResultSession>> {
+        let Endpoint::Direct(endpoint) = &self.endpoint else {
+            anyhow::bail!("intermediate registry is daemon-owned");
+        };
+        endpoint.intermediates.get(uid, token)
+    }
+
+    pub async fn status(self: &Arc<Self>) -> DistInfo {
         match &self.endpoint {
             Endpoint::Namespace { connection, .. } => {
                 let result = connection_task(Arc::clone(connection), |conn| {
@@ -157,20 +272,14 @@ impl NativeCompilerClient {
                 })
             }
             Endpoint::Direct(endpoint) => {
-                let DirectEndpoint {
-                    config, scheduler, ..
-                } = endpoint.as_ref();
+                let scheduler = &endpoint.scheduler;
+                let client = Arc::clone(self);
                 let result = async {
-                    let scheduler = scheduler.as_ref().context("scheduler URL unavailable")?;
-                    let url = dist::http::urls::scheduler_status(&scheduler.to_url())?;
-                    let client = crate::http_client::new_reqwest_client_builder()?
-                        .timeout(Duration::from_secs(config.request_timeout_secs))
-                        .build()?;
-                    dist::http::transport::send_async(
-                        client.get(url),
-                        dist::http::transport::RequestClass::Control,
-                    )
-                    .await
+                    // Enrollment and credential refresh use the synchronous
+                    // cluster runtime bridge; do not block the async IPC task.
+                    let transport =
+                        tokio::task::spawn_blocking(move || client.connect_http()).await??;
+                    transport.scheduler_status().await
                 }
                 .await;
                 match result {
@@ -201,19 +310,39 @@ impl NativeCompilerClient {
             anyhow::bail!("namespace client cannot authenticate directly with scheduler");
         };
         let DirectEndpoint { config, auth, .. } = endpoint.as_ref();
-        let token = match auth {
-            DistAuth::Token { token } => token.clone(),
-            DistAuth::Oauth2CodeGrantPKCE { auth_url, .. }
-            | DistAuth::Oauth2Implicit { auth_url, .. } => {
-                DistClientContainer::get_cached_config_auth_token(auth_url)?
-            }
-        };
-        NativeCacheClient::new(
-            config.endpoint.to_url(),
-            token,
+        let mut saved = endpoint
+            .client
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native client credentials poisoned"))?;
+        if let Some(client) = saved.as_ref().cloned() {
+            drop(saved);
+            client.refresh_credentials();
+            return Ok(client);
+        }
+        let cluster = endpoint
+            .cluster
+            .clone()
+            .context("native client cluster trust required")?;
+        let scheduler = endpoint
+            .scheduler
+            .as_ref()
+            .context("native client scheduler endpoint required")?;
+        let auth = auth.clone();
+        let peer = crate::dist::cluster::open_peer(
+            cluster,
+            &scheduler.to_url(),
+            sccache_cluster_identity::Role::Client,
+            move || DistClientContainer::enrollment_token(&auth),
+        )?;
+        let client = NativeCacheClient::new(
+            &config.endpoint.to_url(),
+            peer,
             Duration::from_secs(config.request_timeout_secs),
             config.max_metadata_bytes,
-        )
+        )?;
+        *saved = Some(client.clone());
+        drop(saved);
+        Ok(client)
     }
 
     async fn execute(
@@ -222,19 +351,30 @@ impl NativeCompilerClient {
         mode: ActionMode,
         pool: &tokio::runtime::Handle,
     ) -> Result<(NativeBuildResult, crate::build_runtime::ActionKey)> {
-        let key = plan.spec.action_request()?.action_fingerprint()?.key()?;
+        let fingerprint = plan.spec.action_request()?.action_fingerprint()?;
+        let key = fingerprint.key()?;
+        debug!(
+            "native action {key:?}: components={:?}; input trees={:?}",
+            fingerprint.components,
+            plan.inputs.iter().map(PreparedTree::id).collect::<Vec<_>>()
+        );
         let result = match &self.endpoint {
             Endpoint::Direct(_) => {
                 pool.spawn_blocking(crate::server::activity::inherit_blocking(move || {
                     let Endpoint::Direct(endpoint) = &self.endpoint else {
                         unreachable!()
                     };
-                    self.connect_http()?.run_action(
+                    self.connect_http()?.run_action_retained(
                         &plan.spec,
                         &plan.inputs,
                         &plan.destinations,
                         &self.policy.build_policy(mode),
                         endpoint.local.as_ref(),
+                        (
+                            &endpoint.intermediates,
+                            // SAFETY: geteuid only queries process credentials.
+                            unsafe { libc::geteuid() },
+                        ),
                     )
                 }))
                 .await?
@@ -332,8 +472,9 @@ impl CompilerPlan {
         transformer: dist::PathTransformer,
         packagers: DistPackagers,
         platform: ContentId,
-        toolchain_digests: &SourceDigestCache,
+        preparation: (&SourceDigestCache, Option<&NativeCompilerClient>),
     ) -> Result<Self> {
+        let (toolchain_digests, native) = preparation;
         let mut layout = pkg::CompilerInputs::new(transformer);
         layout.directory(cwd)?;
         let mut paths = BTreeMap::new();
@@ -370,8 +511,13 @@ impl CompilerPlan {
             after.0,
             after.1
         );
-        let inputs = inputs.native_mapping()?.prepare()?;
-        let layout = layout.into_native_mapping()?.prepare()?;
+        let mapped = inputs.native_mapping()?;
+        let inputs = if let Some(native) = native {
+            mapped.prepare_with_references(&|file, _| native.reference(file))?
+        } else {
+            mapped.prepare()?
+        };
+        let layout = layout.into_native_mapping(|_| false)?.prepare()?;
         let directories = pkg::native_directory_metadata()?;
         let inputs = vec![toolchain, inputs, layout];
         let recipe = TreeRecipe::union(directories, inputs.iter().map(PreparedTree::id));
@@ -666,7 +812,10 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                     layout,
                     packagers,
                     preparation_client.policy.platform,
-                    &preparation_client.toolchain_digests,
+                    (
+                        &preparation_client.toolchain_digests,
+                        Some(&preparation_client),
+                    ),
                 )
             }))
         })();
@@ -701,8 +850,10 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                 // an ordinary nonzero exit. Preserve caller semantics by
                 // rerunning locally without writing an archive cache.
                 warn!(
-                    "native compilation failed on {:?}; retrying locally",
-                    result.source
+                    "native compilation failed on {:?} with {}; retrying locally: {}",
+                    result.source,
+                    result.output.status,
+                    String::from_utf8_lossy(&result.output.stderr)
                 );
                 fallback = DistType::Error;
             }
@@ -737,7 +888,7 @@ mod tests {
     use std::{ffi::OsString, io::Read};
 
     fn config() -> Result<Config> {
-        let endpoint = HTTPUrl::from_url(reqwest::Url::parse("http://127.0.0.1:1/")?);
+        let endpoint = HTTPUrl::from_url(url::Url::parse("http://127.0.0.1:1/")?);
         let mut config = Config::default();
         config.dist.scheduler_url = Some(endpoint.clone());
         config.dist.native = Some(NativeClientConfig {
@@ -792,6 +943,8 @@ mod tests {
             anyhow::bail!("real compiler arguments are not cacheable");
         };
         let hashed = rt.block_on(hasher.generate_hash_key(GenerateHashKeyContext {
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            native: None,
             creator: &creator,
             cwd: cwd.clone(),
             env_vars: environment.clone(),
@@ -853,7 +1006,7 @@ mod tests {
             layout,
             compilation.into_dist_packagers(transformer)?,
             platform,
-            &SourceDigestCache::default(),
+            (&SourceDigestCache::default(), None),
         )?;
         let store = NativeStore::open(&cwd.join("native-store"))?;
         let _leases = plan
