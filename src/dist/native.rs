@@ -1332,7 +1332,7 @@ impl NativeCacheClient {
     /// Returns an error for an unavailable or corrupt retained blob.
     #[cfg(all(target_os = "linux", feature = "native-store"))]
     pub fn download_retained(&self, group: Ticket, blob: BlobRef) -> Result<File> {
-        let stage = |reader, encoding| {
+        fn stage(reader: impl Read, blob: BlobRef, encoding: BlobEncoding) -> Result<File> {
             let mut file = tempfile::tempfile()?;
             crate::build_runtime::transfer_native_blob(
                 reader,
@@ -1343,10 +1343,11 @@ impl NativeCacheClient {
             )?;
             file.rewind()?;
             Ok(file)
-        };
+        }
         let plans = self.retained_source_plans(group, &[blob]);
         if let Some(plan) = plans.get(&blob.id)
-            && let Some(file) = self.try_peer_blob(plan, stage)
+            && let Some(file) =
+                self.try_peer_blob(plan, |reader, encoding| stage(reader, blob, encoding))
         {
             return Ok(file);
         }
@@ -1354,7 +1355,7 @@ impl NativeCacheClient {
         let (reader, encoding) = self
             .receive_blob("retain_download", request, blob, self.timeout)?
             .context("native retained content unavailable")?;
-        stage(reader, encoding)
+        stage(reader, blob, encoding)
     }
 
     /// Report a failed compilation without publishing any shared result.
