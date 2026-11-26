@@ -62,7 +62,7 @@ http = "1.0"
 itertools = "0.15"
 jobserver = "0.1"
 jwt = { package = "jsonwebtoken", version = "12", optional = true, default-features = false }
-jsonwebtoken-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d", optional = true }
+jsonwebtoken-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "9493b94de4830de4bfa83d08457cf0f1c0c3711a", optional = true }
 libc = "0.2.153"
 lru = "0.19"
 log = "0.4"
@@ -278,8 +278,8 @@ exclude = ["tests/test-crate"]
 members = ["crates/build-runtime", "crates/cluster-identity", "crates/peer-identity", "crates/scheduler-dashboard", "tests/integration/randomize_readdir"]
 
 [workspace.dependencies]
-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d" }
-tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d" }
+btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "9493b94de4830de4bfa83d08457cf0f1c0c3711a" }
+tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "9493b94de4830de4bfa83d08457cf0f1c0c3711a" }
 wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "af3924b6d06039a49b0f1cd2b6eac688d49f5a23", default-features = false, features = ["tokio-rt", "native-roots", "webpki-roots", "stream", "json", "form", "query", "system-proxy", "http2"] }
 
 [[bench]]
