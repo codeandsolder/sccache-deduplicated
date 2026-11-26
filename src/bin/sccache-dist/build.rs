@@ -457,6 +457,35 @@ impl OverlayBuilder {
         Ok(target_dir)
     }
 
+    fn collect_outputs(
+        build_fs: &RootedBuildFs,
+        cwd: &Path,
+        output_paths: Vec<String>,
+        compression_level: i32,
+    ) -> Result<Vec<(String, ZstdFrame)>> {
+        let mut outputs = vec![];
+        trace!("retrieving {output_paths:?}");
+        for path in output_paths {
+            // Follow output symlinks with the same root semantics
+            // as bubblewrap, never against the host filesystem.
+            match build_fs.open_output(&cwd.join(&path)) {
+                Ok(file) => {
+                    let output = ZstdFrame::try_from_reader(file, compression_level)
+                        .context("Failed to read output file")?;
+                    outputs.push((path, output));
+                }
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::NotFound {
+                        debug!("Missing output path {path:?}");
+                    } else {
+                        return Err(Error::from(e).context("Failed to open output file"));
+                    }
+                }
+            }
+        }
+        Ok(outputs)
+    }
+
     fn perform_build(
         job_id: JobId,
         bubblewrap: &Path,
@@ -568,28 +597,8 @@ impl OverlayBuilder {
                         .context("Failed to retrieve output from compile")?;
                     trace!("compile_output: {compile_output:?}");
 
-                    let mut outputs = vec![];
-                    trace!("retrieving {output_paths:?}");
-                    for path in output_paths {
-                        // Follow output symlinks with the same root semantics
-                        // as bubblewrap, never against the host filesystem.
-                        match build_fs.open_output(&cwd.join(&path)) {
-                            Ok(file) => {
-                                let output = ZstdFrame::try_from_reader(file, compression_level)
-                                    .context("Failed to read output file")?;
-                                outputs.push((path, output));
-                            }
-                            Err(e) => {
-                                if e.kind() == io::ErrorKind::NotFound {
-                                    debug!("Missing output path {path:?}");
-                                } else {
-                                    return Err(
-                                        Error::from(e).context("Failed to open output file")
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    let outputs =
+                        Self::collect_outputs(&build_fs, cwd, output_paths, compression_level)?;
                     let compile_output = ProcessOutput::try_from(compile_output)
                         .context("Failed to convert compilation exit status")?;
                     Ok(BuildResult {

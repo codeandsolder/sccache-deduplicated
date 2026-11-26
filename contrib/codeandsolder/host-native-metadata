@@ -130,6 +130,32 @@ dashboard_select() {
     rmdir "$temporary"
 }
 
+# Publish the complete accepted release as a single durable record. Readers
+# never observe a mixture of hashes, protocol versions, or asset manifests.
+state_publish() (
+    local state="$1" bundle="$2" tag="$3" published="$4" client_hash="$5" dist_hash="$6"
+    local source_sha protocol tmp
+    source_sha="$(manifest_value "$bundle/build.txt" source_sha)"
+    protocol="$(manifest_value "$bundle/build.txt" dist_protocol)"
+    [[ "$source_sha" =~ ^[0-9a-f]{40}$ && "$protocol" =~ ^[1-9][0-9]*$ &&
+       "$client_hash" =~ ^[0-9a-f]{64}$ && "$dist_hash" =~ ^[0-9a-f]{64}$ &&
+       -n "$tag" && -n "$published" && -s "$bundle/SHA256SUMS" ]]
+    tmp="$(mktemp "$state/.release.XXXXXXXX")"
+    trap 'rm -f -- "$tmp"' EXIT
+    jq -n --arg tag "$tag" --arg source_sha "$source_sha" --arg protocol "$protocol" \
+        --arg client_hash "$client_hash" --arg dist_hash "$dist_hash" \
+        --arg published "$published" --arg updated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --rawfile build "$bundle/build.txt" --rawfile checksums "$bundle/SHA256SUMS" \
+        '{schema:1,release_tag:$tag,source_sha:$source_sha,dist_protocol:$protocol,
+          binary_sha256:$client_hash,dist_binary_sha256:$dist_hash,
+          published_at:$published,updated_at:$updated,build:$build,checksums:$checksums}' > "$tmp"
+    chmod 0644 "$tmp"
+    sync "$tmp"
+    mv -Tf -- "$tmp" "$state/release.json"
+    sync "$state"
+)
+
+
 case "${1:-}" in
     fingerprint) [[ $# == 1 ]]; fingerprint ;;
     verify)
@@ -140,6 +166,7 @@ case "${1:-}" in
         ;;
     dashboard-select) [[ $# == 3 ]]; dashboard_select "$2" "$3" ;;
     dashboard-check) [[ $# == 4 ]]; dashboard_check "$2" "$3" "$4" ;;
-    *) echo "usage: $0 fingerprint | verify ABSOLUTE_BUNDLE_DIRECTORY PUBLISHED_BUILD_TXT [--scheduler-dashboard] | dashboard-select BUNDLE_DIRECTORY ASSET_LINK | dashboard-check BUNDLE_DIRECTORY ASSET_LINK MANIFEST" >&2; exit 2 ;;
+    state-publish) [[ $# == 7 ]]; state_publish "$2" "$3" "$4" "$5" "$6" "$7" ;;
+    *) echo "usage: $0 fingerprint | verify ABSOLUTE_BUNDLE_DIRECTORY PUBLISHED_BUILD_TXT [--scheduler-dashboard] | dashboard-select BUNDLE_DIRECTORY ASSET_LINK | dashboard-check BUNDLE_DIRECTORY ASSET_LINK MANIFEST | state-publish STATE BUNDLE TAG PUBLISHED_AT CLIENT_HASH DIST_HASH" >&2; exit 2 ;;
 esac
 

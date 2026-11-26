@@ -39,12 +39,12 @@ fi
 dashboard_matches() {
     (( dashboard_required == 0 )) && return 0
     [[ -n "$NATIVE_BUNDLE_ROOT" ]] || return 1
-    local directory="$NATIVE_BUNDLE_ROOT/$1" manifest="$NATIVE_BUNDLE_ROOT/$1/SHA256SUMS" helper
-    if [[ -r "$STATE_DIR/source_sha" && "$(cat "$STATE_DIR/source_sha")" == "$1" ]]; then
-        manifest="$STATE_DIR/SHA256SUMS"
+    local directory="$NATIVE_BUNDLE_ROOT/$1"
+    if [[ -r "$state_file" && "$(state_read source_sha)" == "$1" ]]; then
+        "$native_metadata" dashboard-check "$directory" "$DASHBOARD_LINK" <(state_read checksums)
+    else
+        "$native_metadata" dashboard-check "$directory" "$DASHBOARD_LINK" "$directory/SHA256SUMS"
     fi
-    helper="$(dirname -- "$(realpath -- "$0")")/host-native-metadata"
-    "$helper" dashboard-check "$directory" "$DASHBOARD_LINK" "$manifest"
 }
 
 dashboard_ready() {
@@ -56,7 +56,7 @@ LOCK="${SCCACHE_AUTOUPDATE_LOCK:-/run/lock/sccache-autoupdate.lock}"
 MODE=apply
 NATIVE_BUNDLE_ROOT="${SCCACHE_AUTOUPDATE_NATIVE_BUNDLE_ROOT:-}"
 EXPECTED_RUST_TOOLCHAIN="${SCCACHE_AUTOUPDATE_EXPECTED_RUST_TOOLCHAIN:-nightly-2026-11-20}"
-EXPECTED_ROLLOUT_EPOCH="${SCCACHE_AUTOUPDATE_EXPECTED_ROLLOUT_EPOCH:-2}"
+EXPECTED_ROLLOUT_EPOCH="${SCCACHE_AUTOUPDATE_EXPECTED_ROLLOUT_EPOCH:-6}"
 SMOKE_RUSTC="${SCCACHE_AUTOUPDATE_SMOKE_RUSTC:-/opt/toolchains/rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu/bin/rustc}"
 VERIFY_DIST_SMOKE="${SCCACHE_AUTOUPDATE_VERIFY_DIST_SMOKE:-0}"
 REQUIRED_CAPABILITIES="${SCCACHE_AUTOUPDATE_REQUIRED_CAPABILITIES:-direct-metrics}"
@@ -209,6 +209,10 @@ if [[ "$MODE" == apply && -e /etc/systemd/system/sccache-fleet-rollout-drain ]];
     exit 75
 fi
 
+state_file="$STATE_DIR/release.json"
+native_metadata="$(dirname -- "$(realpath -- "$0")")/host-native-metadata"
+state_read() { jq -er --arg field "$1" 'select(.schema == 1) | .[$field]' "$state_file"; }
+
 api="https://api.github.com/repos/$REPO"
 ua="sentinelo2-sccache-autoupdate/1"
 
@@ -244,24 +248,21 @@ IFS='|' read -r tag published_at < <(latest_release)
 # binaries and the running scheduler process still match the recorded release,
 # there is nothing to download or restart.
 if [[ "$MODE" == apply &&
-      -r "$STATE_DIR/release_tag" &&
-      -r "$STATE_DIR/binary_sha256" &&
-      -r "$STATE_DIR/dist_binary_sha256" &&
+      -r "$state_file" &&
       -x "$LIVE" && -x "$DIST_LIVE" ]]; then
-    managed_tag="$(cat "$STATE_DIR/release_tag")"
-    managed_hash="$(cat "$STATE_DIR/binary_sha256")"
-    managed_dist_hash="$(cat "$STATE_DIR/dist_binary_sha256")"
+    managed_tag="$(state_read release_tag)"
+    managed_hash="$(state_read binary_sha256)"
+    managed_dist_hash="$(state_read dist_binary_sha256)"
     live_hash="$(sha256sum "$LIVE" | awk '{print $1}')"
     live_dist_hash="$(sha256sum "$DIST_LIVE" | awk '{print $1}')"
-    managed_kind="$(sed -n 's/^build_kind=//p' "$STATE_DIR/build.txt" 2>/dev/null || true)"
+    managed_kind="$(state_read build | sed -n 's/^build_kind=//p')"
     desired_kind=portable
     native_identity_matches=1
     if [[ -n "$NATIVE_BUNDLE_ROOT" ]]; then
         desired_kind="host-native"
-        native_metadata="$(dirname -- "$(realpath -- "$0")")/host-native-metadata"
         if [[ "$managed_kind" != "host-native" ]] ||
            ! current_fingerprint="$("$native_metadata" fingerprint)" ||
-           [[ "$(sed -n 's/^host_fingerprint=//p' "$STATE_DIR/build.txt" 2>/dev/null || true)" != "$current_fingerprint" ]]; then
+           [[ "$(state_read build | sed -n 's/^host_fingerprint=//p')" != "$current_fingerprint" ]]; then
             native_identity_matches=0
         fi
     fi
@@ -364,7 +365,6 @@ if [[ -n "$NATIVE_BUNDLE_ROOT" ]]; then
         echo "sccache-release-update: awaiting host-native bundle $native_dir; keeping installed binaries"
         exit 0
     fi
-    native_metadata="$(dirname -- "$(realpath -- "$0")")/host-native-metadata"
     native_flags=()
     if (( dashboard_required )); then native_flags+=(--scheduler-dashboard); fi
     "$native_metadata" verify "$native_dir" "$release_dir/build.txt" "${native_flags[@]}"
@@ -394,12 +394,8 @@ if ! capabilities_satisfy_requirements "$candidate_capabilities"; then
 fi
 
 current_sha=""
-# A client-only rollout is still a forward deployment. Prefer its source SHA
-# when enforcing monotonic updates; fall back to the last fully converged bundle.
-if [[ -r "$STATE_DIR/client_source_sha" ]]; then
-    current_sha="$(cat "$STATE_DIR/client_source_sha")"
-elif [[ -r "$STATE_DIR/source_sha" ]]; then
-    current_sha="$(cat "$STATE_DIR/source_sha")"
+if [[ -r "$state_file" ]]; then
+    current_sha="$(state_read source_sha)"
 fi
 
 if [[ -z "$published_at" ]]; then
@@ -435,32 +431,8 @@ echo "release=$tag source_sha=$source_sha published_at=$published_at"
 echo "candidate_sha256=$candidate_sha live_sha256=${live_sha:-missing}"
 echo "candidate_dist_sha256=$candidate_dist_sha live_dist_sha256=${live_dist_sha:-missing}"
 
-record_client_state() {
-    printf '%s\n' "$tag" > "$STATE_DIR/client_release_tag"
-    printf '%s\n' "$source_sha" > "$STATE_DIR/client_source_sha"
-    printf '%s\n' "$candidate_sha" > "$STATE_DIR/client_sha256"
-    printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE_DIR/client_updated_at"
-}
-
-record_dist_state() {
-    printf '%s\n' "$tag" > "$STATE_DIR/dist_release_tag"
-    printf '%s\n' "$source_sha" > "$STATE_DIR/dist_source_sha"
-    printf '%s\n' "$candidate_dist_sha" > "$STATE_DIR/dist_sha256"
-    printf '%s\n' "$dist_protocol" > "$STATE_DIR/dist_protocol"
-    printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE_DIR/dist_updated_at"
-}
-
 record_full_state() {
-    record_client_state
-    record_dist_state
-    printf '%s\n' "$tag" > "$STATE_DIR/release_tag"
-    printf '%s\n' "$source_sha" > "$STATE_DIR/source_sha"
-    printf '%s\n' "$published_at" > "$STATE_DIR/published_at"
-    cp -f "$release_dir/build.txt" "$STATE_DIR/build.txt"
-    cp -f "$release_dir/SHA256SUMS" "$STATE_DIR/SHA256SUMS"
-    printf '%s\n' "$candidate_sha" > "$STATE_DIR/binary_sha256"
-    printf '%s\n' "$candidate_dist_sha" > "$STATE_DIR/dist_binary_sha256"
-    printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE_DIR/updated_at"
+    "$native_metadata" state-publish "$STATE_DIR" "$release_dir" "$tag" "$published_at" "$candidate_sha" "$candidate_dist_sha"
 }
 
 if [[ "$MODE" == check ]]; then
@@ -582,15 +554,10 @@ for service in "${DIST_SERVICES[@]}"; do
 done
 dist_was_active=0
 current_dist_protocol=""
-if [[ -r "$STATE_DIR/dist_protocol" && -r "$STATE_DIR/dist_sha256" ]] &&
-   [[ "$(cat "$STATE_DIR/dist_sha256")" == "$live_dist_sha" ]]; then
-    current_dist_protocol="$(cat "$STATE_DIR/dist_protocol")"
-elif [[ -r "$STATE_DIR/release_tag" && -r "$STATE_DIR/source_sha" &&
-        -r "$STATE_DIR/dist_binary_sha256" ]] &&
-     [[ "$(cat "$STATE_DIR/dist_binary_sha256")" == "$live_dist_sha" ]]; then
-    # Canonical releases predating explicit protocol metadata all used v1.
-    current_dist_protocol=1
+if [[ -r "$state_file" && "$(state_read dist_binary_sha256)" == "$live_dist_sha" ]]; then
+    current_dist_protocol="$(state_read dist_protocol)"
 fi
+
 if (( ${#ACTIVE_DIST_SERVICES[@]} > 0 )); then
     dist_was_active=1
 fi
@@ -650,26 +617,56 @@ start_dist_services() {
         systemctl start "$SCHEDULER_PROXY_SERVICE"
     fi
 }
-backup_dir="$STATE_DIR/backups/$(date -u +%Y%m%dT%H%M%SZ)-${live_sha:-none}"
+mkdir -p "$STATE_DIR/backups"
+backup_dir="$(mktemp -d "$STATE_DIR/backups/$(date -u +%Y%m%dT%H%M%SZ)-${live_sha:-none}.XXXXXXXX")"
 smoke=""
-mkdir -p "$backup_dir"
 [[ -e "$LIVE" ]] && cp -a "$LIVE" "$backup_dir/sccache"
 [[ -e "$DIST_LIVE" ]] && cp -a "$DIST_LIVE" "$backup_dir/sccache-dist"
 if (( dashboard_required )); then
     [[ ! -e "$DASHBOARD_LINK" || -L "$DASHBOARD_LINK" ]] || exit 1
     if [[ -L "$DASHBOARD_LINK" ]]; then cp -a "$DASHBOARD_LINK" "$backup_dir/dashboard-current"; fi
 fi
-[[ -r "$STATE_DIR/release_tag" ]] && cp -a "$STATE_DIR/release_tag" "$backup_dir/release_tag"
-[[ -r "$STATE_DIR/source_sha" ]] && cp -a "$STATE_DIR/source_sha" "$backup_dir/source_sha"
+[[ ! -r "$state_file" ]] || cp -a "$state_file" "$backup_dir/release.json"
+
+client_services_touched=0
+dist_services_touched=0
+client_binary_touched=0
+dist_binary_touched=0
+dashboard_touched=0
+state_touched=0
+client_drain_owned=0
+
+acquire_client_drain() {
+    if (( client_drain_owned )); then return 0; fi
+    (set -o noclobber; : > "$DRAIN") || return 1
+    client_drain_owned=1
+}
+release_client_drain() {
+    if (( client_drain_owned )); then
+        rm -f -- "$DRAIN"
+        client_drain_owned=0
+    fi
+}
+restore_release_state() {
+    if [[ -f "$backup_dir/release.json" ]]; then
+        local tmp
+        tmp="$(mktemp "$STATE_DIR/.release-rollback.XXXXXXXX")"
+        cp -a -- "$backup_dir/release.json" "$tmp"
+        sync "$tmp"
+        mv -Tf -- "$tmp" "$state_file"
+    else
+        rm -f -- "$state_file"
+    fi
+    sync "$STATE_DIR"
+}
 
 rollback() {
-    rc=$?
+    local rc="$1"
     trap - EXIT INT TERM
     echo "sccache-release-update: update failed (rc=$rc), rolling back" >&2
 
-    if (( client_update_required )); then
-        touch "$DRAIN"
-        client_drain_owned=1
+    if (( client_services_touched )); then
+        acquire_client_drain || true
         if (( root_local_was_active )); then
             systemctl stop "$ROOT_LOCAL_SERVICE" >/dev/null 2>&1 || true
         fi
@@ -684,18 +681,28 @@ rollback() {
         fi
         systemctl stop "$LOCAL_SERVICE" >/dev/null 2>&1 || true
     fi
-    if (( dist_was_active && dist_update_required )); then
+    if (( dist_services_touched )); then
         stop_dist_services >/dev/null 2>&1 || true
     fi
 
-    if (( client_update_required )) && [[ -e "$backup_dir/sccache" ]]; then
-        install -o root -g root -m 0755 "$backup_dir/sccache" "$LIVE"
+    if (( client_binary_touched )); then
+        if [[ -e "$backup_dir/sccache" ]]; then
+            install -o root -g root -m 0755 "$backup_dir/sccache" "$LIVE.new"
+            mv -Tf -- "$LIVE.new" "$LIVE"
+        else
+            rm -f -- "$LIVE"
+        fi
     fi
-    if (( dist_update_required )) && [[ -e "$backup_dir/sccache-dist" ]]; then
-        install -o root -g root -m 0755 "$backup_dir/sccache-dist" "$DIST_LIVE"
+    if (( dist_binary_touched )); then
+        if [[ -e "$backup_dir/sccache-dist" ]]; then
+            install -o root -g root -m 0755 "$backup_dir/sccache-dist" "$DIST_LIVE.new"
+            mv -Tf -- "$DIST_LIVE.new" "$DIST_LIVE"
+        else
+            rm -f -- "$DIST_LIVE"
+        fi
     fi
 
-    if (( dashboard_required && dist_update_required )); then
+    if (( dashboard_touched )); then
         if [[ -L "$backup_dir/dashboard-current" ]]; then
             cp -aT --remove-destination "$backup_dir/dashboard-current" "$DASHBOARD_LINK"
         else
@@ -703,16 +710,19 @@ rollback() {
         fi
     fi
 
+    if (( state_touched )); then restore_release_state; fi
+    rm -f -- "$LIVE.new" "$DIST_LIVE.new"
+
     # Restore the scheduler before a reverted client so the client does not
     # enter reconnect backoff against a scheduler that is still down.
-    if (( dist_was_active && dist_update_required )); then
+    if (( dist_services_touched )); then
         start_dist_services >/dev/null 2>&1 || true
         for _ in $(seq 1 100); do
             scheduler_ready && break
             sleep 0.05
         done
     fi
-    if (( client_update_required )); then
+    if (( client_services_touched )); then
         systemctl start "$LOCAL_SERVICE" >/dev/null 2>&1 || true
         if (( root_local_was_active )); then
             systemctl start "$ROOT_LOCAL_SERVICE" >/dev/null 2>&1 || true
@@ -728,27 +738,28 @@ rollback() {
         fi
     fi
     [[ -z "$smoke" ]] || rm -rf -- "$smoke"
-    if (( client_drain_owned )); then
-        rm -f "$DRAIN"
-    fi
+    release_client_drain
     exit "$rc"
 }
-trap rollback EXIT INT TERM
+trap 'rollback $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-client_drain_owned=0
 if (( client_update_required )); then
-    touch "$DRAIN"
-    client_drain_owned=1
+    acquire_client_drain
 fi
 
 if (( dist_was_active && dist_update_required )); then
+    dist_services_touched=1
     stop_dist_services
 fi
 
 if (( dist_update_required )); then
     install -o root -g root -m 0755 "$release_dir/sccache-dist" "$DIST_LIVE.new"
-    mv -f "$DIST_LIVE.new" "$DIST_LIVE"
+    dist_binary_touched=1
+    mv -Tf "$DIST_LIVE.new" "$DIST_LIVE"
     if (( dashboard_required )); then
+        dashboard_touched=1
         "$native_metadata" dashboard-select "$release_dir" "$DASHBOARD_LINK"
     fi
 
@@ -763,6 +774,7 @@ if (( dist_update_required )); then
 fi
 
 if (( client_update_required )); then
+    client_services_touched=1
     if (( root_local_was_active )); then
         systemctl stop "$ROOT_LOCAL_SERVICE"
     fi
@@ -777,7 +789,8 @@ if (( client_update_required )); then
     fi
     systemctl stop "$LOCAL_SERVICE"
     install -o root -g root -m 0755 "$release_dir/sccache" "$LIVE.new"
-    mv -f "$LIVE.new" "$LIVE"
+    client_binary_touched=1
+    mv -Tf "$LIVE.new" "$LIVE"
 
     metrics_not_before="$(date +%s)"
     systemctl start "$LOCAL_SERVICE"
@@ -828,8 +841,7 @@ fi
 
     # All endpoints are ready. Do not block compilation during the metrics
     # heartbeat or distributed smoke; rollback re-acquires the admission gate.
-    rm -f "$DRAIN"
-    client_drain_owned=0
+    release_client_drain
     verify_metrics_heartbeat "$metrics_not_before"
 fi
 
@@ -885,9 +897,8 @@ if [[ "$VERIFY_DIST_SMOKE" == 1 && $dist_was_active -eq 1 ]]; then
 fi
 rm -rf "$smoke"
 
+state_touched=1
 record_full_state
-if (( client_drain_owned )); then
-    rm -f "$DRAIN"
-fi
+release_client_drain
 trap - EXIT INT TERM
 echo "sccache-release-update: installed $tag ($source_sha)"

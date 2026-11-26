@@ -377,31 +377,34 @@ fn run(command: Command) -> Result<i32> {
             without,
         } => audit_index(&index, schema.as_deref(), &without),
         Command::ClusterInit { directory } => cluster_init(&directory),
-        Command::ClusterId { directory } => {
-            anyhow::ensure!(directory.is_absolute(), "member directory must be absolute");
-            std::fs::create_dir_all(&directory)?;
-            println!(
-                "{}",
-                sccache_cluster_identity::Identity::open(&directory.join("key.pem"))?.id()?
-            );
-            Ok(0)
-        }
-        Command::ClusterRevoke { directory, peer } => {
-            anyhow::ensure!(
-                directory.is_absolute(),
-                "cluster directory must be absolute"
-            );
-            let registry =
-                sccache_cluster_identity::Registry::open(&directory.join("registry.bin"))?;
-            registry.revoke(peer)?;
-            Ok(0)
-        }
+        Command::ClusterId { directory } => cluster_id(&directory),
+        Command::ClusterRevoke { directory, peer } => cluster_revoke(&directory, peer),
         Command::ClusterStatus { client_config } => cluster_status(&client_config),
 
         Command::Auth(auth) => run_auth(auth),
         Command::Scheduler(config) => start_scheduler(*config),
         Command::Server(config) => start_worker(*config),
     }
+}
+
+fn cluster_id(directory: &Path) -> Result<i32> {
+    anyhow::ensure!(directory.is_absolute(), "member directory must be absolute");
+    std::fs::create_dir_all(directory)?;
+    println!(
+        "{}",
+        sccache_cluster_identity::Identity::open(&directory.join("key.pem"))?.id()?
+    );
+    Ok(0)
+}
+
+fn cluster_revoke(directory: &Path, peer: ServerId) -> Result<i32> {
+    anyhow::ensure!(
+        directory.is_absolute(),
+        "cluster directory must be absolute"
+    );
+    let registry = sccache_cluster_identity::Registry::open(&directory.join("registry.bin"))?;
+    registry.revoke(peer)?;
+    Ok(0)
 }
 
 fn run_auth(auth: AuthSubcommand) -> Result<i32> {
@@ -411,7 +414,6 @@ fn run_auth(auth: AuthSubcommand) -> Result<i32> {
             rand::fill(&mut bytes);
             // As long as it can be copied, it doesn't matter if this is base64 or hex etc
             println!("{}", BASE64_URL_SAFE_ENGINE.encode(bytes));
-            Ok(0)
         }
         AuthSubcommand::JwtHS256ServerToken {
             secret_key,
@@ -422,9 +424,9 @@ fn run_auth(auth: AuthSubcommand) -> Result<i32> {
             let token = create_jwt_server_token(server_id, &header, &secret_key)
                 .context("Failed to create server token")?;
             println!("{token}");
-            Ok(0)
         }
     }
+    Ok(0)
 }
 
 fn provision_package(
@@ -1221,10 +1223,7 @@ struct Reservation {
     estimated_result_bytes: Option<u64>,
 }
 
-enum ReservationOutcome {
-    Reserved(Reservation),
-    Unavailable(usize),
-}
+struct NoCapacity(usize);
 
 struct CandidateSet {
     healthy: Vec<(ServerId, f64)>,
@@ -1349,7 +1348,7 @@ impl Scheduler {
         network: &NetworkSnapshot,
         packages: &std::sync::Arc<sccache::build_runtime::PackageCatalog>,
         assigned_at: Instant,
-    ) -> Result<ReservationOutcome> {
+    ) -> Result<std::result::Result<Reservation, NoCapacity>> {
         let native = match assignment {
             JobAssignment::Archive(_) => None,
             JobAssignment::Native(native) => Some(native.as_ref()),
@@ -1414,7 +1413,7 @@ impl Scheduler {
             ..
         } = candidates;
         let Some(server_id) = selected else {
-            return Ok(ReservationOutcome::Unavailable(servers.len()));
+            return Ok(Err(NoCapacity(servers.len())));
         };
         let server_details = servers.get_mut(&server_id).ok_or_else(|| {
             anyhow::anyhow!("selected worker disappeared while scheduler lock held")
@@ -1448,7 +1447,7 @@ impl Scheduler {
         server_details.reserve(job_id, assigned);
         drop(servers);
         info!("Job {job_id} created and will be assigned to server {server_id:?}");
-        Ok(ReservationOutcome::Reserved(Reservation {
+        Ok(Ok(Reservation {
             job_id,
             server_id,
             auth,
@@ -1475,8 +1474,8 @@ impl Scheduler {
         }
         let assigned_at = Instant::now();
         let reservation = match self.reserve_job(&assignment, network, packages, assigned_at)? {
-            ReservationOutcome::Reserved(reservation) => reservation,
-            ReservationOutcome::Unavailable(count) => {
+            Ok(reservation) => reservation,
+            Err(NoCapacity(count)) => {
                 return Ok(AllocJobResult::Fail {
                     msg: format!("Insufficient capacity across {count} available servers"),
                 });
@@ -1511,13 +1510,13 @@ impl Scheduler {
                     "assign job failed and server not known"
                 }
             })?;
-        self.complete_reservation(reservation, result, assigned_at)
+        self.complete_reservation(reservation, &result, assigned_at)
     }
 
     fn complete_reservation(
         &self,
         reservation: Reservation,
-        result: AssignJobResult,
+        result: &AssignJobResult,
         assigned_at: Instant,
     ) -> Result<AllocJobResult> {
         let Reservation {
@@ -1530,7 +1529,7 @@ impl Scheduler {
         let AssignJobResult {
             state,
             need_toolchain,
-        } = result;
+        } = *result;
         {
             // LOCKS
             let mut jobs = self
@@ -1593,6 +1592,7 @@ impl Scheduler {
     }
 }
 
+#[derive(Clone, Copy)]
 struct CommitObservation<'a> {
     manifest: &'a sccache::build_runtime::ResultManifest,
     retained_after_begin: Duration,
