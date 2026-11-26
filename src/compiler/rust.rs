@@ -4385,7 +4385,7 @@ fn rust_dependency_names(
 
 /// Rust metadata v12 stores the root and unhashed-root offsets followed by
 /// the 128-bit crate hash. An absent unhashed root denotes a metadata stub.
-/// See rustc_metadata/src/rmeta/{mod,encoder,decoder}.rs.
+/// See `rustc_metadata/src/rmeta/{mod,encoder,decoder}.rs`.
 #[cfg(feature = "dist-client")]
 fn metadata_v12_header(bytes: &[u8]) -> Option<(bool, [u8; 16])> {
     let header = bytes.get(..40)?;
