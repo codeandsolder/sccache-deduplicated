@@ -571,7 +571,7 @@ impl NetworkMeter {
     }
 
     /// Observe bytes supplied by a streaming transport.
-    #[must_use]
+    #[must_use = "the meter must stay alive while the transfer is active"]
     pub fn transfer(
         &self,
         direction: Direction,

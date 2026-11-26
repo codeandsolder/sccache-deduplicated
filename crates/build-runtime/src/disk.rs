@@ -77,7 +77,7 @@ pub fn initialize_async_disk() -> Result<()> {
 
 /// Construct the future on the disk thread. Only the operation's owned
 /// inputs and completed result cross the thread boundary.
-pub(crate) async fn run<T: Send + 'static, F: Future<Output = Result<T>> + 'static>(
+pub async fn run<T: Send + 'static, F: Future<Output = Result<T>> + 'static>(
     operation: impl FnOnce() -> F + Send + 'static,
 ) -> Result<T> {
     let executor = executor()?;
@@ -106,6 +106,10 @@ fn checked_offset(offset: u64, done: usize) -> io::Result<u64> {
 
 // Call only from the completion runtime. A bounded initialized Vec avoids
 // exposing uninitialized memory, and sliced ownership supports short I/O.
+#[expect(
+    clippy::future_not_send,
+    reason = "runs only on the thread-local Compio completion driver"
+)]
 async fn read_exact(file: Arc<File>, offset: u64, count: usize) -> io::Result<Vec<u8>> {
     let mut buffer = vec![0; count];
     let mut done = 0;
@@ -148,11 +152,11 @@ pub async fn read_file_at<T: Send + 'static>(
     .await
 }
 
-pub(crate) async fn write_all(
-    file: Arc<File>,
-    offset: u64,
-    mut buffer: Vec<u8>,
-) -> io::Result<Vec<u8>> {
+#[expect(
+    clippy::future_not_send,
+    reason = "runs only on the thread-local Compio completion driver"
+)]
+pub async fn write_all(file: Arc<File>, offset: u64, mut buffer: Vec<u8>) -> io::Result<Vec<u8>> {
     let mut done = 0;
     while done < buffer.len() {
         let position = checked_offset(offset, done)?;
@@ -174,13 +178,21 @@ pub(crate) async fn write_all(
     Ok(buffer)
 }
 
-pub(crate) async fn sync_all(file: Arc<File>) -> io::Result<()> {
+#[expect(
+    clippy::future_not_send,
+    reason = "runs only on the thread-local Compio completion driver"
+)]
+pub async fn sync_all(file: Arc<File>) -> io::Result<()> {
     compio_runtime::submit(Sync::new(file, false)).await.0?;
     Ok(())
 }
 
 /// Seal an immutable staging file before it enters the durable index.
-pub(crate) async fn seal_file(file: Arc<File>) -> Result<()> {
+#[expect(
+    clippy::future_not_send,
+    reason = "runs only on the thread-local Compio completion driver"
+)]
+pub async fn seal_file(file: Arc<File>) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let metadata_file = Arc::clone(&file);
     compio_runtime::spawn_blocking(move || {

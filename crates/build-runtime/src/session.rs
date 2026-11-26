@@ -575,7 +575,7 @@ impl NativeUpload {
     }
 
     /// Whether incremental encoding may require compression or decompression.
-    #[must_use]
+    #[must_use = "determines whether processing requires the codec executor"]
     pub fn requires_codec_pool(&self) -> bool {
         self.stager.requires_codec_pool()
     }
@@ -1523,6 +1523,7 @@ impl NativeSessions {
                 .transfer_mut()
                 .context("no negotiated native upload")?
                 .start(blob, self.limits.max_concurrent_uploads)?;
+            drop(state);
         }
         let guard = UploadGuard {
             session,
@@ -2013,6 +2014,7 @@ impl NativeSessions {
                 Err(error) => return Err(error),
             }
         }
+        drop(flights);
         Ok(None)
     }
 

@@ -17,7 +17,7 @@ enum InputState {
     Complete,
 }
 
-pub(crate) struct BlobIngest {
+pub struct BlobIngest {
     expected: BlobRef,
     target: BlobEncoding,
     state: InputState,

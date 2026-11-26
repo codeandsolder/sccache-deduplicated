@@ -287,7 +287,7 @@ impl PhysicalStager {
     }
 
     /// Whether a batch may perform compression or decompression.
-    #[must_use]
+    #[must_use = "determines whether processing requires the codec executor"]
     pub fn requires_codec_pool(&self) -> bool {
         self.ingest
             .as_ref()
@@ -327,6 +327,10 @@ impl PhysicalStager {
     }
 
     #[cfg(feature = "async-io")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "runs only on the thread-local Compio completion driver"
+    )]
     pub(crate) async fn flush_pending_io(&mut self) -> Result<()> {
         ensure!(!self.failed, "native staging already failed");
         let buffer = std::mem::take(&mut self.encoded);
@@ -343,6 +347,10 @@ impl PhysicalStager {
     }
 
     #[cfg(feature = "async-io")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "runs only on the thread-local Compio completion driver"
+    )]
     pub(crate) async fn finalize_io(&mut self) -> Result<()> {
         ensure!(self.ingest.is_none(), "native staging codec not finalized");
         self.flush_pending_io().await?;
@@ -2050,7 +2058,7 @@ pub use packages::{
     PackageArchiveLease, PackageDecoder, PackageImportLimits, PackagePolicy, PackageSlot,
     VerifiedPackage, decode_package_process,
 };
-pub(crate) use packages::{PackageImport, PackagePreparation};
+pub use packages::{PackageImport, PackagePreparation};
 mod trees;
 #[cfg(target_os = "linux")]
 pub use trees::MountedTree;

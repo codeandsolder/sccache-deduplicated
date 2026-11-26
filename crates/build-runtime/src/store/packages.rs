@@ -407,14 +407,14 @@ impl NativeStore {
 }
 
 /// Admission to an original archive acquisition.
-pub(crate) enum PackagePreparation<T> {
+pub enum PackagePreparation<T> {
     Cached(VerifiedPackage),
     Import(Box<PackageImport>, T),
 }
 
 /// An exclusive cold import with one private staging file. Both synchronous
 /// and asynchronous ingestion share the digest, length and publication rules.
-pub(crate) struct PackageImport {
+pub struct PackageImport {
     archive: ArchiveStager,
     limits: PackageImportLimits,
     policy: PackagePolicy,
@@ -447,11 +447,19 @@ impl PackageImport {
     }
 
     #[cfg(feature = "async-io")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "runs only on the thread-local Compio completion driver"
+    )]
     pub(crate) async fn write_batch(&self, offset: u64, buffer: Vec<u8>) -> Result<Vec<u8>> {
         Ok(crate::disk::write_all(Arc::clone(&self.archive.file), offset, buffer).await?)
     }
 
     #[cfg(feature = "async-io")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "runs only on the thread-local Compio completion driver"
+    )]
     pub(crate) async fn seal(&mut self) -> Result<()> {
         self.archive.verify()?;
         crate::disk::seal_file(Arc::clone(&self.archive.file)).await?;

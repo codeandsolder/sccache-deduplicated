@@ -401,13 +401,11 @@ impl BlobWireEncoder {
     }
 
     /// Exact number of input bytes required for the next frame. Zero means EOF.
-    #[must_use]
-    pub const fn next_frame_size(&self) -> usize {
-        if self.remaining < CHUNK as u64 {
-            self.remaining as usize
-        } else {
-            CHUNK
-        }
+    #[must_use = "determines the exact size of the next input frame"]
+    pub fn next_frame_size(&self) -> usize {
+        usize::try_from(self.remaining)
+            .unwrap_or(usize::MAX)
+            .min(CHUNK)
     }
 
     /// Encode a single independent frame, with no filesystem or network I/O.
@@ -426,7 +424,7 @@ impl BlobWireEncoder {
     }
 }
 
-fn write_encoded_header(file: &mut File, size: u64, chunks: u32) -> Result<()> {
+fn write_encoded_header(file: &File, size: u64, chunks: u32) -> Result<()> {
     write_at(file, &size.to_le_bytes(), 16)?;
     write_at(file, &u32::try_from(CHUNK)?.to_le_bytes(), 24)?;
     write_at(file, &chunks.to_le_bytes(), 28)?;
@@ -457,7 +455,7 @@ struct ChunkWidths {
     raw: bool,
 }
 
-fn validate_transport_widths(widths: &[u8; 8], remaining: u64) -> Result<ChunkWidths> {
+fn validate_transport_widths(widths: [u8; 8], remaining: u64) -> Result<ChunkWidths> {
     let word = u32::from_le_bytes(widths[..4].try_into()?);
     let stored = usize::try_from(word & !RAW_CHUNK)?;
     let plain = usize::try_from(u32::from_le_bytes(widths[4..].try_into()?))?;
@@ -490,7 +488,7 @@ fn decode_transport_chunk(data: &[u8], widths: ChunkWidths) -> Result<std::borro
 #[cfg(unix)]
 mod ingest;
 #[cfg(unix)]
-pub(crate) use ingest::BlobIngest;
+pub use ingest::BlobIngest;
 
 /// Write one immutable compressed representation while hashing its logical
 /// content. This is one compression pass with bounded buffering.
@@ -610,7 +608,7 @@ fn transfer_zstd_chunks(
         let remaining = size
             .checked_sub(decoded)
             .context("CAS transfer chunk position overflow")?;
-        let parsed = validate_transport_widths(&widths, remaining)?;
+        let parsed = validate_transport_widths(widths, remaining)?;
         decoded = decoded
             .checked_add(u64::try_from(parsed.plain)?)
             .context("decoded length overflow")?;

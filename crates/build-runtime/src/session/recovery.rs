@@ -112,6 +112,7 @@ impl RecoveryQueue {
                     .map_err(|_| anyhow!("result recovery queue poisoned"))?;
                 if let Some(job) = state.jobs.pop_front() {
                     state.queued_bytes -= job.bytes;
+                    drop(state);
                     return Ok(Some(job));
                 }
             }
@@ -239,10 +240,10 @@ impl NativeSessions {
         &self,
         manifest: &ResultManifest,
         deadline: Instant,
-        fetch: impl Fn(BlobRef, NativeStore, Instant) -> Fut,
+        fetch: impl Fn(BlobRef, NativeStore, Instant) -> Fut + Send + Sync,
     ) -> Result<(UploadReservation, Vec<Arc<TreeLease>>)>
     where
-        Fut: Future<Output = Result<Option<StagedBlob>>>,
+        Fut: Future<Output = Result<Option<StagedBlob>>> + Send,
     {
         let check = || {
             ensure!(
@@ -289,10 +290,10 @@ impl NativeSessions {
         &self,
         blob: BlobRef,
         deadline: Instant,
-        fetch: &impl Fn(BlobRef, NativeStore, Instant) -> Fut,
+        fetch: &(impl Fn(BlobRef, NativeStore, Instant) -> Fut + Sync),
     ) -> Result<Arc<TreeLease>>
     where
-        Fut: Future<Output = Result<Option<StagedBlob>>>,
+        Fut: Future<Output = Result<Option<StagedBlob>>> + Send,
     {
         let store = self.store();
         let retention = NativeStore::blob_retention_manifest(blob)?;

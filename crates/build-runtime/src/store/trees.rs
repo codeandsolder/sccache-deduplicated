@@ -230,6 +230,7 @@ impl NativeStore {
                     FlightState::Ready(lease) => return Ok(Arc::clone(lease)),
                     FlightState::Idle => {
                         *state = FlightState::Fetching;
+                        drop(state);
                         Some(FlightOwner(Arc::clone(&flight)))
                     }
                     FlightState::Fetching => None,
