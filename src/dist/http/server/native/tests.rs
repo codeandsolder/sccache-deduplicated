@@ -340,6 +340,7 @@ fn verify_peer_delivery(
                     "/api/v3/distserver/native_blob",
                     super::super::cluster_http::route(
                         MethodFilter::POST,
+                        AdmissionClass::Bulk,
                         move |_: &(), request| {
                             serve_peer_blob(request, &*authorizer, |requested| {
                                 if requested != blob {
@@ -932,6 +933,13 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
 #[tokio::test]
 async fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> Result<()> {
     use std::io::{Seek as _, Write as _};
+    let request = Request::fake_http_from(
+        "127.0.0.1:1".parse()?,
+        "POST",
+        "/test",
+        Vec::new(),
+        Vec::new(),
+    );
     let compressible = vec![b'Z'; 256 * 1024];
     let noise: Vec<u8> = (0..8192_u64)
         .flat_map(|i| *blake3::hash(&i.to_le_bytes()).as_bytes())
@@ -944,7 +952,7 @@ async fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> 
         let mut raw = tempfile::tempfile()?;
         raw.write_all(&original)?;
         raw.rewind()?;
-        let response = physical_blob_response(raw, BlobEncoding::Raw)?;
+        let response = physical_blob_response(&request, raw, BlobEncoding::Raw)?;
         assert_eq!(response.headers()["X-Sccache-CAS-Encoding"], "zstd-chunks");
         let size = response.headers()[http::header::CONTENT_LENGTH]
             .to_str()?
@@ -963,7 +971,7 @@ async fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> 
         )?;
         assert_eq!(decoded, original);
         encoded.rewind()?;
-        let response = physical_blob_response(encoded, BlobEncoding::ZstdChunks)?;
+        let response = physical_blob_response(&request, encoded, BlobEncoding::ZstdChunks)?;
         let reused_size = response.headers()[http::header::CONTENT_LENGTH]
             .to_str()?
             .parse::<u64>()?;

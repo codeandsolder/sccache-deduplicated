@@ -256,7 +256,9 @@ pub mod urls {
 
 #[cfg(feature = "dist-server")]
 mod server {
-    use self::cluster_http::{Listener, ListenerRole, Request, binary, path_route, route, routes};
+    use self::cluster_http::{
+        AdmissionClass, Listener, ListenerRole, Request, binary, path_route, route, routes,
+    };
     use crate::dist::cluster::{ClusterRoutes, refresh_blocking};
     use crate::util::num_cpus;
     use axum::{
@@ -1089,59 +1091,68 @@ mod server {
         Router::new()
             .route(
                 "/api/v1/scheduler/alloc_job",
-                route(MethodFilter::POST, |state: &SchedulerHttp<S>, request| {
-                    let handler = &state.handler;
-                    let requester = &state.requester;
-                    logged(&state.request_count, request, |req_id| {
-                        if let Some(response) = role_error(request, Role::Client) {
-                            return response;
-                        }
-                        let toolchain = try_bincode_input!(req_id, request);
-                        trace!("Req {req_id}: alloc_job: {toolchain:?}");
+                route(
+                    MethodFilter::POST,
+                    AdmissionClass::Dispatch,
+                    |state: &SchedulerHttp<S>, request| {
+                        let handler = &state.handler;
+                        let requester = &state.requester;
+                        logged(&state.request_count, request, |req_id| {
+                            if let Some(response) = role_error(request, Role::Client) {
+                                return response;
+                            }
+                            let toolchain = try_bincode_input!(req_id, request);
+                            trace!("Req {req_id}: alloc_job: {toolchain:?}");
 
-                        let alloc_job_res: AllocJobResult = try_or_500_log!(
-                            req_id,
-                            handler.handle_alloc_job(requester.as_ref(), toolchain)
-                        );
-                        let res = match alloc_job_res {
-                            AllocJobResult::Success {
-                                job_alloc,
-                                need_toolchain,
-                            } => {
-                                let routes = try_or_500_log!(
-                                    req_id,
-                                    requester.addresses(job_alloc.server_id)
-                                );
-                                AllocJobHttpResponse::Success {
+                            let alloc_job_res: AllocJobResult = try_or_500_log!(
+                                req_id,
+                                handler.handle_alloc_job(requester.as_ref(), toolchain)
+                            );
+                            let res = match alloc_job_res {
+                                AllocJobResult::Success {
                                     job_alloc,
                                     need_toolchain,
-                                    routes,
+                                } => {
+                                    let routes = try_or_500_log!(
+                                        req_id,
+                                        requester.addresses(job_alloc.server_id)
+                                    );
+                                    AllocJobHttpResponse::Success {
+                                        job_alloc,
+                                        need_toolchain,
+                                        routes,
+                                    }
                                 }
-                            }
-                            AllocJobResult::Fail { msg } => AllocJobHttpResponse::Fail { msg },
-                        };
-                        prepare_response(request, &res)
-                    })
-                }),
+                                AllocJobResult::Fail { msg } => AllocJobHttpResponse::Fail { msg },
+                            };
+                            prepare_response(request, &res)
+                        })
+                    },
+                ),
             )
             .route(
                 "/api/v1/scheduler/native_routes",
-                route(MethodFilter::GET, |state: &SchedulerHttp<S>, request| {
-                    let native_endpoint = &state.native_endpoint;
-                    logged(&state.request_count, request, |_req_id| {
-                        if let Some((primary, bind)) = *native_endpoint {
-                            let routes = crate::dist::cluster_routes::discover(primary, bind);
-                            prepare_response(request, &WorkerRouteHttpResponse { routes })
-                        } else {
-                            StatusCode::NOT_FOUND.into_response()
-                        }
-                    })
-                }),
+                route(
+                    MethodFilter::GET,
+                    AdmissionClass::Metadata,
+                    |state: &SchedulerHttp<S>, request| {
+                        let native_endpoint = &state.native_endpoint;
+                        logged(&state.request_count, request, |_req_id| {
+                            if let Some((primary, bind)) = *native_endpoint {
+                                let routes = crate::dist::cluster_routes::discover(primary, bind);
+                                prepare_response(request, &WorkerRouteHttpResponse { routes })
+                            } else {
+                                StatusCode::NOT_FOUND.into_response()
+                            }
+                        })
+                    },
+                ),
             )
             .route(
                 "/api/v1/scheduler/worker_route/{server_id}",
                 path_route(
                     MethodFilter::GET,
+                    |_| AdmissionClass::Metadata,
                     |state: &SchedulerHttp<S>, request, server_id: ServerId| {
                         let requester = &state.requester;
                         logged(&state.request_count, request, |req_id| {
@@ -1158,6 +1169,7 @@ mod server {
                 "/api/v1/scheduler/worker_name/{server_id}",
                 path_route(
                     MethodFilter::GET,
+                    |_| AdmissionClass::Metadata,
                     |state: &SchedulerHttp<S>, request, server_id: ServerId| {
                         let handler = &state.handler;
                         logged(&state.request_count, request, |req_id| {
@@ -1176,7 +1188,7 @@ mod server {
     fn scheduler_worker_routes<S: dist::SchedulerIncoming + 'static>()
     -> Router<Arc<SchedulerHttp<S>>> {
         Router::new()
-            .route("/api/v4/scheduler/heartbeat_server", route(MethodFilter::POST, |state: &SchedulerHttp<S>, request| {
+            .route("/api/v4/scheduler/heartbeat_server", route(MethodFilter::POST, AdmissionClass::Control, |state: &SchedulerHttp<S>, request| {
                 let handler = &state.handler;
                 let requester = &state.requester;
                 let registry = &state.registry;
@@ -1227,7 +1239,7 @@ mod server {
                     prepare_response(request, &HeartbeatReply { result: res, revoked })
                 })
             }))
-            .route("/api/v1/scheduler/job_state/{job_id}", path_route(MethodFilter::POST, |state: &SchedulerHttp<S>, request, job_id: JobId| {
+            .route("/api/v1/scheduler/job_state/{job_id}", path_route(MethodFilter::POST, |_| AdmissionClass::Control, |state: &SchedulerHttp<S>, request, job_id: JobId| {
                 let handler = &state.handler;
                 logged(&state.request_count, request, |req_id| {
                     if let Some(response) = role_error(request, Role::Worker) { return response; }
@@ -1241,14 +1253,14 @@ mod server {
                     prepare_response(request, &res)
                 })
             }))
-            .route("/api/v1/scheduler/status", route(MethodFilter::GET, |state: &SchedulerHttp<S>, request| {
+            .route("/api/v1/scheduler/status", route(MethodFilter::GET, AdmissionClass::Metadata, |state: &SchedulerHttp<S>, request| {
                 let handler = &state.handler;
                 logged(&state.request_count, request, |req_id| {
                     let res: SchedulerStatusResult = try_or_500_log!(req_id, handler.handle_status());
                     prepare_response(request, &res)
                 })
             }))
-            .route("/api/v1/scheduler/drain_status", route(MethodFilter::GET, |state: &SchedulerHttp<S>, request| {
+            .route("/api/v1/scheduler/drain_status", route(MethodFilter::GET, AdmissionClass::Control, |state: &SchedulerHttp<S>, request| {
                 let handler = &state.handler;
                 logged(&state.request_count, request, |_req_id| {
                     let draining = u8::from(handler.handle_is_draining());
@@ -1270,6 +1282,7 @@ mod server {
                 "/api/v1/distserver/assign_job/{job_id}",
                 path_route(
                     MethodFilter::POST,
+                    |_| AdmissionClass::Dispatch,
                     |state: &WorkerHttp<S>, request, job_id: JobId| {
                         let handler = &state.handler;
                         let job_authorizer = &state.job_authorizer;
@@ -1294,6 +1307,7 @@ mod server {
                 "/api/v5/distserver/assign_native_job/{job_id}",
                 path_route(
                     MethodFilter::POST,
+                    |_| AdmissionClass::Dispatch,
                     |state: &WorkerHttp<S>, request, job_id: JobId| {
                         let handler = &state.handler;
                         let requester = &state.requester;
@@ -1330,23 +1344,28 @@ mod server {
         Router::new()
             .route(
                 "/api/v3/distserver/native_blob",
-                route(MethodFilter::POST, |state: &WorkerHttp<S>, request| {
-                    let handler = &state.handler;
-                    let job_authorizer = &state.job_authorizer;
-                    logged(&state.request_count, request, |req_id| {
-                        try_or_500_log!(
-                            req_id,
-                            native::serve_peer_blob(request, job_authorizer.as_ref(), |blob| {
-                                handler.handle_native_blob(blob)
-                            })
-                        )
-                    })
-                }),
+                route(
+                    MethodFilter::POST,
+                    AdmissionClass::Bulk,
+                    |state: &WorkerHttp<S>, request| {
+                        let handler = &state.handler;
+                        let job_authorizer = &state.job_authorizer;
+                        logged(&state.request_count, request, |req_id| {
+                            try_or_500_log!(
+                                req_id,
+                                native::serve_peer_blob(request, job_authorizer.as_ref(), |blob| {
+                                    handler.handle_native_blob(blob)
+                                })
+                            )
+                        })
+                    },
+                ),
             )
             .route(
                 "/api/v5/distserver/run_native_job/{job_id}",
                 path_route(
                     MethodFilter::POST,
+                    |_| AdmissionClass::Metadata,
                     |state: &WorkerHttp<S>, request, job_id: JobId| {
                         let handler = &state.handler;
                         let job_authorizer = &state.job_authorizer;
@@ -1378,6 +1397,7 @@ mod server {
                 "/api/v1/distserver/submit_toolchain/{job_id}",
                 path_route(
                     MethodFilter::POST,
+                    |_| AdmissionClass::Bulk,
                     |state: &WorkerHttp<S>, request, job_id: JobId| {
                         let handler = &state.handler;
                         let requester = &state.requester;
@@ -1418,6 +1438,7 @@ mod server {
                 "/api/v2/distserver/run_job/{job_id}",
                 path_route(
                     MethodFilter::POST,
+                    |_| AdmissionClass::Bulk,
                     |state: &WorkerHttp<S>, request, job_id: JobId| {
                         let handler = &state.handler;
                         let requester = &state.requester;

@@ -10,7 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::cluster_http::{Listener, ListenerRole, Request, binary, file_body, path_route, routes};
+use super::cluster_http::{
+    AdmissionClass, Listener, ListenerRole, Request, binary, path_route, routes,
+};
 use anyhow::{Context, Result, ensure};
 use axum::{
     Router,
@@ -301,6 +303,20 @@ pub(super) fn spawn(
     Ok((bound, retained_sessions))
 }
 
+/// Unknown operations stay in the bulk lane; only the enumerated protocol
+/// operations get access to reserved metadata, dispatch or control capacity.
+fn native_admission_class((_, operation): &(String, String)) -> AdmissionClass {
+    match operation.as_str() {
+        "renew" | "fail" | "retain_renew" | "retain_close" | "close" | "inputs_staged"
+        | "input_unavailable" => AdmissionClass::Control,
+        "schedule" => AdmissionClass::Dispatch,
+        "admit" | "status" | "poll_input" | "verify" | "input_prefetch" | "retain_open"
+        | "retain_add" | "blob_sources" | "retain_sources" | "tree_offer" | "tree_commit"
+        | "tree_open" | "package_plan" | "begin" | "commit" => AdmissionClass::Metadata,
+        _ => AdmissionClass::Bulk,
+    }
+}
+
 fn native_router<F>(handler: F) -> Router
 where
     F: Fn(&Request, &str, &str) -> Response + Send + Sync + 'static,
@@ -310,6 +326,7 @@ where
             "/api/v5/native/{role}/{operation}",
             path_route(
                 MethodFilter::POST,
+                native_admission_class,
                 |handler: &F, request, (role, operation): (String, String)| {
                     handler(request, &role, &operation)
                 },
@@ -341,12 +358,16 @@ pub(super) fn serve_peer_blob(
         return Ok((StatusCode::UNAUTHORIZED, "invalid peer capability").into_response());
     }
     match open(blob)? {
-        Some((file, encoding)) => physical_blob_response(file, encoding),
+        Some((file, encoding)) => physical_blob_response(request, file, encoding),
         None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }
 
-pub(super) fn physical_blob_response(mut file: File, encoding: BlobEncoding) -> Result<Response> {
+pub(super) fn physical_blob_response(
+    request: &Request,
+    mut file: File,
+    encoding: BlobEncoding,
+) -> Result<Response> {
     let (file, encoding) = if encoding == BlobEncoding::Raw {
         let mut encoded = tempfile::tempfile()?;
         crate::build_runtime::encode_native_blob(&mut file, &mut encoded, None)?;
@@ -356,7 +377,7 @@ pub(super) fn physical_blob_response(mut file: File, encoding: BlobEncoding) -> 
         (file, encoding)
     };
     let length = file.metadata()?.len();
-    let mut response = file_body(file, length);
+    let mut response = request.file_body(file, length);
     response.headers_mut().insert(
         "x-sccache-cas-encoding",
         http::HeaderValue::from_static(encoding.http_value()),
@@ -807,7 +828,7 @@ fn dispatch(
                 crate::build_runtime::BlobReader::open(file.try_clone()?, encoding)?.len();
             let size = file.metadata()?.len();
             let reader = network.meter(Direction::Send, peer, file, logical, Some(size));
-            let mut response = file_body(reader, size);
+            let mut response = request.file_body(reader, size);
             response.headers_mut().insert(
                 "x-sccache-cas-encoding",
                 http::HeaderValue::from_static(encoding.http_value()),

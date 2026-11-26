@@ -15,7 +15,6 @@ use axum::{
     body::{Body, HttpBody as _},
     extract::rejection::PathRejection,
     extract::{Extension, Path, State},
-    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{MethodFilter, MethodRouter, on},
 };
@@ -44,10 +43,15 @@ pub(super) struct Request {
     remote_addr: SocketAddr,
     path: sccache_cluster_identity::NetworkPath,
     body: RefCell<Option<Box<dyn Read + Send>>>,
+    admission: Arc<OwnedSemaphorePermit>,
 }
 
 impl Request {
-    fn new(peer: AuthenticatedPeer, request: axum::extract::Request) -> Self {
+    fn new(
+        peer: AuthenticatedPeer,
+        request: axum::extract::Request,
+        admission: Arc<OwnedSemaphorePermit>,
+    ) -> Self {
         let (parts, body) = request.into_parts();
         let reader = SyncIoBridge::new(StreamReader::new(Box::pin(idle_bounded_body(body))));
         let length = parts
@@ -69,7 +73,12 @@ impl Request {
             remote_addr: peer.remote_addr(),
             path: peer.path(),
             body: RefCell::new(Some(Box::new(reader))),
+            admission,
         }
+    }
+
+    pub(super) fn file_body(&self, reader: impl Read + Send + 'static, length: u64) -> Response {
+        file_body(reader, length, Arc::clone(&self.admission))
     }
 
     pub(super) fn method(&self) -> &str {
@@ -116,6 +125,9 @@ impl Request {
             remote_addr: address,
             path: sccache_cluster_identity::NetworkPath::new(address.ip(), address.ip()),
             body: RefCell::new(Some(Box::new(io::Cursor::new(body)))),
+            admission: AdmissionPools::new(1)
+                .acquire(AdmissionClass::Bulk)
+                .expect("test admission"),
         }
     }
 }
@@ -164,7 +176,58 @@ async fn blocking_reply(
     }
 }
 
-pub(super) fn route<S, F>(method: MethodFilter, handler: F) -> MethodRouter<Arc<S>>
+/// Independent bounded lanes: bulk bodies and remote assignment cannot
+/// consume the permits reserved for lease/state transitions or metadata.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AdmissionClass {
+    Control,
+    Metadata,
+    Dispatch,
+    Bulk,
+}
+
+struct AdmissionPools {
+    control: Arc<Semaphore>,
+    metadata: Arc<Semaphore>,
+    dispatch: Arc<Semaphore>,
+    bulk: Arc<Semaphore>,
+}
+
+impl AdmissionPools {
+    fn new(bulk: usize) -> Self {
+        Self {
+            control: Arc::new(Semaphore::new(Self::control_capacity(bulk))),
+            metadata: Arc::new(Semaphore::new(bulk)),
+            dispatch: Arc::new(Semaphore::new(bulk)),
+            bulk: Arc::new(Semaphore::new(bulk)),
+        }
+    }
+
+    fn control_capacity(bulk: usize) -> usize {
+        (bulk / 8).clamp(2, 8)
+    }
+
+    fn total_capacity(bulk: usize) -> usize {
+        bulk.saturating_mul(3)
+            .saturating_add(Self::control_capacity(bulk))
+    }
+
+    fn acquire(&self, class: AdmissionClass) -> Option<Arc<OwnedSemaphorePermit>> {
+        let pool = match class {
+            AdmissionClass::Control => &self.control,
+            AdmissionClass::Metadata => &self.metadata,
+            AdmissionClass::Dispatch => &self.dispatch,
+            AdmissionClass::Bulk => &self.bulk,
+        };
+        Arc::clone(pool).try_acquire_owned().ok().map(Arc::new)
+    }
+}
+
+pub(super) fn route<S, F>(
+    method: MethodFilter,
+    class: AdmissionClass,
+    handler: F,
+) -> MethodRouter<Arc<S>>
 where
     S: Send + Sync + 'static,
     F: Fn(&S, &Request) -> Response + Send + Sync + 'static,
@@ -174,11 +237,15 @@ where
         method,
         move |State(state): State<Arc<S>>,
               Extension(peer): Extension<AuthenticatedPeer>,
-              Extension(permit): Extension<Arc<OwnedSemaphorePermit>>,
+              Extension(pools): Extension<Arc<AdmissionPools>>,
               request: axum::extract::Request| {
             let handler = Arc::clone(&handler);
-            let request = Request::new(peer, request);
-            async move { blocking_reply(permit, move || handler(&state, &request)).await }
+            async move {
+                admit(pools, class, peer, request, move |request| {
+                    handler(&state, &request)
+                })
+                .await
+            }
         },
     );
     if method == MethodFilter::GET {
@@ -188,7 +255,11 @@ where
     }
 }
 
-pub(super) fn path_route<S, P, F>(method: MethodFilter, handler: F) -> MethodRouter<Arc<S>>
+pub(super) fn path_route<S, P, F>(
+    method: MethodFilter,
+    classify: impl Fn(&P) -> AdmissionClass + Copy + Send + Sync + 'static,
+    handler: F,
+) -> MethodRouter<Arc<S>>
 where
     S: Send + Sync + 'static,
     P: serde::de::DeserializeOwned + Send + 'static,
@@ -199,15 +270,18 @@ where
         method,
         move |State(state): State<Arc<S>>,
               Extension(peer): Extension<AuthenticatedPeer>,
-              Extension(permit): Extension<Arc<OwnedSemaphorePermit>>,
+              Extension(pools): Extension<Arc<AdmissionPools>>,
               path: std::result::Result<Path<P>, PathRejection>,
               request: axum::extract::Request| {
             let handler = Arc::clone(&handler);
-            let request = Request::new(peer, request);
             async move {
                 match path {
                     Ok(Path(path)) => {
-                        blocking_reply(permit, move || handler(&state, &request, path)).await
+                        let class = classify(&path);
+                        admit(pools, class, peer, request, move |request| {
+                            handler(&state, &request, path)
+                        })
+                        .await
                     }
                     Err(_) => StatusCode::NOT_FOUND.into_response(),
                 }
@@ -231,25 +305,28 @@ pub(super) fn routes<S: Send + Sync + 'static>(router: Router<Arc<S>>, state: S)
 /// blocking-pool thread; cancellation can leave at most one read in flight.
 const RESPONSE_CHUNK: usize = 128 * 1024;
 
-pub(super) fn reader_body(reader: impl Read + Send + 'static) -> Body {
-    Body::from_stream(stream::try_unfold(reader, |mut reader| async move {
-        tokio::task::spawn_blocking(move || {
-            let mut buffer = vec![0; RESPONSE_CHUNK];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => return Ok(None),
-                    Ok(size) => {
-                        buffer.truncate(size);
-                        return Ok(Some((Bytes::from(buffer), reader)));
+fn reader_body(reader: impl Read + Send + 'static, permit: Arc<OwnedSemaphorePermit>) -> Body {
+    Body::from_stream(stream::try_unfold(
+        (reader, permit),
+        |(mut reader, permit)| async move {
+            tokio::task::spawn_blocking(move || {
+                let mut buffer = vec![0; RESPONSE_CHUNK];
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) => return Ok(None),
+                        Ok(size) => {
+                            buffer.truncate(size);
+                            return Ok(Some((Bytes::from(buffer), (reader, permit))));
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                        Err(error) => return Err(error),
                     }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(error) => return Err(error),
                 }
-            }
-        })
-        .await
-        .map_err(io::Error::other)?
-    }))
+            })
+            .await
+            .map_err(io::Error::other)?
+        },
+    ))
 }
 
 pub(super) fn binary(data: Vec<u8>) -> Response {
@@ -260,7 +337,11 @@ pub(super) fn binary(data: Vec<u8>) -> Response {
         .into_response()
 }
 
-pub(super) fn file_body(reader: impl Read + Send + 'static, length: u64) -> Response {
+fn file_body(
+    reader: impl Read + Send + 'static,
+    length: u64,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> Response {
     (
         [
             (
@@ -269,7 +350,7 @@ pub(super) fn file_body(reader: impl Read + Send + 'static, length: u64) -> Resp
             ),
             (http::header::CONTENT_LENGTH, length.to_string()),
         ],
-        reader_body(reader),
+        reader_body(reader, permit),
     )
         .into_response()
 }
@@ -279,12 +360,13 @@ pub(super) fn file_body(reader: impl Read + Send + 'static, length: u64) -> Resp
     reason = "the response stream takes ownership of the permit, so admission remains held until the body is drained or cancelled"
 )]
 async fn admit(
-    State(admission): State<Arc<Semaphore>>,
-    Extension(peer): Extension<AuthenticatedPeer>,
-    mut request: axum::extract::Request,
-    next: Next,
+    pools: Arc<AdmissionPools>,
+    class: AdmissionClass,
+    peer: AuthenticatedPeer,
+    request: axum::extract::Request,
+    operation: impl FnOnce(Request) -> Response + Send + 'static,
 ) -> Response {
-    let Ok(permit) = admission.try_acquire_owned() else {
+    let Some(permit) = pools.acquire(class) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "distributed HTTP pool busy",
@@ -292,9 +374,8 @@ async fn admit(
             .into_response();
     };
     // The response stream must retain the permit even after the handler returns.
-    let permit = Arc::new(permit);
-    request.extensions_mut().insert(Arc::clone(&permit));
-    let response = next.run(request).await;
+    let request = Request::new(peer, request, Arc::clone(&permit));
+    let response = blocking_reply(Arc::clone(&permit), move || operation(request)).await;
     let (mut parts, body) = response.into_parts();
     let length = parts
         .headers
@@ -457,7 +538,11 @@ impl Listener {
     pub(super) fn run_until(self, stop: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .max_blocking_threads(self.threads.saturating_mul(2).max(8))
+            .max_blocking_threads(
+                AdmissionPools::total_capacity(self.threads)
+                    .saturating_mul(2)
+                    .max(8),
+            )
             .enable_all()
             .build()?;
         runtime.block_on(async {
@@ -471,7 +556,11 @@ impl Listener {
     pub(super) fn run(self) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .max_blocking_threads(self.threads.saturating_mul(2).max(8))
+            .max_blocking_threads(
+                AdmissionPools::total_capacity(self.threads)
+                    .saturating_mul(2)
+                    .max(8),
+            )
             .enable_all()
             .build()?;
         runtime.block_on(self.run_async())
@@ -486,11 +575,10 @@ impl Listener {
             router,
         } = self;
         let socket = tokio::net::TcpListener::from_std(socket)?;
-        let connections = Arc::new(Semaphore::new(threads.saturating_mul(4)));
-        let router = router.layer(middleware::from_fn_with_state(
-            Arc::new(Semaphore::new(threads)),
-            admit,
+        let connections = Arc::new(Semaphore::new(
+            AdmissionPools::total_capacity(threads).saturating_mul(4),
         ));
+        let router = router.layer(Extension(Arc::new(AdmissionPools::new(threads))));
         let router = match role {
             ListenerRole::Scheduler(enrollment) => tls.scheduler_router(enrollment, router)?,
             ListenerRole::Worker {
@@ -641,6 +729,80 @@ mod streaming_tests {
     }
 
     #[test]
+    fn each_lane_has_independent_bounded_capacity() -> Result<()> {
+        let pools = AdmissionPools::new(4);
+        for (class, count) in [
+            (AdmissionClass::Bulk, 4),
+            (AdmissionClass::Dispatch, 4),
+            (AdmissionClass::Metadata, 4),
+            (AdmissionClass::Control, 2),
+        ] {
+            let permits = (0..count)
+                .map(|_| pools.acquire(class).context("reserved lane permit"))
+                .collect::<Result<Vec<_>>>()?;
+            assert!(pools.acquire(class).is_none());
+            for other in [
+                AdmissionClass::Bulk,
+                AdmissionClass::Dispatch,
+                AdmissionClass::Metadata,
+                AdmissionClass::Control,
+            ] {
+                if class != other {
+                    assert!(pools.acquire(other).is_some());
+                }
+            }
+            drop(permits);
+            assert!(pools.acquire(class).is_some());
+        }
+        Ok(())
+    }
+
+    struct PausedRead {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Read for PausedRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+            }
+            self.resume
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(io::Error::other)?;
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_retains_admission_until_blocking_io_finishes() -> Result<()> {
+        let pools = AdmissionPools::new(1);
+        let (started, reading) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let body = reader_body(
+            PausedRead {
+                started: Some(started),
+                resume: paused,
+            },
+            pools.acquire(AdmissionClass::Bulk).context("bulk permit")?,
+        );
+        let task = tokio::spawn(async move { body.into_data_stream().next().await });
+        tokio::time::timeout(Duration::from_secs(5), reading).await??;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(pools.acquire(AdmissionClass::Bulk).is_none());
+        assert!(pools.acquire(AdmissionClass::Control).is_some());
+        resume.send(())?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pools.acquire(AdmissionClass::Bulk).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    #[test]
     fn stalled_response_does_not_occupy_blocking_pool() -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .max_blocking_threads(1)
@@ -649,10 +811,16 @@ mod streaming_tests {
         runtime.block_on(async {
             let bytes = Arc::new(AtomicUsize::new(0));
             let (stopped, done) = tokio::sync::oneshot::channel();
-            let mut body = reader_body(InfiniteReader {
-                bytes: Arc::clone(&bytes),
-                stopped: Some(stopped),
-            })
+            let permit = AdmissionPools::new(1)
+                .acquire(AdmissionClass::Bulk)
+                .context("test permit")?;
+            let mut body = reader_body(
+                InfiniteReader {
+                    bytes: Arc::clone(&bytes),
+                    stopped: Some(stopped),
+                },
+                permit,
+            )
             .into_data_stream();
             assert_eq!(bytes.load(Ordering::Relaxed), 0);
             let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
@@ -675,7 +843,12 @@ mod streaming_tests {
     async fn demand_driven_response_preserves_exact_bytes_and_eof() -> Result<()> {
         let expected = vec![0xa5; RESPONSE_CHUNK + 17];
         let actual = axum::body::to_bytes(
-            reader_body(io::Cursor::new(expected.clone())),
+            reader_body(
+                io::Cursor::new(expected.clone()),
+                AdmissionPools::new(1)
+                    .acquire(AdmissionClass::Bulk)
+                    .context("test permit")?,
+            ),
             expected.len(),
         )
         .await?;
