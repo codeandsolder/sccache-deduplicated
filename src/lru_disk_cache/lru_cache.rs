@@ -61,6 +61,11 @@ impl<K: Hash + Eq, V, M: Meter<K, V>> WeightedLru<K, V, M> {
         self.entries.is_empty()
     }
 
+    /// Iterate over entries without changing their recency or accounting.
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.entries.iter().map(|(key, (value, _))| (key, value))
+    }
+
     /// Check membership without refreshing recency.
     pub fn contains_key<Q: Hash + Eq + ?Sized>(&self, key: &Q) -> bool
     where
@@ -148,6 +153,20 @@ mod tests {
         assert_eq!(cache.remove_lru(), Some(("first", 4)));
         assert!(cache.is_empty());
         assert_eq!(cache.size(), 0);
+    }
+
+    #[test]
+    fn snapshot_preserves_eviction_order_and_weight() {
+        let mut cache = WeightedLru::new(5, Weight);
+        cache.insert("first", 2);
+        cache.insert("second", 3);
+        assert_eq!(
+            cache.iter().collect::<Vec<_>>(),
+            vec![(&"second", &3), (&"first", &2)]
+        );
+        assert_eq!(cache.size(), 5);
+        assert_eq!(cache.remove_lru(), Some(("first", 2)));
+        assert_eq!(cache.size(), 3);
     }
 
     #[test]
