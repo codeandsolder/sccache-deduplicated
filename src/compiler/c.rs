@@ -597,19 +597,15 @@ where
             // This is the default location in official AMD packages and containers.
             .unwrap_or_else(|| PathBuf::from("/opt/rocm/amdgcn/bitcode"));
 
-        hip_device_lib_path
-            .read_dir()
-            .ok()
-            .map(|f| {
-                let mut device_libs = f
-                    .flatten()
-                    .filter(|f| f.path().extension().is_some_and(|ext| ext == "bc"))
-                    .map(|f| f.path())
-                    .collect::<Vec<_>>();
-                device_libs.sort_unstable();
-                device_libs
-            })
-            .unwrap_or_default()
+        hip_device_lib_path.read_dir().ok().map_or_default(|f| {
+            let mut device_libs = f
+                .flatten()
+                .filter(|f| f.path().extension().is_some_and(|ext| ext == "bc"))
+                .map(|f| f.path())
+                .collect::<Vec<_>>();
+            device_libs.sort_unstable();
+            device_libs
+        })
     }
 }
 

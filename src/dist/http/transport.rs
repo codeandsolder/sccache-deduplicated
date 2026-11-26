@@ -122,13 +122,13 @@ async fn send<T: serde::de::DeserializeOwned>(
     req: wreq::RequestBuilder,
     class: Option<RequestClass>,
 ) -> Result<T> {
+    use futures::StreamExt;
     let res = req.send().await?;
     let status = res.status();
     let limit = response_limit(status.is_success(), class.unwrap_or(RequestClass::Control));
     let bytes = if let Some(limit) = limit {
         check_advertised_length(res.content_length(), limit)?;
         let mut body = Vec::new();
-        use futures::StreamExt;
         let mut stream = std::pin::pin!(res.bytes_stream());
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;

@@ -144,7 +144,6 @@ impl Publisher {
     }
 
     fn update_tiers(&mut self, tiers: &[crate::cache::CacheTierObservation]) -> Result<(), String> {
-        use crate::build_runtime::analytics::{AGE_UPPER_BOUNDS, CacheBucket, CacheWeight};
         for (index, tier) in tiers.iter().enumerate() {
             let level = index.to_string();
             let base = [("level", level.as_str()), ("backend", tier.backend)];
@@ -163,81 +162,7 @@ impl Publisher {
                 report.sampled_at,
                 base,
             )?;
-            let log_bounds = std::iter::once(Some(0))
-                .chain((1..=16).map(|n| Some(u64::MAX >> (64 - n * 4))))
-                .collect::<Vec<_>>();
-            let age_bounds = std::iter::once(None)
-                .chain(AGE_UPPER_BOUNDS.into_iter().map(Some))
-                .collect::<Vec<_>>();
-            let mut distributions: Vec<(&str, &[CacheBucket], &[Option<u64>])> = vec![
-                ("size", &report.distribution.size, &log_bounds),
-                ("age", &report.distribution.age_seconds, &age_bounds),
-            ];
-            let heat_bounds = std::iter::once(None)
-                .chain(log_bounds.iter().copied())
-                .collect::<Vec<_>>();
-            if report.managed_heat {
-                distributions.extend([
-                    (
-                        "heat",
-                        report.distribution.frequency.as_slice(),
-                        heat_bounds.as_slice(),
-                    ),
-                    (
-                        "policy_age",
-                        report.policy_age.as_slice(),
-                        age_bounds.as_slice(),
-                    ),
-                ]);
-            }
-            for (dimension, buckets, bounds) in distributions {
-                let mut lower = None;
-                for bound in bounds {
-                    let label = match bound {
-                        None => "unknown".to_owned(),
-                        Some(value) if matches!(dimension, "age" | "policy_age") => match value {
-                            3600 => "1h".to_owned(),
-                            86400 => "1d".to_owned(),
-                            604800 => "7d".to_owned(),
-                            2592000 => "30d".to_owned(),
-                            7776000 => "90d".to_owned(),
-                            31536000 => "365d".to_owned(),
-                            _ => ">365d".to_owned(),
-                        },
-                        Some(value) => value.to_string(),
-                    };
-                    let mut weight = CacheWeight::default();
-                    for bucket in buckets
-                        .iter()
-                        .filter(|bucket| match (bucket.upper, *bound) {
-                            (None, None) => true,
-                            (Some(value), Some(upper)) => {
-                                value <= upper && lower.is_none_or(|lower| value > lower)
-                            }
-                            _ => false,
-                        })
-                    {
-                        weight.add(&bucket.weight);
-                    }
-                    lower = *bound;
-                    let labels = [
-                        base[0],
-                        base[1],
-                        ("dimension", dimension),
-                        ("upper", label.as_str()),
-                    ];
-                    self.set_u64(
-                        "sccache_cache_tier_distribution_bytes",
-                        weight.logical_bytes,
-                        labels,
-                    )?;
-                    self.set_u64(
-                        "sccache_cache_tier_distribution_objects",
-                        weight.objects,
-                        labels,
-                    )?;
-                }
-            }
+            self.update_tier_distributions(report, base)?;
             if report.managed_heat {
                 let total = &report.distribution.total;
                 for target in [50_u128, 90, 95, 99] {
@@ -276,6 +201,91 @@ impl Publisher {
                         )?;
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn update_tier_distributions(
+        &mut self,
+        report: &crate::build_runtime::analytics::TierCacheReport,
+        base: [(&str, &str); 2],
+    ) -> Result<(), String> {
+        use crate::build_runtime::analytics::{AGE_UPPER_BOUNDS, CacheBucket, CacheWeight};
+        type Distribution<'a> = (&'a str, &'a [CacheBucket], &'a [Option<u64>]);
+        let log_bounds = std::iter::once(Some(0))
+            .chain((1..=16).map(|n| Some(u64::MAX >> (64 - n * 4))))
+            .collect::<Vec<_>>();
+        let age_bounds = std::iter::once(None)
+            .chain(AGE_UPPER_BOUNDS.into_iter().map(Some))
+            .collect::<Vec<_>>();
+        let mut distributions: Vec<Distribution<'_>> = vec![
+            ("size", &report.distribution.size, &log_bounds),
+            ("age", &report.distribution.age_seconds, &age_bounds),
+        ];
+        let heat_bounds = std::iter::once(None)
+            .chain(log_bounds.iter().copied())
+            .collect::<Vec<_>>();
+        if report.managed_heat {
+            distributions.extend([
+                (
+                    "heat",
+                    report.distribution.frequency.as_slice(),
+                    heat_bounds.as_slice(),
+                ),
+                (
+                    "policy_age",
+                    report.policy_age.as_slice(),
+                    age_bounds.as_slice(),
+                ),
+            ]);
+        }
+        for (dimension, buckets, bounds) in distributions {
+            let mut lower = None;
+            for bound in bounds {
+                let label = match bound {
+                    None => "unknown".to_owned(),
+                    Some(value) if matches!(dimension, "age" | "policy_age") => match value {
+                        3600 => "1h".to_owned(),
+                        86_400 => "1d".to_owned(),
+                        604_800 => "7d".to_owned(),
+                        2_592_000 => "30d".to_owned(),
+                        7_776_000 => "90d".to_owned(),
+                        31_536_000 => "365d".to_owned(),
+                        _ => ">365d".to_owned(),
+                    },
+                    Some(value) => value.to_string(),
+                };
+                let mut weight = CacheWeight::default();
+                for bucket in buckets
+                    .iter()
+                    .filter(|bucket| match (bucket.upper, *bound) {
+                        (None, None) => true,
+                        (Some(value), Some(upper)) => {
+                            value <= upper && lower.is_none_or(|lower| value > lower)
+                        }
+                        _ => false,
+                    })
+                {
+                    weight.add(&bucket.weight);
+                }
+                lower = *bound;
+                let labels = [
+                    base[0],
+                    base[1],
+                    ("dimension", dimension),
+                    ("upper", label.as_str()),
+                ];
+                self.set_u64(
+                    "sccache_cache_tier_distribution_bytes",
+                    weight.logical_bytes,
+                    labels,
+                )?;
+                self.set_u64(
+                    "sccache_cache_tier_distribution_objects",
+                    weight.objects,
+                    labels,
+                )?;
             }
         }
         Ok(())
@@ -583,12 +593,10 @@ where
             if let Err(error) = publisher.update(&info, dist.as_ref(), force_heartbeat) {
                 warn!("direct metrics update failed: {error}");
             }
-            let changed = if let Ok(observations) = receiver.try_recv() {
+            let changed = receiver.try_recv().is_ok_and(|observations| {
                 tiers = observations;
                 true
-            } else {
-                false
-            };
+            });
             if (changed || force_heartbeat)
                 && let Err(error) = publisher.update_tiers(&tiers)
             {

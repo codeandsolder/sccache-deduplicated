@@ -55,6 +55,7 @@ impl NativeResultSession {
             );
             retained.insert(id, size);
         }
+        drop(retained);
         Ok(())
     }
 
@@ -101,7 +102,7 @@ impl Drop for NativeResultSession {
 
 /// Tokens exposed to the local filesystem never contain scheduler authority.
 #[derive(Default)]
-pub(crate) struct Registry {
+pub struct Registry {
     groups: Mutex<BTreeMap<Ticket, (u32, std::sync::Weak<NativeResultSession>)>>,
 }
 
@@ -136,6 +137,8 @@ impl Registry {
             .map_err(|_| anyhow::anyhow!("intermediate registry poisoned"))?;
         let (owner, group) = groups.get(&token).context("unknown intermediate session")?;
         ensure!(*owner == uid, "intermediate session owner mismatch");
-        group.upgrade().context("intermediate session closed")
+        let group = group.upgrade().context("intermediate session closed");
+        drop(groups);
+        group
     }
 }

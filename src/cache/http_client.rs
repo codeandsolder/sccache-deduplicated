@@ -1,4 +1,4 @@
-//! Native Wreq transport for OpenDAL services.
+//! Native Wreq transport for `OpenDAL` services.
 use crate::errors::Result;
 use futures::{StreamExt as _, TryStreamExt as _};
 use http::{Request, Response, header};
@@ -101,7 +101,7 @@ impl HttpTransport for WreqTransport {
                 parts
                     .extensions
                     .get::<HttpRedirect>()
-                    .filter(|saved| saved.uri().original_uri() == final_uri.to_string())
+                    .filter(|saved| saved.uri().original_uri() == final_uri)
                     .cloned()
                     .unwrap_or_else(|| HttpRedirect::new(final_uri)),
             )

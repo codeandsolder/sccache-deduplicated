@@ -291,6 +291,7 @@ async fn admit(
         )
             .into_response();
     };
+    // The response stream must retain the permit even after the handler returns.
     let permit = Arc::new(permit);
     request.extensions_mut().insert(Arc::clone(&permit));
     let response = next.run(request).await;
@@ -316,8 +317,9 @@ async fn admit(
         Some(peer.path()),
     );
     // Keep the request slot until the response is drained or cancelled.
+    let response_state = (body.into_data_stream(), activity, permit);
     let stream = stream::unfold(
-        (body.into_data_stream(), activity, permit),
+        response_state,
         |(mut body, mut activity, permit)| async move {
             body.next().await.map(|chunk| {
                 if let Ok(bytes) = &chunk

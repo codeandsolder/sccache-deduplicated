@@ -386,7 +386,7 @@ mod digest_cache {
         LazyLock::new(|| Mutex::new(LruCache::sparse(MAX_CACHED_FILE_DIGESTS)));
 
     /// Maximum number of memoized paths; cold entries are evicted individually.
-    const MAX_CACHED_FILE_DIGESTS: NonZeroUsize = NonZeroUsize::new(100_000).unwrap();
+    const MAX_CACHED_FILE_DIGESTS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(99_999);
 
     /// How old a file's mtime and ctime must be for its digest to be remembered.
     /// File timestamps come from a coarse clock, so a file rewritten right after

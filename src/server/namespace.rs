@@ -227,7 +227,7 @@ impl TransferSession {
     }
 
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
-    pub(super) fn set_uid(&mut self, uid: u32) {
+    pub(super) const fn set_uid(&mut self, uid: u32) {
         self.uid = uid;
     }
 

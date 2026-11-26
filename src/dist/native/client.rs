@@ -351,17 +351,9 @@ impl NativeCacheClient {
         destinations: &BTreeMap<String, PathBuf>,
         policy: &NativeBuildPolicy,
         local: Option<&LocalExecutor>,
-        registry: &super::result_session::Registry,
-        uid: u32,
+        retention: (&super::result_session::Registry, u32),
     ) -> Result<NativeBuildResult> {
-        self.run_action_inner(
-            spec,
-            inputs,
-            destinations,
-            policy,
-            local,
-            Some((registry, uid)),
-        )
+        self.run_action_inner(spec, inputs, destinations, policy, local, Some(retention))
     }
 
     fn run_action_inner(

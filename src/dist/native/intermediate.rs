@@ -22,11 +22,11 @@ use std::{
 };
 
 fn connection() -> Result<ServerConnection> {
-    Ok(connect_to_server(&crate::commands::get_addr())
-        .context("connect to managed intermediate daemon")?)
+    connect_to_server(&crate::commands::get_addr())
+        .context("connect to managed intermediate daemon")
 }
 
-pub(crate) struct Content;
+pub struct Content;
 
 impl IntermediateContent for Content {
     fn authorize(&self, reference: IntermediateReference) -> Result<()> {
@@ -74,7 +74,7 @@ impl IntermediateContent for Content {
     }
 }
 
-pub(crate) fn open() -> Result<(Ticket, ServerConnection)> {
+pub fn open() -> Result<(Ticket, ServerConnection)> {
     let mut conn = connection()?;
     let TransferReply::IntermediateOpened(token) =
         conn.transfer(TransferRequest::IntermediateOpen)?
@@ -84,7 +84,7 @@ pub(crate) fn open() -> Result<(Ticket, ServerConnection)> {
     Ok((token, conn))
 }
 
-pub(crate) fn source(reference: IntermediateReference) -> ReferenceBlobProvider {
+pub fn source(reference: IntermediateReference) -> ReferenceBlobProvider {
     ReferenceBlobProvider::new(move |blob| {
         ensure!(
             reference.blob == blob,
@@ -169,6 +169,6 @@ impl Destinations {
     }
 }
 
-pub(crate) fn content() -> Arc<dyn IntermediateContent> {
+pub fn content() -> Arc<dyn IntermediateContent> {
     Arc::new(Content)
 }

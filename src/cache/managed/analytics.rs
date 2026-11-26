@@ -1,5 +1,9 @@
 //! Low-rate shared namespace observations, independent of capacity pruning.
-use super::*;
+use super::{
+    ANALYTICS_LEASE_BASENAME, ANALYTICS_REPORT_BASENAME, CacheObjectKey, Candidate, Duration,
+    EntryMode, ErrorKind, METADATA_SHARD_DIR, ManagedRemoteCache, StreamExt, decayed_heat_milli,
+    timestamp_seconds, unix_seconds, warn,
+};
 use crate::build_runtime::analytics::{TierCacheReport, record_age_bucket};
 
 impl ManagedRemoteCache {
@@ -15,8 +19,8 @@ impl ManagedRemoteCache {
         const REFRESH_SECS: u64 = 1800;
         const LEASE_SECS: u64 = 300;
         const SCAN_TIMEOUT: Duration = Duration::from_secs(240);
-        let path = format!("{}/{}", self.metadata_prefix(), ANALYTICS_REPORT_BASENAME);
-        let lease = format!("{}/{}", self.metadata_prefix(), ANALYTICS_LEASE_BASENAME);
+        let path = format!("{}/{ANALYTICS_REPORT_BASENAME}", self.metadata_prefix());
+        let lease = format!("{}/{ANALYTICS_LEASE_BASENAME}", self.metadata_prefix());
         let previous = self.read_analytics_report(&path).await?;
         if !allow_refresh
             || previous.as_ref().is_some_and(|(report, _)| {

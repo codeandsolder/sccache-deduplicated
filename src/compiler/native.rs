@@ -106,7 +106,7 @@ impl NativeCompilerClient {
                 client: std::sync::Mutex::new(None),
                 auth,
                 local,
-                intermediates: Default::default(),
+                intermediates: crate::dist::native::result_session::Registry::default(),
             })),
             policy,
             toolchains,
@@ -357,7 +357,13 @@ impl NativeCompilerClient {
         mode: ActionMode,
         pool: &tokio::runtime::Handle,
     ) -> Result<(NativeBuildResult, crate::build_runtime::ActionKey)> {
-        let key = plan.spec.action_request()?.action_fingerprint()?.key()?;
+        let fingerprint = plan.spec.action_request()?.action_fingerprint()?;
+        let key = fingerprint.key()?;
+        debug!(
+            "native action {key:?}: components={:?}; input trees={:?}",
+            fingerprint.components,
+            plan.inputs.iter().map(PreparedTree::id).collect::<Vec<_>>()
+        );
         let result = match &self.endpoint {
             Endpoint::Direct(_) => {
                 pool.spawn_blocking(crate::server::activity::inherit_blocking(move || {
@@ -370,9 +376,11 @@ impl NativeCompilerClient {
                         &plan.destinations,
                         &self.policy.build_policy(mode),
                         endpoint.local.as_ref(),
-                        &endpoint.intermediates,
-                        // SAFETY: geteuid only queries process credentials.
-                        unsafe { libc::geteuid() },
+                        (
+                            &endpoint.intermediates,
+                            // SAFETY: geteuid only queries process credentials.
+                            unsafe { libc::geteuid() },
+                        ),
                     )
                 }))
                 .await?
@@ -470,9 +478,9 @@ impl CompilerPlan {
         transformer: dist::PathTransformer,
         packagers: DistPackagers,
         platform: ContentId,
-        toolchain_digests: &SourceDigestCache,
-        native: Option<&NativeCompilerClient>,
+        preparation: (&SourceDigestCache, Option<&NativeCompilerClient>),
     ) -> Result<Self> {
+        let (toolchain_digests, native) = preparation;
         let mut layout = pkg::CompilerInputs::new(transformer);
         layout.directory(cwd)?;
         let mut paths = BTreeMap::new();
@@ -810,8 +818,10 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                     layout,
                     packagers,
                     preparation_client.policy.platform,
-                    &preparation_client.toolchain_digests,
-                    Some(&preparation_client),
+                    (
+                        &preparation_client.toolchain_digests,
+                        Some(&preparation_client),
+                    ),
                 )
             }))
         })();
@@ -1000,8 +1010,7 @@ mod tests {
             layout,
             compilation.into_dist_packagers(transformer)?,
             platform,
-            &SourceDigestCache::default(),
-            None,
+            (&SourceDigestCache::default(), None),
         )?;
         let store = NativeStore::open(&cwd.join("native-store"))?;
         let _leases = plan

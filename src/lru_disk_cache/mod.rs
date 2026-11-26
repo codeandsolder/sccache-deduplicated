@@ -252,6 +252,7 @@ impl LruDiskCache {
     }
 
     /// Snapshot indexed paths without changing LRU order.
+    #[must_use = "the returned paths and sizes describe resident cache objects"]
     pub fn analytics_entries(&self) -> Vec<(PathBuf, u64)> {
         self.lru
             .iter()

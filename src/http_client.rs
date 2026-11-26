@@ -24,6 +24,8 @@ pub(crate) fn new_http_client_builder() -> wreq::ClientBuilder {
 
 /// Shared asynchronous network reactor for synchronous compiler/storage callers.
 /// Use only at synchronous boundaries; async callers await requests directly.
+/// # Errors
+/// Returns an error if the shared network runtime cannot be initialized.
 #[cfg(any(feature = "dist-server", feature = "dist-client"))]
 pub fn io_runtime() -> Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: std::sync::OnceLock<std::io::Result<tokio::runtime::Runtime>> =
@@ -131,6 +133,7 @@ impl Drop for ResponseReader {
 /// # Errors
 /// Returns an error on transport failure or oversized response.
 pub async fn read_bounded_bytes_async(response: wreq::Response, limit: usize) -> Result<Vec<u8>> {
+    use futures::StreamExt;
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)
@@ -138,7 +141,6 @@ pub async fn read_bounded_bytes_async(response: wreq::Response, limit: usize) ->
         anyhow::bail!("authentication HTTP response exceeds {limit} bytes");
     }
     let mut data = Vec::new();
-    use futures::StreamExt;
     let mut stream = std::pin::pin!(response.bytes_stream());
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;

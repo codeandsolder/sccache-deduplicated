@@ -247,11 +247,11 @@ fn run(final_only: bool, args: Vec<OsString>) -> Result<i32> {
         // SAFETY: rlimit is initialized by getrlimit before being read.
         unsafe {
             let mut limit = std::mem::zeroed::<libc::rlimit>();
-            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == -1 {
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) == -1 {
                 return Err(std::io::Error::last_os_error()).context("query descriptor limit");
             }
             limit.rlim_cur = limit.rlim_max;
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == -1 {
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) == -1 {
                 return Err(std::io::Error::last_os_error()).context("raise descriptor limit");
             }
         }

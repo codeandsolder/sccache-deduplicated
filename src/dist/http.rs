@@ -763,20 +763,6 @@ mod server {
         split.next()
     }
 
-    fn authenticate_client(request: &Request) -> StdResult<(), Response> {
-        if request.role() != Role::Client {
-            return Err(make_401("client_role_required"));
-        }
-        Ok(())
-    }
-
-    fn authenticate_server(request: &Request) -> StdResult<ServerId, Response> {
-        if request.role() != Role::Worker {
-            return Err(make_401("worker_role_required"));
-        }
-        Ok(request.id())
-    }
-
     /// Return `content` as a bincode-encoded `Response`.
     pub fn bincode_response<T>(content: &T) -> Response
     where
@@ -1088,67 +1074,105 @@ mod server {
         response
     }
 
-    fn scheduler_routes<S: dist::SchedulerIncoming + 'static>(state: SchedulerHttp<S>) -> Router {
-        let router = Router::new()
-            .route("/api/v1/scheduler/alloc_job", route(MethodFilter::POST, |state: &SchedulerHttp<S>, request| {
-                let handler = &state.handler;
-                let requester = &state.requester;
-                logged(&state.request_count, request, |req_id| {
-                    if let Err(response) = authenticate_client(request) {
-                        return response;
-                    }
-                    let toolchain = try_bincode_input!(req_id, request);
-                    trace!("Req {req_id}: alloc_job: {toolchain:?}");
-
-                    let alloc_job_res: AllocJobResult = try_or_500_log!(req_id, handler.handle_alloc_job(requester.as_ref(), toolchain));
-                    let res = match alloc_job_res {
-                        AllocJobResult::Success { job_alloc, need_toolchain } => {
-                            let routes = try_or_500_log!(req_id, requester.addresses(job_alloc.server_id));
-                            AllocJobHttpResponse::Success { job_alloc, need_toolchain, routes }
+    fn scheduler_client_routes<S: dist::SchedulerIncoming + 'static>()
+    -> Router<Arc<SchedulerHttp<S>>> {
+        Router::new()
+            .route(
+                "/api/v1/scheduler/alloc_job",
+                route(MethodFilter::POST, |state: &SchedulerHttp<S>, request| {
+                    let handler = &state.handler;
+                    let requester = &state.requester;
+                    logged(&state.request_count, request, |req_id| {
+                        if request.role() != Role::Client {
+                            return make_401("client_role_required");
                         }
-                        AllocJobResult::Fail { msg } => AllocJobHttpResponse::Fail { msg }
-                    };
-                    prepare_response(request, &res)
-                })
-            }))
-            .route("/api/v1/scheduler/native_routes", route(MethodFilter::GET, |state: &SchedulerHttp<S>, request| {
-                let native_endpoint = &state.native_endpoint;
-                logged(&state.request_count, request, |_req_id| {
-                    if let Some((primary, bind)) = *native_endpoint {
-                        let routes = crate::dist::cluster_routes::discover(primary, bind);
-                        prepare_response(request, &WorkerRouteHttpResponse { routes })
-                    } else {
-                        StatusCode::NOT_FOUND.into_response()
-                    }
-                })
-            }))
-            .route("/api/v1/scheduler/worker_route/{server_id}", path_route(MethodFilter::GET, |state: &SchedulerHttp<S>, request, server_id: ServerId| {
-                let requester = &state.requester;
-                logged(&state.request_count, request, |req_id| {
-                    if let Err(response) = authenticate_client(request) { return response; }
-                    let routes = try_or_500_log!(req_id, requester.addresses(server_id));
-                    prepare_response(request, &WorkerRouteHttpResponse { routes })
-                })
-            }))
-            .route("/api/v1/scheduler/worker_name/{server_id}", path_route(MethodFilter::GET, |state: &SchedulerHttp<S>, request, server_id: ServerId| {
-                let handler = &state.handler;
-                logged(&state.request_count, request, |req_id| {
-                    if let Err(response) = authenticate_client(request) {
-                        return response;
-                    }
-                    let worker_name = try_or_500_log!(
-                        req_id,
-                        handler.handle_get_worker_name(server_id)
-                    );
-                    prepare_response(request, &WorkerNameHttpResponse { worker_name })
-                })
-            }))
+                        let toolchain = try_bincode_input!(req_id, request);
+                        trace!("Req {req_id}: alloc_job: {toolchain:?}");
+
+                        let alloc_job_res: AllocJobResult = try_or_500_log!(
+                            req_id,
+                            handler.handle_alloc_job(requester.as_ref(), toolchain)
+                        );
+                        let res = match alloc_job_res {
+                            AllocJobResult::Success {
+                                job_alloc,
+                                need_toolchain,
+                            } => {
+                                let routes = try_or_500_log!(
+                                    req_id,
+                                    requester.addresses(job_alloc.server_id)
+                                );
+                                AllocJobHttpResponse::Success {
+                                    job_alloc,
+                                    need_toolchain,
+                                    routes,
+                                }
+                            }
+                            AllocJobResult::Fail { msg } => AllocJobHttpResponse::Fail { msg },
+                        };
+                        prepare_response(request, &res)
+                    })
+                }),
+            )
+            .route(
+                "/api/v1/scheduler/native_routes",
+                route(MethodFilter::GET, |state: &SchedulerHttp<S>, request| {
+                    let native_endpoint = &state.native_endpoint;
+                    logged(&state.request_count, request, |_req_id| {
+                        if let Some((primary, bind)) = *native_endpoint {
+                            let routes = crate::dist::cluster_routes::discover(primary, bind);
+                            prepare_response(request, &WorkerRouteHttpResponse { routes })
+                        } else {
+                            StatusCode::NOT_FOUND.into_response()
+                        }
+                    })
+                }),
+            )
+            .route(
+                "/api/v1/scheduler/worker_route/{server_id}",
+                path_route(
+                    MethodFilter::GET,
+                    |state: &SchedulerHttp<S>, request, server_id: ServerId| {
+                        let requester = &state.requester;
+                        logged(&state.request_count, request, |req_id| {
+                            if request.role() != Role::Client {
+                                return make_401("client_role_required");
+                            }
+                            let routes = try_or_500_log!(req_id, requester.addresses(server_id));
+                            prepare_response(request, &WorkerRouteHttpResponse { routes })
+                        })
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/scheduler/worker_name/{server_id}",
+                path_route(
+                    MethodFilter::GET,
+                    |state: &SchedulerHttp<S>, request, server_id: ServerId| {
+                        let handler = &state.handler;
+                        logged(&state.request_count, request, |req_id| {
+                            if request.role() != Role::Client {
+                                return make_401("client_role_required");
+                            }
+                            let worker_name =
+                                try_or_500_log!(req_id, handler.handle_get_worker_name(server_id));
+                            prepare_response(request, &WorkerNameHttpResponse { worker_name })
+                        })
+                    },
+                ),
+            )
+    }
+
+    fn scheduler_worker_routes<S: dist::SchedulerIncoming + 'static>()
+    -> Router<Arc<SchedulerHttp<S>>> {
+        Router::new()
             .route("/api/v4/scheduler/heartbeat_server", route(MethodFilter::POST, |state: &SchedulerHttp<S>, request| {
                 let handler = &state.handler;
                 let requester = &state.requester;
                 let registry = &state.registry;
                 logged(&state.request_count, request, |req_id| {
-                    let server_id = match authenticate_server(request) { Ok(id) => id, Err(response) => return response };
+                    if request.role() != Role::Worker { return make_401("worker_role_required"); }
+                    let server_id = request.id();
                     let worker_name = request
                         .header("X-Sccache-Worker-Name")
                         .map(ToOwned::to_owned);
@@ -1196,7 +1220,8 @@ mod server {
             .route("/api/v1/scheduler/job_state/{job_id}", path_route(MethodFilter::POST, |state: &SchedulerHttp<S>, request, job_id: JobId| {
                 let handler = &state.handler;
                 logged(&state.request_count, request, |req_id| {
-                    let server_id = match authenticate_server(request) { Ok(id) => id, Err(response) => return response };
+                    if request.role() != Role::Worker { return make_401("worker_role_required"); }
+                    let server_id = request.id();
                     let job_state = try_bincode_input!(req_id, request);
                     trace!("Req {req_id}: job state: {job_state:?}");
 
@@ -1219,12 +1244,18 @@ mod server {
                     let draining = u8::from(handler.handle_is_draining());
                     format!("{draining}\n").into_response()
                 })
-            }));
-        routes(router, state)
+            }))
     }
 
-    fn worker_routes<S: dist::ServerIncoming + 'static>(state: WorkerHttp<S>) -> Router {
-        let router = Router::new()
+    fn scheduler_routes<S: dist::SchedulerIncoming + 'static>(state: SchedulerHttp<S>) -> Router {
+        routes(
+            scheduler_client_routes().merge(scheduler_worker_routes()),
+            state,
+        )
+    }
+
+    fn worker_assignment_routes<S: dist::ServerIncoming + 'static>() -> Router<Arc<WorkerHttp<S>>> {
+        Router::new()
             .route(
                 "/api/v1/distserver/assign_job/{job_id}",
                 path_route(
@@ -1283,6 +1314,10 @@ mod server {
                     },
                 ),
             )
+    }
+
+    fn worker_native_routes<S: dist::ServerIncoming + 'static>() -> Router<Arc<WorkerHttp<S>>> {
+        Router::new()
             .route(
                 "/api/v3/distserver/native_blob",
                 route(MethodFilter::POST, |state: &WorkerHttp<S>, request| {
@@ -1325,6 +1360,10 @@ mod server {
                     },
                 ),
             )
+    }
+
+    fn worker_archive_routes<S: dist::ServerIncoming + 'static>() -> Router<Arc<WorkerHttp<S>>> {
+        Router::new()
             .route(
                 "/api/v1/distserver/submit_toolchain/{job_id}",
                 path_route(
@@ -1417,8 +1456,16 @@ mod server {
                         })
                     },
                 ),
-            );
-        routes(router, state)
+            )
+    }
+
+    fn worker_routes<S: dist::ServerIncoming + 'static>(state: WorkerHttp<S>) -> Router {
+        routes(
+            worker_assignment_routes()
+                .merge(worker_native_routes())
+                .merge(worker_archive_routes()),
+            state,
+        )
     }
 
     pub struct Scheduler<S> {
@@ -1706,8 +1753,9 @@ mod server {
                     move || {
                         dashboard_native.as_ref().map(|(sessions, network)| {
                             let mut snapshot = dashboard::snapshot(sessions, network);
-                            snapshot.analytics =
-                                analytics.as_ref().and_then(|receiver| receiver.poll());
+                            snapshot.analytics = analytics
+                                .as_ref()
+                                .and_then(crate::build_runtime::CacheAnalyticsSampler::poll);
                             snapshot
                         })
                     },

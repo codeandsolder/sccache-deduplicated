@@ -369,6 +369,10 @@ fn auth_details(State(session): State<Arc<CallbackSession>>) -> impl Future<Outp
     )
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Axum extracts the owned request URI for its synchronous handler adapter"
+)]
 fn redirect(
     State(session): State<Arc<CallbackSession>>,
     uri: Uri,
@@ -388,6 +392,10 @@ fn redirect(
     std::future::ready(outcome.unwrap_or_else(|error| error_code_response(&uri, error)))
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Axum extracts the owned request URI for its synchronous handler adapter"
+)]
 fn save_auth(
     State(session): State<Arc<CallbackSession>>,
     uri: Uri,
