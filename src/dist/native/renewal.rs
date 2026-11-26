@@ -170,13 +170,12 @@ where
                             let result = if timeout.is_zero() {
                                 Err(anyhow!("native renewal retry budget exhausted"))
                             } else {
-                                match tokio::time::timeout(timeout, renew(ticket, timeout)).await {
-                                    Ok(result) => result,
-                                    Err(_) => {
+                                tokio::time::timeout(timeout, renew(ticket, timeout))
+                                    .await
+                                    .unwrap_or_else(|_| {
                                         Err(std::io::Error::from(std::io::ErrorKind::TimedOut)
                                             .into())
-                                    }
-                                }
+                                    })
                             };
                             (ticket, result)
                         }

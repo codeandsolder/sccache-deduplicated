@@ -414,11 +414,15 @@ impl NativeCacheClient {
             .map(|(response, _)| response)
     }
 
-    fn control<T: Serialize, R: DeserializeOwned>(&self, operation: &str, value: &T) -> Result<R> {
+    fn control<T: Serialize + Sync, R: DeserializeOwned>(
+        &self,
+        operation: &str,
+        value: &T,
+    ) -> Result<R> {
         self.control_with_timeout(operation, value, self.timeout)
     }
 
-    fn control_with_timeout<T: Serialize, R: DeserializeOwned>(
+    fn control_with_timeout<T: Serialize + Sync, R: DeserializeOwned>(
         &self,
         operation: &str,
         value: &T,
@@ -428,7 +432,7 @@ impl NativeCacheClient {
             .block_on(self.control_with_timeout_async(operation, value, timeout))
     }
 
-    async fn control_with_timeout_async<T: Serialize, R: DeserializeOwned>(
+    async fn control_with_timeout_async<T: Serialize + Sync, R: DeserializeOwned>(
         &self,
         operation: &str,
         value: &T,
@@ -457,7 +461,7 @@ impl NativeCacheClient {
 
     // Retrying is deliberately limited to package resolution: a busy reply
     // does not mutate anything, and even a repeated acquisition is idempotent.
-    fn package_control<T: Serialize, R: DeserializeOwned>(
+    fn package_control<T: Serialize + Sync, R: DeserializeOwned>(
         &self,
         operation: &str,
         value: &T,
@@ -1030,7 +1034,7 @@ impl NativeCacheClient {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         };
-        store.acquire_tree_async(id, deadline, cancelled, || async {
+        Box::pin(store.acquire_tree_async(id, deadline, cancelled, || async {
             check()?;
             let (manifest, reservation) = {
                 let store = store.clone();
@@ -1101,7 +1105,7 @@ impl NativeCacheClient {
                 drop(reservation);
                 Ok(tree)
             }).await?
-        }).await
+        })).await
     }
 
     /// Negotiate missing content for a successful result.

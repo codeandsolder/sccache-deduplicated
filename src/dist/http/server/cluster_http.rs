@@ -468,7 +468,9 @@ fn reader_body(
     Body::from_stream(stream::try_unfold(
         (Arc::new(file), 0_u64, meter, permit),
         move |(file, offset, mut meter, permit)| async move {
-            let count = (length - offset).min(RESPONSE_CHUNK as u64) as usize;
+            let count = usize::try_from(length - offset)
+                .unwrap_or(usize::MAX)
+                .min(RESPONSE_CHUNK);
             if count == 0 {
                 if let Some(meter) = &mut meter {
                     meter.eof();
@@ -571,6 +573,10 @@ fn busy_response() -> Response {
         .into_response()
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the buffered request is moved into the blocking operation with its admission guard"
+)]
 async fn admit(
     pools: Arc<AdmissionPools>,
     class: AdmissionClass,
@@ -590,10 +596,6 @@ async fn admit(
     track_response(peer, permit, response)
 }
 
-#[expect(
-    clippy::significant_drop_tightening,
-    reason = "the response stream takes ownership of the permit, so admission remains held until the body is drained or cancelled"
-)]
 fn track_response(
     peer: AuthenticatedPeer,
     permit: Arc<OwnedSemaphorePermit>,

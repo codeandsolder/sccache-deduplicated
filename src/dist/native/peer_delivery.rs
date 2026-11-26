@@ -87,17 +87,14 @@ impl NativeCacheClient {
             return Vec::new();
         }
         let transfer = Transfer::Download(plan.blob.size);
-        let scheduler_cost = if let Some(routes) = routes {
+        // A scheduler miss requires another acquisition and relay; prefer a peer.
+        let scheduler_cost = routes.map_or(u128::MAX, |routes| {
             self.routes
                 .estimated_cost(self.peer.scheduler_id(), Role::Scheduler, routes, transfer)
                 .unwrap_or_else(|| {
                     50_000_000 + u128::from(plan.blob.size) * 1_000_000_000 / (16 << 20)
                 })
-        } else {
-            // A scheduler miss would require another content acquisition and
-            // relay. Prefer an authenticated peer; no origin bytes are needed.
-            u128::MAX
-        };
+        });
         let mut candidates = plan
             .sources
             .iter()
@@ -145,10 +142,6 @@ impl NativeCacheClient {
 
     /// The consumer verifies before success. A rejected transfer starts with
     /// a fresh consumer, and never exposes its unverified prefix.
-    #[expect(
-        clippy::future_not_send,
-        reason = "also serves synchronous non-Send IPC output sinks; worker consumers are Send"
-    )]
     pub(super) async fn try_peer_blob_async<T, F, Fut>(
         &self,
         plan: &BlobSourcePlan,

@@ -148,7 +148,7 @@ async fn package_response(
     limit: usize,
 ) -> Response {
     if let Err(response) = request_publisher(&request, "client") {
-        return response;
+        return *response;
     }
     let result = async {
         let rust = operation.starts_with("rust_");
@@ -452,6 +452,10 @@ fn native_admission_class((_, operation): &(String, String)) -> AdmissionClass {
     }
 }
 
+#[expect(
+    clippy::literal_string_with_formatting_args,
+    reason = "Axum route parameters use literal braces"
+)]
 fn native_router<F, A, Fut, U, UFut>(
     handler: F,
     schedule: A,
@@ -681,7 +685,7 @@ fn respond(
 ) -> Response {
     let publisher = match request_publisher(request, role) {
         Ok(publisher) => publisher,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     native_response(
         operation,
@@ -689,31 +693,34 @@ fn respond(
     )
 }
 
-fn request_publisher(request: &Request, role: &str) -> std::result::Result<Publisher, Response> {
+fn request_publisher(
+    request: &Request,
+    role: &str,
+) -> std::result::Result<Publisher, Box<Response>> {
     if request.header("Content-Type") != Some("application/octet-stream") {
-        return Err(StatusCode::BAD_REQUEST.into_response());
+        return Err(Box::new(StatusCode::BAD_REQUEST.into_response()));
     }
     Ok(match role {
         "client" => {
             if let Some(response) = role_error(request, Role::Client) {
-                return Err(response);
+                return Err(Box::new(response));
             }
             Publisher::Client
         }
         "worker" => {
             if let Some(response) = role_error(request, Role::Worker) {
-                return Err(response);
+                return Err(Box::new(response));
             }
             let server = request.id();
             let Some(job) = request
                 .header("X-Sccache-Native-Job")
                 .and_then(|job| job.parse::<u64>().ok())
             else {
-                return Err(StatusCode::BAD_REQUEST.into_response());
+                return Err(Box::new(StatusCode::BAD_REQUEST.into_response()));
             };
             Publisher::Worker { peer: server, job }
         }
-        _ => return Err(StatusCode::NOT_FOUND.into_response()),
+        _ => return Err(Box::new(StatusCode::NOT_FOUND.into_response())),
     })
 }
 
@@ -727,7 +734,7 @@ async fn upload_response(
 ) -> Response {
     let publisher = match request_publisher(&request, role) {
         Ok(publisher) => publisher,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let peer = match publisher {
         Publisher::Client => Peer::Client(request.id()),
