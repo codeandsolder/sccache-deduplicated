@@ -248,6 +248,7 @@ mod tests {
     use super::*;
     use crate::{ClusterCa, ClusterListener, EnrollmentAuthority, Registry, SchedulerEnrollment};
     use hyper::StatusCode;
+    use std::sync::Arc;
     use tokio::{net::TcpListener, task::JoinHandle};
 
     struct Server {
@@ -440,7 +441,7 @@ mod tests {
         let denied = bootstrap
             .transport
             .client
-            .get(bootstrap.transport.base.join("probe")?)
+            .get(bootstrap.transport.base.join("probe")?.as_str())
             .header("X-Sccache-Peer", worker_id.to_string())
             .bearer_auth("worker-token")
             .send()
@@ -476,7 +477,7 @@ mod tests {
         let probe = enrolled
             .transport
             .client
-            .get(enrolled.transport.base.join("probe")?)
+            .get(enrolled.transport.base.join("probe")?.as_str())
             .send()
             .await?
             .error_for_status()?
@@ -512,7 +513,7 @@ mod tests {
         let revoked = enrolled
             .transport
             .client
-            .get(enrolled.transport.base.join("probe")?)
+            .get(enrolled.transport.base.join("probe")?.as_str())
             .send()
             .await?;
         assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
@@ -537,6 +538,7 @@ mod worker_tests {
     use super::*;
     use crate::{ClusterCa, ClusterListener, EnrollmentAuthority, Registry};
     use hyper::StatusCode;
+    use std::sync::Arc;
     use tokio::{net::TcpListener, task::JoinHandle};
 
     fn listen(

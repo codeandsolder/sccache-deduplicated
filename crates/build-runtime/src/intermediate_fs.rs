@@ -1,5 +1,6 @@
-//! Writable, private Cargo build-directory mount. The backing namespace has
-//! ordinary Unix inode semantics; immutable content is a separate lease, not
+//! Writable, private Cargo build-directory mount.
+//!
+//! The backing namespace has ordinary Unix inode semantics; immutable content is a separate lease, not
 //! a sparse file that can accidentally be read as zeroes.
 use crate::{BlobRef, ContentId, wire::Ticket};
 use anyhow::{Context, Result, ensure};
@@ -38,6 +39,7 @@ pub struct IntermediateReference {
     pub blob: BlobRef,
 }
 impl IntermediateReference {
+    #[must_use = "the encoded bytes identify the retained content"]
     pub fn encode(self) -> [u8; 72] {
         let mut bytes = [0; 72];
         bytes[..32].copy_from_slice(&self.session.0);
@@ -63,11 +65,17 @@ impl IntermediateReference {
 /// The caller supplies an authenticated authorization and a verified content
 /// reader. The mount owns no remote credentials.
 pub trait IntermediateContent: Send + Sync + 'static {
+    /// Verify that the session is authorized to access this exact content.
+    /// # Errors
+    /// Returns an error if the reference is not authorized.
     fn authorize(&self, reference: IntermediateReference) -> Result<()>;
+    /// Retrieve content into the caller-owned staging file.
+    /// # Errors
+    /// Returns an error if the content cannot be retrieved.
     fn fetch(&self, reference: IntermediateReference, destination: &mut File) -> Result<()>;
 }
 
-fn fs_error(error: anyhow::Error) -> Errno {
+fn fs_error(error: &anyhow::Error) -> Errno {
     log::debug!("intermediate filesystem: {error:#}");
     for cause in error.chain() {
         if let Some(error) = cause.downcast_ref::<io::Error>() {
@@ -137,7 +145,8 @@ fn unix_time(seconds: i64, nanos: i64) -> Result<SystemTime> {
     } else {
         SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds.unsigned_abs()))
     };
-    base.and_then(|t| t.checked_add(Duration::from_nanos(nanos as u64)))
+    let nanos = u64::try_from(nanos)?;
+    base.and_then(|t| t.checked_add(Duration::from_nanos(nanos)))
         .context("inode time overflow")
 }
 struct Entry {
@@ -296,6 +305,7 @@ impl IntermediateFs {
         );
         let reader = Arc::new(staged.reopen()?);
         *file = Some(staged.into_temp_path());
+        drop(file);
         Ok(reader)
     }
     // Caller holds the inode mutation lock. A write-open detaches before
@@ -339,7 +349,7 @@ impl IntermediateFs {
         // The FUSE kernel owns the logical file offset. Do not pass append
         // through to pwrite, which ignores its offset on Linux O_APPEND FDs.
         let flags = flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_APPEND | libc::O_NOFOLLOW);
-        let file = Arc::new(node.open(OFlags::from_bits_truncate(flags as u32))?);
+        let file = Arc::new(node.open(OFlags::from_bits_truncate(flags.cast_unsigned()))?);
         drop(guard);
         lock(&self.namespace)?.handle(ino, Handle::File { ino, file })
     }

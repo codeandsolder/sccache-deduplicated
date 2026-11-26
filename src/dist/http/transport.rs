@@ -10,9 +10,9 @@ use std::io::Read;
 #[cfg(any(feature = "dist-client", test))]
 use std::time::Duration;
 
-const CONTROL_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+/// Maximum encoded control-plane response size.
+pub const CONTROL_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
 const ERROR_RESPONSE_LIMIT: usize = 64 * 1024;
-#[cfg(feature = "dist-client")]
 #[cfg(feature = "dist-client")]
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_mins(20);
 

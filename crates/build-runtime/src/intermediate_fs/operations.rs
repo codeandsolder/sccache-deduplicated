@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    Arc, AtFlags, Context, Errno, File, FileAttr, FileExt, FileHandle, FileType, Generation,
+    Handle, INTERNAL, INodeNo, IntermediateFs, IntermediateReference, MetadataExt, Mode, OFlags,
+    OsStr, Path, PermissionsExt, REFERENCE_XATTR, Result, SESSION_XATTR, SystemTime, TTL, ensure,
+    fs, fs_error, io, lock, missing, rfs,
+};
 use fuser::{
     BsdFileFlags, Filesystem, FopenFlags, LockOwner, OpenFlags, Owner, RenameFlags, ReplyAttr,
     ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
@@ -10,13 +15,13 @@ use std::os::unix::fs::DirEntryExt;
 fn reply_empty(reply: ReplyEmpty, result: Result<()>) {
     match result {
         Ok(()) => reply.ok(),
-        Err(error) => reply.error(fs_error(error)),
+        Err(error) => reply.error(fs_error(&error)),
     }
 }
 fn reply_entry(reply: ReplyEntry, result: Result<FileAttr>) {
     match result {
         Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
-        Err(error) => reply.error(fs_error(error)),
+        Err(error) => reply.error(fs_error(&error)),
     }
 }
 fn xattr_reply(reply: ReplyXattr, size: u32, result: Result<Vec<u8>>) {
@@ -27,7 +32,7 @@ fn xattr_reply(reply: ReplyXattr, size: u32, result: Result<Vec<u8>>) {
         },
         Ok(bytes) if bytes.len() <= size as usize => reply.data(&bytes),
         Ok(_) => reply.error(Errno::ERANGE),
-        Err(error) => reply.error(fs_error(error)),
+        Err(error) => reply.error(fs_error(&error)),
     }
 }
 fn attr_time(time: Option<TimeOrNow>) -> Result<Timespec> {
@@ -139,7 +144,7 @@ impl Filesystem for IntermediateFs {
     fn getattr(&self, _: &Request, ino: INodeNo, _: Option<FileHandle>, reply: ReplyAttr) {
         match self.node(ino).and_then(|node| node.attr(ino)) {
             Ok(attr) => reply.attr(&TTL, &attr),
-            Err(error) => reply.error(fs_error(error)),
+            Err(error) => reply.error(fs_error(&error)),
         }
     }
     fn setattr(
@@ -168,13 +173,10 @@ impl Filesystem for IntermediateFs {
                 self.detach(&node, size == 0)?;
                 node.open(OFlags::WRONLY)?.set_len(size)?;
             }
-            if let Some(mode) = mode.or_else(|| {
-                kill.then(|| node.fd.metadata().map(|m| m.mode() & !0o6000).unwrap_or(0))
-            }) {
-                ensure!(
-                    !node.fd.metadata()?.file_type().is_symlink(),
-                    "cannot chmod a symlink"
-                );
+            if mode.is_some() || kill {
+                let metadata = node.fd.metadata()?;
+                ensure!(!metadata.file_type().is_symlink(), "cannot chmod a symlink");
+                let mode = mode.unwrap_or_else(|| metadata.mode() & !0o6000);
                 fs::set_permissions(node.path(), fs::Permissions::from_mode(mode & 0o7777))?;
             }
             if uid.is_some() || gid.is_some() {
@@ -202,7 +204,7 @@ impl Filesystem for IntermediateFs {
         })();
         match result {
             Ok(attr) => reply.attr(&TTL, &attr),
-            Err(error) => reply.error(fs_error(error)),
+            Err(error) => reply.error(fs_error(&error)),
         }
     }
     fn readlink(&self, _: &Request, ino: INodeNo, reply: ReplyData) {
@@ -211,7 +213,7 @@ impl Filesystem for IntermediateFs {
             .and_then(|node| Ok(rfs::readlinkat(&node.fd, "", Vec::new())?))
         {
             Ok(link) => reply.data(link.as_bytes()),
-            Err(error) => reply.error(fs_error(error)),
+            Err(error) => reply.error(fs_error(&error)),
         }
     }
     fn mkdir(
@@ -353,7 +355,7 @@ impl Filesystem for IntermediateFs {
     fn open(&self, _: &Request, ino: INodeNo, flags: OpenFlags, _: bool, reply: ReplyOpen) {
         match self.open_file(ino, flags.0) {
             Ok(fh) => reply.opened(fh, FopenFlags::empty()),
-            Err(error) => reply.error(fs_error(error)),
+            Err(error) => reply.error(fs_error(&error)),
         }
     }
     fn create(
@@ -370,7 +372,7 @@ impl Filesystem for IntermediateFs {
     ) {
         let result = (|| {
             let permissions = Mode::from_bits_truncate(mode & !umask);
-            let open_flags = OFlags::from_bits_truncate((flags & !libc::O_APPEND) as u32)
+            let open_flags = OFlags::from_bits_truncate((flags & !libc::O_APPEND).cast_unsigned())
                 | OFlags::CREATE
                 | OFlags::EXCL
                 | OFlags::CLOEXEC;
@@ -397,7 +399,7 @@ impl Filesystem for IntermediateFs {
         })();
         match result {
             Ok((attr, fh)) => reply.created(&TTL, &attr, Generation(0), fh, FopenFlags::empty()),
-            Err(error) => reply.error(fs_error(error)),
+            Err(error) => reply.error(fs_error(&error)),
         }
     }
     fn read(
@@ -413,7 +415,7 @@ impl Filesystem for IntermediateFs {
     ) {
         match self.read_file(ino, fh, offset, size) {
             Ok(bytes) => reply.data(&bytes),
-            Err(error) => reply.error(fs_error(error)),
+            Err(error) => reply.error(fs_error(&error)),
         }
     }
     fn write(
@@ -430,7 +432,7 @@ impl Filesystem for IntermediateFs {
     ) {
         match self.write_file(ino, fh, offset, bytes) {
             Ok(n) => reply.written(n),
-            Err(error) => reply.error(fs_error(error)),
+            Err(error) => reply.error(fs_error(&error)),
         }
     }
     fn release(
@@ -512,7 +514,7 @@ impl Filesystem for IntermediateFs {
         })();
         match result {
             Ok(fh) => reply.opened(fh, FopenFlags::empty()),
-            Err(error) => reply.error(fs_error(error)),
+            Err(error) => reply.error(fs_error(&error)),
         }
     }
     fn readdir(
@@ -529,11 +531,15 @@ impl Filesystem for IntermediateFs {
         }) {
             Ok(entries) => entries,
             Err(error) => {
-                reply.error(fs_error(error));
+                reply.error(fs_error(&error));
                 return;
             }
         };
-        for (index, (ino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
+        for (index, (ino, kind, name)) in entries
+            .iter()
+            .enumerate()
+            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+        {
             if reply.add(*ino, index as u64 + 1, *kind, name) {
                 break;
             }
@@ -561,20 +567,33 @@ impl Filesystem for IntermediateFs {
         );
     }
     fn statfs(&self, _: &Request, _: INodeNo, reply: ReplyStatfs) {
-        match rfs::statvfs(&self.scratch) {
-            Ok(s) => reply.statfs(
-                s.f_blocks,
-                s.f_bfree,
-                s.f_bavail,
-                s.f_files,
-                s.f_ffree,
-                s.f_bsize as u32,
-                s.f_namemax as u32,
-                s.f_frsize as u32,
-            ),
-            Err(error) => reply.error(Errno::from_i32(error.raw_os_error())),
-        }
+        let stat = match rfs::statvfs(&self.scratch) {
+            Ok(stat) => stat,
+            Err(error) => {
+                reply.error(Errno::from_i32(error.raw_os_error()));
+                return;
+            }
+        };
+        let (Ok(block), Ok(name), Ok(fragment)) = (
+            u32::try_from(stat.f_bsize),
+            u32::try_from(stat.f_namemax),
+            u32::try_from(stat.f_frsize),
+        ) else {
+            reply.error(Errno::EOVERFLOW);
+            return;
+        };
+        reply.statfs(
+            stat.f_blocks,
+            stat.f_bfree,
+            stat.f_bavail,
+            stat.f_files,
+            stat.f_ffree,
+            block,
+            name,
+            fragment,
+        );
     }
+
     fn getxattr(&self, _: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         xattr_reply(reply, size, self.read_xattr(ino, name));
     }
@@ -607,7 +626,7 @@ impl Filesystem for IntermediateFs {
                     node.path(),
                     name,
                     value,
-                    rfs::XattrFlags::from_bits_truncate(flags as u32),
+                    rfs::XattrFlags::from_bits_truncate(flags.cast_unsigned()),
                 )?;
                 Ok(())
             })(),
@@ -672,7 +691,7 @@ impl Filesystem for IntermediateFs {
                 self.detach(&node, false)?;
                 rfs::fallocate(
                     &*self.file(fh)?,
-                    rfs::FallocateFlags::from_bits_truncate(mode as u32),
+                    rfs::FallocateFlags::from_bits_truncate(mode.cast_unsigned()),
                     offset,
                     length,
                 )?;

@@ -1,6 +1,10 @@
 //! Read-only distinct-blob accounting. Never hold the mutation lock or invoke
 //! eviction while inspecting the store.
-use super::*;
+use super::{
+    ActionKey, BLOB_ROOTS, BTreeMap, BTreeSet, ContentId, Duration, MetadataExt, NativeStore,
+    Options, PACKAGES, PackageRecord, RESULT_ACTIONS, RESULTS, ReadableDatabase, ReadableTable,
+    Result, Root, TREES, TreeId, UsageRecord, anyhow, encoding, ensure, now_ms, reuse_utility,
+};
 use crate::analytics::CacheDistribution;
 
 #[derive(Default)]
@@ -86,6 +90,7 @@ impl NativeStore {
                         usage.last_used_ms = usage.last_used_ms.max(record.last_used_ms);
                     }
                 }
+                drop(pins);
             }
             let age = (usage.last_used_ms != 0)
                 .then(|| observed.saturating_sub(usage.last_used_ms) / 1000);
@@ -116,7 +121,8 @@ impl NativeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ActionFingerprint, ActionMode, Artifact};
+    use crate::{ActionFingerprint, ActionMode, Artifact, ResultManifest};
+    use anyhow::Context;
     use std::io::Cursor;
 
     #[test]
@@ -174,7 +180,7 @@ pub struct CacheAnalyticsSampler {
 }
 
 impl CacheAnalyticsSampler {
-    #[must_use]
+    #[must_use = "the sample contains the latest completed observation"]
     pub fn poll(&self) -> Option<crate::analytics::CacheAnalyticsSample> {
         self.receiver.try_recv().ok()
     }

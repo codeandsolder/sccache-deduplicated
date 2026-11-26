@@ -309,17 +309,7 @@ impl MappedTree {
                             None => hash_open_source(&file, &stat)?,
                         }
                     };
-                    let metadata = match policy {
-                        MappedMetadata::Preserve => metadata(&stat)?,
-                        MappedMetadata::Normalize(modified) => TreeMetadata {
-                            mode: if stat.st_mode & 0o100 == 0 {
-                                0o644
-                            } else {
-                                0o755
-                            },
-                            modified,
-                        },
-                    };
+                    let metadata = mapped_file_metadata(&stat, policy)?;
                     if reference.is_none() {
                         let file = PreparedFile { path, stat };
                         match sources.entry(blob.id) {
@@ -375,6 +365,20 @@ fn add_reference(
         providers.push(provider);
     }
     Ok(())
+}
+
+fn mapped_file_metadata(stat: &Stat, policy: MappedMetadata) -> Result<TreeMetadata> {
+    Ok(match policy {
+        MappedMetadata::Preserve => metadata(stat)?,
+        MappedMetadata::Normalize(modified) => TreeMetadata {
+            mode: if stat.st_mode & 0o100 == 0 {
+                0o644
+            } else {
+                0o755
+            },
+            modified,
+        },
+    })
 }
 
 fn open_source(path: &Path) -> Result<(File, Stat)> {
@@ -441,7 +445,7 @@ impl PreparedTree {
     /// Returns an error for invalid topology or inconsistent content.
     pub fn from_references(
         manifest: TreeManifest,
-        provider: ReferenceBlobProvider,
+        provider: &ReferenceBlobProvider,
     ) -> Result<Self> {
         let id = manifest.id()?;
         let references = manifest

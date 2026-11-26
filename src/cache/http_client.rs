@@ -38,7 +38,7 @@ impl http_body::Body for BufferBody {
         mut self: Pin<&mut Self>,
         _: &mut Context<'_>,
     ) -> Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        Poll::Ready(self.0.next().map(|chunk| Ok(http_body::Frame::data(chunk))))
+        Poll::Ready(Iterator::next(&mut self.0).map(|chunk| Ok(http_body::Frame::data(chunk))))
     }
 
     fn is_end_stream(&self) -> bool {

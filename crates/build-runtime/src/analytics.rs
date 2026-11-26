@@ -15,7 +15,7 @@ pub struct CacheWeight {
 }
 
 impl CacheWeight {
-    pub fn add(&mut self, other: &Self) {
+    pub const fn add(&mut self, other: &Self) {
         self.objects = self.objects.saturating_add(other.objects);
         self.logical_bytes = self.logical_bytes.saturating_add(other.logical_bytes);
         self.stored_bytes = self.stored_bytes.saturating_add(other.stored_bytes);
@@ -125,7 +125,7 @@ impl CacheDistribution {
     }
 }
 
-fn log_bucket(value: u64) -> u64 {
+const fn log_bucket(value: u64) -> u64 {
     if value == 0 {
         0
     } else {
@@ -153,9 +153,9 @@ mod tests {
     #[test]
     fn cold_bytes_and_unknown_usage_are_distinct() {
         let mut report = CacheDistribution::default();
-        report.record(10, None, 1, Some(3), Some(86400));
-        report.record(20, None, 1, Some(1), Some(604801));
-        report.record(30, None, 1, Some(0), Some(7776001));
+        report.record(10, None, 1, Some(3), Some(86_400));
+        report.record(20, None, 1, Some(1), Some(604_801));
+        report.record(30, None, 1, Some(0), Some(7_776_001));
         report.record(40, None, 1, None, None);
         assert_eq!(report.frequency[0].upper, None);
         assert_eq!(report.frequency[0].weight.logical_bytes, 40);
@@ -220,7 +220,7 @@ pub struct CacheSiteSummary {
 }
 
 impl CacheAnalyticsSample {
-    #[must_use]
+    #[must_use = "the summary reports fleet cache usage"]
     pub fn site_summary(self) -> CacheSiteSummary {
         let mut summary = CacheSiteSummary {
             sampled_at: self.sampled_at,
@@ -236,15 +236,15 @@ impl CacheAnalyticsSample {
             for bucket in report.age_seconds {
                 let bytes = bucket.weight.logical_bytes;
                 if let Some(upper) = bucket.upper {
-                    if upper > 604800 {
+                    if upper > 604_800 {
                         summary.older_than_seven_days =
                             summary.older_than_seven_days.saturating_add(bytes);
                     }
-                    if upper > 2592000 {
+                    if upper > 2_592_000 {
                         summary.older_than_thirty_days =
                             summary.older_than_thirty_days.saturating_add(bytes);
                     }
-                    if upper > 7776000 {
+                    if upper > 7_776_000 {
                         summary.older_than_ninety_days =
                             summary.older_than_ninety_days.saturating_add(bytes);
                     }
@@ -259,9 +259,10 @@ impl CacheAnalyticsSample {
     }
 }
 
-/// Object-store and legacy disk tiers account serialized object bytes, not
-/// uncompressed native artifact lengths. Heat is a decaying milli-hit score,
-/// never a count of requests. Only the managed tier supplies policy age.
+/// Serialized object-byte accounting for object-store and legacy disk tiers.
+///
+/// Heat is a decaying milli-hit score, never a count of requests. Only the
+/// managed tier supplies policy age.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TierCacheReport {
     pub sampled_at: u64,
@@ -270,7 +271,15 @@ pub struct TierCacheReport {
     pub policy_age: Vec<CacheBucket>,
 }
 
-pub const AGE_UPPER_BOUNDS: [u64; 7] = [3600, 86400, 604800, 2592000, 7776000, 31536000, u64::MAX];
+pub const AGE_UPPER_BOUNDS: [u64; 7] = [
+    3600,
+    86_400,
+    604_800,
+    2_592_000,
+    7_776_000,
+    31_536_000,
+    u64::MAX,
+];
 
 pub fn record_age_bucket(buckets: &mut Vec<CacheBucket>, age: Option<u64>, weight: &CacheWeight) {
     let upper = age.map(|age| {

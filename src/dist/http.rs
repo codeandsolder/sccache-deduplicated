@@ -22,6 +22,7 @@ pub use self::server::{
 };
 
 pub(crate) mod transport;
+pub use transport::CONTROL_RESPONSE_LIMIT;
 #[cfg(feature = "dist-client")]
 mod worker_routes;
 

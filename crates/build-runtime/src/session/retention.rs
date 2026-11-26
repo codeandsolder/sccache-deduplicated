@@ -1,6 +1,10 @@
 //! Build-scoped retention. Result leases are shared with the original action
 //! before its delivery ticket is released, so GC never observes a pin gap.
-use super::*;
+use super::{
+    Arc, BTreeMap, BlobEncoding, BlobRef, ContentId, Context, File, HashMap, Instant, Mutex,
+    MutexGuard, NativeSessions, Phase, Publisher, Ready, Result, ResultLease, Ticket, anyhow, bail,
+    encode_delivery, ensure,
+};
 use crate::ResultId;
 
 #[derive(Default)]
@@ -26,13 +30,12 @@ impl RetentionGroups {
     pub(super) fn reap(&self, now: Instant) -> Result<usize> {
         let expired = {
             let mut groups = self.lock()?;
-            let keys = groups
-                .iter()
-                .filter_map(|(id, group)| (group.expires <= now).then_some(*id))
+            let expired = groups
+                .extract_if(|_, group| group.expires <= now)
+                .map(|(_, group)| group)
                 .collect::<Vec<_>>();
-            keys.into_iter()
-                .filter_map(|id| groups.remove(&id))
-                .collect::<Vec<_>>()
+            drop(groups);
+            expired
         };
         Ok(expired.len())
     }
@@ -128,6 +131,7 @@ impl NativeSessions {
                 blobs: BTreeMap::new(),
             },
         );
+        drop(groups);
         Ok(ticket)
     }
 
@@ -157,7 +161,9 @@ impl NativeSessions {
             let Phase::Ready(Ready::Result(lease)) = &state.phase else {
                 bail!("only committed results can be retained");
             };
-            Arc::clone(lease)
+            let lease = Arc::clone(lease);
+            drop(state);
+            lease
         };
         ensure!(
             lease.manifest().id()? == expected,
@@ -169,12 +175,14 @@ impl NativeSessions {
             .get_mut(&group)
             .context("unknown or expired native retention group")?;
         group.touch(owner, self.deadline())?;
-        group.insert(
+        let result = group.insert(
             lease,
             expected,
             blobs,
             u64::try_from(self.limits.max_manifest_cache_bytes)?,
-        )
+        );
+        drop(groups);
+        result
     }
 
     /// Renew a build-wide lease, independent of the number of retained results.
@@ -209,6 +217,7 @@ impl NativeSessions {
         for &blob in blobs {
             group.source(blob)?;
         }
+        drop(groups);
         Ok(())
     }
 
@@ -228,7 +237,9 @@ impl NativeSessions {
                 .get_mut(&group)
                 .context("unknown or expired native retention group")?;
             group.touch(owner, self.deadline())?;
-            group.source(blob)?
+            let lease = group.source(blob)?;
+            drop(groups);
+            lease
         };
         encode_delivery(
             (lease.open_file(blob.id)?, lease.physical_encoding(blob.id)?),

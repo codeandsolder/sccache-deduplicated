@@ -17,7 +17,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 

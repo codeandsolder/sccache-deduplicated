@@ -61,11 +61,11 @@ fn share(part: u64, total: u64) -> String {
 fn age_label(bound: u64) -> String {
     match bound {
         3600 => "1 hour".into(),
-        86400 => "1 day".into(),
-        604800 => "7 days".into(),
-        2592000 => "30 days".into(),
-        7776000 => "90 days".into(),
-        31536000 => "365 days".into(),
+        86_400 => "1 day".into(),
+        604_800 => "7 days".into(),
+        2_592_000 => "30 days".into(),
+        7_776_000 => "90 days".into(),
+        31_536_000 => "365 days".into(),
         u64::MAX => ">365 days".into(),
         _ => format!("{bound} s"),
     }

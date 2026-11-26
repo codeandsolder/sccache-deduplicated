@@ -593,13 +593,22 @@ fn cluster_status(client_config: &Path) -> Result<i32> {
         Role::Scheduler,
         sccache::dist::cluster::Route::unbound(peer.scheduler_address()),
     )?;
-    let status: dist::SchedulerStatusResult = http
-        .get(dist::http::urls::scheduler_status(&base)?)
-        .header("Accept", "application/json")
-        .timeout(Duration::from_secs(5))
-        .send()?
-        .error_for_status()?
-        .json()?;
+    let status: dist::SchedulerStatusResult =
+        sccache::http_client::io_runtime()?.block_on(async {
+            let response = http
+                .get(dist::http::urls::scheduler_status(&base)?.as_str())
+                .header("Accept", "application/json")
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await?
+                .error_for_status()?;
+            let body = sccache::http_client::read_bounded_bytes_async(
+                response,
+                dist::http::CONTROL_RESPONSE_LIMIT,
+            )
+            .await?;
+            serde_json::from_slice(&body).context("decode scheduler status")
+        })?;
     println!("{}", serde_json::to_string(&status)?);
     Ok(0)
 }
