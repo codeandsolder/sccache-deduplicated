@@ -17,10 +17,10 @@ if [[ "$role" == asus ]]; then
 fi
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 case "$role" in
-  acer) user=jan; source=/etc/sccache/client.conf; worker_gib=32; worker_target=24; minimum=16; target=24 ;;
+  acer) user=jan; source=/etc/sccache/client.conf; worker_gib=12; worker_target=10; minimum=16; target=24 ;;
   asus) user=jan; source=/etc/sccache/client.conf; worker_gib=48; worker_target=36; minimum=32; target=48 ;;
   cold-storage) user=sentinelx; source=/etc/sccache/client.conf; worker_gib=0 ;;
-  wsl) user=jan; source=/etc/sccache/config; worker_gib=48; worker_target=36; minimum=32; target=48 ;;
+  wsl) user=jan; source=/etc/sccache/config; worker_gib=12; worker_target=10; minimum=32; target=48 ;;
   *) exit 2 ;;
 esac
 [[ "$(systemctl show sccache-local.service -p User --value)" == "$user" ]]
@@ -43,7 +43,7 @@ assert_absent() {
 }
 record_source "$source"
 assert_absent '^\s*\[(shared_daemon|dist\.native|dist\.cluster|compiler_aliases)(\.|\])' "$source"
-cp -- "$source" "$stage/client-shared.toml"
+"$repo/fleet/native-only-config" client "$source" > "$stage/client-shared.toml"
 [[ $(rg -c '^\s*scheduler_url\s*=' "$stage/client-shared.toml") == 1 ]]
 sed -i -E "s|^\s*scheduler_url\s*=.*$|scheduler_url = \"$scheduler_url\"|" "$stage/client-shared.toml"
 cat >> "$stage/client-shared.toml" <<EOF
@@ -198,7 +198,7 @@ if (( worker_gib > 0 )); then
   worker=/etc/sccache-dist/server.conf
   record_source "$worker"
   assert_absent '^\s*\[(native_worker|cluster)(\.|\])' "$worker"
-  cp -- "$worker" "$stage/server.conf"
+  "$repo/fleet/native-only-config" worker "$worker" "$((worker_gib*gib))" "$((worker_target*gib))" > "$stage/server.conf"
   [[ $(rg -c '^\s*scheduler_url\s*=' "$stage/server.conf") == 1 ]]
   sed -i -E "s|^\s*scheduler_url\s*=.*$|scheduler_url = \"$scheduler_url\"|; /^\s*bind_address\s*=/d" "$stage/server.conf"
   cat >> "$stage/server.conf" <<EOF

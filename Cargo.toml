@@ -62,11 +62,11 @@ http = "1.0"
 itertools = "0.15"
 jobserver = "0.1"
 jwt = { package = "jsonwebtoken", version = "12", optional = true, default-features = false }
-jsonwebtoken-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d", optional = true }
+jsonwebtoken-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a4b12ba7391e03470626504fad60d887be790cfb", optional = true }
 libc = "0.2.153"
 lru = "0.19"
 log = "0.4"
-lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "e58a7abdb5a0f47a969771fc0b6837c5103863ee", optional = true }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "75f22d14467e185a8d85af9486d9bd28ebd5648d", optional = true }
 memchr = "2"
 mime = "0.3"
 object = { version = "0.41", default-features = false, features = ["read", "std"] }
@@ -278,9 +278,9 @@ exclude = ["tests/test-crate"]
 members = ["crates/build-runtime", "crates/cluster-identity", "crates/peer-identity", "crates/scheduler-dashboard", "tests/integration/randomize_readdir"]
 
 [workspace.dependencies]
-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d" }
-tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d" }
-wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "e660e87ec3661fc10d96f99b44022764bfdcf307", default-features = false, features = ["tokio-rt", "native-roots", "webpki-roots", "stream", "json", "form", "query", "system-proxy", "http2"] }
+btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a4b12ba7391e03470626504fad60d887be790cfb" }
+tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a4b12ba7391e03470626504fad60d887be790cfb" }
+wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "a8385c80ba6a5b035067d3a2e472d37df591faf0", default-features = false, features = ["tokio-rt", "native-roots", "webpki-roots", "stream", "json", "form", "query", "system-proxy", "http2"] }
 
 [[bench]]
 harness = false

@@ -257,7 +257,7 @@ impl NativeCompilerClient {
         endpoint.intermediates.get(uid, token)
     }
 
-    pub async fn status(&self) -> DistInfo {
+    pub async fn status(self: &Arc<Self>) -> DistInfo {
         match &self.endpoint {
             Endpoint::Namespace { connection, .. } => {
                 let result = connection_task(Arc::clone(connection), |conn| {
@@ -272,20 +272,14 @@ impl NativeCompilerClient {
                 })
             }
             Endpoint::Direct(endpoint) => {
-                let DirectEndpoint {
-                    config, scheduler, ..
-                } = endpoint.as_ref();
+                let scheduler = &endpoint.scheduler;
+                let client = Arc::clone(self);
                 let result = async {
-                    let scheduler = scheduler.as_ref().context("scheduler URL unavailable")?;
-                    let url = dist::http::urls::scheduler_status(&scheduler.to_url())?;
-                    let client = crate::http_client::new_http_client_builder()
-                        .timeout(Duration::from_secs(config.request_timeout_secs))
-                        .build()?;
-                    dist::http::transport::send_async(
-                        client.get(url.as_str()),
-                        dist::http::transport::RequestClass::Control,
-                    )
-                    .await
+                    // Enrollment and credential refresh use the synchronous
+                    // cluster runtime bridge; do not block the async IPC task.
+                    let transport =
+                        tokio::task::spawn_blocking(move || client.connect_http()).await??;
+                    transport.scheduler_status().await
                 }
                 .await;
                 match result {
@@ -856,8 +850,10 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                 // an ordinary nonzero exit. Preserve caller semantics by
                 // rerunning locally without writing an archive cache.
                 warn!(
-                    "native compilation failed on {:?}; retrying locally",
-                    result.source
+                    "native compilation failed on {:?} with {}; retrying locally: {}",
+                    result.source,
+                    result.output.status,
+                    String::from_utf8_lossy(&result.output.stderr)
                 );
                 fallback = DistType::Error;
             }

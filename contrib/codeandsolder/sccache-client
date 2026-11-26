@@ -38,10 +38,12 @@ sccache_wrapper_main() {
 
     if [[ "$mode" == compiler ]]; then
         # A strict compiler wrapper invoked by sccache itself is already
-        # inside a managed compilation. Resubmission would deadlock.
+        # inside a managed compilation. Rustc's native linker driver is
+        # likewise a nested operation, not an independent cacheable compile.
+        # The canonical compilation namespace cannot reach the host daemon.
         parent_exe="$(readlink "/proc/$PPID/exe" 2>/dev/null || true)"
         parent_exe="${parent_exe% (deleted)}"
-        if [[ "$parent_exe" == */sccache ]]; then
+        if [[ "$parent_exe" == */sccache || "$parent_exe" == */rustc ]]; then
             exec "$@"
         fi
     fi
