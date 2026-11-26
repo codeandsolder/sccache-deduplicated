@@ -36,10 +36,11 @@ use crate::{
     errors::{Context, Result},
 };
 
+use super::super::transport::BoundedReadError;
+
 enum RequestBody {
     Network(Body),
-    #[cfg(test)]
-    InMemory(Vec<u8>),
+    Buffered(std::result::Result<Vec<u8>, BoundedReadError>),
 }
 
 /// The authenticated request, with either asynchronous metadata extraction
@@ -103,8 +104,7 @@ impl Request {
                     Some(self.path),
                 )))
             }
-            #[cfg(test)]
-            RequestBody::InMemory(body) => Some(Box::new(io::Cursor::new(body))),
+            RequestBody::Buffered(_) => None,
         }
     }
 
@@ -113,8 +113,8 @@ impl Request {
     ) -> Option<impl futures::Stream<Item = io::Result<Bytes>> + Send + use<>> {
         let body = match self.body.get_mut().take()? {
             RequestBody::Network(body) => body,
-            #[cfg(test)]
-            RequestBody::InMemory(bytes) => Body::from(bytes),
+            RequestBody::Buffered(Ok(bytes)) => Body::from(bytes),
+            RequestBody::Buffered(Err(_)) => return None,
         };
         let mut activity = interface::activity(
             Some(self.path.local),
@@ -133,7 +133,6 @@ impl Request {
         &mut self,
         limit: usize,
     ) -> std::result::Result<Vec<u8>, super::super::transport::BoundedReadError> {
-        use super::super::transport::BoundedReadError;
         let mut bytes = Vec::new();
         let mut stream = std::pin::pin!(
             self.body_stream()
@@ -148,6 +147,30 @@ impl Request {
         }
         Ok(bytes)
     }
+    // Buffer only explicitly bounded metadata before dispatching its
+    // synchronous parser/database work. Preserve the body error so the
+    // route's existing authorization and error mapping remain authoritative.
+    async fn buffer_body(&mut self, limit: usize) {
+        let body = self.read_bounded(limit).await;
+        *self.body.get_mut() = Some(RequestBody::Buffered(body));
+    }
+
+    pub(super) fn read_buffered(
+        &self,
+        limit: usize,
+    ) -> std::result::Result<Vec<u8>, BoundedReadError> {
+        match self.body.borrow_mut().take() {
+            Some(RequestBody::Buffered(body)) => {
+                let body = body?;
+                if body.len() > limit {
+                    return Err(BoundedReadError::TooLarge);
+                }
+                Ok(body)
+            }
+            _ => Err(BoundedReadError::AlreadyExtracted),
+        }
+    }
+
     pub(super) const fn id(&self) -> PeerId {
         self.id
     }
@@ -179,7 +202,7 @@ impl Request {
             role: Role::Client,
             remote_addr: address,
             path: sccache_cluster_identity::NetworkPath::new(address.ip(), address.ip()),
-            body: RefCell::new(Some(RequestBody::InMemory(body))),
+            body: RefCell::new(Some(RequestBody::Buffered(Ok(body)))),
             admission: AdmissionPools::new(1)
                 .acquire(AdmissionClass::Bulk)
                 .expect("test admission"),
@@ -286,6 +309,7 @@ impl AdmissionPools {
 pub(super) fn route<S, F>(
     method: MethodFilter,
     class: AdmissionClass,
+    body_limit: impl Fn(&S) -> Option<usize> + Copy + Send + Sync + 'static,
     handler: F,
 ) -> MethodRouter<Arc<S>>
 where
@@ -301,7 +325,8 @@ where
               request: axum::extract::Request| {
             let handler = Arc::clone(&handler);
             async move {
-                admit(pools, class, peer, request, move |request| {
+                let limit = body_limit(&state);
+                admit(pools, class, peer, request, limit, move |request| {
                     handler(&state, &request)
                 })
                 .await
@@ -361,6 +386,7 @@ where
 pub(super) fn path_route<S, P, F>(
     method: MethodFilter,
     classify: impl Fn(&P) -> AdmissionClass + Copy + Send + Sync + 'static,
+    body_limit: impl Fn(&S, &P) -> Option<usize> + Copy + Send + Sync + 'static,
     handler: F,
 ) -> MethodRouter<Arc<S>>
 where
@@ -381,7 +407,8 @@ where
                 match path {
                     Ok(Path(path)) => {
                         let class = classify(&path);
-                        admit(pools, class, peer, request, move |request| {
+                        let limit = body_limit(&state, &path);
+                        admit(pools, class, peer, request, limit, move |request| {
                             handler(&state, &request, path)
                         })
                         .await
@@ -471,12 +498,16 @@ async fn admit(
     class: AdmissionClass,
     peer: AuthenticatedPeer,
     request: axum::extract::Request,
+    body_limit: Option<usize>,
     operation: impl FnOnce(Request) -> Response + Send + 'static,
 ) -> Response {
     let Some(permit) = pools.acquire(class) else {
         return busy_response();
     };
-    let request = Request::new(peer, request, Arc::clone(&permit));
+    let mut request = Request::new(peer, request, Arc::clone(&permit));
+    if let Some(limit) = body_limit {
+        request.buffer_body(limit).await;
+    }
     let response = blocking_reply(Arc::clone(&permit), move || operation(request)).await;
     track_response(peer, permit, response)
 }
@@ -818,6 +849,42 @@ mod streaming_tests {
         }
         assert!(body.next().await.is_none());
         assert!(start.elapsed() > BODY_IDLE_TIMEOUT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn buffered_metadata_preserves_body_budget_and_extraction_error() -> Result<()> {
+        let mut request = Request::fake_http_from(
+            "127.0.0.1:0".parse()?,
+            "POST",
+            "/metadata",
+            Vec::new(),
+            Vec::new(),
+        );
+        *request.body.get_mut() = Some(RequestBody::Network(Body::from_stream(stream::iter([
+            Ok::<_, io::Error>(Bytes::from_static(b"meta")),
+            Ok(Bytes::from_static(b"data")),
+        ]))));
+        request.buffer_body(8).await;
+        assert_eq!(request.read_buffered(8).unwrap(), b"metadata");
+        assert!(matches!(
+            request.read_buffered(8),
+            Err(BoundedReadError::AlreadyExtracted)
+        ));
+        *request.body.get_mut() = Some(RequestBody::Network(Body::from("oversized")));
+        request.buffer_body(8).await;
+        assert!(matches!(
+            request.read_buffered(8),
+            Err(BoundedReadError::TooLarge)
+        ));
+        *request.body.get_mut() = Some(RequestBody::Network(Body::from_stream(stream::once(
+            async { Err::<Bytes, _>(io::Error::other("interrupted body")) },
+        ))));
+        request.buffer_body(8).await;
+        assert!(matches!(
+            request.read_buffered(8),
+            Err(BoundedReadError::Io(_))
+        ));
         Ok(())
     }
 

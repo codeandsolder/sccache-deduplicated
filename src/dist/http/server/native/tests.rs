@@ -254,6 +254,7 @@ fn with_native_service(
                         1024 * 1024,
                     )
                 },
+                1024 * 1024,
             )
         },
     )?;
@@ -368,6 +369,7 @@ fn verify_peer_delivery(
                     super::super::cluster_http::route(
                         MethodFilter::POST,
                         AdmissionClass::Bulk,
+                        |_| Some(40),
                         move |_: &(), request| {
                             serve_peer_blob(request, &*authorizer, |requested| {
                                 if requested != blob {

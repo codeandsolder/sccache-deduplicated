@@ -290,6 +290,7 @@ where
                     metadata_limit,
                 )
             },
+            metadata_limit,
         ),
     )?;
     info!("Native cache listening on {bound}");
@@ -336,7 +337,12 @@ fn native_admission_class((_, operation): &(String, String)) -> AdmissionClass {
     }
 }
 
-fn native_router<F, A, Fut, U, UFut>(handler: F, schedule: A, upload: U) -> Router
+fn native_router<F, A, Fut, U, UFut>(
+    handler: F,
+    schedule: A,
+    upload: U,
+    metadata_limit: usize,
+) -> Router
 where
     F: Fn(&Request, &str, &str) -> Response + Send + Sync + 'static,
     A: Fn(Request) -> Fut + Send + Sync + 'static,
@@ -386,6 +392,10 @@ where
                 path_route(
                     MethodFilter::POST,
                     native_admission_class,
+                    move |_, (_, operation): &(String, String)| match operation.as_str() {
+                        "package_import" | "rust_package_import" => None,
+                        _ => Some(metadata_limit),
+                    },
                     |handler: &F, request, (role, operation): (String, String)| {
                         handler(request, &role, &operation)
                     },
@@ -1088,21 +1098,12 @@ fn dispatch(
 }
 
 pub(super) fn metadata<T: DeserializeOwned>(request: &Request, limit: usize) -> Result<T> {
-    let limit = u64::try_from(limit)?;
-    let max_read = limit
-        .checked_add(1)
-        .context("native metadata limit overflow")?;
-    let mut data = Vec::new();
-    request
-        .data()
-        .context("missing native metadata body")?
-        .take(max_read)
-        .read_to_end(&mut data)?;
-    ensure!(
-        u64::try_from(data.len())? <= limit,
-        "native metadata exceeds configured limit"
-    );
-    Ok(codec().with_limit(limit).deserialize(&data)?)
+    let data = request
+        .read_buffered(limit)
+        .map_err(|error| anyhow::anyhow!("native metadata body: {error:?}"))?;
+    Ok(codec()
+        .with_limit(u64::try_from(limit)?)
+        .deserialize(&data)?)
 }
 
 fn encode<T: Serialize>(value: &T, limit: usize) -> Result<Response> {
