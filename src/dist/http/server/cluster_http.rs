@@ -49,22 +49,7 @@ pub(super) struct Request {
 impl Request {
     fn new(peer: AuthenticatedPeer, request: axum::extract::Request) -> Self {
         let (parts, body) = request.into_parts();
-        let stream = stream::unfold(Some(body.into_data_stream()), |state| async move {
-            let mut data = state?;
-            match tokio::time::timeout(BODY_IDLE_TIMEOUT, data.next()).await {
-                Ok(Some(Ok(bytes))) => Some((Ok(bytes), Some(data))),
-                Ok(Some(Err(error))) => Some((Err(io::Error::other(error)), None)),
-                Ok(None) => None,
-                Err(_) => Some((
-                    Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "distributed request body idle",
-                    )),
-                    None,
-                )),
-            }
-        });
-        let reader = SyncIoBridge::new(StreamReader::new(Box::pin(stream)));
+        let reader = SyncIoBridge::new(StreamReader::new(Box::pin(idle_bounded_body(body))));
         let length = parts
             .headers
             .get(http::header::CONTENT_LENGTH)
@@ -136,6 +121,24 @@ impl Request {
 }
 
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn idle_bounded_body(body: Body) -> impl futures::Stream<Item = io::Result<Bytes>> + Send {
+    stream::unfold(Some(body.into_data_stream()), |state| async move {
+        let mut data = state?;
+        match tokio::time::timeout(BODY_IDLE_TIMEOUT, data.next()).await {
+            Ok(Some(Ok(bytes))) => Some((Ok(bytes), Some(data))),
+            Ok(Some(Err(error))) => Some((Err(io::Error::other(error)), None)),
+            Ok(None) => None,
+            Err(_) => Some((
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "distributed request body idle",
+                )),
+                None,
+            )),
+        }
+    })
+}
 
 // Blocking filesystem/compilation operations retain admission even if the HTTP
 // caller cancels. TLS and HTTP parsing stay on the asynchronous runtime.
@@ -584,6 +587,44 @@ mod revocation_tests {
 mod streaming_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test(start_paused = true)]
+    async fn unfinished_request_body_releases_reader_at_idle_deadline() -> Result<()> {
+        let prefix = Bytes::from_static(b"partial archive");
+        let source = stream::iter([Ok::<_, io::Error>(prefix.clone())]).chain(stream::pending());
+        let mut body = std::pin::pin!(idle_bounded_body(Body::from_stream(source)));
+        assert_eq!(body.next().await.transpose()?, Some(prefix));
+        let start = tokio::time::Instant::now();
+        let Some(Err(error)) =
+            tokio::time::timeout(BODY_IDLE_TIMEOUT + Duration::from_secs(1), body.next()).await?
+        else {
+            anyhow::bail!("unfinished request must time out");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() >= BODY_IDLE_TIMEOUT);
+        assert!(body.next().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progressing_body_may_exceed_one_idle_interval() -> Result<()> {
+        let chunks = [b"one".as_slice(), b"two", b"three"];
+        let source = stream::iter(chunks).then(|chunk| async move {
+            tokio::time::sleep(BODY_IDLE_TIMEOUT / 2).await;
+            Ok::<_, io::Error>(Bytes::from_static(chunk))
+        });
+        let mut body = std::pin::pin!(idle_bounded_body(Body::from_stream(source)));
+        let start = tokio::time::Instant::now();
+        for chunk in chunks {
+            assert_eq!(
+                body.next().await.transpose()?,
+                Some(Bytes::from_static(chunk))
+            );
+        }
+        assert!(body.next().await.is_none());
+        assert!(start.elapsed() > BODY_IDLE_TIMEOUT);
+        Ok(())
+    }
 
     struct InfiniteReader {
         bytes: Arc<AtomicUsize>,
