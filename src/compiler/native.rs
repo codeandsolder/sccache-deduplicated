@@ -495,7 +495,7 @@ impl ResultIdentityPolicy {
             for entry in manifest.entries.values_mut() {
                 match entry {
                     TreeEntry::Directory(metadata) | TreeEntry::File { metadata, .. } => {
-                        metadata.modified = stamp
+                        metadata.modified = stamp;
                     }
                     TreeEntry::Symlink { modified, .. } => *modified = stamp,
                     TreeEntry::Hardlink(_) => {}
