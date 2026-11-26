@@ -774,7 +774,7 @@ async fn upload_response(
             }
         })
         .await?;
-        tokio::task::spawn_blocking(move || sessions.finish_upload(upload)).await??;
+        sessions.finish_upload_async(upload).await?;
         encode(&(), limit)
     }
     .await;
