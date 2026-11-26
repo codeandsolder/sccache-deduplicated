@@ -66,8 +66,10 @@ output="$(SCCACHE_SERVER_UDS='\x00explicit' route compiler 0 gcc -c a.c)"
 rg -Fxq 'uds=\x00explicit port= canonical= start=0 no_auto=1' <<<"$output"
 # Rustc's nested linker must not contact the daemon even in an isolated
 # namespace. An unrelated compiler caller must still route normally.
+# shellcheck disable=SC2329 # Invoked indirectly by the sourced router.
 output="$(readlink() { printf '/rust/bin/rustc\n'; }; route compiler 1000 /usr/bin/printf '%s' 'nested-link')"
 [[ "$output" == nested-link ]]
+# shellcheck disable=SC2329 # Invoked indirectly by the sourced router.
 output="$(readlink() { printf '/usr/bin/bash\n'; }; route compiler 1000 gcc -c a.c)"
 rg -Fxq 'arg=<gcc>' <<<"$output"
 printf 'user_endpoint=unix:%s/unavailable.sock\n' "$root" >"$root/wrapper.conf"

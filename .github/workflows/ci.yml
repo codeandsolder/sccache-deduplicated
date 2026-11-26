@@ -116,6 +116,7 @@ jobs:
           contrib/codeandsolder/test-sccache-router
           sudo contrib/codeandsolder/test-host-native-metadata
           shellcheck -x contrib/codeandsolder/fleet/* contrib/codeandsolder/test-native-cache-reuse
+          contrib/codeandsolder/fleet/test-native-only-config
           contrib/codeandsolder/test-native-cache-reuse --self-test
           sudo contrib/codeandsolder/fleet/test-activate-host
 
