@@ -83,6 +83,7 @@ fn request() -> Result<ActionRequest> {
     let root = empty_root();
     let id = root.id()?;
     Ok(ActionRequest {
+        result_fingerprint: None,
         fingerprint: ActionFingerprint {
             schema: "test-native-v1".into(),
             components: BTreeMap::from([("source".into(), ContentId::of(b"input"))]),
@@ -112,6 +113,68 @@ fn manifest(bytes: &[u8]) -> ResultManifest {
         stdout: None,
         stderr: None,
     }
+}
+
+#[test]
+fn semantic_reuse_does_not_weaken_execution_verification() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let mut first = request()?;
+    first.result_fingerprint = Some(ActionFingerprint {
+        schema: "compiler-test".into(),
+        components: BTreeMap::from([("source".into(), ContentId::of(b"input"))]),
+    });
+    let mut second = first.clone();
+    second
+        .fingerprint
+        .components
+        .insert("environment/noise".into(), ContentId::of(b"job two"));
+    assert_ne!(first, second);
+    assert_eq!(
+        first.action_fingerprint()?.key()?,
+        second.action_fingerprint()?.key()?
+    );
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
+    let NativeAdmission::Compile { ticket } =
+        service.admit(first.clone(), worker, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("expected compilation")
+    };
+    service.verify_execution(ticket, worker, &first)?;
+    assert!(service.verify_execution(ticket, worker, &second).is_err());
+    assert_eq!(
+        service.admit(
+            second.clone(),
+            Publisher::Client,
+            ActionMode::Reuse,
+            BTreeMap::new()
+        )?,
+        NativeAdmission::InFlight
+    );
+    let output = manifest(b"object");
+    let blob = output.outputs["obj"].test_file_blob();
+    service.begin(ticket, worker, output.clone())?;
+    upload_encoded(&service, ticket, worker, blob, b"object")?;
+    assert_eq!(service.commit(ticket, worker)?, output);
+    let NativeAdmission::Hit {
+        ticket: hit,
+        manifest,
+    } = service.admit(
+        second,
+        Publisher::Client,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
+    else {
+        bail!("expected semantic hit")
+    };
+    assert_eq!(manifest, output);
+    service.close(hit, Publisher::Client)?;
+    service.close(ticket, Publisher::Client)?;
+    Ok(())
 }
 
 #[test]
