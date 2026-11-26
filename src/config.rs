@@ -2250,6 +2250,8 @@ pub mod scheduler {
         pub maintenance_drain_file: Option<PathBuf>,
         pub job_slack: JobSlackConfig,
         pub native_cache: Option<NativeCacheConfig>,
+        /// Native worker sharing this scheduler's store and process.
+        pub local_worker: Option<Box<super::server::Config>>,
     }
 
     /// Load and validate scheduler configuration.
@@ -2261,6 +2263,33 @@ pub mod scheduler {
             .context("Failed to load scheduler config file")?;
         if let Some(config) = &config {
             config.job_slack.validate()?;
+            if let Some(worker) = &config.local_worker {
+                let native = config
+                    .native_cache
+                    .as_ref()
+                    .context("local_worker requires native_cache")?;
+                worker.validate_native_store(true)?;
+                if !cfg!(target_os = "linux")
+                    || worker.builder != super::server::BuilderType::Native
+                    || worker.cluster.directory == config.cluster_directory
+                    || worker.public_addr == config.public_addr
+                    || worker.public_addr == native.public_addr
+                    || sccache_cluster_identity::endpoint(&worker.scheduler_url.to_url())?
+                        != config.public_addr
+                    || sccache_cluster_identity::endpoint(
+                        &worker
+                            .native_worker
+                            .as_ref()
+                            .context("local_worker requires native_worker")?
+                            .cache_url
+                            .to_url(),
+                    )? != native.public_addr
+                {
+                    bail!(
+                        "local_worker must be a native Linux worker with a separate identity and listener targeting this scheduler and cache"
+                    );
+                }
+            }
             if let Some(dashboard) = &config.dashboard {
                 if !cfg!(feature = "scheduler-dashboard") {
                     bail!("dashboard requires the scheduler-dashboard build feature");
@@ -2329,7 +2358,7 @@ pub mod server {
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
 
-    use crate::errors::{Context, Result};
+    use crate::errors::{Context, Result, bail};
 
     const TEN_GIGS: u64 = 10 * 1024 * 1024 * 1024;
     const fn default_toolchain_cache_size() -> u64 {
@@ -2413,8 +2442,8 @@ pub mod server {
     #[serde(deny_unknown_fields)]
     pub struct NativeWorkerConfig {
         pub cache_url: HTTPUrl,
-        pub directory: PathBuf,
-        pub space: crate::build_runtime::SpacePolicy,
+        pub directory: Option<PathBuf>,
+        pub space: Option<crate::build_runtime::SpacePolicy>,
         pub scratch: PathBuf,
         pub bubblewrap: PathBuf,
         pub platform_contract: String,
@@ -2450,12 +2479,36 @@ pub mod server {
         pub native_worker: Option<NativeWorkerConfig>,
     }
 
+    impl Config {
+        pub(super) fn validate_native_store(&self, shared: bool) -> Result<()> {
+            if let Some(native) = &self.native_worker {
+                match (&native.directory, native.space, shared) {
+                    (None, None, true) => (),
+                    (Some(directory), Some(space), false) if directory.is_absolute() => {
+                        space.validate()?;
+                    }
+                    _ => bail!(
+                        "standalone native workers require directory and space; local workers inherit both from the scheduler"
+                    ),
+                }
+            } else if shared {
+                bail!("local_worker requires native_worker");
+            }
+            Ok(())
+        }
+    }
+
     /// Load worker configuration.
     ///
     /// # Errors
     /// Returns an error for unreadable or malformed configuration.
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
-        super::try_read_config_file(conf_path).context("Failed to load server config file")
+        let config: Option<Config> =
+            super::try_read_config_file(conf_path).context("Failed to load server config file")?;
+        if let Some(config) = &config {
+            config.validate_native_store(false)?;
+        }
+        Ok(config)
     }
 }
 
