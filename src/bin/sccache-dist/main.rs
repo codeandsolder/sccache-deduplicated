@@ -717,24 +717,26 @@ fn start_scheduler(config: scheduler_config::Config) -> Result<i32> {
         dashboard,
     );
     // A running server never exits successfully (Result<Infallible>).
-    let local_worker: Option<dist::http::LocalWorkerStart> = local_worker.map(|config| {
-        Box::new(move |store| {
-            std::thread::Builder::new()
-                .name("colocated-native-worker".into())
-                .spawn(move || match start_worker(*config, Some(store)) {
-                    Ok(code) => {
-                        error!("colocated worker unexpectedly returned {code}");
-                        std::process::exit(1);
-                    }
-                    Err(error) => {
-                        error!("colocated worker failed: {error:#}");
-                        std::process::exit(1);
-                    }
-                })?;
-            Ok(())
-        }) as dist::http::LocalWorkerStart
-    });
+    let local_worker = local_worker.map(colocated_worker_start);
     match http_scheduler.start(local_worker)? {}
+}
+
+fn colocated_worker_start(config: Box<server_config::Config>) -> dist::http::LocalWorkerStart {
+    Box::new(move |store| {
+        std::thread::Builder::new()
+            .name("colocated-native-worker".into())
+            .spawn(move || match start_worker(*config, Some(store)) {
+                Ok(code) => {
+                    error!("colocated worker unexpectedly returned {code}");
+                    std::process::exit(1);
+                }
+                Err(error) => {
+                    error!("colocated worker failed: {error:#}");
+                    std::process::exit(1);
+                }
+            })?;
+        Ok(())
+    })
 }
 
 fn worker_bootstrap_token(
