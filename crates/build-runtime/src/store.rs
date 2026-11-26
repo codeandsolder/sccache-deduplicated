@@ -619,7 +619,13 @@ impl Inner {
 
     fn blob_encoding(&self, id: ContentId) -> Result<BlobEncoding> {
         let read = self.db.begin_read()?;
-        let layouts = read.open_table(BLOB_LAYOUTS)?;
+        Self::indexed_encoding(&read.open_table(BLOB_LAYOUTS)?, id)
+    }
+
+    fn indexed_encoding(
+        layouts: &impl ReadableTable<&'static [u8; 32], u8>,
+        id: ContentId,
+    ) -> Result<BlobEncoding> {
         let value = layouts
             .get(&id.0)?
             .with_context(|| format!("missing indexed physical encoding for {id:?}"))?
@@ -627,26 +633,48 @@ impl Inner {
         BlobEncoding::try_from(value)
     }
 
-    fn blob_present(&self, id: ContentId, size: u64) -> Result<bool> {
-        let path = self.blob_path(id);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() => {
-                Ok(BlobReader::open(File::open(path)?, self.blob_encoding(id)?)?.len() == size)
-            }
-            Ok(_) => Ok(false),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error.into()),
+    // Validate the same opened inode that will be returned to the caller.
+    // NOFOLLOW excludes symlinks, and NONBLOCK prevents an unexpected FIFO
+    // from pinning a cache thread. The index snapshot describes its encoding.
+    fn open_checked_blob(
+        &self,
+        layouts: &impl ReadableTable<&'static [u8; 32], u8>,
+        id: ContentId,
+        size: u64,
+    ) -> Result<Option<(File, BlobEncoding)>> {
+        use rustix::fs::{Mode, OFlags};
+        let file = match rustix::fs::open(
+            self.blob_path(id),
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => File::from(fd),
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Ok(None);
         }
+        let encoding = Self::indexed_encoding(layouts, id)?;
+        let reader = BlobReader::open_with_length(file, encoding, metadata.len())?;
+        Ok((reader.len() == size).then(|| (reader.into_file(), encoding)))
+    }
+
+    fn blob_present(
+        &self,
+        layouts: &impl ReadableTable<&'static [u8; 32], u8>,
+        id: ContentId,
+        size: u64,
+    ) -> Result<bool> {
+        Ok(self.open_checked_blob(layouts, id, size)?.is_some())
     }
 
     fn check_blob(&self, id: ContentId, size: u64) -> Result<()> {
-        let path = self.blob_path(id);
-        let metadata = fs::symlink_metadata(&path)
-            .with_context(|| format!("missing native store content {id:?}"))?;
-        ensure!(metadata.is_file(), "invalid native store content {id:?}");
+        let read = self.db.begin_read()?;
         ensure!(
-            BlobReader::open(File::open(&path)?, self.blob_encoding(id)?)?.len() == size,
-            "invalid native store content {id:?}"
+            self.blob_present(&read.open_table(BLOB_LAYOUTS)?, id, size)?,
+            "missing or invalid native store content {id:?}"
         );
         Ok(())
     }
@@ -1303,35 +1331,76 @@ impl NativeStore {
     /// # Errors
     /// Returns an error for inconsistent lengths or storage failure.
     pub fn reserve_blobs(&self, blobs: BTreeMap<ContentId, u64>) -> Result<UploadReservation> {
-        let _mutation = self.inner.lock_mutations()?;
+        // Live references can be pinned under the same lock used by GC's
+        // candidate selection. Only pending-only references require exclusion
+        // of a collector that may already have selected their files.
+        let mut reservation = match self.reserve_indexed_blobs(&blobs, false)? {
+            Some(reservation) => reservation,
+            None => {
+                let _mutation = self.inner.lock_mutations()?;
+                self.reserve_indexed_blobs(&blobs, true)?
+                    .context("pending reservation unexpectedly declined")?
+            }
+        };
+        let read = self.inner.db.begin_read()?;
+        let layouts = read.open_table(BLOB_LAYOUTS)?;
+        let mut unavailable = Vec::new();
+        for &id in &reservation.reserved {
+            let size = blobs[&id];
+            if !self.inner.blob_present(&layouts, id, size)? {
+                unavailable.push(id);
+                reservation.missing.push(BlobRef { id, size });
+            }
+        }
+        if !unavailable.is_empty() {
+            let mut pins = self.inner.lock_pins()?;
+            for id in &unavailable {
+                release_pin(&mut pins.blobs, id);
+            }
+            reservation
+                .reserved
+                .retain(|id| unavailable.binary_search(id).is_err());
+            reservation.missing.sort_unstable_by_key(|blob| blob.id);
+        }
+        Ok(reservation)
+    }
+
+    fn reserve_indexed_blobs(
+        &self,
+        blobs: &BTreeMap<ContentId, u64>,
+        allow_pending: bool,
+    ) -> Result<Option<UploadReservation>> {
+        let mut pins = self.inner.lock_pins()?;
         let read = self.inner.db.begin_read()?;
         let live = read.open_table(BLOBS)?;
         let pending = read.open_table(PENDING_DELETIONS)?;
         let mut missing = Vec::new();
         let mut reserved = Vec::new();
-        for (id, size) in blobs {
-            let live_size = live.get(&id.0)?.map(|entry| entry.value());
-            let pending_size = pending.get(&id.0)?.map(|entry| entry.value());
-            if let Some(indexed_size) = live_size.or(pending_size) {
-                ensure!(indexed_size == size, "inconsistent indexed content length");
-                if self.inner.blob_present(id, size)? {
-                    reserved.push(id);
-                } else {
-                    missing.push(BlobRef { id, size });
+        for (&id, &size) in blobs {
+            let indexed = if let Some(entry) = live.get(&id.0)? {
+                Some(entry.value())
+            } else if let Some(entry) = pending.get(&id.0)? {
+                if !allow_pending {
+                    return Ok(None);
                 }
+                Some(entry.value())
+            } else {
+                None
+            };
+            if let Some(indexed_size) = indexed {
+                ensure!(indexed_size == size, "inconsistent indexed content length");
+                reserved.push(id);
             } else {
                 missing.push(BlobRef { id, size });
             }
         }
-        let mut pins = self.inner.lock_pins()?;
-        // Validate every count before changing any pin.
         pins.reserve_content(reserved.iter())?;
         drop(pins);
-        Ok(UploadReservation {
+        Ok(Some(UploadReservation {
             inner: Arc::clone(&self.inner),
             reserved,
             missing,
-        })
+        }))
     }
 
     /// Wait for independently produced content, pinning each available subset.
@@ -1535,8 +1604,10 @@ impl NativeStore {
     }
 
     fn blobs_present(&self, blobs: &BTreeMap<ContentId, u64>) -> Result<bool> {
+        let read = self.inner.db.begin_read()?;
+        let layouts = read.open_table(BLOB_LAYOUTS)?;
         for (&id, &size) in blobs {
-            if !self.inner.blob_present(id, size)? {
+            if !self.inner.blob_present(&layouts, id, size)? {
                 return Ok(false);
             }
         }
@@ -1603,7 +1674,7 @@ impl NativeStore {
         for (&id, &size) in blobs {
             if let Some(existing_size) = blob_table.get(&id.0)?.map(|entry| entry.value()) {
                 ensure!(existing_size == size, "content length mismatch for {id:?}");
-                if !self.inner.blob_present(id, size)? {
+                if !self.inner.blob_present(&layouts, id, size)? {
                     let blob = staged.get(&id).context("missing staged repair content")?;
                     ensure!(blob.reference.size == size, "staged repair length mismatch");
                     repair.insert(id);
@@ -1615,7 +1686,7 @@ impl NativeStore {
                         old_size == size,
                         "pending content length mismatch for {id:?}"
                     );
-                    if self.inner.check_blob(id, size).is_ok() {
+                    if self.inner.blob_present(&layouts, id, size).unwrap_or(false) {
                         resurrected.push(id);
                         continue;
                     }
@@ -1717,11 +1788,6 @@ impl NativeStore {
             "invalid indexed result manifest"
         );
         let blobs = manifest.blobs()?;
-        for (&id, &size) in &blobs {
-            if !self.inner.blob_present(id, size)? {
-                return Ok(None);
-            }
-        }
         let count = pins
             .actions
             .get(&action)
@@ -1733,14 +1799,20 @@ impl NativeStore {
         // survives. Pin its content independently of the action mapping.
         pins.reserve_content(blobs.keys())?;
         pins.actions.insert(action, count);
-        pins.touch(space::Root::Action(action));
         drop(pins);
-        Ok(Some(ResultLease {
+        let lease = ResultLease {
             inner: Arc::clone(&self.inner),
             action,
             manifest,
             blobs,
-        }))
+        };
+        // Refresh can retire this result, but the provisional content pins
+        // above keep its closure alive throughout physical validation.
+        if !self.blobs_present(&lease.blobs)? {
+            return Ok(None);
+        }
+        self.inner.lock_pins()?.touch(space::Root::Action(action));
+        Ok(Some(lease))
     }
 
     /// Find all actions that yielded the same complete result, retaining their

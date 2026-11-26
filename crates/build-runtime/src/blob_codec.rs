@@ -158,6 +158,14 @@ impl BlobReader {
     /// Returns an error if the on-disk file or its chunk directory is malformed.
     pub fn open(file: File, encoding: BlobEncoding) -> Result<Self> {
         let stored_len = file.metadata()?.len();
+        Self::open_with_length(file, encoding, stored_len)
+    }
+
+    pub(crate) fn open_with_length(
+        file: File,
+        encoding: BlobEncoding,
+        stored_len: u64,
+    ) -> Result<Self> {
         if encoding == BlobEncoding::Raw {
             return Ok(Self {
                 file,
@@ -239,6 +247,11 @@ impl BlobReader {
             position: 0,
             current: None,
         })
+    }
+
+    #[cfg(all(unix, feature = "store"))]
+    pub(crate) fn into_file(self) -> File {
+        self.file
     }
 
     #[must_use = "the decoded length must be validated against the logical CAS reference"]

@@ -79,14 +79,8 @@ impl NativeStore {
             },
         };
         ensure!(size == blob.size, "inconsistent indexed blob length");
-        if !self.inner.blob_present(blob.id, blob.size)? {
-            return Ok(None);
-        }
-        match File::open(self.inner.blob_path(blob.id)) {
-            Ok(file) => Ok(Some((file, self.inner.blob_encoding(blob.id)?))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        let layouts = read.open_table(super::BLOB_LAYOUTS)?;
+        self.inner.open_checked_blob(&layouts, blob.id, blob.size)
     }
 
     /// A canonical single-blob retention root. Uses the ordinary CAS and eviction
@@ -494,27 +488,28 @@ impl NativeStore {
         let Some(record) = trees.get(&id.0)? else {
             return Ok(None);
         };
-        let manifest: TreeManifest = encoding().deserialize(record.value())?;
-        ensure!(manifest.id()? == id, "invalid indexed tree");
-        let blobs = manifest.blobs()?;
-        for (&content, &size) in &blobs {
-            if !self.inner.blob_present(content, size)? {
-                return Ok(None);
-            }
-        }
-        pins.touch(Root::Tree(id));
+        // A tree's identity is immutable. Pin the root before validating
+        // its manifest and files, without retaining the shared pin mutex.
         let count = pins.trees.entry(id).or_default();
         *count = count.checked_add(1).context("tree pin count overflow")?;
         drop(pins);
+        let pin = TreePin {
+            inner: Arc::clone(&self.inner),
+            id,
+        };
+        let manifest: TreeManifest = encoding().deserialize(record.value())?;
+        ensure!(manifest.id()? == id, "invalid indexed tree");
+        let blobs = manifest.blobs()?;
+        if !self.blobs_present(&blobs)? {
+            return Ok(None);
+        }
+        self.inner.lock_pins()?.touch(Root::Tree(id));
         Ok(Some(TreeLease {
             inner: Arc::clone(&self.inner),
             id,
             manifest,
             blobs,
-            pins: vec![TreePin {
-                inner: Arc::clone(&self.inner),
-                id,
-            }],
+            pins: vec![pin],
         }))
     }
 
