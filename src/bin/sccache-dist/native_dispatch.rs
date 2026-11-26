@@ -359,8 +359,7 @@ where
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     runtime.spawn(async move {
-        use futures::{StreamExt, stream::FuturesUnordered};
-        let mut active = FuturesUnordered::new();
+        let mut active = tokio::task::JoinSet::new();
         let mut closed = false;
         loop {
             if closed && active.is_empty() {
@@ -369,11 +368,15 @@ where
             tokio::select! {
                 task = receiver.recv(), if !closed && active.len() < width => {
                     match task {
-                        Some(task) => active.push(operation(task)),
+                        Some(task) => { active.spawn(operation(task)); }
                         None => closed = true,
                     }
                 }
-                _ = active.next(), if !active.is_empty() => {}
+                result = active.join_next(), if !active.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        error!("Native dispatcher stage operation failed: {error:#}");
+                    }
+                }
             }
         }
     })
