@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, ensure};
 use bincode::Options;
-use redb::{ReadOnlyMultimapTable, ReadableDatabase, ReadableTable};
+use redb::{ReadOnlyMultimapTable, ReadableDatabase, ReadableMultimapTable, ReadableTable};
 use serde::{Deserialize, Serialize};
 
 use super::{
