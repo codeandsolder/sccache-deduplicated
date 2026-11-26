@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, ensure};
 use bincode::Options;
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableMultimapTable, ReadableTable};
 
 use super::{PackageArchiveLease, PackageRecord};
 use crate::store::{BLOB_PACKAGES, PACKAGES, encoding};
