@@ -522,6 +522,17 @@ impl NativeCacheClient {
                 check()?;
                 let (tree, hit) = if let Some(tree) = cached {
                     (Arc::new(tree), true)
+                } else if delivery.artifact_grace.is_none() {
+                    warm = false;
+                    // Shared-store acquisition depends on the scheduler's own
+                    // producer flights; wait without taking their ownership.
+                    (
+                        Arc::new(
+                            Box::pin(self.fetch_tree(ticket, id, store, delivery, check, on_tree))
+                                .await?,
+                        ),
+                        false,
+                    )
                 } else {
                     warm = false;
                     let deadline = Instant::now()

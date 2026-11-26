@@ -970,6 +970,11 @@ impl NativeCacheClient {
                 let manifest = manifest.clone();
                 tokio::task::spawn_blocking(move || store.reserve_tree_upload(&manifest)).await??
             };
+            if delivery.artifact_grace.is_none() {
+                let tree = self.fetch_shared_tree(ticket, store, manifest, reserved, check).await?;
+                renewals.finish_async().await?;
+                return Ok(tree);
+            }
             let packages = match delivery.package_import {
                 Some(limits) if !reserved.missing().is_empty() => self.reconstruct_packages(
                     ticket, reserved.missing(), store, limits, transport, check
@@ -1028,6 +1033,70 @@ impl NativeCacheClient {
             )
             .await;
         result
+    }
+
+    /// The scheduler is the acquisition producer for a colocated worker.
+    /// Never own a retention-tree flight while waiting for that producer, and
+    /// never stream bytes from the same CAS back into itself.
+    #[cfg(all(target_os = "linux", feature = "native-store"))]
+    async fn fetch_shared_tree(
+        &self,
+        ticket: Ticket,
+        store: &crate::build_runtime::NativeStore,
+        manifest: TreeManifest,
+        reserved: crate::build_runtime::UploadReservation,
+        check: &LeaseCheck<'_>,
+    ) -> Result<crate::build_runtime::TreeLease> {
+        let mut missing = reserved.missing().to_vec();
+        missing.sort_unstable_by_key(|blob| std::cmp::Reverse(blob.size));
+        let mut pins = vec![reserved];
+        for chunk in missing.chunks(256) {
+            check()?;
+            self.control_with_timeout_async::<_, ()>(
+                "input_prefetch",
+                &InputPrefetchRequest {
+                    ticket,
+                    missing: chunk.to_vec(),
+                },
+                self.timeout,
+            )
+            .await?;
+            let start = Instant::now();
+            let mut pending = chunk.to_vec();
+            let mut delay = Duration::from_millis(10);
+            while !pending.is_empty() {
+                check()?;
+                ensure!(
+                    start.elapsed() < self.timeout,
+                    "shared native input backfill timed out"
+                );
+                let count = pending.len();
+                let blobs = pending
+                    .into_iter()
+                    .map(|blob| (blob.id, blob.size))
+                    .collect();
+                let owned = store.clone();
+                let ready =
+                    tokio::task::spawn_blocking(move || owned.reserve_blobs(blobs)).await??;
+                pending = ready.missing().to_vec();
+                if pending.len() < count {
+                    pins.push(ready);
+                    delay = Duration::from_millis(10);
+                }
+                if !pending.is_empty() {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_millis(200));
+                }
+            }
+        }
+        check()?;
+        let owned = store.clone();
+        tokio::task::spawn_blocking(move || {
+            let tree = owned.publish_tree_pinned(&manifest, Vec::new())?;
+            drop(pins);
+            Ok(tree)
+        })
+        .await?
     }
 
     #[cfg(all(target_os = "linux", feature = "native-store"))]
