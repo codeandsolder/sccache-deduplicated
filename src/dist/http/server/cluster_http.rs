@@ -749,8 +749,7 @@ const LISTENER_CONNECTION_LIMIT: usize = 65_536;
 const PROCESS_FD_TARGET: u64 = 262_144;
 
 fn connection_capacity(soft_limit: u64) -> usize {
-    usize::try_from((soft_limit / 2).min(PROCESS_FD_TARGET / 2))
-        .expect("connection budget fits usize")
+    usize::try_from((soft_limit / 2).min(PROCESS_FD_TARGET / 2)).unwrap_or(usize::MAX)
 }
 
 fn process_connections() -> Arc<Semaphore> {
