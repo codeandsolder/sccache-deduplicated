@@ -2,8 +2,9 @@
 //! eviction while inspecting the store.
 use super::{
     ActionKey, BLOB_ROOTS, BTreeMap, BTreeSet, ContentId, Duration, MetadataExt, NativeStore,
-    Options, PACKAGES, PackageRecord, RESULT_ACTIONS, RESULTS, ReadableDatabase, ReadableTable,
-    Result, Root, TREES, TreeId, UsageRecord, anyhow, encoding, ensure, now_ms, reuse_utility,
+    Options, PACKAGES, PackageRecord, RESULT_ACTIONS, RESULTS, ReadableDatabase,
+    ReadableMultimapTable, ReadableTable, Result, Root, TREES, TreeId, UsageRecord, anyhow,
+    encoding, ensure, now_ms, reuse_utility,
 };
 use crate::analytics::CacheDistribution;
 
