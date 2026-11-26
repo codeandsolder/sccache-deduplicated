@@ -43,6 +43,15 @@ async fn reply(
             Err(error) => Some((Err(error), None)),
         }
     });
+    reply_stream(request, length, limit, stream).await
+}
+
+async fn reply_stream(
+    request: wreq::RequestBuilder,
+    length: u64,
+    limit: u64,
+    stream: impl futures::Stream<Item = io::Result<Bytes>> + Send + 'static,
+) -> Result<Reply> {
     let response = request
         .header(http::header::CONTENT_LENGTH, length)
         .body(wreq::Body::wrap_stream(stream))
@@ -123,6 +132,73 @@ pub(super) fn send(
             }
         }
     }
+}
+
+/// Demand-driven immutable file upload. There is no synchronous producer,
+/// no temporary copy, and at most one completion read per body poll.
+#[cfg(all(unix, feature = "native-store"))]
+pub(super) async fn send_file(
+    request: wreq::RequestBuilder,
+    header: Bytes,
+    file: std::sync::Arc<std::fs::File>,
+    size: u64,
+    limit: u64,
+    activity: Option<crate::dist::cluster_routes::interface::Activity>,
+) -> Result<Attempt> {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
+    let length = size
+        .checked_add(header.len() as u64)
+        .context("native upload length overflow")?;
+    let consumed = Arc::new(AtomicU64::new(0));
+    let local_error = Arc::new(Mutex::new(None));
+    let count = Arc::clone(&consumed);
+    let errors = Arc::clone(&local_error);
+    let stream = futures::stream::try_unfold(
+        (Some(header), file, 0_u64, activity),
+        move |(header, file, offset, mut activity)| {
+            let count = Arc::clone(&count);
+            let errors = Arc::clone(&errors);
+            async move {
+                let (bytes, next) = if let Some(header) = header {
+                    (header, offset)
+                } else if offset < size {
+                    let width = usize::try_from((size - offset).min(CHUNK as u64))
+                        .map_err(io::Error::other)?;
+                    match crate::build_runtime::read_file_at(Arc::clone(&file), offset, width, ())
+                        .await
+                    {
+                        Ok((bytes, ())) => (Bytes::from(bytes), offset + width as u64),
+                        Err(error) => {
+                            let description = format!("{error:#}");
+                            *errors
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                            return Err(io::Error::other(description));
+                        }
+                    }
+                } else {
+                    return Ok(None);
+                };
+                count.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                if let Some(activity) = &mut activity {
+                    activity.bytes(bytes.len() as u64);
+                }
+                Ok(Some((bytes, (None, file, next, activity))))
+            }
+        },
+    );
+    let result = reply_stream(request, length, limit, stream).await;
+    let local_error = local_error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    Ok(Attempt {
+        result: local_error.map_or(result, Err),
+        consumed: consumed.load(Ordering::Relaxed),
+    })
 }
 
 #[cfg(test)]

@@ -1159,21 +1159,29 @@ impl NativeCacheClient {
         encoding: BlobEncoding,
         file: File,
     ) -> Result<()> {
-        let size = file.metadata()?.len();
-        if encoding == BlobEncoding::Raw {
-            ensure!(size == blob.size, "native raw upload size mismatch");
+        #[cfg(all(unix, feature = "native-store"))]
+        {
+            crate::http_client::io_runtime()?
+                .block_on(self.upload_stored_file_async(ticket, blob, encoding, file))
         }
-        self.send_stream(
-            "upload",
-            &UploadHeader {
-                ticket,
-                blob,
-                encoding: encoding as u8,
-            },
-            size,
-            file,
-        )?;
-        Ok(())
+        #[cfg(not(all(unix, feature = "native-store")))]
+        {
+            let size = file.metadata()?.len();
+            if encoding == BlobEncoding::Raw {
+                ensure!(size == blob.size, "native raw upload size mismatch");
+            }
+            self.send_stream(
+                "upload",
+                &UploadHeader {
+                    ticket,
+                    blob,
+                    encoding: encoding as u8,
+                },
+                size,
+                file,
+            )?;
+            Ok(())
+        }
     }
 
     fn send_stream(
@@ -1219,50 +1227,150 @@ impl NativeCacheClient {
             );
             let evidence = tracked.evidence();
             let attempt = upload::send(request, length, self.metadata_limit, tracked)?;
-            match attempt.result {
-                Ok(mut response) => {
-                    if response.path.local == local {
-                        response.path.quality =
-                            evidence.map_or(response.path.quality, |sample| sample.quality());
-                    }
-                    // An already-provisioned package can return before reading
-                    // the entire archive; it supplies no full-body rate sample.
-                    if attempt.consumed == length {
-                        self.routes.transferred(
-                            peer,
-                            role,
-                            address,
-                            Transfer::Upload(length),
-                            started.elapsed(),
-                            response.path,
-                        );
-                    }
-                    return Ok(response.bytes);
+            match self.record_upload_attempt(
+                address,
+                length,
+                header.len(),
+                started,
+                local,
+                evidence,
+                attempt,
+            )? {
+                std::ops::ControlFlow::Break(bytes) => return Ok(bytes),
+                std::ops::ControlFlow::Continue(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.context("native upload route unavailable")?)
+    }
+
+    fn record_upload_attempt(
+        &self,
+        address: crate::dist::cluster_routes::Route,
+        length: u64,
+        header_length: usize,
+        started: Instant,
+        local: Option<std::net::IpAddr>,
+        evidence: Option<crate::dist::cluster_routes::interface::Evidence>,
+        attempt: upload::Attempt,
+    ) -> Result<std::ops::ControlFlow<Vec<u8>, anyhow::Error>> {
+        let peer = self.peer.scheduler_id();
+        let role = sccache_cluster_identity::Role::Scheduler;
+        match attempt.result {
+            Ok(mut response) => {
+                if response.path.local == local {
+                    response.path.quality =
+                        evidence.map_or(response.path.quality, |sample| sample.quality());
                 }
-                Err(error) => {
-                    let transport = error.downcast_ref::<wreq::Error>();
-                    let connect = transport.is_some_and(wreq::Error::is_connect);
-                    let interrupted = transport.is_some_and(|error| {
-                        error.is_connect()
-                            || error.is_timeout()
-                            || error.is_body()
-                            || error.is_request()
-                    });
-                    if interrupted {
-                        self.routes.failed(peer, role, address);
-                    }
-                    // Before any request body is polled, the server cannot
-                    // consume a ticket/claim. A proven connect failure may
-                    // also replay metadata, but never a consumed source byte.
-                    if interrupted
-                        && (attempt.consumed == 0
-                            || (connect && attempt.consumed <= header.len() as u64))
-                    {
-                        last_error = Some(error);
-                    } else {
-                        return Err(error);
-                    }
+                // An already-provisioned package can return before reading
+                // the entire archive; it supplies no full-body rate sample.
+                if attempt.consumed == length {
+                    self.routes.transferred(
+                        peer,
+                        role,
+                        address,
+                        Transfer::Upload(length),
+                        started.elapsed(),
+                        response.path,
+                    );
                 }
+                Ok(std::ops::ControlFlow::Break(response.bytes))
+            }
+            Err(error) => {
+                let transport = error.downcast_ref::<wreq::Error>();
+                let connect = transport.is_some_and(wreq::Error::is_connect);
+                let interrupted = transport.is_some_and(|error| {
+                    error.is_connect()
+                        || error.is_timeout()
+                        || error.is_body()
+                        || error.is_request()
+                });
+                if interrupted {
+                    self.routes.failed(peer, role, address);
+                }
+                // Before any request body is polled, the server cannot
+                // consume a ticket/claim. A proven connect failure may
+                // also replay metadata, but never a consumed source byte.
+                if interrupted
+                    && (attempt.consumed == 0
+                        || (connect && attempt.consumed <= header_length as u64))
+                {
+                    Ok(std::ops::ControlFlow::Continue(error))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "native-store"))]
+    async fn upload_stored_file_async(
+        &self,
+        ticket: Ticket,
+        blob: BlobRef,
+        encoding: BlobEncoding,
+        file: File,
+    ) -> Result<()> {
+        let (file, size) = tokio::task::spawn_blocking(move || {
+            let size = file.metadata()?.len();
+            Ok::<_, io::Error>((std::sync::Arc::new(file), size))
+        })
+        .await??;
+        if encoding == BlobEncoding::Raw {
+            ensure!(size == blob.size, "native raw upload size mismatch");
+        }
+        let header = bytes::Bytes::from(codec().with_limit(self.metadata_limit).serialize(
+            &UploadHeader {
+                ticket,
+                blob,
+                encoding: encoding as u8,
+            },
+        )?);
+        let length = size
+            .checked_add(header.len() as u64)
+            .context("native upload length overflow")?;
+        let peer = self.peer.scheduler_id();
+        let role = sccache_cluster_identity::Role::Scheduler;
+        let start = Instant::now();
+        let routes = self.cache_routes_async().await;
+        let mut last_error = None;
+        for address in self.order_cache_endpoints(&routes, Some(Transfer::Upload(length))) {
+            let remaining = self
+                .timeout
+                .checked_sub(start.elapsed())
+                .context("native upload deadline expired")?;
+            let request = self.request_at("upload", address)?.timeout(remaining);
+            let started = Instant::now();
+            let local = self.routes.local_source(peer, role, address);
+            let activity = crate::dist::cluster_routes::interface::activity(
+                local,
+                Transfer::Upload(length),
+                address.source.map(|local| {
+                    sccache_peer_identity::NetworkPath::new(local, address.address.ip())
+                }),
+            );
+            let evidence = activity
+                .as_ref()
+                .map(crate::dist::cluster_routes::interface::Activity::evidence);
+            let attempt = upload::send_file(
+                request,
+                header.clone(),
+                std::sync::Arc::clone(&file),
+                size,
+                self.metadata_limit,
+                activity,
+            )
+            .await?;
+            match self.record_upload_attempt(
+                address,
+                length,
+                header.len(),
+                started,
+                local,
+                evidence,
+                attempt,
+            )? {
+                std::ops::ControlFlow::Break(_) => return Ok(()),
+                std::ops::ControlFlow::Continue(error) => last_error = Some(error),
             }
         }
         Err(last_error.context("native upload route unavailable")?)
