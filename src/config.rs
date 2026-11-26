@@ -2485,7 +2485,7 @@ pub mod server {
                 match (&native.directory, native.space, shared) {
                     (None, None, true) => (),
                     (Some(directory), Some(space), false) if directory.is_absolute() => {
-                        space.validate()?
+                        space.validate()?;
                     }
                     _ => bail!(
                         "standalone native workers require directory and space; local workers inherit both from the scheduler"
