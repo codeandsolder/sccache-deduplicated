@@ -286,14 +286,14 @@ impl Shared {
         }
     }
 
-    fn compile(&self, ready: Ready, publishing: &SyncSender<Publishing>) {
+    fn compile(&self, ready: Ready, publishing: &tokio::sync::mpsc::Sender<Publishing>) {
         let Ready { job, prepared } = ready;
         let completed = self.worker.execute(prepared, &self.queue, || {
             self.phase(job.id, NativeJobPhase::Executing);
         });
         self.phase(job.id, NativeJobPhase::AwaitingPublication);
-        if let Err(error) = publishing.send(Publishing { job, completed }) {
-            let Publishing { job, completed } = error.0;
+        if let Err(error) = publishing.try_send(Publishing { job, completed }) {
+            let Publishing { job, completed } = error.into_inner();
             drop(completed);
             self.finish_blocking(
                 &job,
@@ -302,11 +302,11 @@ impl Shared {
         }
     }
 
-    fn publish(&self, publishing: Publishing) {
+    async fn publish(&self, publishing: Publishing) {
         let Publishing { job, completed } = publishing;
         self.phase(job.id, NativeJobPhase::Publishing);
-        let result = self.worker.publish(completed);
-        self.finish_blocking(&job, result);
+        let result = self.worker.publish(completed).await;
+        self.finish(&job, result).await;
     }
 }
 
@@ -345,10 +345,45 @@ fn spawn_pool<T: Send + 'static>(
     Ok(threads)
 }
 
+// Own each admitted operation until it completes, including when its
+// scheduler/client stops polling. The queue capacity and width are independent.
+fn spawn_async_pool<T, F, Fut>(
+    runtime: &tokio::runtime::Runtime,
+    width: usize,
+    mut receiver: tokio::sync::mpsc::Receiver<T>,
+    operation: F,
+) -> tokio::task::JoinHandle<()>
+where
+    T: Send + 'static,
+    F: Fn(T) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    runtime.spawn(async move {
+        use futures::{StreamExt, stream::FuturesUnordered};
+        let mut active = FuturesUnordered::new();
+        let mut closed = false;
+        loop {
+            if closed && active.is_empty() {
+                break;
+            }
+            tokio::select! {
+                task = receiver.recv(), if !closed && active.len() < width => {
+                    match task {
+                        Some(task) => active.push(operation(task)),
+                        None => closed = true,
+                    }
+                }
+                _ = active.next(), if !active.is_empty() => {}
+            }
+        }
+    })
+}
+
 pub struct NativeDispatcher {
     shared: Arc<Shared>,
     staging: Option<tokio::sync::mpsc::Sender<Staging>>,
     staging_task: Option<tokio::task::JoinHandle<()>>,
+    publication_task: Option<tokio::task::JoinHandle<()>>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -374,55 +409,36 @@ impl NativeDispatcher {
             capacity,
             io_width,
         });
-        let (staging, mut staging_rx) = tokio::sync::mpsc::channel(capacity);
+        let (staging, staging_rx) = tokio::sync::mpsc::channel(capacity);
         let runtime = sccache::http_client::io_runtime()?;
         let (ready, ready_rx) = mpsc::sync_channel(capacity);
-        let (publishing, publishing_rx) = mpsc::sync_channel(capacity);
-        let mut threads = {
+        let (publishing, publishing_rx) = tokio::sync::mpsc::channel(capacity);
+        let threads = {
             let shared = Arc::clone(&shared);
-            spawn_pool("native-publish", io_width, publishing_rx, move |task| {
-                shared.publish(task);
+            spawn_pool("native-compile", width, ready_rx, move |task| {
+                shared.compile(task, &publishing)
             })?
         };
-        {
+        let publication_task = {
             let shared = Arc::clone(&shared);
-            threads.extend(spawn_pool(
-                "native-compile",
-                width,
-                ready_rx,
-                move |task| shared.compile(task, &publishing),
-            )?);
-        }
+            spawn_async_pool(runtime, io_width, publishing_rx, move |task| {
+                let shared = Arc::clone(&shared);
+                async move { shared.publish(task).await }
+            })
+        };
         let staging_task = {
             let shared = Arc::clone(&shared);
-            runtime.spawn(async move {
-                use futures::{StreamExt, stream::FuturesUnordered};
-                let mut active = FuturesUnordered::new();
-                let mut closed = false;
-                loop {
-                    if closed && active.is_empty() {
-                        break;
-                    }
-                    tokio::select! {
-                        task = staging_rx.recv(), if !closed && active.len() < io_width => {
-                            match task {
-                                Some(task) => {
-                                    let shared = &shared;
-                                    let ready = &ready;
-                                    active.push(async move { shared.stage(task, ready).await });
-                                }
-                                None => closed = true,
-                            }
-                        }
-                        _ = active.next(), if !active.is_empty() => {}
-                    }
-                }
+            spawn_async_pool(runtime, io_width, staging_rx, move |task| {
+                let shared = Arc::clone(&shared);
+                let ready = ready.clone();
+                async move { shared.stage(task, &ready).await }
             })
         };
         Ok(Self {
             shared,
             staging: Some(staging),
             staging_task: Some(staging_task),
+            publication_task: Some(publication_task),
             threads,
         })
     }
@@ -583,23 +599,27 @@ impl Drop for NativeDispatcher {
             }
         }
         drop(self.staging.take());
-        // Drain staging before joining compiler/publication threads: it owns
-        // the ready sender. Cancellation prevents new execution on shutdown.
-        if let Some(task) = self.staging_task.take() {
-            match sccache::http_client::io_runtime() {
-                Ok(runtime) => {
-                    if let Err(error) = runtime.block_on(task) {
-                        error!("Native staging task failed: {error:#}");
-                    }
-                }
-                Err(error) => error!("Native staging runtime unavailable: {error:#}"),
-            }
-        }
-        // Closing each upstream channel releases the downstream senders.
+        // Drain staging, then compilation, then publication. Each stage
+        // owns the downstream sender, so joining in this order closes it.
+        join_async_stage(self.staging_task.take());
         for thread in self.threads.drain(..) {
             if thread.join().is_err() {
-                error!("Native dispatcher thread panicked");
+                error!("Native dispatcher compiler thread panicked");
             }
+        }
+        join_async_stage(self.publication_task.take());
+    }
+}
+
+fn join_async_stage(task: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = task {
+        match sccache::http_client::io_runtime() {
+            Ok(runtime) => {
+                if let Err(error) = runtime.block_on(task) {
+                    error!("Native dispatcher stage failed: {error:#}");
+                }
+            }
+            Err(error) => error!("Native dispatcher runtime unavailable: {error:#}"),
         }
     }
 }

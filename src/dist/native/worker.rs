@@ -493,106 +493,117 @@ impl NativeCacheClient {
             preparation.cancelled,
         )
         .await?;
-        lease.check()?;
-        (preparation.on_authorized)().await?;
-        lease.check()?;
-        let mut warm = true;
-        let request = spec.action_request()?;
-        ensure!(
-            spec.platform == policy.platform,
-            "native executor platform mismatch"
-        );
-        let owned_store = store.clone();
-        let grace = delivery.artifact_grace.clone();
-        tokio::task::spawn_blocking(move || {
-            grace.reap();
-            maintain_executor_space(&owned_store)
-        })
-        .await??;
-        let predicted = preparation
-            .estimated_result_bytes
-            .unwrap_or(policy.max_result_bytes)
-            .clamp(1, policy.max_result_bytes);
-        let reservation_started = Instant::now();
-        let reservation = loop {
+        let result = async {
             lease.check()?;
-            let grace = delivery.artifact_grace.clone();
-            if let Some(reservation) =
-                tokio::task::spawn_blocking(move || grace.reserve(predicted)).await??
-            {
-                break reservation;
-            }
+            (preparation.on_authorized)().await?;
+            lease.check()?;
+            let mut warm = true;
+            let request = spec.action_request()?;
             ensure!(
-                reservation_started.elapsed() < policy.timeout,
-                "native artifact grace admission timed out"
+                spec.platform == policy.platform,
+                "native executor platform mismatch"
             );
-            warm = false;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        };
-        let output = {
-            let store = store.clone();
-            let limit = policy.max_result_bytes;
-            let budget =
-                tokio::task::spawn_blocking(move || store.reserve_staging(limit)).await??;
-            Some((reservation, budget))
-        };
-        let mut inputs = Vec::new();
-        let on_tree = preparation.on_tree;
-        let check = &|| lease.check();
-        for &id in &request.input_trees {
-            check()?;
             let owned_store = store.clone();
-            let cached = tokio::task::spawn_blocking(move || owned_store.lookup_tree(id)).await??;
-            let (tree, hit) = if let Some(tree) = cached {
-                (Arc::new(tree), true)
-            } else {
-                warm = false;
-                let deadline = Instant::now()
-                    .checked_add(policy.timeout)
-                    .context("input staging deadline overflow")?;
-                let cancelled = async {
-                    loop {
-                        check()?;
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                };
-                Box::pin(store.acquire_tree_async(id, deadline, cancelled, || {
-                    self.fetch_tree(ticket, id, store, delivery, check, on_tree)
-                }))
-                .await?
-            };
-            trace_tree_access(id, &tree, hit)?;
-            on_tree(&tree);
-            inputs.push(tree);
-        }
-        let announced = Instant::now();
-        loop {
-            check()?;
-            match self
-                .control_with_timeout_async::<_, ()>("inputs_staged", &ticket, self.timeout)
-                .await
-            {
-                Ok(()) => break,
-                Err(error)
-                    if retryable_transport_error(&error)
-                        && announced.elapsed() < policy.timeout =>
+            let grace = delivery.artifact_grace.clone();
+            tokio::task::spawn_blocking(move || {
+                grace.reap();
+                maintain_executor_space(&owned_store)
+            })
+            .await??;
+            let predicted = preparation
+                .estimated_result_bytes
+                .unwrap_or(policy.max_result_bytes)
+                .clamp(1, policy.max_result_bytes);
+            let reservation_started = Instant::now();
+            let reservation = loop {
+                lease.check()?;
+                let grace = delivery.artifact_grace.clone();
+                if let Some(reservation) =
+                    tokio::task::spawn_blocking(move || grace.reserve(predicted)).await??
                 {
-                    warm = false;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    break reservation;
                 }
-                Err(error) => return Err(error),
+                ensure!(
+                    reservation_started.elapsed() < policy.timeout,
+                    "native artifact grace admission timed out"
+                );
+                warm = false;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            let output = {
+                let store = store.clone();
+                let limit = policy.max_result_bytes;
+                let budget =
+                    tokio::task::spawn_blocking(move || store.reserve_staging(limit)).await??;
+                Some((reservation, budget))
+            };
+            let mut inputs = Vec::new();
+            let on_tree = preparation.on_tree;
+            let check = &|| lease.check();
+            for &id in &request.input_trees {
+                check()?;
+                let owned_store = store.clone();
+                let cached =
+                    tokio::task::spawn_blocking(move || owned_store.lookup_tree(id)).await??;
+                let (tree, hit) = if let Some(tree) = cached {
+                    (Arc::new(tree), true)
+                } else {
+                    warm = false;
+                    let deadline = Instant::now()
+                        .checked_add(policy.timeout)
+                        .context("input staging deadline overflow")?;
+                    let cancelled = async {
+                        loop {
+                            check()?;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    };
+                    Box::pin(store.acquire_tree_async(id, deadline, cancelled, || {
+                        self.fetch_tree(ticket, id, store, delivery, check, on_tree)
+                    }))
+                    .await?
+                };
+                trace_tree_access(id, &tree, hit)?;
+                on_tree(&tree);
+                inputs.push(tree);
             }
-        }
-        Ok(PreparedWorker {
-            lease,
-            prepared: PreparedExecution {
+            let announced = Instant::now();
+            loop {
+                check()?;
+                match self
+                    .control_with_timeout_async::<_, ()>("inputs_staged", &ticket, self.timeout)
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(error)
+                        if retryable_transport_error(&error)
+                            && announced.elapsed() < policy.timeout =>
+                    {
+                        warm = false;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(PreparedExecution {
                 request,
                 _inputs: inputs,
                 output,
                 warm_staging: warm.then(|| started.elapsed()),
-            },
-            spec: spec.clone(),
-        })
+            })
+        }
+        .await;
+        match result {
+            Ok(prepared) => Ok(PreparedWorker {
+                lease,
+                prepared,
+                spec: spec.clone(),
+            }),
+            Err(error) => {
+                lease.fail().await;
+                Err(error)
+            }
+        }
     }
 
     #[cfg(feature = "dist-client")]
@@ -621,7 +632,13 @@ impl NativeCacheClient {
                 &mut |_| {},
             )?;
             let captured = compile(context, control.queue, control.transport, check, || {})?;
-            self.publish_execution(context, prepared, captured, control.transport, check)
+            crate::http_client::io_runtime()?.block_on(self.publish_execution(
+                context,
+                prepared,
+                captured,
+                control.transport,
+                check,
+            ))
         });
         if result.is_err() {
             let _ = self.fail(ticket);
@@ -629,6 +646,7 @@ impl NativeCacheClient {
         result
     }
 
+    #[cfg(feature = "dist-client")]
     fn prepare_execution(
         &self,
         context: ExecutionContext<'_>,
@@ -712,7 +730,7 @@ impl NativeCacheClient {
         })
     }
 
-    fn publish_execution(
+    async fn publish_execution(
         &self,
         context: ExecutionContext<'_>,
         mut prepared: PreparedExecution,
@@ -723,61 +741,78 @@ impl NativeCacheClient {
         let ExecutionContext { ticket, store, .. } = context;
         let MeasuredExecution { captured, duration } = measured;
         check()?;
-        if let Some(manifest) = captured.successful_result() {
-            let publication_started = Instant::now();
-            prepared.request.validate_result(manifest)?;
-            let blobs = manifest.blobs()?;
-            let retained = if let Some((grace, mut budget)) = prepared.output.take() {
-                grace.retain(
-                    store,
-                    &mut budget,
-                    &prepared.request.action_fingerprint()?,
-                    manifest,
-                    &captured,
+        let Some(manifest) = captured.successful_result().cloned() else {
+            self.control_with_timeout_async::<_, ()>("fail", &ticket, self.timeout)
+                .await?;
+            return Ok(captured);
+        };
+        let publication_started = Instant::now();
+        prepared.request.validate_result(&manifest)?;
+        let blobs = manifest.blobs()?;
+        let (captured, retained) = if let Some((grace, budget)) = prepared.output.take() {
+            grace
+                .retain(
+                    store.clone(),
+                    budget,
+                    prepared.request.action_fingerprint()?,
+                    captured,
                     (context.policy.timeout, check),
-                )?
-            } else {
-                None
-            };
-            let missing = self.begin(ticket, manifest.clone())?.missing;
-            let publication_setup = retained
-                .as_ref()
-                .is_none_or(|output| output.warm)
-                .then(|| publication_started.elapsed());
-            // The scheduler recorded its anchor before sending the begin
-            // response. Its clock need not be synchronized with ours.
-            let retained_after_begin = retained.map_or(Duration::ZERO, |output| {
-                output.deadline.saturating_duration_since(Instant::now())
-            });
-            let bytes = missing
-                .iter()
-                .map(|blob| blob.size)
-                .fold(0_u64, u64::saturating_add);
-            let requests = u64::try_from(missing.len())?;
-            let started = Instant::now();
-            for missing in missing {
-                check()?;
-                ensure!(
-                    blobs.get(&missing.id) == Some(&missing.size),
-                    "scheduler requested undeclared output"
-                );
-                self.upload_stored_file(
+                )
+                .await?
+        } else {
+            (captured, None)
+        };
+        let begin: crate::build_runtime::wire::BeginResult = self
+            .control_with_timeout_async(
+                "begin",
+                &super::ManifestRequest {
                     ticket,
-                    missing,
-                    captured.physical_encoding(),
-                    captured.open_file(missing.id)?,
-                )?;
-            }
-            let upload_duration = started.elapsed();
-            let worker_timing = transport.map(|transport| {
-                transport.observe_result(bytes, requests, upload_duration);
-                transport.snapshot()
-            });
+                    manifest: manifest.clone(),
+                },
+                self.timeout,
+            )
+            .await?;
+        let missing = begin.missing;
+        let publication_setup = retained
+            .as_ref()
+            .is_none_or(|output| output.warm)
+            .then(|| publication_started.elapsed());
+        let retained_after_begin = retained.map_or(Duration::ZERO, |output| {
+            output.deadline.saturating_duration_since(Instant::now())
+        });
+        let bytes = missing
+            .iter()
+            .map(|blob| blob.size)
+            .fold(0_u64, u64::saturating_add);
+        let requests = u64::try_from(missing.len())?;
+        let started = Instant::now();
+        for missing in missing {
+            check()?;
             ensure!(
-                self.commit(
+                blobs.get(&missing.id) == Some(&missing.size),
+                "scheduler requested undeclared output"
+            );
+            self.upload_stored_file_async(
+                ticket,
+                missing,
+                captured.physical_encoding(),
+                captured.open_file(missing.id)?,
+            )
+            .await?;
+        }
+        let upload_duration = started.elapsed();
+        let worker_timing = transport.map(|transport| {
+            transport.observe_result(bytes, requests, upload_duration);
+            transport.snapshot()
+        });
+        let committed: crate::build_runtime::ResultManifest = self
+            .control_with_timeout_async(
+                "commit",
+                &super::CommitRequest {
                     ticket,
-                    retained_after_begin,
-                    Some(ActionObservation {
+                    retained_after_begin_millis: u64::try_from(retained_after_begin.as_millis())
+                        .unwrap_or(u64::MAX),
+                    observation: Some(ActionObservation {
                         worker_timing,
                         warm_staging_nanoseconds: prepared
                             .warm_staging
@@ -791,13 +826,15 @@ impl NativeCacheClient {
                         upload_requests: requests,
                         upload_nanoseconds: u64::try_from(upload_duration.as_nanos())
                             .unwrap_or(u64::MAX),
-                    })
-                )? == *manifest,
-                "native publication manifest mismatch"
-            );
-        } else {
-            self.fail(ticket)?;
-        }
+                    }),
+                },
+                self.timeout,
+            )
+            .await?;
+        ensure!(
+            committed == manifest,
+            "native publication manifest mismatch"
+        );
         Ok(captured)
     }
 }
@@ -965,11 +1002,21 @@ impl WorkerLease {
             .check()
     }
 
-    fn finish(mut self) {
+    async fn finish(mut self) {
         if let Some(renewals) = self.renewals.take()
-            && let Err(error) = renewals.finish()
+            && let Err(error) = renewals.finish_async().await
         {
             debug!("Native worker lease ended after terminal publication: {error:#}");
+        }
+    }
+
+    async fn fail(mut self) {
+        if let Some(renewals) = self.renewals.take() {
+            drop(renewals);
+            let _ = self
+                .client
+                .control_with_timeout_async::<_, ()>("fail", &self.ticket, self.client.timeout)
+                .await;
         }
     }
 }
@@ -1046,7 +1093,7 @@ impl CompletedWorker {
     /// Publish retained outputs and finish the scheduler lease.
     /// # Errors
     /// Returns an error for failed publication, verification or cancellation.
-    pub fn publish(
+    pub async fn publish(
         self,
         store: &NativeStore,
         policy: &ExecutionPolicy,
@@ -1063,14 +1110,26 @@ impl CompletedWorker {
             store,
             policy,
         };
-        let captured = lease.client.publish_execution(
-            context,
-            prepared,
-            self.captured?,
-            Some(transport),
-            &|| lease.check(),
-        )?;
-        lease.finish();
-        Ok(captured)
+        let result = match self.captured {
+            Ok(captured) => {
+                lease
+                    .client
+                    .publish_execution(context, prepared, captured, Some(transport), &|| {
+                        lease.check()
+                    })
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(captured) => {
+                lease.finish().await;
+                Ok(captured)
+            }
+            Err(error) => {
+                lease.fail().await;
+                Err(error)
+            }
+        }
     }
 }

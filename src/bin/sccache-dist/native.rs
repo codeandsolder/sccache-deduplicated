@@ -221,8 +221,10 @@ impl NativeWorker {
         prepared.execute(&self.store, &self.policy, self.delivery(queue), on_start)
     }
 
-    pub(super) fn publish(&self, completed: CompletedWorker) -> Result<CapturedExecution> {
-        completed.publish(&self.store, &self.policy, &self.package_transfer)
+    pub(super) async fn publish(&self, completed: CompletedWorker) -> Result<CapturedExecution> {
+        completed
+            .publish(&self.store, &self.policy, &self.package_transfer)
+            .await
     }
 }
 

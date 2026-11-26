@@ -1042,7 +1042,11 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
             assert_eq!(execution_queue.active(), 1)
         });
         assert_eq!(execution_queue.active(), 0);
-        let result = completed.publish(&worker_store, &policy, &transport)?;
+        let result = crate::http_client::io_runtime()?.block_on(completed.publish(
+            &worker_store,
+            &policy,
+            &transport,
+        ))?;
         let manifest = result
             .successful_result()
             .context("native execution failed")?;
