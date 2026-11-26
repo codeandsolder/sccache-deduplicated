@@ -1126,6 +1126,7 @@ impl Default for NativeQueueSnapshot {
 #[cfg(feature = "dist-server")]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativePlacement {
+    pub cache_analytics: Option<crate::build_runtime::analytics::CacheSiteSummary>,
     pub package_limits: Option<crate::build_runtime::PackageDeliveryLimits>,
     pub residency: Option<crate::build_runtime::BlobResidency>,
     pub timing: crate::build_runtime::wire::WorkerTiming,

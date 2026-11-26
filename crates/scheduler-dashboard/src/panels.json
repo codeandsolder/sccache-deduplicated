@@ -1,5 +1,110 @@
 [
   {
+    "title": "Cache tier capacity (shared tiers repeat per client)",
+    "kind": "timeseries",
+    "unit": "bytes",
+    "queries": [
+      {
+        "expr": "sccache_cache_tier_size_bytes{instance=~\"$client\",resolution=\"raw\"}",
+        "legend": "{{instance}} L{{level}} {{backend}} {{kind}}"
+      }
+    ]
+  },
+  {
+    "title": "Legacy serialized object sizes (bytes per bucket)",
+    "kind": "bargauge",
+    "unit": "bytes",
+    "queries": [
+      {
+        "expr": "sccache_cache_tier_distribution_bytes{instance=~\"$client\",resolution=\"raw\",dimension=\"size\"}",
+        "legend": "{{instance}} L{{level}} {{backend}} {{upper}}"
+      }
+    ],
+    "requires_client": true
+  },
+  {
+    "title": "Legacy serialized object sizes (objects per bucket)",
+    "kind": "bargauge",
+    "unit": "short",
+    "queries": [
+      {
+        "expr": "sccache_cache_tier_distribution_objects{instance=~\"$client\",resolution=\"raw\",dimension=\"size\"}",
+        "legend": "{{instance}} L{{level}} {{backend}} {{upper}}"
+      }
+    ],
+    "requires_client": true
+  },
+  {
+    "title": "Legacy last-access age (bytes per bucket)",
+    "kind": "bargauge",
+    "unit": "bytes",
+    "queries": [
+      {
+        "expr": "sccache_cache_tier_distribution_bytes{instance=~\"$client\",resolution=\"raw\",dimension=\"age\"}",
+        "legend": "{{instance}} L{{level}} {{backend}} {{upper}}"
+      }
+    ],
+    "requires_client": true
+  },
+  {
+    "title": "Managed decayed heat, milli-hits (bytes per bucket)",
+    "kind": "bargauge",
+    "unit": "bytes",
+    "queries": [
+      {
+        "expr": "sccache_cache_tier_distribution_bytes{instance=~\"$client\",resolution=\"raw\",dimension=\"heat\"}",
+        "legend": "{{instance}} L{{level}} {{backend}} {{upper}}"
+      }
+    ],
+    "requires_client": true
+  },
+  {
+    "title": "Managed eviction-adjusted age (bytes per bucket)",
+    "kind": "bargauge",
+    "unit": "bytes",
+    "queries": [
+      {
+        "expr": "sccache_cache_tier_distribution_bytes{instance=~\"$client\",resolution=\"raw\",dimension=\"policy_age\"}",
+        "legend": "{{instance}} L{{level}} {{backend}} {{upper}}"
+      }
+    ],
+    "requires_client": true
+  },
+  {
+    "title": "Managed heat percentile storage share (bounds)",
+    "kind": "stat",
+    "unit": "percent",
+    "queries": [
+      {
+        "expr": "sccache_cache_tier_heat_storage_share_percent{instance=~\"$client\",resolution=\"raw\"}",
+        "legend": "{{instance}} L{{level}} {{backend}} p{{percentile}} {{bound}}"
+      }
+    ],
+    "requires_client": true
+  },
+  {
+    "title": "Legacy analytics snapshot age (seconds)",
+    "kind": "stat",
+    "unit": "short",
+    "queries": [
+      {
+        "expr": "time()-sccache_cache_tier_snapshot_timestamp_seconds{instance=~\"$client\",resolution=\"raw\"}",
+        "legend": "{{instance}} L{{level}} {{backend}}"
+      }
+    ]
+  },
+  {
+    "title": "Reported cache size by client (shared tiers may repeat)",
+    "kind": "timeseries",
+    "unit": "bytes",
+    "queries": [
+      {
+        "expr": "sccache_cache_size_bytes{instance=~\"$client\",resolution=\"raw\"}",
+        "legend": "{{instance}} {{kind}}"
+      }
+    ]
+  },
+  {
     "title": "Workers",
     "kind": "stat",
     "unit": "short",

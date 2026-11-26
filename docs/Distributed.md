@@ -709,8 +709,8 @@ goodput is not physical link capacity.
 
 ### Fleet history
 
-If configured, Liberta supplies the existing Grafana dashboard's 33 query
-panels. Select an exact client or all clients and a range from 15 minutes
+If configured, Liberta supplies the existing Grafana dashboard plus cache-tier analytics (42 query
+panels total). Select an exact client or all clients and a range from 15 minutes
 to seven days. Requests use fixed server-side PromQL templates; user labels
 are escaped as literal regular expressions. Linux host-wide panels include monitored Linux hosts rather than claiming all
 are workers. Ingress panels require an explicit Certifex virtual host. Range-dependent resolution is 5–1800 seconds;
@@ -737,6 +737,36 @@ behind long-running I/O or trigger eviction. The CAS view shows physical free
 space separately from logical resident bytes, staging reservations and both
 physical and logical budget watermarks. Headroom estimates exclude prospective
 reclamation and are advisory, not admission guarantees.
+
+### Cache analytics
+
+The scheduler and each native worker run a separate five-minute sampler.
+The scheduler GUI reports the distribution of distinct live CAS blobs by size,
+last root touch and cumulative root touches. Shared content is counted once in
+storage; touches are attributed to each distinct referencing action or tree.
+Publications are touches, so the curve is not a request-hit rate. Unknown
+usage is distinct from zero. Cumulative reuse percentiles give bucket bounds
+rather than pretending to know the ordering within a bucket.
+
+Logical/reference, stored-file and allocated-block sizes are distinct.
+Measured ratios use measured bytes only; allocated blocks do not establish
+exclusive space consumption on ZFS (snapshots, clones and compression).
+Eviction distributions use root reuse utility divided by independently
+reclaimable bytes; pinned and shared content cannot be reclaimed by a single
+root. The read-only scan is best effort for concurrent filesystem changes and
+does not invoke eviction. Per-worker summaries accompany existing heartbeats;
+do not sum replicated host content to infer cluster-wide uniqueness.
+
+With direct metrics enabled, the client samples each legacy cache tier every
+five minutes independently of compilation. Disk reports indexed serialized
+objects and LRU modification times; persistent hit frequency is not available.
+Managed S3 reports serialized object sizes, metadata age, decayed milli-hit heat,
+and the age adjusted by eviction policy. One shared lease limits namespace
+scans to a 30-minute cadence; a failed refresh retains the prior timestamped
+report. Its two internal analytics metadata objects are excluded from pruning.
+The fleet metrics UI exposes capacity for all clients, and bounded histogram
+and percentile panels for the selected client. Shared remote tiers can repeat
+across clients. Managed-heat percentiles are heat proxies, not observed hits.
 
 ### Portable release package
 

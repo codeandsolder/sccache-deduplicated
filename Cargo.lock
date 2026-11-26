@@ -4101,6 +4101,7 @@ dependencies = [
  "leptos_axum",
  "leptos_meta",
  "log",
+ "sccache-build",
  "send_wrapper",
  "serde",
  "serde_json",

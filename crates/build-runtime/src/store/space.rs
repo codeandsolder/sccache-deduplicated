@@ -645,5 +645,8 @@ impl Drop for StageBudget {
     }
 }
 
+mod analytics;
+pub use analytics::CacheAnalyticsSampler;
+
 #[cfg(test)]
 mod tests;

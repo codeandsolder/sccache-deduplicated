@@ -83,6 +83,7 @@ pub(super) fn NativeStatus(data: Memo<Option<DashboardData>>) -> impl IntoView {
         <JobTable jobs=jobs sampled_at=sampled_at/>
         <CasPanel telemetry=telemetry/>
         <super::topology::Topology graph=topology/>
+        <super::analytics::CacheAnalytics telemetry=telemetry workers=workers/>
         <NetworkPanel telemetry=telemetry/>
     }
 }

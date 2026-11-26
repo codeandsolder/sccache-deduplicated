@@ -1722,6 +1722,11 @@ where
         self.dist_client.native.clone()
     }
 
+    #[cfg(feature = "direct-metrics")]
+    pub(crate) fn metrics_storage(&self) -> Arc<dyn Storage> {
+        self.storage.clone()
+    }
+
     pub(crate) async fn get_info(&self) -> Result<ServerInfo> {
         let stats = self.stats.lock().await.clone();
         ServerInfo::new(stats, Some(&*self.storage)).await

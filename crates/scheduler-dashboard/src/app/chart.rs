@@ -74,6 +74,16 @@ fn plot_path(points: &[(f64, Option<f64>)], bounds: Bounds, step: u64) -> String
 
 fn value_label(value: f64, unit: &str) -> String {
     match unit {
+        "bytes" if value >= 0.0 => {
+            let mut scaled = value;
+            for unit in ["B", "KiB", "MiB", "GiB", "TiB", "PiB"] {
+                if scaled < 1024.0 || unit == "PiB" {
+                    return format!("{scaled:.1} {unit}");
+                }
+                scaled /= 1024.0;
+            }
+            format!("{value:.0} B")
+        }
         "percent" => format!("{value:.1}%"),
         "s" if value.abs() < 0.001 && value != 0.0 => format!("{:.1} µs", value * 1e6),
         "s" if value.abs() < 1.0 && value != 0.0 => format!("{:.1} ms", value * 1e3),
@@ -224,6 +234,7 @@ pub(super) fn PanelContent(
         }.into_any(),
         PanelKind::Bargauge => {
             let mut rows = rows;
+            rows.retain(|(_, _, value)| *value > 0.0);
             rows.sort_unstable_by(|a,b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
             let maximum = rows.iter().map(|(_,_,value)| *value).fold(0.0_f64,f64::max);
             view! {

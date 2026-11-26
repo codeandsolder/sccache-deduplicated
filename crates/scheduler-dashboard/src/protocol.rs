@@ -96,7 +96,13 @@ pub fn apply_event(state: &mut DashboardData, event: NativeEvent) -> bool {
                 .sort_unstable_by(|a, b| (a.assigned_at_ms, &a.id).cmp(&(b.assigned_at_ms, &b.id)));
         }
     }
-    if let Some(telemetry) = patch.telemetry {
+    if let Some(mut telemetry) = patch.telemetry {
+        if telemetry.analytics.is_none() {
+            telemetry.analytics = state
+                .telemetry
+                .as_mut()
+                .and_then(|previous| previous.analytics.take());
+        }
         state.telemetry = Some(telemetry);
     }
     true
@@ -121,6 +127,48 @@ mod tests {
             remaining_input_blobs: None,
             predicted_completion_secs: None,
         }
+    }
+
+    #[test]
+    fn analytics_survives_unrelated_telemetry_and_reset() {
+        use crate::{AnalyticsObservation, NativeTelemetry};
+        use sccache_build::analytics::CacheDistribution;
+        let mut distribution = CacheDistribution::default();
+        distribution.record(42, Some((21, 4096)), 2, Some(10), Some(10));
+        let sample = AnalyticsObservation {
+            sampled_at: 100,
+            report: Some(distribution),
+            error: None,
+            maximum_bytes: Some(1000),
+        };
+        let mut state = DashboardData::default();
+        for (revision, analytics) in [(1, Some(sample.clone())), (2, None)] {
+            let patch = NativePatch {
+                revision,
+                telemetry: Some(NativeTelemetry {
+                    analytics,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let event = NativeEvent::Patch(Box::new(patch));
+            let encoded = serde_json::to_string(&event).unwrap();
+            assert!(apply_event(
+                &mut state,
+                serde_json::from_str(&encoded).unwrap()
+            ));
+            assert_eq!(
+                state.telemetry.as_ref().unwrap().analytics.as_ref(),
+                Some(&sample)
+            );
+        }
+        let reset = NativeEvent::Reset(Box::new(state.clone()));
+        let mut browser = DashboardData::default();
+        assert!(apply_event(
+            &mut browser,
+            serde_json::from_str(&serde_json::to_string(&reset).unwrap()).unwrap()
+        ));
+        assert_eq!(browser, state);
     }
 
     #[test]

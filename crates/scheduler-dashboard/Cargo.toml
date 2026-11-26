@@ -17,6 +17,7 @@ hydrate = ["dep:serde_json", "ui", "leptos/hydrate", "dep:wasm-bindgen", "dep:gl
 leptos = { version = "0.8", optional = true }
 leptos_meta = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"] }
+sccache-build = { path = "../build-runtime", default-features = false }
 serde_json = { version = "1", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 anyhow = { version = "1", optional = true }

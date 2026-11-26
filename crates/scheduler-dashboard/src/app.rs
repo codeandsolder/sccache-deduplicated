@@ -23,6 +23,7 @@ use leptos_meta::{Title, provide_meta_context};
 
 use crate::{DashboardData, MetricsData, MetricsView, TimeRange, styles};
 
+mod analytics;
 mod chart;
 mod native;
 #[cfg(target_arch = "wasm32")]
@@ -141,7 +142,7 @@ pub fn App() -> impl IntoView {
         <Title text="sccache | Scheduler status"/>
         <header class=styles::top>
             <div><small>"SCCACHE / DISTRIBUTED BUILD"</small><h1>"Scheduler status"</h1></div>
-            <nav><a href="#workers">"Workers"</a><a href="#jobs">"Jobs"</a><a href="#cas">"CAS"</a><a href="#topology">"Topology"</a><a href="#network">"Network"</a><a href="#metrics">"Fleet metrics"</a></nav>
+            <nav><a href="#workers">"Workers"</a><a href="#jobs">"Jobs"</a><a href="#cas">"CAS"</a><a href="#cache-analytics">"Cache analytics"</a><a href="#topology">"Topology"</a><a href="#network">"Network"</a><a href="#metrics">"Fleet metrics"</a></nav>
         </header>
         <main>
             <ConnectionIndicator status=status retry=retry/>
