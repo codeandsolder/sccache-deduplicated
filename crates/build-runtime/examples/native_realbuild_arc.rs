@@ -177,6 +177,7 @@ mod linux {
         platform: ContentId,
     ) -> Result<ExecutionSpec> {
         Ok(ExecutionSpec {
+            compiler_result: None,
             platform,
             root: ExecutionRoot { id: root, recipe },
             mounts: BTreeMap::new(),

@@ -347,7 +347,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"9";
+const CACHE_VERSION: &[u8] = b"10";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -2521,6 +2521,14 @@ fn relocate_rust_operands(
     Some(())
 }
 
+fn native_link_only_argument(argument: &Argument<ArgData>) -> bool {
+    matches!(
+        argument.get_data(),
+        Some(CodeGen(ArgCodegen { opt, .. }))
+            if matches!(opt.as_str(), "link-arg" | "link-args" | "link_arg" | "link_args")
+    )
+}
+
 /// Identify the source operand using the same typed argument grammar as
 /// compiler hashing. Retain the expanded argv itself, not a reserialization:
 /// linker options, repeated options, and option spellings remain exact.
@@ -2556,11 +2564,7 @@ pub(super) fn native_link_stage_input(
         // These options are consumed exclusively by the native linker.
         // Keep their exact original spelling in the link-stage arguments,
         // but exclude them from the generated-tree action identity.
-        if !matches!(
-            argument.get_data(),
-            Some(CodeGen(ArgCodegen { opt, .. }))
-                if matches!(opt.as_str(), "link-arg" | "link-args" | "link_arg" | "link_args")
-        ) {
+        if !native_link_only_argument(&argument) {
             codegen_arguments.extend_from_slice(&expanded[previous..end]);
         }
         previous = end;
@@ -3117,7 +3121,11 @@ where
             .collect();
         let hash_os_string_arguments = os_string_arguments
             .iter()
-            .map(|(arg, val)| {
+            .zip(&effective_arguments)
+            .filter(|(_, argument)| {
+                !self.parsed_args.split_link || !native_link_only_argument(argument)
+            })
+            .map(|((arg, val), _)| {
                 canonical_paths.as_ref().map_or_else(
                     || (arg.clone(), val.clone()),
                     |canonical| {
@@ -3238,17 +3246,11 @@ where
         let (mut sortables, rest): (Vec<_>, Vec<_>) = hash_os_string_arguments
             .iter()
             // We exclude a few arguments from the hash:
-            //   -L, --extern, --out-dir, --diagnostic-width
+            //   -L, --extern, --out-dir
             // These contain paths which aren't relevant to the output, and the compiler inputs
             // in those paths (rlibs and static libs used in the compilation) are used as hash
             // inputs below.
-            .filter(|&(arg, _)| {
-                !(arg == "--extern"
-                    || arg == "-L"
-                    || arg == "--check-cfg"
-                    || arg == "--out-dir"
-                    || arg == "--diagnostic-width")
-            })
+            .filter(|&(arg, _)| !(arg == "--extern" || arg == "-L" || arg == "--out-dir"))
             // We also exclude `--target` if it specifies a path to a .json file. The file content
             // is used as hash input below.
             // If `--target` specifies a string, it continues to be hashed as part of the arguments.
@@ -3641,6 +3643,11 @@ where
 }
 
 impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    fn native_result_policy(&self) -> super::native::ResultIdentityPolicy {
+        super::native::ResultIdentityPolicy::Rust
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "local, canonical, and distributed Rust command construction share one argument transformation pipeline and ownership flow"
@@ -8636,7 +8643,6 @@ version='2.0.0'
                     "foo.rs",
                     "--out-dir",
                     "out",
-                    "--diagnostic-width=1",
                     "--extern",
                     "a=1",
                     "--crate-name",
@@ -8678,9 +8684,9 @@ version='2.0.0'
 
     #[test_case(true ; "with preprocessor cache")]
     #[test_case(false ; "without preprocessor cache")]
-    fn test_equal_hashes_ignored_check_cfg_arg(preprocessor_cache_mode: bool) {
+    fn test_different_hashes_check_cfg_arg(preprocessor_cache_mode: bool) {
         let f = TestFixture::new();
-        assert_eq!(
+        assert_ne!(
             hash_key(
                 &f,
                 &[

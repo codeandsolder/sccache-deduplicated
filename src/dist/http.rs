@@ -18,7 +18,8 @@ pub use self::client::Client;
 pub use self::server::Server;
 #[cfg(feature = "dist-server")]
 pub use self::server::{
-    ClientAuthCheck, ClientVisibleMsg, HEARTBEAT_TIMEOUT, Scheduler, ServerAuthCheck,
+    ClientAuthCheck, ClientVisibleMsg, HEARTBEAT_TIMEOUT, LocalWorkerStart, Scheduler,
+    ServerAuthCheck,
 };
 
 pub(crate) mod transport;
@@ -1478,6 +1479,10 @@ mod server {
         )
     }
 
+    /// Start a colocated worker using the exact store owned by the scheduler.
+    pub type LocalWorkerStart =
+        Box<dyn FnOnce(crate::build_runtime::NativeStore) -> Result<()> + Send>;
+
     pub struct Scheduler<S> {
         cluster_directory: PathBuf,
         public_addr: SocketAddr,
@@ -1519,7 +1524,7 @@ mod server {
             clippy::too_many_lines,
             reason = "scheduler startup ties the enrollment, native publication, dashboard and control RPC listeners to a single handler lifetime"
         )]
-        pub fn start(self) -> Result<Infallible> {
+        pub fn start(self, local_worker: Option<LocalWorkerStart>) -> Result<Infallible> {
             let Self {
                 cluster_directory,
                 public_addr,
@@ -1621,7 +1626,15 @@ mod server {
                 })?;
             #[cfg(feature = "scheduler-dashboard")]
             let mut dashboard_native = None;
+            let mut local_store = None;
             let native_endpoint = if let Some(config) = native_cache {
+                let store = crate::build_runtime::NativeStore::open_managed(
+                    &config.directory,
+                    config.space,
+                )?;
+                if local_worker.is_some() {
+                    local_store = Some(store.clone());
+                }
                 let handler = Arc::clone(&handler);
                 let requester = Arc::clone(&requester);
                 let allocation_routes = Arc::clone(&requester);
@@ -1633,7 +1646,7 @@ mod server {
                 let network = Arc::new(crate::build_runtime::NetworkMeter::default());
                 let peer_network = Arc::clone(&network);
                 let (bound, sessions) = native::spawn(
-                    &config,
+                    (&config, store),
                     move |assignment, snapshot, packages| match handler.handle_alloc_native_job(
                         &*requester,
                         assignment,
@@ -1796,6 +1809,9 @@ mod server {
                 "Scheduler listening for clients on {}",
                 server.local_addr()?
             );
+            if let Some(start) = local_worker {
+                start(local_store.context("local worker requires native cache")?)?;
+            }
             server.run()?;
             Err(anyhow!("scheduler HTTPS listener terminated"))
         }

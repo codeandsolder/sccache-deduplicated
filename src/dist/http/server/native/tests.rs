@@ -18,6 +18,7 @@ use crate::{
 fn action(root: &TreeManifest) -> Result<ExecutionSpec> {
     let id = root.id()?;
     Ok(ExecutionSpec {
+        compiler_result: None,
         platform: ContentId::of(b"test-platform"),
         root: ExecutionRoot::resolve(
             TreeRecipe::union(
@@ -854,7 +855,7 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
             package_import: None,
             transport: &transport,
             execution_queue: &execution_queue,
-            artifact_grace: &artifact_grace,
+            artifact_grace: Some(&artifact_grace),
         };
         let busy = execution_queue.acquire(|| Ok(()))?;
         let prepared = worker.prepare_on_worker(
