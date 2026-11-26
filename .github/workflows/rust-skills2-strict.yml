@@ -14,13 +14,13 @@ permissions:
 
 jobs:
   strict-rust:
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@7d0552029497cf094787c3593f804d5bce137c4b # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@f2b37a67bfe379e8db96731f97ad3c345065b168 # main
     with:
+      command: ":"
+      rustflags: ""
       python-ci-paths: tools
-      allow-test-panics: true
-
-  strict-cpu-target-profile:
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@7d0552029497cf094787c3593f804d5bce137c4b # main
-    with:
-      working-directory: tools/cpu-target-profile
-      python-ci-paths: tools
+      strict-suites: |
+        [
+          {"name":"workspace","allow-test-panics":true},
+          {"name":"cpu-target-profile","directory":"tools/cpu-target-profile"}
+        ]
