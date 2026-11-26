@@ -999,11 +999,12 @@ pub enum JobAssignment {
 }
 
 #[cfg(feature = "dist-server")]
-pub trait SchedulerOutgoing {
+#[async_trait]
+pub trait SchedulerOutgoing: Send + Sync {
     // To Server
     /// # Errors
     /// The worker could not be contacted or rejected the assignment.
-    fn do_assign_job(
+    async fn do_assign_job(
         &self,
         server_id: ServerId,
         job_id: JobId,
@@ -1013,11 +1014,16 @@ pub trait SchedulerOutgoing {
 }
 
 #[cfg(feature = "dist-server")]
+#[async_trait]
 pub trait ServerOutgoing: Send + Sync {
     // To Scheduler
     /// # Errors
     /// The scheduler could not accept or acknowledge the state update.
-    fn do_update_job_state(&self, job_id: JobId, state: JobState) -> Result<UpdateJobStateResult>;
+    async fn do_update_job_state(
+        &self,
+        job_id: JobId,
+        state: JobState,
+    ) -> Result<UpdateJobStateResult>;
 }
 
 // Trait to handle the creation and verification of job authorization tokens
@@ -1185,12 +1191,13 @@ impl WorkerCapabilities {
 }
 
 #[cfg(feature = "dist-server")]
-pub trait SchedulerIncoming: Send + Sync {
+#[async_trait]
+pub trait SchedulerIncoming: Send + Sync + 'static {
     // From Client
     /// # Errors
     /// Worker selection or assignment failed.
-    fn handle_alloc_job(
-        &self,
+    async fn handle_alloc_job(
+        self: std::sync::Arc<Self>,
         requester: &dyn SchedulerOutgoing,
         tc: Toolchain,
     ) -> ExtResult<AllocJobResult, Error>;
@@ -1198,8 +1205,8 @@ pub trait SchedulerIncoming: Send + Sync {
     ///
     /// # Errors
     /// Returns an error if allocation or assignment fails.
-    fn handle_alloc_native_job(
-        &self,
+    async fn handle_alloc_native_job(
+        self: std::sync::Arc<Self>,
         requester: &dyn SchedulerOutgoing,
         assignment: NativeAssignment,
         network: &crate::build_runtime::NetworkSnapshot,

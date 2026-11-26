@@ -54,8 +54,8 @@ fn decoded_download(
     id: ContentId,
 ) -> Result<crate::BlobReader> {
     {
-        let (file, encoding) = service.download(ticket, publisher, id)?;
-        crate::BlobReader::open(file, encoding)
+        let download = service.download(ticket, publisher, id)?;
+        crate::BlobReader::open(download.file, download.encoding)
     }
 }
 
@@ -339,6 +339,29 @@ fn result_contract_and_limits_control_publication() -> Result<()> {
     Ok(())
 }
 
+impl NativeSessions {
+    fn schedule(
+        &self,
+        ticket: Ticket,
+        request: &ActionRequest,
+        requester: crate::PeerId,
+        selection: DeliverySelection,
+        allocate: impl FnOnce(
+            BTreeMap<ContentId, u64>,
+            Vec<&BTreeMap<ContentId, u64>>,
+        ) -> Result<ScheduleReply>,
+    ) -> Result<ScheduleReply> {
+        match self.prepare_schedule(ticket, request, requester, selection)? {
+            SchedulePreparation::Replay(reply) => Ok(reply),
+            SchedulePreparation::Dispatch(mut reservation) => {
+                let (blobs, trees) = reservation.placement_inputs();
+                let reply = allocate(blobs, trees)?;
+                reservation.finish(reply)
+            }
+        }
+    }
+}
+
 #[test]
 fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -598,7 +621,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
 }
 
 #[test]
-fn delegation_blocks_early_worker_verification_until_assignment_returns() -> Result<()> {
+fn delegation_is_nonblocking_and_retries_early_worker_verification() -> Result<()> {
     use std::{sync::mpsc, thread};
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
@@ -636,29 +659,48 @@ fn delegation_blocks_early_worker_verification_until_assignment_returns() -> Res
         };
         thread::scope(|scope| -> Result<()> {
             let (start, start_rx) = mpsc::channel();
-            let (attempt, attempt_rx) = mpsc::channel();
             let (done, done_rx) = mpsc::channel();
             let service = &service;
             let action = &action;
             let verifier = scope.spawn(move || -> Result<()> {
                 start_rx.recv_timeout(Duration::from_secs(5))?;
-                attempt.send(())?;
-                done.send(service.verify_execution(ticket, publisher, action))?;
+                assert_eq!(service.status(ticket)?, NativeStatus::Compiling);
+                service.renew(ticket, Publisher::Client)?;
+                assert!(
+                    service
+                        .verify_execution(ticket, publisher, action)
+                        .unwrap_err()
+                        .is::<NativeServiceBusy>()
+                );
+                assert!(
+                    service
+                        .schedule(ticket, action, test_peer(9), selection(), |_, _| bail!(
+                            "duplicate allocation"
+                        ))
+                        .unwrap_err()
+                        .is::<NativeServiceBusy>()
+                );
+                assert!(
+                    !service
+                        .schedule(ticket, action, test_peer(8), selection(), |_, _| bail!(
+                            "wrong requester"
+                        ))
+                        .unwrap_err()
+                        .is::<NativeServiceBusy>()
+                );
+                done.send(())?;
                 Ok(())
             });
             let reply = service.schedule(ticket, action, test_peer(9), selection(), |_, _| {
                 start.send(())?;
-                attempt_rx.recv_timeout(Duration::from_secs(5))?;
-                // The action mutex is still held while assignment returns.
-                assert!(matches!(
-                    done_rx.recv_timeout(Duration::from_millis(50)),
-                    Err(mpsc::RecvTimeoutError::Timeout)
-                ));
+                done_rx.recv_timeout(Duration::from_secs(5))?;
                 Ok(expected.clone())
             })?;
             assert_eq!(reply, expected);
-            let verified = done_rx.recv_timeout(Duration::from_secs(5))?;
-            assert_eq!(verified.is_ok(), accepted);
+            assert_eq!(
+                service.verify_execution(ticket, publisher, action).is_ok(),
+                accepted
+            );
             verifier
                 .join()
                 .map_err(|_| anyhow!("verification thread panicked"))??;
@@ -666,6 +708,107 @@ fn delegation_blocks_early_worker_verification_until_assignment_returns() -> Res
         })?;
         service.close(ticket, Publisher::Client)?;
     }
+    Ok(())
+}
+
+#[test]
+fn closing_during_assignment_cannot_resurrect_the_ticket() -> Result<()> {
+    use std::{sync::mpsc, thread};
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let action = request()?;
+    let NativeAdmission::Compile { ticket } = service.admit(
+        action.clone(),
+        Publisher::Client,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
+    else {
+        bail!("expected compilation");
+    };
+    let worker = WorkerAllocation {
+        peer: test_peer(1),
+        routes: sccache_peer_identity::RouteSet::new("127.0.0.1:10501".parse()?, []),
+        job: 42,
+        auth: "proof".into(),
+    };
+    let publisher = Publisher::Worker {
+        peer: worker.peer,
+        job: worker.job,
+    };
+    thread::scope(|scope| -> Result<()> {
+        let (start, started) = mpsc::channel();
+        let (done, closed) = mpsc::channel();
+        let service = &service;
+        let closer = scope.spawn(move || -> Result<()> {
+            started.recv_timeout(Duration::from_secs(5))?;
+            service.close(ticket, Publisher::Client)?;
+            done.send(())?;
+            Ok(())
+        });
+        let result = service.schedule(ticket, &action, test_peer(9), selection(), |_, _| {
+            start.send(())?;
+            closed.recv_timeout(Duration::from_secs(5))?;
+            Ok(ScheduleReply::Assigned(worker))
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled before acknowledgement")
+        );
+        closer.join().map_err(|_| anyhow!("closer panicked"))??;
+        Ok(())
+    })?;
+    assert!(
+        service
+            .verify_execution(ticket, publisher, &action)
+            .is_err()
+    );
+    assert!(service.status(ticket).is_err());
+    assert!(matches!(
+        service.admit(
+            action,
+            Publisher::Client,
+            ActionMode::Reuse,
+            BTreeMap::new()
+        )?,
+        NativeAdmission::Compile { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn failed_assignment_releases_intent_for_retry() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let action = request()?;
+    let NativeAdmission::Compile { ticket } = service.admit(
+        action.clone(),
+        Publisher::Client,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
+    else {
+        bail!("expected compilation");
+    };
+    assert!(
+        service
+            .schedule(ticket, &action, test_peer(9), selection(), |_, _| bail!(
+                "transport failed"
+            ))
+            .is_err()
+    );
+    let expected = ScheduleReply::Unavailable {
+        message: "no capacity".into(),
+    };
+    assert_eq!(
+        service.schedule(ticket, &action, test_peer(9), selection(), |_, _| Ok(
+            expected.clone()
+        ))?,
+        expected
+    );
+    service.renew(ticket, Publisher::Client)?;
     Ok(())
 }
 
@@ -1011,6 +1154,74 @@ fn original_package_slots_deduplicate_identities_and_bound_parallel_imports() ->
     Ok(())
 }
 
+#[cfg(feature = "async-io")]
+#[tokio::test]
+async fn package_upload_reservations_release_on_drop_and_invalid_input() -> Result<()> {
+    use crate::PackageCompression;
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let limits = PackageImportLimits {
+        retain_original: false,
+        max_concurrent_imports: 8,
+        max_archive_bytes: 1024,
+        max_entries: 8,
+        max_expanded_bytes: 1024,
+        max_tar_bytes: 4096,
+        max_metadata_bytes: 4096,
+        decoder_memory_bytes: 1 << 20,
+        decoder_timeout_secs: 5,
+    };
+    let bytes = b"original archive bytes";
+    let identity = PackageIdentity {
+        sha256: Sha256::digest(bytes).into(),
+        compression: PackageCompression::Tar,
+    };
+    let length = ArchiveLength::Exact(bytes.len() as u64);
+    let prepare = |identity| -> Result<_> {
+        match service.prepare_package(identity, length, limits)? {
+            PackagePreparation::Import(upload) => Ok(upload),
+            PackagePreparation::Cached(_) => bail!("unexpected cached package"),
+        }
+    };
+    let mut uploads = Vec::new();
+    for byte in 0..4 {
+        uploads.push(prepare(PackageIdentity {
+            sha256: [byte; 32],
+            ..identity
+        })?);
+    }
+    assert!(
+        prepare(identity)
+            .err()
+            .context("shared upload capacity exceeded")?
+            .is::<NativeServiceBusy>()
+    );
+    drop(uploads);
+    let upload = prepare(identity)?;
+    assert!(
+        prepare(identity)
+            .err()
+            .context("duplicate package admitted")?
+            .is::<NativeServiceBusy>()
+    );
+    let (upload, _) = upload.append(bytes[..5].to_vec()).await?;
+    assert!(upload.seal().await.is_err());
+    let upload = prepare(identity)?;
+    assert!(upload.append(vec![0; bytes.len() + 1]).await.is_err());
+    let upload = prepare(identity)?;
+    let (upload, _) = upload.append(vec![0; bytes.len()]).await?;
+    assert!(upload.seal().await.is_err());
+    let upload = prepare(identity)?;
+    let (upload, _) = upload.append(bytes.to_vec()).await?;
+    let upload = upload.seal().await?;
+    drop(upload);
+    assert_eq!(std::fs::read_dir(dir.path().join("staging"))?.count(), 0);
+    assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
+    assert!(service.lookup_package(identity, limits)?.is_none());
+    Ok(())
+}
+
 #[test]
 fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1348,12 +1559,13 @@ fn exercise_source_release(staged: bool) -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
+#[tokio::test]
+async fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     use crate::{TreeEntry, TreePath};
     let directory = tempfile::tempdir()?;
     let mut service = service(directory.path())?;
     service.limits.peer_discovery_timeout = Duration::from_secs(1);
+    let service = Arc::new(service);
     let root = empty_root().root;
     let first = BlobRef {
         id: ContentId::of(b"peer bytes"),
@@ -1415,17 +1627,49 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     service.request_inputs(delivery, worker, vec![first])?;
     assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
     let claim = service
-        .claim_peer_input(Duration::ZERO)?
+        .claim_peer_input(Duration::ZERO)
+        .await?
         .context("peer claim missing")?;
     assert_eq!(claim.blob(), first);
     assert_eq!(claim.requester(), peer);
     assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
-    assert!(service.claim_peer_input(Duration::ZERO)?.is_none());
-    service.recover_peer_input(
-        claim,
-        Instant::now() + Duration::from_secs(1),
-        |blob, store, _| Ok(Some(store.stage_expected(blob, &b"peer bytes"[..])?)),
-    )?;
+    assert!(service.claim_peer_input(Duration::ZERO).await?.is_none());
+    let started = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let recovery = {
+        let sessions = Arc::clone(&service);
+        let started = Arc::clone(&started);
+        let resume = Arc::clone(&resume);
+        tokio::spawn(async move {
+            sessions
+                .recover_peer_input(
+                    claim,
+                    Instant::now() + Duration::from_secs(5),
+                    move |blob, store, _| {
+                        let started = Arc::clone(&started);
+                        let resume = Arc::clone(&resume);
+                        async move {
+                            started.notify_one();
+                            resume.notified().await;
+                            Ok(Some(store.stage_expected(blob, &b"peer bytes"[..])?))
+                        }
+                    },
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), started.notified()).await?;
+    recovery.abort();
+    assert!(recovery.await.unwrap_err().is_cancelled());
+    assert_eq!(service.active_uploads.load(Ordering::Acquire), 1);
+    assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
+    resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while service.active_uploads.load(Ordering::Acquire) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
     let mut bytes = Vec::new();
     decoded_download(&service, delivery, worker, first.id)?.read_to_end(&mut bytes)?;
     assert_eq!(bytes, b"peer bytes");
@@ -1433,7 +1677,8 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
 
     service.request_inputs(delivery, worker, vec![second])?;
     let claim = service
-        .claim_peer_input(Duration::ZERO)?
+        .claim_peer_input(Duration::ZERO)
+        .await?
         .context("peer claim missing")?;
     assert_eq!(claim.blob(), second);
     // A wrong peer payload must not become visible; the failed claim
@@ -1443,8 +1688,9 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
             .recover_peer_input(
                 claim,
                 Instant::now() + Duration::from_secs(1),
-                |_, store, _| { Ok(Some(store.stage(&b"wrong bytes!"[..])?)) }
+                |_, store, _| async move { Ok(Some(store.stage(&b"wrong bytes!"[..])?)) }
             )
+            .await
             .is_err()
     );
     assert!(service.store().open_available_blob(second)?.is_none());
@@ -1463,7 +1709,8 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     service.request_inputs(delivery, worker, vec![third])?;
     drop(
         service
-            .claim_peer_input(Duration::ZERO)?
+            .claim_peer_input(Duration::ZERO)
+            .await?
             .context("initial peer claim missing")?,
     );
     assert_eq!(
@@ -1482,7 +1729,8 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
 
     assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
     let claim = service
-        .claim_peer_input(Duration::ZERO)?
+        .claim_peer_input(Duration::ZERO)
+        .await?
         .context("renewed peer claim missing")?;
     drop(claim);
     let flight = service
@@ -1494,13 +1742,14 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
         .context("missing flight")?;
     flight.lock()?.peer_retry_at = Some(Instant::now());
     let claim = service
-        .claim_peer_input(Duration::ZERO)?
+        .claim_peer_input(Duration::ZERO)
+        .await?
         .context("periodic peer retry missing")?;
     service.recover_peer_input(
         claim,
         Instant::now() + Duration::from_secs(1),
-        |blob, store, _| Ok(Some(store.stage_expected(blob, &b"late peer"[..])?)),
-    )?;
+        |blob, store, _| async move { Ok(Some(store.stage_expected(blob, &b"late peer"[..])?)) },
+    ).await?;
     bytes.clear();
     decoded_download(&service, delivery, worker, third.id)?.read_to_end(&mut bytes)?;
     assert_eq!(bytes, b"late peer");
@@ -1510,8 +1759,8 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Result<()> {
+#[tokio::test]
+async fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let req = request()?;
     let fingerprint = req.action_fingerprint()?;
@@ -1536,6 +1785,7 @@ fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Result<()> 
     }
     let mut service = service(dir.path())?;
     service.limits.peer_discovery_timeout = Duration::from_millis(25);
+    let service = Arc::new(service);
     for _ in 0..2 {
         assert_eq!(
             service.admit(
@@ -1547,16 +1797,26 @@ fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Result<()> 
             NativeAdmission::InFlight
         );
     }
-    let calls = std::cell::Cell::new(0);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let expected = output.outputs["obj"].test_file_blob();
     assert!(
-        service.recover_next_result(Duration::ZERO, |blob, store, _| {
-            calls.set(calls.get() + 1);
-            assert_eq!(blob, output.outputs["obj"].test_file_blob());
-            Ok(Some(store.stage_expected(blob, &b"peer object"[..])?))
-        })?
+        service
+            .recover_next_result(Duration::ZERO, move |blob, store, _| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    assert_eq!(blob, expected);
+                    Ok(Some(store.stage_expected(blob, &b"peer object"[..])?))
+                }
+            })
+            .await?
     );
-    assert_eq!(calls.get(), 1);
-    assert!(!service.recover_next_result(Duration::ZERO, |_, _, _| unreachable!())?);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(
+        !service
+            .recover_next_result(Duration::ZERO, |_, _, _| async { unreachable!() })
+            .await?
+    );
     let NativeAdmission::Hit { ticket, manifest } =
         service.admit(req, Publisher::Client, ActionMode::Reuse, BTreeMap::new())?
     else {
@@ -1577,11 +1837,12 @@ fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Result<()> 
     Ok(())
 }
 
-#[test]
-fn failed_result_recovery_preserves_partial_content_and_allows_compilation() -> Result<()> {
+#[tokio::test]
+async fn failed_result_recovery_preserves_partial_content_and_allows_compilation() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let mut service = service(dir.path())?;
     service.limits.peer_discovery_timeout = Duration::from_millis(25);
+    let service = Arc::new(service);
     let req = request()?;
     let fingerprint = req.action_fingerprint()?;
     let key = fingerprint.key()?;
@@ -1614,14 +1875,16 @@ fn failed_result_recovery_preserves_partial_content_and_allows_compilation() -> 
         NativeAdmission::InFlight
     );
     assert!(
-        service.recover_next_result(Duration::ZERO, |blob, store, _| {
-            if blob == object {
-                Ok(Some(store.stage_expected(blob, &b"larger object"[..])?))
-            } else {
-                assert_eq!(blob, missing);
-                Ok(None)
-            }
-        })?
+        service
+            .recover_next_result(Duration::ZERO, move |blob, store, _| async move {
+                if blob == object {
+                    Ok(Some(store.stage_expected(blob, &b"larger object"[..])?))
+                } else {
+                    assert_eq!(blob, missing);
+                    Ok(None)
+                }
+            })
+            .await?
     );
     assert!(store.open_available_blob(object)?.is_some());
     assert!(store.open_available_blob(missing)?.is_none());
@@ -1756,8 +2019,9 @@ fn retention_group_survives_action_close_refresh_and_exceeds_action_slots() -> R
     assert_eq!(service.store().evict(key)?, Eviction::Pinned);
     for (blob, bytes) in retained {
         assert!(service.download_retained(group, other, blob).is_err());
-        let (file, encoding) = service.download_retained(group, owner, blob)?;
-        let mut reader = crate::BlobReader::open(file, encoding)?;
+        let download = service.download_retained(group, owner, blob)?;
+        assert_eq!(download.logical_size, blob.size);
+        let mut reader = crate::BlobReader::open(download.file, download.encoding)?;
         let mut actual = Vec::new();
         reader.read_to_end(&mut actual)?;
         assert_eq!(actual, bytes);
@@ -1775,5 +2039,41 @@ fn retention_group_survives_action_close_refresh_and_exceeds_action_slots() -> R
     );
     assert!(service.renew_retention(expiring, owner).is_err());
     assert!(!matches!(service.store().evict(key)?, Eviction::Pinned));
+    Ok(())
+}
+
+#[test]
+fn interrupted_incremental_upload_releases_claim_and_rejects_failed_finish() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
+    let NativeAdmission::Compile { ticket } =
+        service.admit(request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("expected compilation")
+    };
+    let output = manifest(b"object");
+    let blob = output.outputs["obj"].test_file_blob();
+    service.begin(ticket, worker, output.clone())?;
+    let mut interrupted = service.prepare_upload(ticket, worker, blob, BlobEncoding::Raw)?;
+    interrupted.feed(b"obj")?;
+    assert!(
+        service
+            .prepare_upload(ticket, worker, blob, BlobEncoding::Raw)
+            .is_err()
+    );
+    drop(interrupted);
+    let mut failed = service.prepare_upload(ticket, worker, blob, BlobEncoding::Raw)?;
+    failed.feed(b"object")?;
+    assert!(failed.feed(b"x").is_err());
+    assert!(service.finish_upload(failed).is_err());
+    let mut complete = service.prepare_upload(ticket, worker, blob, BlobEncoding::Raw)?;
+    complete.feed(b"ob")?;
+    complete.feed(b"ject")?;
+    service.finish_upload(complete)?;
+    assert_eq!(service.commit(ticket, worker)?, output);
     Ok(())
 }

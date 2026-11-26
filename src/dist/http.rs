@@ -257,7 +257,10 @@ pub mod urls {
 
 #[cfg(feature = "dist-server")]
 mod server {
-    use self::cluster_http::{Listener, ListenerRole, Request, binary, path_route, route, routes};
+    use self::cluster_http::{
+        AdmissionClass, Listener, ListenerRole, Request, async_route, binary, path_route, route,
+        routes,
+    };
     use crate::dist::cluster::{ClusterRoutes, refresh_blocking};
     use crate::util::num_cpus;
     use axum::{
@@ -654,15 +657,40 @@ mod server {
             return Err(BincodeInputError::WrongContentType);
         }
 
-        let mut body = request
-            .data()
-            .ok_or(BincodeInputError::BodyAlreadyExtracted)?;
-        let bytes = transport::read_bounded(&mut body, transport::CONTROL_REQUEST_LIMIT).map_err(
-            |error| match error {
+        let bytes = request
+            .read_buffered(transport::CONTROL_REQUEST_LIMIT)
+            .map_err(|error| match error {
                 transport::BoundedReadError::TooLarge => BincodeInputError::BodyTooLarge,
+                transport::BoundedReadError::AlreadyExtracted => {
+                    BincodeInputError::BodyAlreadyExtracted
+                }
                 transport::BoundedReadError::Io(error) => BincodeInputError::BodyReadError(error),
-            },
-        )?;
+            })?;
+        transport::decode_bincode(&bytes).map_err(From::from)
+    }
+
+    async fn bincode_input_async<O>(
+        request: &mut Request,
+    ) -> std::result::Result<O, BincodeInputError>
+    where
+        O: serde::de::DeserializeOwned,
+    {
+        if !request
+            .header("Content-Type")
+            .is_some_and(|header| header.starts_with("application/octet-stream"))
+        {
+            return Err(BincodeInputError::WrongContentType);
+        }
+        let bytes = request
+            .read_bounded(transport::CONTROL_REQUEST_LIMIT)
+            .await
+            .map_err(|error| match error {
+                transport::BoundedReadError::TooLarge => BincodeInputError::BodyTooLarge,
+                transport::BoundedReadError::AlreadyExtracted => {
+                    BincodeInputError::BodyAlreadyExtracted
+                }
+                transport::BoundedReadError::Io(error) => BincodeInputError::BodyReadError(error),
+            })?;
         transport::decode_bincode(&bytes).map_err(From::from)
     }
 
@@ -715,9 +743,9 @@ mod server {
             try_or_err_and_log!($reqid, StatusCode::BAD_REQUEST, $result)
         };
     }
-    macro_rules! try_bincode_input {
-        ($reqid:expr, $request:expr) => {{
-            match bincode_input($request) {
+    macro_rules! try_bincode_result {
+        ($reqid:expr, $result:expr) => {{
+            match $result {
                 Ok(value) => value,
                 Err(error) => {
                     let status = if matches!(error, BincodeInputError::BodyTooLarge) {
@@ -730,6 +758,12 @@ mod server {
                 }
             }
         }};
+    }
+
+    macro_rules! try_bincode_input {
+        ($reqid:expr, $request:expr) => {
+            try_bincode_result!($reqid, bincode_input($request))
+        };
     }
 
     macro_rules! try_or_500_log {
@@ -1085,64 +1119,79 @@ mod server {
         response
     }
 
+    async fn allocate_archive<S: dist::SchedulerIncoming>(
+        state: Arc<SchedulerHttp<S>>,
+        mut request: Request,
+    ) -> Response {
+        let req_id = state.request_count.fetch_add(1, atomic::Ordering::Relaxed);
+        trace!(target: "sccache_http", "Req {req_id}: {:?}", SafeRequest(&request));
+        if let Some(response) = role_error(&request, Role::Client) {
+            return response;
+        }
+        let toolchain = try_bincode_result!(req_id, bincode_input_async(&mut request).await);
+        trace!("Req {req_id}: alloc_job: {toolchain:?}");
+        let alloc_job_res = try_or_500_log!(
+            req_id,
+            Arc::clone(&state.handler)
+                .handle_alloc_job(state.requester.as_ref(), toolchain)
+                .await
+        );
+        let res = match alloc_job_res {
+            AllocJobResult::Success {
+                job_alloc,
+                need_toolchain,
+            } => {
+                let routes =
+                    try_or_500_log!(req_id, state.requester.addresses(job_alloc.server_id));
+                AllocJobHttpResponse::Success {
+                    job_alloc,
+                    need_toolchain,
+                    routes,
+                }
+            }
+            AllocJobResult::Fail { msg } => AllocJobHttpResponse::Fail { msg },
+        };
+        let response = prepare_response(&request, &res);
+        trace!(target: "sccache_http", "Res {req_id}: {}", response.status());
+        response
+    }
+
     fn scheduler_client_routes<S: dist::SchedulerIncoming + 'static>()
     -> Router<Arc<SchedulerHttp<S>>> {
         Router::new()
             .route(
                 "/api/v1/scheduler/alloc_job",
-                route(MethodFilter::POST, |state: &SchedulerHttp<S>, request| {
-                    let handler = &state.handler;
-                    let requester = &state.requester;
-                    logged(&state.request_count, request, |req_id| {
-                        if let Some(response) = role_error(request, Role::Client) {
-                            return response;
-                        }
-                        let toolchain = try_bincode_input!(req_id, request);
-                        trace!("Req {req_id}: alloc_job: {toolchain:?}");
-
-                        let alloc_job_res: AllocJobResult = try_or_500_log!(
-                            req_id,
-                            handler.handle_alloc_job(requester.as_ref(), toolchain)
-                        );
-                        let res = match alloc_job_res {
-                            AllocJobResult::Success {
-                                job_alloc,
-                                need_toolchain,
-                            } => {
-                                let routes = try_or_500_log!(
-                                    req_id,
-                                    requester.addresses(job_alloc.server_id)
-                                );
-                                AllocJobHttpResponse::Success {
-                                    job_alloc,
-                                    need_toolchain,
-                                    routes,
-                                }
-                            }
-                            AllocJobResult::Fail { msg } => AllocJobHttpResponse::Fail { msg },
-                        };
-                        prepare_response(request, &res)
-                    })
-                }),
+                async_route(
+                    MethodFilter::POST,
+                    AdmissionClass::Dispatch,
+                    allocate_archive::<S>,
+                ),
             )
             .route(
                 "/api/v1/scheduler/native_routes",
-                route(MethodFilter::GET, |state: &SchedulerHttp<S>, request| {
-                    let native_endpoint = &state.native_endpoint;
-                    logged(&state.request_count, request, |_req_id| {
-                        if let Some((primary, bind)) = *native_endpoint {
-                            let routes = crate::dist::cluster_routes::discover(primary, bind);
-                            prepare_response(request, &WorkerRouteHttpResponse { routes })
-                        } else {
-                            StatusCode::NOT_FOUND.into_response()
-                        }
-                    })
-                }),
+                route(
+                    MethodFilter::GET,
+                    AdmissionClass::Metadata,
+                    |_| None,
+                    |state: &SchedulerHttp<S>, request| {
+                        let native_endpoint = &state.native_endpoint;
+                        logged(&state.request_count, request, |_req_id| {
+                            if let Some((primary, bind)) = *native_endpoint {
+                                let routes = crate::dist::cluster_routes::discover(primary, bind);
+                                prepare_response(request, &WorkerRouteHttpResponse { routes })
+                            } else {
+                                StatusCode::NOT_FOUND.into_response()
+                            }
+                        })
+                    },
+                ),
             )
             .route(
                 "/api/v1/scheduler/worker_route/{server_id}",
                 path_route(
                     MethodFilter::GET,
+                    |_| AdmissionClass::Metadata,
+                    |_, _| None,
                     |state: &SchedulerHttp<S>, request, server_id: ServerId| {
                         let requester = &state.requester;
                         logged(&state.request_count, request, |req_id| {
@@ -1159,6 +1208,8 @@ mod server {
                 "/api/v1/scheduler/worker_name/{server_id}",
                 path_route(
                     MethodFilter::GET,
+                    |_| AdmissionClass::Metadata,
+                    |_, _| None,
                     |state: &SchedulerHttp<S>, request, server_id: ServerId| {
                         let handler = &state.handler;
                         logged(&state.request_count, request, |req_id| {
@@ -1177,7 +1228,7 @@ mod server {
     fn scheduler_worker_routes<S: dist::SchedulerIncoming + 'static>()
     -> Router<Arc<SchedulerHttp<S>>> {
         Router::new()
-            .route("/api/v4/scheduler/heartbeat_server", route(MethodFilter::POST, |state: &SchedulerHttp<S>, request| {
+            .route("/api/v4/scheduler/heartbeat_server", route(MethodFilter::POST, AdmissionClass::Control, |_| Some(transport::CONTROL_REQUEST_LIMIT), |state: &SchedulerHttp<S>, request| {
                 let handler = &state.handler;
                 let requester = &state.requester;
                 let registry = &state.registry;
@@ -1228,7 +1279,7 @@ mod server {
                     prepare_response(request, &HeartbeatReply { result: res, revoked })
                 })
             }))
-            .route("/api/v1/scheduler/job_state/{job_id}", path_route(MethodFilter::POST, |state: &SchedulerHttp<S>, request, job_id: JobId| {
+            .route("/api/v1/scheduler/job_state/{job_id}", path_route(MethodFilter::POST, |_| AdmissionClass::Control, |_, _| Some(transport::CONTROL_REQUEST_LIMIT), |state: &SchedulerHttp<S>, request, job_id: JobId| {
                 let handler = &state.handler;
                 logged(&state.request_count, request, |req_id| {
                     if let Some(response) = role_error(request, Role::Worker) { return response; }
@@ -1242,14 +1293,14 @@ mod server {
                     prepare_response(request, &res)
                 })
             }))
-            .route("/api/v1/scheduler/status", route(MethodFilter::GET, |state: &SchedulerHttp<S>, request| {
+            .route("/api/v1/scheduler/status", route(MethodFilter::GET, AdmissionClass::Metadata, |_| None, |state: &SchedulerHttp<S>, request| {
                 let handler = &state.handler;
                 logged(&state.request_count, request, |req_id| {
                     let res: SchedulerStatusResult = try_or_500_log!(req_id, handler.handle_status());
                     prepare_response(request, &res)
                 })
             }))
-            .route("/api/v1/scheduler/drain_status", route(MethodFilter::GET, |state: &SchedulerHttp<S>, request| {
+            .route("/api/v1/scheduler/drain_status", route(MethodFilter::GET, AdmissionClass::Control, |_| None, |state: &SchedulerHttp<S>, request| {
                 let handler = &state.handler;
                 logged(&state.request_count, request, |_req_id| {
                     let draining = u8::from(handler.handle_is_draining());
@@ -1271,6 +1322,8 @@ mod server {
                 "/api/v1/distserver/assign_job/{job_id}",
                 path_route(
                     MethodFilter::POST,
+                    |_| AdmissionClass::Dispatch,
+                    |_, _| Some(transport::CONTROL_REQUEST_LIMIT),
                     |state: &WorkerHttp<S>, request, job_id: JobId| {
                         let handler = &state.handler;
                         let job_authorizer = &state.job_authorizer;
@@ -1295,6 +1348,10 @@ mod server {
                 "/api/v5/distserver/assign_native_job/{job_id}",
                 path_route(
                     MethodFilter::POST,
+                    |_| AdmissionClass::Dispatch,
+                    |state: &WorkerHttp<S>, _| {
+                        Some(state.handler.native_metadata_limit().unwrap_or(0))
+                    },
                     |state: &WorkerHttp<S>, request, job_id: JobId| {
                         let handler = &state.handler;
                         let requester = &state.requester;
@@ -1331,23 +1388,30 @@ mod server {
         Router::new()
             .route(
                 "/api/v3/distserver/native_blob",
-                route(MethodFilter::POST, |state: &WorkerHttp<S>, request| {
-                    let handler = &state.handler;
-                    let job_authorizer = &state.job_authorizer;
-                    logged(&state.request_count, request, |req_id| {
-                        try_or_500_log!(
-                            req_id,
-                            native::serve_peer_blob(request, job_authorizer.as_ref(), |blob| {
-                                handler.handle_native_blob(blob)
-                            })
-                        )
-                    })
-                }),
+                route(
+                    MethodFilter::POST,
+                    AdmissionClass::Bulk,
+                    |_| Some(40),
+                    |state: &WorkerHttp<S>, request| {
+                        let handler = &state.handler;
+                        let job_authorizer = &state.job_authorizer;
+                        logged(&state.request_count, request, |req_id| {
+                            try_or_500_log!(
+                                req_id,
+                                native::serve_peer_blob(request, job_authorizer.as_ref(), |blob| {
+                                    handler.handle_native_blob(blob)
+                                })
+                            )
+                        })
+                    },
+                ),
             )
             .route(
                 "/api/v5/distserver/run_native_job/{job_id}",
                 path_route(
                     MethodFilter::POST,
+                    |_| AdmissionClass::Metadata,
+                    |_, _| Some(16),
                     |state: &WorkerHttp<S>, request, job_id: JobId| {
                         let handler = &state.handler;
                         let job_authorizer = &state.job_authorizer;
@@ -1379,6 +1443,8 @@ mod server {
                 "/api/v1/distserver/submit_toolchain/{job_id}",
                 path_route(
                     MethodFilter::POST,
+                    |_| AdmissionClass::Bulk,
+                    |_, _| None,
                     |state: &WorkerHttp<S>, request, job_id: JobId| {
                         let handler = &state.handler;
                         let requester = &state.requester;
@@ -1419,6 +1485,8 @@ mod server {
                 "/api/v2/distserver/run_job/{job_id}",
                 path_route(
                     MethodFilter::POST,
+                    |_| AdmissionClass::Bulk,
+                    |_, _| None,
                     |state: &WorkerHttp<S>, request, job_id: JobId| {
                         let handler = &state.handler;
                         let requester = &state.requester;
@@ -1647,59 +1715,75 @@ mod server {
                 let peer_network = Arc::clone(&network);
                 let (bound, sessions) = native::spawn(
                     (&config, store),
-                    move |assignment, snapshot, packages| match handler.handle_alloc_native_job(
-                        &*requester,
-                        assignment,
-                        snapshot,
-                        packages,
-                    )? {
-                        AllocJobResult::Success {
-                            job_alloc,
-                            need_toolchain,
-                        } => {
-                            anyhow::ensure!(!need_toolchain, "native allocation requested archive");
-                            Ok(ScheduleReply::Assigned(WorkerAllocation {
-                                peer: job_alloc.server_id,
-                                routes: allocation_routes.addresses(job_alloc.server_id)?,
-                                job: job_alloc.job_id.0,
-                                auth: job_alloc.auth,
-                            }))
-                        }
-                        AllocJobResult::Fail { msg } => {
-                            Ok(ScheduleReply::Unavailable { message: msg })
+                    move |assignment, snapshot, packages| {
+                        let handler = Arc::clone(&handler);
+                        let requester = Arc::clone(&requester);
+                        let allocation_routes = Arc::clone(&allocation_routes);
+                        async move {
+                            match handler
+                                .handle_alloc_native_job(
+                                    &*requester,
+                                    assignment,
+                                    &snapshot,
+                                    packages,
+                                )
+                                .await?
+                            {
+                                AllocJobResult::Success {
+                                    job_alloc,
+                                    need_toolchain,
+                                } => {
+                                    anyhow::ensure!(
+                                        !need_toolchain,
+                                        "native allocation requested archive"
+                                    );
+                                    Ok(ScheduleReply::Assigned(WorkerAllocation {
+                                        peer: job_alloc.server_id,
+                                        routes: allocation_routes.addresses(job_alloc.server_id)?,
+                                        job: job_alloc.job_id.0,
+                                        auth: job_alloc.auth,
+                                    }))
+                                }
+                                AllocJobResult::Fail { msg } => {
+                                    Ok(ScheduleReply::Unavailable { message: msg })
+                                }
+                            }
                         }
                     },
-                    move |blob, requester, store, deadline| {
-                        let mut snapshot = peer_network.snapshot();
-                        snapshot.interfaces = crate::dist::cluster::interface_report();
-                        for source in peer_handler.native_blob_sources(
-                            blob,
-                            requester,
-                            crate::build_runtime::wire::BlobRecipient::Scheduler,
-                            None,
-                            Some(&snapshot),
-                        )? {
-                            if std::time::Instant::now() >= deadline {
-                                break;
-                            }
-                            match native::fetch_peer(
-                                &peer_routes,
-                                &source,
+                    move |blob, requester, store: crate::build_runtime::NativeStore, deadline| {
+                        let peer_network = Arc::clone(&peer_network);
+                        let peer_handler = Arc::clone(&peer_handler);
+                        let peer_routes = Arc::clone(&peer_routes);
+                        async move {
+                            let mut snapshot = peer_network.snapshot();
+                            snapshot.interfaces = crate::dist::cluster::interface_report();
+                            for source in peer_handler.native_blob_sources(
                                 blob,
-                                &peer_network,
-                                deadline,
-                            ) {
-                                Ok(Some((reader, encoding))) => match store
-                                    .stage_expected_physical(blob, encoding, reader)
+                                requester,
+                                crate::build_runtime::wire::BlobRecipient::Scheduler,
+                                None,
+                                Some(&snapshot),
+                            )? {
+                                if std::time::Instant::now() >= deadline {
+                                    break;
+                                }
+                                match native::fetch_peer(
+                                    &peer_routes,
+                                    &source,
+                                    blob,
+                                    store.clone(),
+                                    &peer_network,
+                                    deadline,
+                                )
+                                .await
                                 {
-                                    Ok(staged) => return Ok(Some(staged)),
-                                    Err(error) => debug!("native peer content rejected: {error:#}"),
-                                },
-                                Ok(None) => {}
-                                Err(error) => debug!("native peer lookup failed: {error:#}"),
+                                    Ok(Some(staged)) => return Ok(Some(staged)),
+                                    Ok(None) => {}
+                                    Err(error) => debug!("native peer lookup failed: {error:#}"),
+                                }
                             }
+                            Ok(None)
                         }
-                        Ok(None)
                     },
                     native::PublicationCallbacks {
                         source_plan: move |blob, recipient, producer| {
@@ -1876,8 +1960,9 @@ mod server {
         }
     }
 
+    #[async_trait::async_trait]
     impl dist::SchedulerOutgoing for SchedulerRequester {
-        fn do_assign_job(
+        async fn do_assign_job(
             &self,
             server_id: ServerId,
             job_id: JobId,
@@ -1901,7 +1986,7 @@ mod server {
                         .header("Content-Type", "application/octet-stream")
                         .body(crate::dist::native::codec().serialize(&**assignment)?),
                 };
-                match crate::http_client::io_runtime()?.block_on(send_control(req)) {
+                match send_control(req).await {
                     Err(error)
                         if error
                             .downcast_ref::<wreq::Error>()
@@ -2154,33 +2239,40 @@ mod server {
         }
     }
 
+    #[async_trait::async_trait]
     impl dist::ServerOutgoing for ServerRequester {
-        fn do_update_job_state(
+        async fn do_update_job_state(
             &self,
             job_id: JobId,
             state: JobState,
         ) -> Result<UpdateJobStateResult> {
-            let publish = || {
+            let publish = || async {
                 let (client, base) = self.endpoint()?;
                 let url = urls::scheduler_job_state(&base, job_id)?;
-                crate::http_client::io_runtime()?.block_on(send_control(
+                send_control(
                     client
                         .post(url.as_str())
                         // Never retain an execution slot forever on a stalled ACK.
                         .timeout(HEARTBEAT_TIMEOUT)
                         .bincode(&state)?,
-                ))
+                )
+                .await
             };
             // A lost response may follow a successful scheduler transition.
             // The scheduler accepts repeated state updates and terminal acks.
-            publish().or_else(|first_error| {
-                warn!(
-                    "Retrying job {job_id} state {state} after scheduler response failure: {first_error:#}"
-                );
-                publish().with_context(|| {
-                    format!("POST to scheduler job_state failed; first attempt: {first_error:#}")
-                })
-            })
+            match publish().await {
+                Ok(result) => Ok(result),
+                Err(first_error) => {
+                    warn!(
+                        "Retrying job {job_id} state {state} after scheduler response failure: {first_error:#}"
+                    );
+                    publish().await.with_context(|| {
+                        format!(
+                            "POST to scheduler job_state failed; first attempt: {first_error:#}"
+                        )
+                    })
+                }
+            }
         }
     }
     #[cfg(test)]

@@ -4,9 +4,11 @@
 use std::{
     cell::RefCell,
     collections::BTreeSet,
+    fs::File,
+    future::Future,
     io::{self, Read},
     net::{SocketAddr, TcpListener},
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
     time::{Duration, Instant},
 };
 
@@ -15,7 +17,6 @@ use axum::{
     body::{Body, HttpBody as _},
     extract::rejection::PathRejection,
     extract::{Extension, Path, State},
-    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{MethodFilter, MethodRouter, on},
 };
@@ -25,51 +26,79 @@ use http::StatusCode;
 use sccache_cluster_identity::{
     AuthenticatedPeer, ClusterListener, PeerId, Role, SchedulerEnrollment,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::io::{StreamReader, SyncIoBridge};
 
 use crate::{
+    build_runtime::TransferMeter,
     dist::cluster_routes::{
         Transfer,
         interface::{self, TrackedReader},
     },
+    dist::native::ingress::compute,
     errors::{Context, Result},
 };
 
-/// The single request abstraction used by all synchronous dist handlers.
+use super::super::transport::BoundedReadError;
+
+enum RequestBody {
+    Network(Body),
+    Buffered(std::result::Result<Vec<u8>, BoundedReadError>),
+}
+
+/// The authenticated request, with either asynchronous metadata extraction
+/// or a synchronous bridge for filesystem/codec consumers.
 pub(super) struct Request {
     parts: http::request::Parts,
     id: PeerId,
     role: Role,
     remote_addr: SocketAddr,
     path: sccache_cluster_identity::NetworkPath,
-    body: RefCell<Option<Box<dyn Read + Send>>>,
+    body: RefCell<Option<RequestBody>>,
+    admission: Arc<OwnedSemaphorePermit>,
 }
 
 impl Request {
-    fn new(peer: AuthenticatedPeer, request: axum::extract::Request) -> Self {
+    fn new(
+        peer: AuthenticatedPeer,
+        request: axum::extract::Request,
+        admission: Arc<OwnedSemaphorePermit>,
+    ) -> Self {
         let (parts, body) = request.into_parts();
-        let reader = SyncIoBridge::new(StreamReader::new(Box::pin(idle_bounded_body(body))));
-        let length = parts
-            .headers
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
-        let reader = TrackedReader::new(
-            reader,
-            Some(peer.path().local),
-            Transfer::Download(length),
-            Some(peer.path()),
-        );
         Self {
             parts,
             id: peer.id(),
             role: peer.role(),
             remote_addr: peer.remote_addr(),
             path: peer.path(),
-            body: RefCell::new(Some(Box::new(reader))),
+            body: RefCell::new(Some(RequestBody::Network(body))),
+            admission,
         }
+    }
+
+    pub(super) fn file_body(
+        &self,
+        file: File,
+        length: u64,
+        meter: Option<TransferMeter>,
+    ) -> Response {
+        file_body(file, length, meter, Arc::clone(&self.admission))
+    }
+
+    pub(super) fn compressed_file_body(
+        &self,
+        file: File,
+        length: u64,
+        meter: Option<TransferMeter>,
+    ) -> Result<Response> {
+        let (encoder, header) = crate::build_runtime::BlobWireEncoder::new(length)?;
+        let body =
+            compressed_reader_body(file, encoder, header, meter, Arc::clone(&self.admission));
+        Ok((
+            [(http::header::CONTENT_TYPE, "application/octet-stream")],
+            body,
+        )
+            .into_response())
     }
 
     pub(super) fn method(&self) -> &str {
@@ -81,9 +110,91 @@ impl Request {
     pub(super) fn header(&self, name: &str) -> Option<&str> {
         self.parts.headers.get(name)?.to_str().ok()
     }
-    pub(super) fn data(&self) -> Option<Box<dyn Read + Send>> {
-        self.body.borrow_mut().take()
+    fn body_length(&self) -> u64 {
+        self.header("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
     }
+
+    pub(super) fn data(&self) -> Option<Box<dyn Read + Send>> {
+        match self.body.borrow_mut().take()? {
+            RequestBody::Network(body) => {
+                let reader =
+                    SyncIoBridge::new(StreamReader::new(Box::pin(idle_bounded_body(body))));
+                Some(Box::new(TrackedReader::new(
+                    reader,
+                    Some(self.path.local),
+                    Transfer::Download(self.body_length()),
+                    Some(self.path),
+                )))
+            }
+            RequestBody::Buffered(_) => None,
+        }
+    }
+
+    pub(super) fn body_stream(
+        &mut self,
+    ) -> Option<impl futures::Stream<Item = io::Result<Bytes>> + Send + use<>> {
+        let body = match self.body.get_mut().take()? {
+            RequestBody::Network(body) => body,
+            RequestBody::Buffered(Ok(bytes)) => Body::from(bytes),
+            RequestBody::Buffered(Err(_)) => return None,
+        };
+        let mut activity = interface::activity(
+            Some(self.path.local),
+            Transfer::Download(self.body_length()),
+            Some(self.path),
+        );
+        Some(idle_bounded_body(body).map(move |chunk| {
+            if let (Ok(bytes), Some(activity)) = (&chunk, &mut activity) {
+                activity.bytes(bytes.len() as u64);
+            }
+            chunk
+        }))
+    }
+
+    pub(super) async fn read_bounded(
+        &mut self,
+        limit: usize,
+    ) -> std::result::Result<Vec<u8>, super::super::transport::BoundedReadError> {
+        let mut bytes = Vec::new();
+        let mut stream = std::pin::pin!(
+            self.body_stream()
+                .ok_or(BoundedReadError::AlreadyExtracted)?
+        );
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(BoundedReadError::Io)?;
+            if chunk.len() > limit.saturating_sub(bytes.len()) {
+                return Err(BoundedReadError::TooLarge);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+    // Buffer only explicitly bounded metadata before dispatching its
+    // synchronous parser/database work. Preserve the body error so the
+    // route's existing authorization and error mapping remain authoritative.
+    async fn buffer_body(&mut self, limit: usize) {
+        let body = self.read_bounded(limit).await;
+        *self.body.get_mut() = Some(RequestBody::Buffered(body));
+    }
+
+    pub(super) fn read_buffered(
+        &self,
+        limit: usize,
+    ) -> std::result::Result<Vec<u8>, BoundedReadError> {
+        match self.body.borrow_mut().take() {
+            Some(RequestBody::Buffered(body)) => {
+                let body = body?;
+                if body.len() > limit {
+                    return Err(BoundedReadError::TooLarge);
+                }
+                Ok(body)
+            }
+            _ => Err(BoundedReadError::AlreadyExtracted),
+        }
+    }
+
     pub(super) const fn id(&self) -> PeerId {
         self.id
     }
@@ -115,7 +226,10 @@ impl Request {
             role: Role::Client,
             remote_addr: address,
             path: sccache_cluster_identity::NetworkPath::new(address.ip(), address.ip()),
-            body: RefCell::new(Some(Box::new(io::Cursor::new(body)))),
+            body: RefCell::new(Some(RequestBody::Buffered(Ok(body)))),
+            admission: AdmissionPools::new(1)
+                .acquire(AdmissionClass::Bulk)
+                .expect("test admission"),
         }
     }
 }
@@ -146,12 +260,17 @@ async fn blocking_reply(
     permit: Arc<OwnedSemaphorePermit>,
     operation: impl FnOnce() -> Response + Send + 'static,
 ) -> Response {
-    match tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        operation()
-    })
-    .await
-    {
+    joined_reply(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation()
+        })
+        .await,
+    )
+}
+
+fn joined_reply(result: std::result::Result<Response, tokio::task::JoinError>) -> Response {
+    match result {
         Ok(response) => response,
         Err(error) => {
             warn!("distributed HTTP handler terminated: {error}");
@@ -164,7 +283,59 @@ async fn blocking_reply(
     }
 }
 
-pub(super) fn route<S, F>(method: MethodFilter, handler: F) -> MethodRouter<Arc<S>>
+/// Independent bounded lanes: bulk bodies and remote assignment cannot
+/// consume the permits reserved for lease/state transitions or metadata.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AdmissionClass {
+    Control,
+    Metadata,
+    Dispatch,
+    Bulk,
+}
+
+struct AdmissionPools {
+    control: Arc<Semaphore>,
+    metadata: Arc<Semaphore>,
+    dispatch: Arc<Semaphore>,
+    bulk: Arc<Semaphore>,
+}
+
+impl AdmissionPools {
+    fn new(bulk: usize) -> Self {
+        Self {
+            control: Arc::new(Semaphore::new(Self::control_capacity(bulk))),
+            metadata: Arc::new(Semaphore::new(bulk)),
+            dispatch: Arc::new(Semaphore::new(bulk)),
+            bulk: Arc::new(Semaphore::new(bulk)),
+        }
+    }
+
+    fn control_capacity(bulk: usize) -> usize {
+        (bulk / 8).clamp(2, 8)
+    }
+
+    fn total_capacity(bulk: usize) -> usize {
+        bulk.saturating_mul(3)
+            .saturating_add(Self::control_capacity(bulk))
+    }
+
+    fn acquire(&self, class: AdmissionClass) -> Option<Arc<OwnedSemaphorePermit>> {
+        let pool = match class {
+            AdmissionClass::Control => &self.control,
+            AdmissionClass::Metadata => &self.metadata,
+            AdmissionClass::Dispatch => &self.dispatch,
+            AdmissionClass::Bulk => &self.bulk,
+        };
+        Arc::clone(pool).try_acquire_owned().ok().map(Arc::new)
+    }
+}
+
+pub(super) fn route<S, F>(
+    method: MethodFilter,
+    class: AdmissionClass,
+    body_limit: impl Fn(&S) -> Option<usize> + Copy + Send + Sync + 'static,
+    handler: F,
+) -> MethodRouter<Arc<S>>
 where
     S: Send + Sync + 'static,
     F: Fn(&S, &Request) -> Response + Send + Sync + 'static,
@@ -174,11 +345,16 @@ where
         method,
         move |State(state): State<Arc<S>>,
               Extension(peer): Extension<AuthenticatedPeer>,
-              Extension(permit): Extension<Arc<OwnedSemaphorePermit>>,
+              Extension(pools): Extension<Arc<AdmissionPools>>,
               request: axum::extract::Request| {
             let handler = Arc::clone(&handler);
-            let request = Request::new(peer, request);
-            async move { blocking_reply(permit, move || handler(&state, &request)).await }
+            async move {
+                let limit = body_limit(&state);
+                admit(pools, class, peer, request, limit, move |request| {
+                    handler(&state, &request)
+                })
+                .await
+            }
         },
     );
     if method == MethodFilter::GET {
@@ -188,7 +364,55 @@ where
     }
 }
 
-pub(super) fn path_route<S, P, F>(method: MethodFilter, handler: F) -> MethodRouter<Arc<S>>
+/// An admitted operation that can await transport directly. Its task retains
+/// admission and finishes state transitions even if the HTTP caller disconnects.
+pub(super) fn async_route<S, F, Fut>(
+    method: MethodFilter,
+    class: AdmissionClass,
+    handler: F,
+) -> MethodRouter<Arc<S>>
+where
+    S: Send + Sync + 'static,
+    F: Fn(Arc<S>, Request) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Response> + Send + 'static,
+{
+    let handler = Arc::new(handler);
+    let router = on(
+        method,
+        move |State(state): State<Arc<S>>,
+              Extension(peer): Extension<AuthenticatedPeer>,
+              Extension(pools): Extension<Arc<AdmissionPools>>,
+              request: axum::extract::Request| {
+            let handler = Arc::clone(&handler);
+            async move {
+                let Some(permit) = pools.acquire(class) else {
+                    return busy_response();
+                };
+                let request = Request::new(peer, request, Arc::clone(&permit));
+                let task_permit = Arc::clone(&permit);
+                let operation = tokio::spawn(async move {
+                    let _permit = task_permit;
+                    handler(state, request).await
+                });
+
+                let response = joined_reply(operation.await);
+                track_response(peer, permit, response)
+            }
+        },
+    );
+    if method == MethodFilter::GET {
+        router.head(|| std::future::ready(StatusCode::NOT_FOUND))
+    } else {
+        router
+    }
+}
+
+pub(super) fn path_route<S, P, F>(
+    method: MethodFilter,
+    classify: impl Fn(&P) -> AdmissionClass + Copy + Send + Sync + 'static,
+    body_limit: impl Fn(&S, &P) -> Option<usize> + Copy + Send + Sync + 'static,
+    handler: F,
+) -> MethodRouter<Arc<S>>
 where
     S: Send + Sync + 'static,
     P: serde::de::DeserializeOwned + Send + 'static,
@@ -199,15 +423,19 @@ where
         method,
         move |State(state): State<Arc<S>>,
               Extension(peer): Extension<AuthenticatedPeer>,
-              Extension(permit): Extension<Arc<OwnedSemaphorePermit>>,
+              Extension(pools): Extension<Arc<AdmissionPools>>,
               path: std::result::Result<Path<P>, PathRejection>,
               request: axum::extract::Request| {
             let handler = Arc::clone(&handler);
-            let request = Request::new(peer, request);
             async move {
                 match path {
                     Ok(Path(path)) => {
-                        blocking_reply(permit, move || handler(&state, &request, path)).await
+                        let class = classify(&path);
+                        let limit = body_limit(&state, &path);
+                        admit(pools, class, peer, request, limit, move |request| {
+                            handler(&state, &request, path)
+                        })
+                        .await
                     }
                     Err(_) => StatusCode::NOT_FOUND.into_response(),
                 }
@@ -227,36 +455,87 @@ pub(super) fn routes<S: Send + Sync + 'static>(router: Router<Arc<S>>, state: S)
         .with_state(Arc::new(state))
 }
 
-/// Stream a blocking file/codec reader with a two-chunk bounded queue. Closing
-/// the response closes the receiver and stops the producer without buffering
-/// the entire artifact.
+/// Read one chunk per downstream poll. A slow peer holds the reader, not a
+/// blocking-pool thread; cancellation can leave at most one read in flight.
 const RESPONSE_CHUNK: usize = 128 * 1024;
-const RESPONSE_QUEUE: usize = 2;
 
-pub(super) fn reader_body(mut reader: impl Read + Send + 'static) -> Body {
-    let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(RESPONSE_QUEUE);
-    tokio::task::spawn_blocking(move || {
-        while !tx.is_closed() {
-            let mut buffer = vec![0; RESPONSE_CHUNK];
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(size) => {
-                    buffer.truncate(size);
-                    if tx.blocking_send(Ok(Bytes::from(buffer))).is_err() {
-                        break;
-                    }
+fn reader_body(
+    file: File,
+    length: u64,
+    meter: Option<TransferMeter>,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> Body {
+    Body::from_stream(stream::try_unfold(
+        (Arc::new(file), 0_u64, meter, permit),
+        move |(file, offset, mut meter, permit)| async move {
+            let count = usize::try_from(length - offset)
+                .unwrap_or(usize::MAX)
+                .min(RESPONSE_CHUNK);
+            if count == 0 {
+                if let Some(meter) = &mut meter {
+                    meter.eof();
                 }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => {
-                    let _ = tx.blocking_send(Err(error));
-                    break;
-                }
+                return Ok(None);
             }
-        }
-    });
-    Body::from_stream(stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|chunk| (chunk, rx))
-    }))
+            let (bytes, permit) =
+                crate::build_runtime::read_file_at(Arc::clone(&file), offset, count, permit)
+                    .await?;
+            if let Some(meter) = &mut meter {
+                meter.observe(count as u64);
+            }
+            Ok::<_, anyhow::Error>(Some((
+                Bytes::from(bytes),
+                (file, offset + count as u64, meter, permit),
+            )))
+        },
+    ))
+}
+
+/// Emit the final header immediately and encode at most one frame per demand.
+/// Slow receivers retain file/codec state, never an encoder or I/O thread.
+fn compressed_reader_body(
+    file: File,
+    encoder: crate::build_runtime::BlobWireEncoder,
+    header: [u8; 32],
+    meter: Option<TransferMeter>,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> Body {
+    Body::from_stream(stream::try_unfold(
+        (Arc::new(file), 0_u64, encoder, meter, permit, Some(header)),
+        |(file, offset, mut encoder, mut meter, permit, header)| async move {
+            if let Some(header) = header {
+                if let Some(meter) = &mut meter {
+                    meter.observe(header.len() as u64);
+                }
+                return Ok(Some((
+                    Bytes::copy_from_slice(&header),
+                    (file, offset, encoder, meter, permit, None),
+                )));
+            }
+            let count = encoder.next_frame_size();
+            if count == 0 {
+                if let Some(meter) = &mut meter {
+                    meter.eof();
+                }
+                return Ok(None);
+            }
+            let (bytes, permit) =
+                crate::build_runtime::read_file_at(Arc::clone(&file), offset, count, permit)
+                    .await?;
+            let (frame, encoder, file, permit) = compute(move || {
+                let frame = encoder.frame(&bytes)?;
+                Ok((frame, encoder, file, permit))
+            })
+            .await?;
+            if let Some(meter) = &mut meter {
+                meter.observe(frame.len() as u64);
+            }
+            Ok::<_, anyhow::Error>(Some((
+                Bytes::from(frame),
+                (file, offset + count as u64, encoder, meter, permit, None),
+            )))
+        },
+    ))
 }
 
 pub(super) fn binary(data: Vec<u8>) -> Response {
@@ -267,7 +546,12 @@ pub(super) fn binary(data: Vec<u8>) -> Response {
         .into_response()
 }
 
-pub(super) fn file_body(reader: impl Read + Send + 'static, length: u64) -> Response {
+fn file_body(
+    file: File,
+    length: u64,
+    meter: Option<TransferMeter>,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> Response {
     (
         [
             (
@@ -276,32 +560,47 @@ pub(super) fn file_body(reader: impl Read + Send + 'static, length: u64) -> Resp
             ),
             (http::header::CONTENT_LENGTH, length.to_string()),
         ],
-        reader_body(reader),
+        reader_body(file, length, meter, permit),
+    )
+        .into_response()
+}
+
+fn busy_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "distributed HTTP pool busy",
     )
         .into_response()
 }
 
 #[expect(
     clippy::significant_drop_tightening,
-    reason = "the response stream takes ownership of the permit, so admission remains held until the body is drained or cancelled"
+    reason = "the buffered request is moved into the blocking operation with its admission guard"
 )]
 async fn admit(
-    State(admission): State<Arc<Semaphore>>,
-    Extension(peer): Extension<AuthenticatedPeer>,
-    mut request: axum::extract::Request,
-    next: Next,
+    pools: Arc<AdmissionPools>,
+    class: AdmissionClass,
+    peer: AuthenticatedPeer,
+    request: axum::extract::Request,
+    body_limit: Option<usize>,
+    operation: impl FnOnce(Request) -> Response + Send + 'static,
 ) -> Response {
-    let Ok(permit) = admission.try_acquire_owned() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "distributed HTTP pool busy",
-        )
-            .into_response();
+    let Some(permit) = pools.acquire(class) else {
+        return busy_response();
     };
-    // The response stream must retain the permit even after the handler returns.
-    let permit = Arc::new(permit);
-    request.extensions_mut().insert(Arc::clone(&permit));
-    let response = next.run(request).await;
+    let mut request = Request::new(peer, request, Arc::clone(&permit));
+    if let Some(limit) = body_limit {
+        request.buffer_body(limit).await;
+    }
+    let response = blocking_reply(Arc::clone(&permit), move || operation(request)).await;
+    track_response(peer, permit, response)
+}
+
+fn track_response(
+    peer: AuthenticatedPeer,
+    permit: Arc<OwnedSemaphorePermit>,
+    response: Response,
+) -> Response {
     let (mut parts, body) = response.into_parts();
     let length = parts
         .headers
@@ -419,6 +718,39 @@ pub(super) fn bind_data_socket(
     }
 }
 
+// Connection budgets count idle sockets, not admitted application work.
+// Reserve half the process descriptor budget for outgoing RPCs, CAS files,
+// compilers, listeners, logs and other non-accepted descriptors.
+const LISTENER_CONNECTION_LIMIT: usize = 65_536;
+const PROCESS_FD_TARGET: u64 = 262_144;
+
+fn connection_capacity(soft_limit: u64) -> usize {
+    usize::try_from((soft_limit / 2).min(PROCESS_FD_TARGET / 2)).unwrap_or(usize::MAX)
+}
+
+fn process_connections() -> Arc<Semaphore> {
+    static CONNECTIONS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(CONNECTIONS.get_or_init(|| {
+        use rustix::process::{Resource, getrlimit, setrlimit};
+        let mut limit = getrlimit(Resource::Nofile);
+        let target = limit.maximum.unwrap_or(PROCESS_FD_TARGET).min(PROCESS_FD_TARGET);
+        if limit.current.is_some_and(|current| current < target) {
+            let requested = rustix::process::Rlimit {
+                current: Some(target),
+                maximum: limit.maximum,
+            };
+            if let Err(error) = setrlimit(Resource::Nofile, requested) {
+                warn!("cannot raise distributed server FD limit: {error}");
+            }
+            limit = getrlimit(Resource::Nofile);
+        }
+        let soft = limit.current.unwrap_or(PROCESS_FD_TARGET);
+        let capacity = connection_capacity(soft);
+        info!("distributed socket admission: {capacity} process-wide, {LISTENER_CONNECTION_LIMIT} per listener (FD soft limit {soft})");
+        Arc::new(Semaphore::new(capacity))
+    }))
+}
+
 /// Bind the listener before starting any dependent background services.
 pub(super) struct Listener {
     socket: TcpListener,
@@ -464,7 +796,11 @@ impl Listener {
     pub(super) fn run_until(self, stop: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .max_blocking_threads(self.threads.saturating_mul(2).max(8))
+            .max_blocking_threads(
+                AdmissionPools::total_capacity(self.threads)
+                    .saturating_mul(2)
+                    .max(8),
+            )
             .enable_all()
             .build()?;
         runtime.block_on(async {
@@ -477,14 +813,19 @@ impl Listener {
 
     pub(super) fn run(self) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .max_blocking_threads(self.threads.saturating_mul(2).max(8))
+            .worker_threads(crate::util::num_cpus())
+            .max_blocking_threads(
+                AdmissionPools::total_capacity(self.threads)
+                    .saturating_mul(2)
+                    .max(8),
+            )
             .enable_all()
             .build()?;
         runtime.block_on(self.run_async())
     }
 
     async fn run_async(self) -> Result<()> {
+        crate::build_runtime::initialize_async_disk()?;
         let Self {
             socket,
             tls,
@@ -493,11 +834,9 @@ impl Listener {
             router,
         } = self;
         let socket = tokio::net::TcpListener::from_std(socket)?;
-        let connections = Arc::new(Semaphore::new(threads.saturating_mul(4)));
-        let router = router.layer(middleware::from_fn_with_state(
-            Arc::new(Semaphore::new(threads)),
-            admit,
-        ));
+        let connections = Arc::new(Semaphore::new(LISTENER_CONNECTION_LIMIT));
+        let process_connections = process_connections();
+        let router = router.layer(Extension(Arc::new(AdmissionPools::new(threads))));
         let router = match role {
             ListenerRole::Scheduler(enrollment) => tls.scheduler_router(enrollment, router)?,
             ListenerRole::Worker {
@@ -512,14 +851,31 @@ impl Listener {
             )?,
         };
         loop {
-            let (socket, _) = socket.accept().await?;
-            let Ok(connection) = Arc::clone(&connections).try_acquire_owned() else {
-                continue;
+            // Backpressure accept rather than accepting and immediately resetting
+            // an otherwise valid connection. The process-wide budget spans all listeners.
+            let connection = Arc::clone(&connections).acquire_owned().await?;
+            let process_connection = Arc::clone(&process_connections).acquire_owned().await?;
+            let socket = match socket.accept().await {
+                Ok((socket, _)) => socket,
+                Err(error) if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) => {
+                    warn!("distributed listener descriptor exhaustion: {error}");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
             };
             let tls = Arc::clone(&tls);
             let router = router.clone();
             tokio::spawn(async move {
-                let _connection = connection;
+                let _connection = (connection, process_connection);
                 let result = tls.serve(socket, router).await;
                 if let Err(error) = result {
                     debug!("distributed HTTPS connection ended: {error:#}");
@@ -586,7 +942,7 @@ mod revocation_tests {
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::io::Write;
 
     #[tokio::test(start_paused = true)]
     async fn unfinished_request_body_releases_reader_at_idle_deadline() -> Result<()> {
@@ -626,50 +982,132 @@ mod streaming_tests {
         Ok(())
     }
 
-    struct InfiniteReader {
-        bytes: Arc<AtomicUsize>,
-        stopped: Option<tokio::sync::oneshot::Sender<()>>,
+    #[tokio::test]
+    async fn buffered_metadata_preserves_body_budget_and_extraction_error() -> Result<()> {
+        let mut request = Request::fake_http_from(
+            "127.0.0.1:0".parse()?,
+            "POST",
+            "/metadata",
+            Vec::new(),
+            Vec::new(),
+        );
+        *request.body.get_mut() = Some(RequestBody::Network(Body::from_stream(stream::iter([
+            Ok::<_, io::Error>(Bytes::from_static(b"meta")),
+            Ok(Bytes::from_static(b"data")),
+        ]))));
+        request.buffer_body(8).await;
+        assert_eq!(request.read_buffered(8).unwrap(), b"metadata");
+        assert!(matches!(
+            request.read_buffered(8),
+            Err(BoundedReadError::AlreadyExtracted)
+        ));
+        *request.body.get_mut() = Some(RequestBody::Network(Body::from("oversized")));
+        request.buffer_body(8).await;
+        assert!(matches!(
+            request.read_buffered(8),
+            Err(BoundedReadError::TooLarge)
+        ));
+        *request.body.get_mut() = Some(RequestBody::Network(Body::from_stream(stream::once(
+            async { Err::<Bytes, _>(io::Error::other("interrupted body")) },
+        ))));
+        request.buffer_body(8).await;
+        assert!(matches!(
+            request.read_buffered(8),
+            Err(BoundedReadError::Io(_))
+        ));
+        Ok(())
     }
 
-    impl Read for InfiniteReader {
-        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            buffer.fill(0x5a);
-            self.bytes.fetch_add(buffer.len(), Ordering::Relaxed);
-            Ok(buffer.len())
-        }
+    #[test]
+    fn socket_budget_is_independent_of_request_capacity() {
+        assert_eq!(connection_capacity(2_048), 1_024);
+        assert_eq!(connection_capacity(262_144), 131_072);
+        assert_eq!(connection_capacity(u64::MAX), 131_072);
+        assert_eq!(LISTENER_CONNECTION_LIMIT, 65_536);
     }
 
-    impl Drop for InfiniteReader {
-        fn drop(&mut self) {
-            if let Some(stopped) = self.stopped.take() {
-                let _ = stopped.send(());
+    #[test]
+    fn each_lane_has_independent_bounded_capacity() -> Result<()> {
+        let pools = AdmissionPools::new(4);
+        for (class, count) in [
+            (AdmissionClass::Bulk, 4),
+            (AdmissionClass::Dispatch, 4),
+            (AdmissionClass::Metadata, 4),
+            (AdmissionClass::Control, 2),
+        ] {
+            let permits = (0..count)
+                .map(|_| pools.acquire(class).context("reserved lane permit"))
+                .collect::<Result<Vec<_>>>()?;
+            assert!(pools.acquire(class).is_none());
+            for other in [
+                AdmissionClass::Bulk,
+                AdmissionClass::Dispatch,
+                AdmissionClass::Metadata,
+                AdmissionClass::Control,
+            ] {
+                if class != other {
+                    assert!(pools.acquire(other).is_some());
+                }
             }
+            drop(permits);
+            assert!(pools.acquire(class).is_some());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn stalled_response_does_not_occupy_blocking_pool() -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let file = tempfile::tempfile()?;
+            let length = (2 * RESPONSE_CHUNK) as u64;
+            file.set_len(length)?;
+            let truncate = file.try_clone()?;
+            let pools = AdmissionPools::new(1);
+            let permit = pools.acquire(AdmissionClass::Bulk).context("test permit")?;
+            let mut body = reader_body(file, length, None, permit).into_data_stream();
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await?
+                .context("missing response chunk")??;
+            assert_eq!(chunk.len(), RESPONSE_CHUNK);
+            tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| ()))
+                .await??;
+            assert!(pools.acquire(AdmissionClass::Bulk).is_none());
+            // No read-ahead: truncating after the first demand must make the next read fail.
+            truncate.set_len(RESPONSE_CHUNK as u64)?;
+            assert!(
+                body.next()
+                    .await
+                    .context("missing truncated chunk")?
+                    .is_err()
+            );
+            drop(body);
+            assert!(pools.acquire(AdmissionClass::Bulk).is_some());
+            Ok(())
+        })
     }
 
     #[tokio::test]
-    async fn abandoned_response_stops_bounded_reader() {
-        let bytes = Arc::new(AtomicUsize::new(0));
-        let (stopped, done) = tokio::sync::oneshot::channel();
-        let body = reader_body(InfiniteReader {
-            bytes: Arc::clone(&bytes),
-            stopped: Some(stopped),
-        });
-        // Two queued chunks plus the producer's in-flight chunk.
-        let maximum = (RESPONSE_QUEUE + 1) * RESPONSE_CHUNK;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while bytes.load(Ordering::Relaxed) < maximum {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("reader did not fill bounded queue");
-        assert_eq!(bytes.load(Ordering::Relaxed), maximum);
-        drop(body);
-        tokio::time::timeout(Duration::from_secs(5), done)
-            .await
-            .expect("reader did not stop after cancellation")
-            .expect("reader exited without signalling");
-        assert_eq!(bytes.load(Ordering::Relaxed), maximum);
+    async fn demand_driven_response_preserves_exact_bytes_and_eof() -> Result<()> {
+        let expected = vec![0xa5; RESPONSE_CHUNK + 17];
+        let mut file = tempfile::tempfile()?;
+        file.write_all(&expected)?;
+        let actual = axum::body::to_bytes(
+            reader_body(
+                file,
+                expected.len() as u64,
+                None,
+                AdmissionPools::new(1)
+                    .acquire(AdmissionClass::Bulk)
+                    .context("test permit")?,
+            ),
+            expected.len(),
+        )
+        .await?;
+        assert_eq!(actual.as_ref(), expected.as_slice());
+        Ok(())
     }
 }

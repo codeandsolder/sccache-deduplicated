@@ -119,6 +119,11 @@ impl Counters {
 /// even when the transport aborts before the body has been consumed.
 pub struct MeteredReader<R> {
     reader: R,
+    transfer: TransferMeter,
+}
+
+/// An active body observation independent of its transport.
+pub struct TransferMeter {
     counters: Arc<Counters>,
     logical_size: u64,
     exact_wire_size: Option<u64>,
@@ -127,7 +132,7 @@ pub struct MeteredReader<R> {
     complete: bool,
 }
 
-impl<R> MeteredReader<R> {
+impl TransferMeter {
     fn finish(&mut self) {
         if !self.complete {
             self.complete = true;
@@ -146,10 +151,9 @@ impl<R> MeteredReader<R> {
     }
 }
 
-impl<R: Read> Read for MeteredReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let count = self.reader.read(buffer)?;
-        let bytes = u64::try_from(count).unwrap_or(u64::MAX);
+impl TransferMeter {
+    /// Account for bytes consumed from the physical body.
+    pub fn observe(&mut self, bytes: u64) {
         self.read = self.read.saturating_add(bytes);
         let consumed = self.remaining.min(bytes);
         self.remaining -= consumed;
@@ -157,16 +161,32 @@ impl<R: Read> Read for MeteredReader<R> {
             .remaining
             .fetch_sub(consumed, Ordering::Relaxed);
         self.counters.bytes.fetch_add(bytes, Ordering::Relaxed);
-        if self.exact_wire_size == Some(self.read)
-            || (count == 0 && !buffer.is_empty() && self.exact_wire_size.is_none())
-        {
+        if self.exact_wire_size == Some(self.read) {
             self.finish();
+        }
+    }
+
+    /// Mark a fully consumed body, without treating cancellation as EOF.
+    pub fn eof(&mut self) {
+        if self.exact_wire_size.is_none() || self.exact_wire_size == Some(self.read) {
+            self.finish();
+        }
+    }
+}
+
+impl<R: Read> Read for MeteredReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.reader.read(buffer)?;
+        self.transfer
+            .observe(u64::try_from(count).unwrap_or(u64::MAX));
+        if count == 0 && !buffer.is_empty() {
+            self.transfer.eof();
         }
         Ok(count)
     }
 }
 
-impl<R> Drop for MeteredReader<R> {
+impl Drop for TransferMeter {
     fn drop(&mut self) {
         let mut activity = self
             .counters
@@ -544,6 +564,21 @@ impl NetworkMeter {
         logical_size: u64,
         exact_wire_size: Option<u64>,
     ) -> MeteredReader<R> {
+        MeteredReader {
+            reader,
+            transfer: self.transfer(direction, peer, logical_size, exact_wire_size),
+        }
+    }
+
+    /// Observe bytes supplied by a streaming transport.
+    #[must_use = "the meter must stay alive while the transfer is active"]
+    pub fn transfer(
+        &self,
+        direction: Direction,
+        peer: Peer,
+        logical_size: u64,
+        exact_wire_size: Option<u64>,
+    ) -> TransferMeter {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let record = state.direction(direction).record(peer, Instant::now());
         let remaining = exact_wire_size.unwrap_or_else(|| {
@@ -562,8 +597,7 @@ impl NetworkMeter {
             activity.active += 1;
         }
         drop(state);
-        MeteredReader {
-            reader,
+        TransferMeter {
             counters,
             logical_size,
             exact_wire_size,
