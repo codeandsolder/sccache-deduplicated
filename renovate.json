@@ -53,7 +53,7 @@
       "enabled": false
     },
     {
-      "description": "Wreq, BTLS and lurkmoar must agree on one Cargo git source identity for the native TLS provider",
+      "description": "Wreq, BTLS, lurkmoar and Reqsign must agree on one Cargo git source identity for the native TLS provider",
       "matchManagers": [
         "cargo"
       ],
@@ -62,7 +62,10 @@
         "btls",
         "tokio-btls",
         "jsonwebtoken-btls",
-        "lurkmoar"
+        "lurkmoar",
+        "reqsign-core",
+        "reqsign-azure-storage",
+        "reqsign-google"
       ],
       "groupName": "native transport stack",
       "groupSlug": "native-transport-stack",
