@@ -1,7 +1,8 @@
 //! Recover scheduler-authoritative result receipts before compiling again.
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Condvar, Mutex},
+    future::Future,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -35,7 +36,7 @@ struct State {
 #[derive(Default)]
 pub(super) struct RecoveryQueue {
     state: Mutex<State>,
-    wake: Condvar,
+    wake: tokio::sync::Notify,
 }
 
 impl State {
@@ -99,23 +100,30 @@ impl RecoveryQueue {
         Ok(None)
     }
 
-    fn take(&self, wait: Duration) -> Result<Option<RecoveryJob>> {
-        let (mut state, _) = self
-            .wake
-            .wait_timeout_while(
-                self.state
+    async fn take(&self, wait: Duration) -> Result<Option<RecoveryJob>> {
+        let deadline = Instant::now() + wait;
+        loop {
+            let mut notified = std::pin::pin!(self.wake.notified());
+            notified.as_mut().enable();
+            {
+                let mut state = self
+                    .state
                     .lock()
-                    .map_err(|_| anyhow!("result recovery queue poisoned"))?,
-                wait,
-                |state| state.jobs.is_empty(),
-            )
-            .map_err(|_| anyhow!("result recovery queue poisoned"))?;
-        let job = state.jobs.pop_front();
-        if let Some(job) = &job {
-            state.queued_bytes -= job.bytes;
+                    .map_err(|_| anyhow!("result recovery queue poisoned"))?;
+                if let Some(job) = state.jobs.pop_front() {
+                    state.queued_bytes -= job.bytes;
+                    drop(state);
+                    return Ok(Some(job));
+                }
+            }
+            if Instant::now() >= deadline
+                || tokio::time::timeout_at(deadline.into(), notified)
+                    .await
+                    .is_err()
+            {
+                return Ok(None);
+            }
         }
-        drop(state);
-        Ok(job)
     }
 
     pub(super) fn release_ready(&self, key: ActionKey) -> Result<()> {
@@ -188,37 +196,55 @@ impl NativeSessions {
     ///
     /// # Errors
     /// Returns an error for recovery queue failures.
-    pub fn recover_next_result(
-        &self,
+    pub async fn recover_next_result<F, Fut>(
+        self: &Arc<Self>,
         wait: Duration,
-        fetch: impl Fn(BlobRef, &NativeStore, Instant) -> Result<Option<StagedBlob>>,
-    ) -> Result<bool> {
-        let Some(job) = self.recovery.take(wait)? else {
+        fetch: F,
+    ) -> Result<bool>
+    where
+        F: Fn(BlobRef, NativeStore, Instant) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<StagedBlob>>> + Send + 'static,
+    {
+        let Some(job) = self.recovery.take(wait).await? else {
             return Ok(false);
         };
-        let RecoveryJob {
-            permit,
-            manifest,
-            deadline,
-            ..
-        } = job;
-        let key = permit.key();
-        let recovered = self
-            .recover_result_blobs(&manifest, deadline, fetch)
-            .and_then(|(_reserved, _acquired)| permit.publish_pinned(&manifest, Vec::new()));
-        // Publish the outcome before releasing the permit, even on failure.
-        self.recovery
-            .finish(key, recovered, self.limits.max_sessions)?;
-        drop(permit);
-        Ok(true)
+        let sessions = Arc::clone(self);
+        tokio::spawn(async move {
+            let RecoveryJob {
+                permit,
+                manifest,
+                deadline,
+                ..
+            } = job;
+            let key = permit.key();
+            let recovered = sessions
+                .recover_result_blobs(&manifest, deadline, fetch)
+                .await;
+            tokio::task::spawn_blocking(move || {
+                let recovered = recovered.and_then(|(_reserved, _acquired)| {
+                    permit.publish_pinned(&manifest, Vec::new())
+                });
+                // Publish the outcome before releasing the action permit.
+                sessions
+                    .recovery
+                    .finish(key, recovered, sessions.limits.max_sessions)?;
+                drop(permit);
+                Ok(true)
+            })
+            .await?
+        })
+        .await?
     }
 
-    fn recover_result_blobs(
+    async fn recover_result_blobs<Fut>(
         &self,
         manifest: &ResultManifest,
         deadline: Instant,
-        fetch: impl Fn(BlobRef, &NativeStore, Instant) -> Result<Option<StagedBlob>>,
-    ) -> Result<(UploadReservation, Vec<Arc<TreeLease>>)> {
+        fetch: impl Fn(BlobRef, NativeStore, Instant) -> Fut + Send + Sync,
+    ) -> Result<(UploadReservation, Vec<Arc<TreeLease>>)>
+    where
+        Fut: Future<Output = Result<Option<StagedBlob>>> + Send,
+    {
         let check = || {
             ensure!(
                 Instant::now() < deadline,
@@ -227,25 +253,32 @@ impl NativeSessions {
             Ok(())
         };
         check()?;
-        let store = self.store();
-        let reserved = store.reserve_upload(manifest)?;
-        let mut missing = reserved.missing().to_vec();
-        // Attempt the expensive parts first; successful partial acquisitions
-        // survive a later source miss.
-        missing.sort_unstable_by_key(|blob| std::cmp::Reverse(blob.size));
+        let store = self.store().clone();
+        let manifest = manifest.clone();
+        let (reserved, missing) = tokio::task::spawn_blocking(move || {
+            let reserved = store.reserve_upload(&manifest)?;
+            let mut missing = reserved.missing().to_vec();
+            missing.sort_unstable_by_key(|blob| std::cmp::Reverse(blob.size));
+            Ok::<_, anyhow::Error>((reserved, missing))
+        })
+        .await??;
         let mut acquired = Vec::with_capacity(missing.len());
         for blob in missing {
             let _slot = loop {
                 check()?;
+                let mut notified = std::pin::pin!(self.peer_wake.notified());
+                notified.as_mut().enable();
                 match self.upload_slot(UploadSource::Peer) {
                     Ok(slot) => break slot,
                     Err(error) if error.is::<NativeServiceBusy>() => {
-                        std::thread::sleep(Duration::from_millis(25));
+                        tokio::time::timeout_at(deadline.into(), notified)
+                            .await
+                            .context("native result recovery deadline exceeded")?;
                     }
                     Err(error) => return Err(error),
                 }
             };
-            acquired.push(self.acquire_peer_blob(blob, deadline, &fetch)?);
+            acquired.push(self.acquire_peer_blob(blob, deadline, &fetch).await?);
         }
         check()?;
         Ok((reserved, acquired))
@@ -253,36 +286,49 @@ impl NativeSessions {
 
     // Caller owns a bounded upload slot before entering the shared tree
     // flight, so an active producer never waits on slots held by followers.
-    pub(super) fn acquire_peer_blob(
+    pub(super) async fn acquire_peer_blob<Fut>(
         &self,
         blob: BlobRef,
         deadline: Instant,
-        fetch: &impl Fn(BlobRef, &NativeStore, Instant) -> Result<Option<StagedBlob>>,
-    ) -> Result<Arc<TreeLease>> {
-        let check = || {
-            ensure!(
-                Instant::now() < deadline,
-                "native peer recovery deadline exceeded"
-            );
-            Ok(())
-        };
+        fetch: &(impl Fn(BlobRef, NativeStore, Instant) -> Fut + Sync),
+    ) -> Result<Arc<TreeLease>>
+    where
+        Fut: Future<Output = Result<Option<StagedBlob>>> + Send,
+    {
         let store = self.store();
         let retention = NativeStore::blob_retention_manifest(blob)?;
-        let (lease, _) = store.acquire_tree(retention.id()?, check, || {
-            let reservation = store.reserve_tree_upload(&retention)?;
-            let staged = if reservation.missing().is_empty() {
-                Vec::new()
-            } else {
-                let staged =
-                    fetch(blob, store, deadline)?.context("no peer has the required blob")?;
-                ensure!(
-                    staged.reference() == blob,
-                    "peer returned unrelated staged content"
-                );
-                vec![staged]
-            };
-            store.publish_tree_pinned(&retention, staged)
-        })?;
-        Ok(lease)
+        store
+            .acquire_tree_async(
+                retention.id()?,
+                deadline,
+                std::future::pending(),
+                || async move {
+                    let owned = store.clone();
+                    let manifest = retention.clone();
+                    let reservation =
+                        tokio::task::spawn_blocking(move || owned.reserve_tree_upload(&manifest))
+                            .await??;
+                    let staged = if reservation.missing().is_empty() {
+                        Vec::new()
+                    } else {
+                        let staged = fetch(blob, store.clone(), deadline)
+                            .await?
+                            .context("no peer has the required blob")?;
+                        ensure!(
+                            staged.reference() == blob,
+                            "peer returned unrelated staged content"
+                        );
+                        vec![staged]
+                    };
+                    let owned = store.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _reservation = reservation;
+                        owned.publish_tree_pinned(&retention, staged)
+                    })
+                    .await?
+                },
+            )
+            .await
+            .map(|(lease, _)| lease)
     }
 }

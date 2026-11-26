@@ -749,20 +749,16 @@ impl<R> MeasuredReader<R> {
     }
 }
 
-impl<R: Read> Read for MeasuredReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let count = match self.reader.read(buffer) {
-            Ok(count) => count,
-            Err(error) => {
-                if error.kind() != io::ErrorKind::Interrupted {
-                    self.book
-                        .observe(self.key.peer, self.key.role, self.key.address, None);
-                }
-                return Err(error);
-            }
-        };
-        if count == 0 && !buffer.is_empty() && self.length.is_some_and(|length| self.bytes < length)
-        {
+impl<R> MeasuredReader<R> {
+    fn record_error(&self, error: &io::Error) {
+        if error.kind() != io::ErrorKind::Interrupted {
+            self.book
+                .observe(self.key.peer, self.key.role, self.key.address, None);
+        }
+    }
+
+    fn record_read(&mut self, count: usize, nonempty: bool) {
+        if count == 0 && nonempty && self.length.is_some_and(|length| self.bytes < length) {
             self.book
                 .observe(self.key.peer, self.key.role, self.key.address, None);
         }
@@ -772,7 +768,7 @@ impl<R: Read> Read for MeasuredReader<R> {
         }
         if !self.finished
             && (self.length == Some(self.bytes)
-                || (self.length.is_none() && count == 0 && !buffer.is_empty()))
+                || (self.length.is_none() && count == 0 && nonempty))
         {
             self.finished = true;
             if let Some(activity) = self.interface.take() {
@@ -789,7 +785,49 @@ impl<R: Read> Read for MeasuredReader<R> {
                 self.connection,
             );
         }
-        Ok(count)
+    }
+}
+
+impl<R: Read> Read for MeasuredReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self.reader.read(buffer) {
+            Ok(count) => {
+                self.record_read(count, !buffer.is_empty());
+                Ok(count)
+            }
+            Err(error) => {
+                self.record_error(&error);
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(any(
+    feature = "dist-server",
+    all(target_os = "linux", feature = "native-store")
+))]
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for MeasuredReader<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::{pin::Pin, task::Poll};
+        let this = self.get_mut();
+        let before = buffer.filled().len();
+        let nonempty = buffer.remaining() > 0;
+        match Pin::new(&mut this.reader).poll_read(cx, buffer) {
+            Poll::Ready(Ok(())) => {
+                this.record_read(buffer.filled().len() - before, nonempty);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => {
+                this.record_error(&error);
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
