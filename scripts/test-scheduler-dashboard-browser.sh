@@ -15,7 +15,7 @@ driver=
 cleanup() {
     status=$?
     if [[ -n "$session" ]]; then
-        curl -fsS --max-time 5 -X DELETE "$driver/session/$session" >/dev/null || true
+        curl --noproxy '*' -fsS --max-time 5 -X DELETE "$driver/session/$session" >/dev/null || true
     fi
     for pid in "$scheduler_pid" "$driver_pid"; do
         if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi
@@ -37,7 +37,7 @@ jq -n --arg assets "$assets" --arg drain "$root/drain" --arg cluster "$root/clus
 }' > "$root/scheduler.json"
 SCCACHE_NO_DAEMON=1 SCCACHE_LOG=info "$binary" scheduler --config "$root/scheduler.json" > "$root/scheduler.log" 2>&1 &
 scheduler_pid=$!
-chromedriver --port=0 --allowed-ips=127.0.0.1 > "$root/driver.log" 2>&1 &
+chromedriver --verbose --port=0 --allowed-ips=127.0.0.1 > "$root/driver.log" 2>&1 &
 driver_pid=$!
 dashboard=
 for ((i=0;i<100;i++)); do
@@ -51,13 +51,21 @@ test -n "$driver"
 curl --noproxy '*' -fsS --max-time 10 "$dashboard/" | rg 'Scheduler status' >/dev/null
 chrome="$(command -v chromium || command -v google-chrome || command -v google-chrome-stable)"
 caps="$(jq -n --arg chrome "$chrome" --arg profile "$root/chrome" '{
-    capabilities: {alwaysMatch: {browserName: "chrome", "goog:chromeOptions": {
-        binary: $chrome, args: ["--headless=new", "--disable-dev-shm-usage", "--no-sandbox", "--no-proxy-server", ("--user-data-dir=" + $profile)]
+    capabilities: {alwaysMatch: {browserName: "chrome", pageLoadStrategy: "eager", timeouts: {pageLoad: 20000, script: 20000}, "goog:chromeOptions": {
+        binary: $chrome, args: ["--headless=new", "--disable-dev-shm-usage", "--no-sandbox", "--no-proxy-server", "--remote-debugging-pipe", "--no-first-run", ("--user-data-dir=" + $profile)]
     }}}
 }')"
-session="$(curl -fsS --max-time 30 -H 'Content-Type: application/json' -d "$caps" "$driver/session" | jq -er '.value.sessionId')"
+echo "Creating headless Chrome session via $driver"
+if ! curl --noproxy '*' --fail-with-body --show-error --silent --max-time 60 \
+    -H 'Content-Type: application/json' -d "$caps" "$driver/session" > "$root/session.json"; then
+    echo "Chrome session creation failed" >&2
+    cat "$root/session.json" >&2
+    exit 1
+fi
+session="$(jq -er '.value.sessionId' "$root/session.json")"
+echo "Chrome session established; loading $dashboard"
 webdriver() {
-    curl -fsS --max-time 30 -H 'Content-Type: application/json' -d "$2" "$driver/session/$session/$1"
+    curl --noproxy '*' -fsS --max-time 30 -H 'Content-Type: application/json' -d "$2" "$driver/session/$session/$1"
 }
 js() {
     webdriver execute/sync "$(jq -n --arg script "$1" '{script: $script, args: []}')"

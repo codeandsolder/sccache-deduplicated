@@ -42,7 +42,7 @@ jobs:
           toolchain: "nightly-2026-11-22"
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
         with:
           rust-toolchain: ${{ steps.rust.outputs.name }}
 
@@ -55,7 +55,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
 
   check_features:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
@@ -76,7 +76,7 @@ jobs:
           toolchain: "nightly-2026-11-22"
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
         with:
           rust-toolchain: ${{ steps.rust.outputs.name }}
 
@@ -89,7 +89,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
 
 
   host_tools:
@@ -166,7 +166,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
         with:
           rust-toolchain: ${{ steps.rust.outputs.name }}
 
@@ -275,14 +275,14 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
 
   shared-sccache:
     name: Linux tests (runner-local sccache)
     # Single current-Rust Linux lane on every PR and main push.
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@343303848026ed142e48a6a82e7a889080b99b26 # Last reusable workflow without provider-only OIDC permission
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
     with:
       isolate-public-sccache-server: true
       # Bubblewrap 0.11+ supplies private writable overlay mounts.
@@ -335,6 +335,7 @@ jobs:
           {"name":"build-runtime","cargo":["--locked","--target","x86_64-unknown-linux-gnu","-p","sccache-build"],"nextest":["--profile","ci-isolated","--run-ignored","all","-E","not test(benchmark_native_zfs_clones_against_reuse) & not test(benchmark_native_zfs_clones_against_fuse_views)"],"doctests":["--locked","--target","x86_64-unknown-linux-gnu","-p","sccache-build"]},
           {"name":"cluster-identity","cargo":["--locked","--target","x86_64-unknown-linux-gnu","-p","sccache-cluster-identity"],"nextest":["--profile","ci-isolated"],"doctests":["--locked","-p","sccache-cluster-identity"]},
           {"name":"scheduler-worker","cargo":["--locked","--target","x86_64-unknown-linux-gnu","--no-default-features","--features=dist-server","--bin","sccache-dist"],"nextest":["--profile","ci-isolated"]},
+          {"name":"native-http-server","continuous":true,"cargo":["--locked","--target","x86_64-unknown-linux-gnu","--no-default-features","--features=dist-client,dist-server","--lib"],"nextest":["--profile","ci-isolated","-E","test(dist::http::server::)"]},
           {"name":"native-dist","continuous":true,"cargo":["--locked","--target","x86_64-unknown-linux-gnu","--no-default-features","--features=dist-client,dist-server","--test","native_dist"],"nextest":["--profile","ci-isolated","--run-ignored","all","-E","not test(=shared_daemon_credential_isolation)"]},
           {"name":"cpu-target-profile","directory":"tools/cpu-target-profile","cargo":["--locked"],"doctests":["--locked"]}
         ]
@@ -357,14 +358,14 @@ jobs:
         with:
           toolchain: "nightly-2026-11-20"
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
         with:
           rust-toolchain: ${{ steps.rust.outputs.name }}
       - name: Verify long Rust compiler arguments with actual rustc
         run: cargo +${{ steps.rust.outputs.name }} test --locked --no-default-features --test sccache_cargo test_rust_response_file_long_command -- --test-threads 1
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
 
   ci-bundle-release-profile:
     name: CI bundle release profile (publisher toolchain)
@@ -388,7 +389,7 @@ jobs:
           printf 'channel=%s\n' "$rust_toolchain" >> "$GITHUB_OUTPUT"
       - name: Verify publisher compiler quarantine
         id: compiler
-        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
         with:
           validation-tier: release
           rust-toolchain: ${{ steps.publisher.outputs.channel }}
@@ -396,7 +397,7 @@ jobs:
         shell: bash
         run: rustup toolchain install ${{ steps.compiler.outputs.channel }} --profile minimal
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
         with:
           rust-toolchain: ${{ steps.compiler.outputs.channel }}
       - name: Check exact release feature profile
@@ -431,7 +432,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
 
   build:
     name: build ${{ matrix.binary || 'sccache' }} ${{ matrix.target }}
@@ -454,7 +455,7 @@ jobs:
           target: ${{ matrix.target != 's390x-unknown-linux-musl' && matrix.target || '' }}
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
         with:
           rust-toolchain: ${{ steps.rust.outputs.name }}
 
@@ -496,7 +497,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
 
       # Workaround for the lack of substring() function in github actions expressions.
       - name: Id

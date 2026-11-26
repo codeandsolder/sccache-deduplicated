@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   strict-rust:
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@343303848026ed142e48a6a82e7a889080b99b26 # Last unprivileged reusable workflow
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
     with:
       command: ":"
       rustflags: ""
