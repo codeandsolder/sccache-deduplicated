@@ -5,7 +5,7 @@
 //! intentionally not assigned an artificial size limit here.
 use crate::errors::{Context, Result, anyhow};
 use bincode::Options;
-#[cfg(feature = "dist-server")]
+#[cfg(all(test, feature = "dist-server"))]
 use std::io::Read;
 #[cfg(any(feature = "dist-client", test))]
 use std::time::Duration;
@@ -72,11 +72,12 @@ pub(super) fn decode_bincode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> bi
 #[cfg(feature = "dist-server")]
 #[derive(Debug)]
 pub(super) enum BoundedReadError {
+    AlreadyExtracted,
     Io(std::io::Error),
     TooLarge,
 }
 
-#[cfg(feature = "dist-server")]
+#[cfg(all(test, feature = "dist-server"))]
 pub(super) fn read_bounded(
     mut input: impl Read,
     limit: usize,

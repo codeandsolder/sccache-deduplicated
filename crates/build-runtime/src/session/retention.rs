@@ -1,9 +1,9 @@
 //! Build-scoped retention. Result leases are shared with the original action
 //! before its delivery ticket is released, so GC never observes a pin gap.
 use super::{
-    Arc, BTreeMap, BlobEncoding, BlobRef, ContentId, Context, File, HashMap, Instant, Mutex,
-    MutexGuard, NativeSessions, Phase, Publisher, Ready, Result, ResultLease, Ticket, anyhow, bail,
-    encode_delivery, ensure,
+    Arc, BTreeMap, BlobRef, ContentId, Context, HashMap, Instant, Mutex, MutexGuard,
+    NativeDownload, NativeSessions, Phase, Publisher, Ready, Result, ResultLease, Ticket, anyhow,
+    bail, ensure,
 };
 use crate::ResultId;
 
@@ -230,7 +230,7 @@ impl NativeSessions {
         group: Ticket,
         owner: crate::PeerId,
         blob: BlobRef,
-    ) -> Result<(File, BlobEncoding)> {
+    ) -> Result<NativeDownload> {
         let lease = {
             let mut groups = self.retained.lock()?;
             let group = groups
@@ -241,10 +241,10 @@ impl NativeSessions {
             drop(groups);
             lease
         };
-        encode_delivery(
+        Ok(NativeDownload::blob(
             (lease.open_file(blob.id)?, lease.physical_encoding(blob.id)?),
-            false,
-        )
+            blob.size,
+        ))
     }
 
     /// Close a group, releasing all its content pins outside the registry lock.

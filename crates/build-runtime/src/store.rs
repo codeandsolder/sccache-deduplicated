@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::{FileExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
@@ -228,6 +228,224 @@ pub struct StagedBlob {
     _reservation: space::StagingReservation,
 }
 
+/// An admitted staging file and its incremental verifier. No I/O is
+/// performed until the caller supplies bytes, so asynchronous transports
+/// can move it between short blocking-pool operations.
+pub struct PhysicalStager {
+    store: NativeStore,
+    file: Arc<File>,
+    path: TempPath,
+    written: u64,
+    synced: bool,
+    budget: StageBudget,
+    ingest: Option<blob_codec::BlobIngest>,
+    encoded: Vec<u8>,
+    expected: BlobRef,
+    failed: bool,
+}
+
+struct StagingWriter<'a> {
+    file: &'a File,
+    offset: &'a mut u64,
+}
+
+impl Write for StagingWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let count = self.file.write_at(bytes, *self.offset)?;
+        *self.offset = self
+            .offset
+            .checked_add(count as u64)
+            .ok_or_else(|| io::Error::other("CAS file offset overflow"))?;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl PhysicalStager {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Result<()> {
+        ensure!(!self.failed, "native staging already failed");
+        ensure!(
+            self.encoded.is_empty(),
+            "encoded native staging bytes not flushed"
+        );
+        let result = self
+            .ingest
+            .as_mut()
+            .context("native staging codec finalized")?
+            .feed(
+                &mut StagingWriter {
+                    file: &self.file,
+                    offset: &mut self.written,
+                },
+                bytes,
+            );
+        self.failed = result.is_err();
+        result
+    }
+
+    /// Whether a batch may perform compression or decompression.
+    #[must_use = "determines whether processing requires the codec executor"]
+    pub fn requires_codec_pool(&self) -> bool {
+        self.ingest
+            .as_ref()
+            .is_some_and(blob_codec::BlobIngest::requires_codec_pool)
+    }
+
+    /// Verify and encode a bounded batch without filesystem I/O.
+    ///
+    /// # Errors
+    /// Returns an error for malformed input or an unflushed previous batch.
+    pub fn encode_pending(&mut self, bytes: &[u8]) -> Result<()> {
+        ensure!(!self.failed, "native staging already failed");
+        ensure!(
+            self.encoded.is_empty(),
+            "encoded native staging bytes not flushed"
+        );
+        let result = self
+            .ingest
+            .as_mut()
+            .context("native staging codec finalized")?
+            .feed(&mut self.encoded, bytes);
+        self.failed = result.is_err();
+        result
+    }
+
+    pub(crate) fn flush_pending(&mut self) -> Result<()> {
+        ensure!(!self.failed, "native staging already failed");
+        let result = StagingWriter {
+            file: &self.file,
+            offset: &mut self.written,
+        }
+        .write_all(&self.encoded);
+        self.failed = result.is_err();
+        self.encoded.clear();
+        result?;
+        Ok(())
+    }
+
+    #[cfg(feature = "async-io")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "runs only on the thread-local Compio completion driver"
+    )]
+    pub(crate) async fn flush_pending_io(&mut self) -> Result<()> {
+        ensure!(!self.failed, "native staging already failed");
+        let buffer = std::mem::take(&mut self.encoded);
+        let end = self
+            .written
+            .checked_add(buffer.len() as u64)
+            .context("CAS file offset overflow")?;
+        let result = crate::disk::write_all(Arc::clone(&self.file), self.written, buffer).await;
+        self.failed = result.is_err();
+        self.encoded = result?;
+        self.encoded.clear();
+        self.written = end;
+        Ok(())
+    }
+
+    #[cfg(feature = "async-io")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "runs only on the thread-local Compio completion driver"
+    )]
+    pub(crate) async fn finalize_io(&mut self) -> Result<()> {
+        ensure!(self.ingest.is_none(), "native staging codec not finalized");
+        self.flush_pending_io().await?;
+        crate::disk::seal_file(Arc::clone(&self.file)).await?;
+        self.synced = true;
+        Ok(())
+    }
+
+    /// Validate the complete logical digest and flush the last codec frame.
+    ///
+    /// # Errors
+    /// Returns an error for invalid content or pending unflushed bytes.
+    pub fn finish_encoding(&mut self) -> Result<()> {
+        ensure!(!self.failed, "native staging already failed");
+        ensure!(
+            self.encoded.is_empty(),
+            "encoded native staging bytes not flushed"
+        );
+        let result = self
+            .ingest
+            .take()
+            .context("native staging codec finalized")?
+            .finish(&mut self.encoded);
+        self.failed = result.is_err();
+        result
+    }
+
+    /// Submit the pending encoded bytes to the completion driver.
+    ///
+    /// # Errors
+    /// Returns an error for failed staging or storage errors.
+    #[cfg(feature = "async-io")]
+    pub async fn flush_pending_async(mut self) -> Result<Self> {
+        crate::disk::run(move || async move {
+            self.flush_pending_io().await?;
+            Ok(self)
+        })
+        .await
+    }
+
+    /// Flush and synchronize a fully verified staging file.
+    ///
+    /// # Errors
+    /// Returns an error for failed staging or storage errors.
+    #[cfg(feature = "async-io")]
+    pub async fn finish_file_async(mut self) -> Result<Self> {
+        crate::disk::run(move || async move {
+            self.finalize_io().await?;
+            Ok(self)
+        })
+        .await
+    }
+
+    pub(crate) fn read_from(&mut self, mut reader: impl Read) -> Result<()> {
+        let mut buffer = vec![0_u8; 128 * 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(count) => self.feed(&buffer[..count])?,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// Finish an immutable verified staging file.
+    ///
+    /// # Errors
+    /// Returns an error for failed validation or storage errors.
+    pub fn finish(mut self) -> Result<StagedBlob> {
+        ensure!(!self.failed, "native staging already failed");
+        if !self.synced {
+            self.flush_pending()?;
+            if let Some(ingest) = self.ingest.take() {
+                ingest.finish(&mut StagingWriter {
+                    file: &self.file,
+                    offset: &mut self.written,
+                })?;
+            }
+            self.file
+                .set_permissions(fs::Permissions::from_mode(0o400))?;
+            self.file.sync_all()?;
+        }
+        let metadata = self.file.metadata()?;
+        Ok(StagedBlob {
+            path: self.path,
+            metadata,
+            reference: self.expected,
+            encoding: self.store.physical_encoding,
+            owner: Arc::clone(&self.store.inner),
+            _reservation: self.budget.finish(self.expected.size)?,
+        })
+    }
+}
+
 impl StagedBlob {
     #[must_use = "the reference identifies the staged content"]
     pub const fn reference(&self) -> BlobRef {
@@ -370,6 +588,7 @@ struct Inner {
     pins: Mutex<Pins>,
     package_imports: Mutex<BTreeSet<crate::PackageIdentity>>,
     tree_flights: trees::TreeFlights,
+    publications: tokio::sync::watch::Sender<()>,
     space_policy: Option<SpacePolicy>,
     space: Mutex<space::SpaceState>,
     // Releases never acquire the space admission lock, avoiding lock-order
@@ -826,6 +1045,7 @@ impl NativeStore {
             pins: Mutex::new(pins),
             package_imports: Mutex::new(BTreeSet::new()),
             tree_flights: trees::TreeFlights::default(),
+            publications: tokio::sync::watch::Sender::new(()),
             space_policy,
             space: Mutex::default(),
             space_released: AtomicU64::new(0),
@@ -1016,32 +1236,44 @@ impl NativeStore {
         encoding: BlobEncoding,
         reader: impl Read,
     ) -> Result<StagedBlob> {
-        // Convert physical storage at ingress, instead of persisting the
-        // sender's encoding on an incompatible backing filesystem.
-        if encoding == BlobEncoding::Raw {
-            return self.stage_expected(expected, reader);
-        }
+        let mut stager = self.prepare_physical(expected, encoding)?;
+        stager.read_from(reader)?;
+        stager.finish()
+    }
+
+    /// Reserve storage and begin incremental verified physical ingestion.
+    ///
+    /// # Errors
+    /// Returns an error for invalid metadata or insufficient storage.
+    pub fn prepare_physical(
+        &self,
+        expected: BlobRef,
+        encoding: BlobEncoding,
+    ) -> Result<PhysicalStager> {
         let mut budget = space::StageBudget::new(self);
         budget.grow_to(expected.size)?;
-        let mut staged = NamedTempFile::new_in(self.inner.root.join("staging"))?;
-        if self.physical_encoding == encoding {
-            blob_codec::transfer(reader, staged.as_file_mut(), io::sink(), expected, encoding)?;
-        } else {
-            // ZFS receives compressed content, but stores decoded ordinary files.
-            blob_codec::transfer(reader, io::sink(), staged.as_file_mut(), expected, encoding)?;
-        }
-        staged
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(0o400))?;
-        staged.as_file().sync_all()?;
-        let metadata = staged.as_file().metadata()?;
-        Ok(StagedBlob {
-            path: staged.into_temp_path(),
-            metadata,
-            reference: expected,
-            encoding: self.physical_encoding,
-            owner: Arc::clone(&self.inner),
-            _reservation: budget.finish(expected.size)?,
+        let (file, path) = NamedTempFile::new_in(self.inner.root.join("staging"))?.into_parts();
+        let mut written = 0;
+        let ingest = blob_codec::BlobIngest::new(
+            &mut StagingWriter {
+                file: &file,
+                offset: &mut written,
+            },
+            expected,
+            encoding,
+            self.physical_encoding,
+        )?;
+        Ok(PhysicalStager {
+            store: self.clone(),
+            file: Arc::new(file),
+            path,
+            written,
+            synced: false,
+            budget,
+            ingest: Some(ingest),
+            encoded: Vec::new(),
+            expected,
+            failed: false,
         })
     }
 
@@ -1100,6 +1332,58 @@ impl NativeStore {
             reserved,
             missing,
         })
+    }
+
+    /// Wait for independently produced content, pinning each available subset.
+    /// A publication notification is registered before checking residency, so
+    /// a concurrent commit cannot be lost between the check and the wait.
+    /// This does not claim acquisition ownership or request any network I/O.
+    ///
+    /// # Errors
+    /// Returns an error for cancellation, timeout, invalid content or storage failure.
+    pub async fn await_blobs<Cancel>(
+        &self,
+        mut blobs: BTreeMap<ContentId, u64>,
+        deadline: Instant,
+        cancelled: Cancel,
+    ) -> Result<Vec<UploadReservation>>
+    where
+        Cancel: std::future::Future<Output = Result<()>> + Send,
+    {
+        let mut publications = self.inner.publications.subscribe();
+        let mut cancelled = std::pin::pin!(cancelled);
+        let mut pins = Vec::new();
+        while !blobs.is_empty() {
+            ensure!(
+                Instant::now() < deadline,
+                "native content publication deadline exceeded"
+            );
+            // Forget prior changes, then check the current durable index.
+            let _ = publications.borrow_and_update();
+            let count = blobs.len();
+            let store = self.clone();
+            let ready = tokio::task::spawn_blocking(move || store.reserve_blobs(blobs)).await??;
+            blobs = ready
+                .missing()
+                .iter()
+                .map(|blob| (blob.id, blob.size))
+                .collect();
+            if blobs.len() < count {
+                pins.push(ready);
+            }
+            if !blobs.is_empty() {
+                tokio::select! {
+                    result = tokio::time::timeout_at(deadline.into(), publications.changed()) => {
+                        result.context("native content publication deadline exceeded")??;
+                    }
+                    result = &mut cancelled => {
+                        result?;
+                        anyhow::bail!("native content publication cancelled");
+                    }
+                }
+            }
+        }
+        Ok(pins)
     }
 
     /// Atomically publish a successful result. All newly referenced blobs must
@@ -1269,6 +1553,7 @@ impl NativeStore {
         // Files and their directory entries are durable before the index
         // exposes them. Orphans from an interrupted write are harmless.
         write.commit()?;
+        self.inner.publications.send_modify(|()| {});
         // Keep the staging budget reserved until the resident count includes the new bytes.
         drop(staged_reservations);
         self.inner
@@ -1760,6 +2045,13 @@ impl ResultLease {
         &self.manifest
     }
 
+    pub(crate) fn blob_size(&self, id: ContentId) -> Result<u64> {
+        self.blobs
+            .get(&id)
+            .copied()
+            .context("undeclared result content")
+    }
+
     /// Open a file for transport. Its inode remains valid after unlinking,
     /// so a response can own it independently of this lease.
     ///
@@ -1833,6 +2125,7 @@ pub use packages::{
     PackageArchiveLease, PackageDecoder, PackageImportLimits, PackagePolicy, PackageSlot,
     VerifiedPackage, decode_package_process,
 };
+pub use packages::{PackageImport, PackagePreparation};
 mod trees;
 #[cfg(target_os = "linux")]
 pub use trees::MountedTree;

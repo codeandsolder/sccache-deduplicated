@@ -886,8 +886,8 @@ impl ServerIncoming for FailingServer {
         _outputs: OutputRequest,
         _inputs_rdr: InputsReader,
     ) -> Result<RunJobResult> {
-        requester
-            .do_update_job_state(job_id, JobState::Started)
+        sccache::http_client::io_runtime()?
+            .block_on(requester.do_update_job_state(job_id, JobState::Started))
             .context("Updating job state failed")?;
         bail!("internal build failure")
     }

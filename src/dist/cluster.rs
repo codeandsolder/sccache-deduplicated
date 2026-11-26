@@ -20,6 +20,19 @@ use super::cluster_routes::{
 };
 use sccache_peer_identity::RouteSet;
 
+#[cfg(any(
+    feature = "dist-server",
+    all(target_os = "linux", feature = "native-store")
+))]
+type AsyncResponseStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send>>;
+#[cfg(any(
+    feature = "dist-server",
+    all(target_os = "linux", feature = "native-store")
+))]
+pub(super) type AsyncResponseReader =
+    tokio_util::io::StreamReader<AsyncResponseStream, bytes::Bytes>;
+
 type Current = dyn Fn() -> Result<Arc<TlsCredentials>> + Send + Sync;
 
 /// Total interface traffic and learned directional path overlap on this host.
@@ -143,13 +156,17 @@ impl ClusterRoutes {
         let Ok(runtime) = io_runtime() else {
             return;
         };
+        runtime.block_on(self.probe_routes_async(routes.into_iter().collect()));
+    }
+
+    pub(super) async fn probe_routes_async(&self, routes: Vec<(PeerId, Role, &RouteSet)>) {
         let probes = routes.into_iter().flat_map(|(peer, role, routes)| {
             self.book
                 .reserve(peer, role, routes)
                 .into_iter()
                 .map(move |probe| self.probe(peer, role, probe))
         });
-        runtime.block_on(futures::future::join_all(probes));
+        futures::future::join_all(probes).await;
     }
 
     /// Refresh measurements outside the heartbeat and allocation request pools.
@@ -249,6 +266,37 @@ impl ClusterRoutes {
             length,
             path,
         ))
+    }
+
+    #[cfg(any(
+        feature = "dist-server",
+        all(target_os = "linux", feature = "native-store")
+    ))]
+    pub(super) fn measure_response_async(
+        &self,
+        peer: PeerId,
+        role: Role,
+        address: Route,
+        response: wreq::Response,
+    ) -> MeasuredReader<AsyncResponseReader> {
+        use futures::TryStreamExt;
+        let length = response.content_length();
+        let path = ConnectionPath::from_response(&response);
+        let stream: AsyncResponseStream = Box::pin(
+            response
+                .bytes_stream()
+                .map_err(|error| std::io::Error::other(error.without_uri())),
+        );
+        let reader = tokio_util::io::StreamReader::new(stream);
+        MeasuredReader::new(
+            reader,
+            Arc::clone(&self.book),
+            peer,
+            role,
+            address,
+            length,
+            path,
+        )
     }
 
     pub(super) fn local_source(
