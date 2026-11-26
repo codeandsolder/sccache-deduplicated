@@ -220,9 +220,9 @@ impl ValidJWTCheck {
     }
 
     fn check_jwt_validity(&self, token: &str) -> Result<()> {
-        jsonwebtoken_btls::install()?;
         #[derive(Deserialize)]
         struct Claims {}
+        jsonwebtoken_btls::install()?;
         let header = jwt::decode_header(token).context("Could not decode jwt header")?;
         trace!("Validating JWT in scheduler");
         // Prepare validation

@@ -1930,8 +1930,7 @@ impl SchedulerIncoming for Scheduler {
         let receiver_rates = requester
             .and_then(|id| servers.get(&id))
             .and_then(|details| details.capabilities.native_placement.as_ref())
-            .map(|placement| placement.peer_download_rates.as_slice())
-            .unwrap_or_default();
+            .map_or_default(|placement| placement.peer_download_rates.as_slice());
         let rate = |source: ServerId| {
             receiver_rates
                 .binary_search_by_key(&source, |rate| rate.source)
