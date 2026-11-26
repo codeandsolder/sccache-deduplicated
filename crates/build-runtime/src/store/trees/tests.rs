@@ -535,7 +535,8 @@ async fn asynchronous_tree_waiters_share_the_synchronous_owner_and_honor_deadlin
     resume.send(())?;
     let (owner, reused) = leader.await??;
     assert!(!reused);
-    let follower = follower.await??;
+    let (follower, reused) = follower.await??;
+    assert!(reused);
     assert_eq!(owner.id(), follower.id());
     assert_eq!(store.evict_tree(id)?, Eviction::Pinned);
     drop((owner, follower));

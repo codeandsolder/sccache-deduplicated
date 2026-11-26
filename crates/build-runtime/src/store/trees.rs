@@ -211,7 +211,7 @@ impl NativeStore {
         deadline: Instant,
         cancelled: Cancel,
         fetch: impl FnOnce() -> Fut + Send,
-    ) -> Result<Arc<TreeLease>>
+    ) -> Result<(Arc<TreeLease>, bool)>
     where
         Fut: std::future::Future<Output = Result<TreeLease>> + Send,
         Cancel: std::future::Future<Output = Result<()>> + Send,
@@ -221,7 +221,7 @@ impl NativeStore {
             "native tree acquisition deadline exceeded"
         );
         if let Some(tree) = self.lookup_tree_async(id).await? {
-            return Ok(Arc::new(tree));
+            return Ok((Arc::new(tree), true));
         }
         let flight = self.tree_flight(id);
         let mut cancelled = std::pin::pin!(cancelled);
@@ -235,7 +235,7 @@ impl NativeStore {
             let owner = {
                 let mut state = flight.state.lock().unwrap_or_else(PoisonError::into_inner);
                 match &*state {
-                    FlightState::Ready(lease) => return Ok(Arc::clone(lease)),
+                    FlightState::Ready(lease) => return Ok((Arc::clone(lease), true)),
                     FlightState::Idle => {
                         *state = FlightState::Fetching;
                         drop(state);
@@ -245,11 +245,11 @@ impl NativeStore {
                 }
             };
             if let Some(_owner) = owner {
-                let lease = match self.lookup_tree_async(id).await? {
-                    Some(lease) => lease,
-                    None => fetch().await?,
+                let (lease, reused) = match self.lookup_tree_async(id).await? {
+                    Some(lease) => (lease, true),
+                    None => (fetch().await?, false),
                 };
-                return self.complete_flight(id, &flight, lease);
+                return Ok((self.complete_flight(id, &flight, lease)?, reused));
             }
             tokio::select! {
                 result = tokio::time::timeout_at(deadline.into(), notified) => {

@@ -329,5 +329,6 @@ impl NativeSessions {
                 },
             )
             .await
+            .map(|(lease, _)| lease)
     }
 }

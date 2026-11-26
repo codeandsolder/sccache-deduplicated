@@ -556,11 +556,10 @@ impl NativeCacheClient {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 };
-                let tree = Box::pin(store.acquire_tree_async(id, deadline, cancelled, || {
+                Box::pin(store.acquire_tree_async(id, deadline, cancelled, || {
                     self.fetch_tree(ticket, id, store, delivery, check, on_tree)
                 }))
-                .await?;
-                (tree, false)
+                .await?
             };
             trace_tree_access(id, &tree, hit)?;
             on_tree(&tree);

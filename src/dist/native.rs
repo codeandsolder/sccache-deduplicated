@@ -1113,7 +1113,7 @@ impl NativeCacheClient {
                 drop(reservation);
                 Ok(tree)
             }).await?
-        })).await
+        })).await.map(|(lease, _)| lease)
     }
 
     /// Negotiate missing content for a successful result.
