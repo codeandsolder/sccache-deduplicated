@@ -1394,7 +1394,12 @@ impl NativeCacheClient {
         request: Vec<u8>,
         blob: BlobRef,
         timeout: Duration,
-    ) -> Result<Option<(MeasuredReader<reqwest::blocking::Response>, BlobEncoding)>> {
+    ) -> Result<
+        Option<(
+            MeasuredReader<crate::http_client::ResponseReader>,
+            BlobEncoding,
+        )>,
+    > {
         let (response, address) = self.send_to_cache(
             operation,
             request,

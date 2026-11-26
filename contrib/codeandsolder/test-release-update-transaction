@@ -19,6 +19,8 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "$root"/{bin,state,etc,services,cache}
 cp /etc/{passwd,group,nsswitch.conf} "$root/etc/"
+# Preserve distro command symlinks such as /usr/bin/awk -> /etc/alternatives/awk.
+if [[ -d /etc/alternatives ]]; then cp -a /etc/alternatives "$root/etc/"; fi
 cp "$here"/{sccache-release-update,host-native-metadata} "$root/"
 sha=2222222222222222222222222222222222222222
 old=1111111111111111111111111111111111111111

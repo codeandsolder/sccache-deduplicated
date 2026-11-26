@@ -6,6 +6,8 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/sccache-fleet-activation-test.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 mkdir -p "$tmp"/{usr-local/bin,usr-local/libexec/sccache-bin,etc/sccache,etc/sccache-dist,etc/systemd/system,var-lib/sccache-autoupdate,var-cache,var-tmp,shm,run,bin}
 cp /etc/{passwd,group,nsswitch.conf,machine-id} "$tmp/etc/"
+# Preserve distro command symlinks such as /usr/bin/awk -> /etc/alternatives/awk.
+if [[ -d /etc/alternatives ]]; then cp -a /etc/alternatives "$tmp/etc/"; fi
 # Namespace root is the only mapped identity, including on development hosts
 # that already have a real scheduler account.
 sed -i '/^sccache-scheduler:/d' "$tmp/etc/passwd" "$tmp/etc/group"

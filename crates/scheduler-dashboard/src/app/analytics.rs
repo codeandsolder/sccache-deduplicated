@@ -30,7 +30,7 @@ pub(super) fn CacheAnalytics(
     }
 }
 
-#[allow(
+#[expect(
     clippy::cast_precision_loss,
     reason = "display-only ratio of exact integer counters"
 )]
@@ -42,7 +42,7 @@ fn percent(part: u128, total: u128) -> f64 {
     }
 }
 
-#[allow(
+#[expect(
     clippy::cast_precision_loss,
     reason = "display-only ratio of exact integer counters"
 )]
