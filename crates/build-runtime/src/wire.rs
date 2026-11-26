@@ -29,6 +29,7 @@ pub enum Publisher {
 }
 
 /// A client request for a complete native execution declaration.
+///
 /// A compiler front end may additionally supply a semantic result fingerprint;
 /// the exact declaration is still compared when assigning and verifying work.
 /// The output contract is a mandatory component of either result identity.
@@ -67,6 +68,7 @@ impl ActionRequest {
             .as_ref()
             .unwrap_or(&self.fingerprint)
             .clone();
+        ensure!(!fingerprint.schema.is_empty(), "empty result schema");
         let digest = ContentId(typed_digest(
             b"sccache-output-contract-v2\0",
             &(&self.required_outputs, &self.optional_outputs),

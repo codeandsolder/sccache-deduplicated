@@ -460,6 +460,7 @@ impl NativeOutput {
 }
 
 /// The compiler frontend declares which semantic identity it can establish.
+///
 /// Opaque extensions keep exact execution identity: their code can observe
 /// arbitrary environment values and input metadata outside compiler dep-info.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -513,8 +514,9 @@ impl ResultIdentityPolicy {
     }
 }
 
-/// Compiler extensions execute arbitrary native code, outside the semantic
-/// dependency model of ordinary frontends. Retain the exact declaration key.
+/// Retain exact identity for extensions executing arbitrary native code.
+///
+/// Their dependencies lie outside ordinary compiler frontend discovery.
 fn opaque_compiler_extension(command: &CommandSpec, inputs: &TreeManifest) -> bool {
     command.arguments.iter().any(|arg| {
         [
@@ -537,10 +539,10 @@ fn opaque_compiler_extension(command: &CommandSpec, inputs: &TreeManifest) -> bo
         .any(|path| path.as_bytes().ends_with(b".so"))
 }
 
-/// Extra driver/runtime dependencies not necessarily present in preprocessor
-/// output or Rust's dep-info. Hash the observed command environment, not job,
-/// shell or scheduler bookkeeping. Rust source-observed values and Cargo
-/// semantic environment are already included in the frontend digest.
+/// Hash compiler driver/runtime environment dependencies.
+///
+/// Rust source-observed values and Cargo semantic environment are already
+/// included in the frontend digest. Omit job, shell and scheduler bookkeeping.
 fn compiler_environment(command: &CommandSpec, policy: ResultIdentityPolicy) -> ContentId {
     let mut digest = blake3::Hasher::new();
     digest.update(b"sccache-native-compiler-environment-v1\0");

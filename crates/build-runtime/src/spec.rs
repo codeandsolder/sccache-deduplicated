@@ -154,8 +154,9 @@ impl ExecutionRoot {
     }
 }
 
-/// Compiler-front-end identity of a reusable result. The authenticated client
-/// supplies the compiler's semantic input digest; the exact execution plan
+/// Compiler-front-end identity of a reusable result.
+///
+/// The authenticated client supplies the compiler's semantic input digest; the exact execution plan
 /// remains independently verified. The packaged toolchain is also an input
 /// because an identical driver may load different auxiliary programs/libraries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
