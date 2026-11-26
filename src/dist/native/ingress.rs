@@ -175,3 +175,44 @@ pub(in crate::dist) async fn stage_blob(
     let staging = receive_blob(staging, input, meter, anyhow::Error::from).await?;
     tokio::task::spawn_blocking(move || staging.finish()).await?
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn failed_batch_drains_active_acquisitions_without_admitting_more() -> Result<()> {
+        let started = AtomicUsize::new(0);
+        let completed = AtomicUsize::new(0);
+        let both_started = tokio::sync::Barrier::new(2);
+        let failed = tokio::sync::Notify::new();
+        let result = map_bounded(
+            0..8,
+            std::num::NonZeroUsize::new(2).context("width")?,
+            |index| {
+                let started = &started;
+                let completed = &completed;
+                let both_started = &both_started;
+                let failed = &failed;
+                async move {
+                    started.fetch_add(1, Ordering::Relaxed);
+                    both_started.wait().await;
+                    if index == 0 {
+                        failed.notify_one();
+                        anyhow::bail!("acquisition failed");
+                    }
+                    failed.notified().await;
+                    tokio::task::yield_now().await;
+                    completed.fetch_add(1, Ordering::Relaxed);
+                    Ok(index)
+                }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(started.load(Ordering::Relaxed), 2);
+        assert_eq!(completed.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+}

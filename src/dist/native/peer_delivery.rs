@@ -81,13 +81,13 @@ impl NativeCacheClient {
     fn direct_candidates<'a>(
         &self,
         plan: &'a BlobSourcePlan,
-        routes: &sccache_peer_identity::RouteSet,
+        routes: Option<&sccache_peer_identity::RouteSet>,
     ) -> Vec<(u128, &'a BlobSource)> {
         if plan.sources.is_empty() {
             return Vec::new();
         }
         let transfer = Transfer::Download(plan.blob.size);
-        let scheduler_cost = if plan.scheduler_present {
+        let scheduler_cost = if let Some(routes) = routes {
             self.routes
                 .estimated_cost(self.peer.scheduler_id(), Role::Scheduler, routes, transfer)
                 .unwrap_or_else(|| {
@@ -118,7 +118,10 @@ impl NativeCacheClient {
     pub(super) fn has_direct_source(&self, plan: &BlobSourcePlan) -> bool {
         !plan.sources.is_empty()
             && !self
-                .direct_candidates(plan, &self.cache_routes())
+                .direct_candidates(
+                    plan,
+                    plan.scheduler_present.then(|| self.cache_routes()).as_ref(),
+                )
                 .is_empty()
     }
 
@@ -166,10 +169,14 @@ impl NativeCacheClient {
                     .collect(),
             )
             .await;
-        let cache_routes = self.cache_routes_async().await;
+        let cache_routes = if plan.scheduler_present {
+            Some(self.cache_routes_async().await)
+        } else {
+            None
+        };
         let blob = plan.blob;
         let started = Instant::now();
-        for (cost, source) in self.direct_candidates(plan, &cache_routes) {
+        for (cost, source) in self.direct_candidates(plan, cache_routes.as_ref()) {
             let budget =
                 self.timeout
                     .min(Duration::from_secs(5).saturating_add(Duration::from_nanos(

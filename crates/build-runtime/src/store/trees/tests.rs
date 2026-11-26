@@ -510,6 +510,17 @@ async fn asynchronous_tree_waiters_share_the_synchronous_owner_and_honor_deadlin
         .err()
         .context("active flight must outlast the waiter's deadline")?;
     assert!(timeout.to_string().contains("deadline exceeded"));
+    let cancelled = store
+        .acquire_tree_async(
+            id,
+            Instant::now() + Duration::from_secs(5),
+            async { anyhow::bail!("lease expired") },
+            || async { anyhow::bail!("cancelled waiter must not acquire") },
+        )
+        .await
+        .err()
+        .context("cancelled flight waiter succeeded")?;
+    assert_eq!(cancelled.to_string(), "lease expired");
     let follower_store = store.clone();
     let follower = tokio::spawn(async move {
         follower_store
