@@ -369,10 +369,9 @@ impl<'a> ResultDelivery<'a> {
                 .then(tempfile::tempfile)
                 .transpose()?;
             let direct = {
-                let mut target = match &mut spool {
-                    Some(file) => BlobSink::File(file),
-                    None => destination.reborrow(),
-                };
+                let mut target = spool
+                    .as_mut()
+                    .map_or_else(|| destination.reborrow(), BlobSink::File);
                 self.client
                     .try_peer_blob(plan, |reader, encoding| {
                         target.reset()?;

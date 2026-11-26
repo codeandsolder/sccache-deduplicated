@@ -278,6 +278,10 @@ pub(super) fn file_body(reader: impl Read + Send + 'static, length: u64) -> Resp
         .into_response()
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the response stream takes ownership of the permit, so admission remains held until the body is drained or cancelled"
+)]
 async fn admit(
     State(admission): State<Arc<Semaphore>>,
     Extension(peer): Extension<AuthenticatedPeer>,
@@ -292,10 +296,6 @@ async fn admit(
             .into_response();
     };
     // The response stream must retain the permit even after the handler returns.
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "the response stream takes ownership of this permit, so admission remains held until the body is drained or cancelled"
-    )]
     let permit = Arc::new(permit);
     request.extensions_mut().insert(Arc::clone(&permit));
     let response = next.run(request).await;

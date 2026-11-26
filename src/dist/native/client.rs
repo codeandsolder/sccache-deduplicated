@@ -921,10 +921,10 @@ impl<D: FnMut(BlobRef, &mut BlobSink<'_>) -> Result<()>> ResultBlobs<'_, D> {
             None
         };
         {
-            let mut target = match &mut spool {
-                Some(file) => BlobSink::File(file.as_file_mut()),
-                None => output.reborrow(),
-            };
+            let mut target = spool.as_mut().map_or_else(
+                || output.reborrow(),
+                |file| BlobSink::File(file.as_file_mut()),
+            );
             let mut reused = false;
             for candidate in existing.into_iter().chain(inputs.matching_sources(blob.id)) {
                 target.reset()?;
