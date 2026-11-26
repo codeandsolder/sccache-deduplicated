@@ -403,7 +403,7 @@ impl<T: Send + 'static> PackageImport<T> {
     ///
     /// # Errors
     /// Returns an error for invalid content, decoder failure or storage failure.
-    pub fn finish(self: Box<Self>, executable: &std::path::Path) -> Result<VerifiedPackage> {
+    pub fn finish(self, executable: &std::path::Path) -> Result<VerifiedPackage> {
         let store = self.archive.store.clone();
         let (source, archive) = self.archive.finish()?;
         store.decode_verified_package(
