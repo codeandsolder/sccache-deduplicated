@@ -1643,3 +1643,61 @@ fn session_telemetry_reports_contended_tickets_without_waiting() -> Result<()> {
     assert!(service.telemetry()?.tickets.is_none());
     Ok(())
 }
+
+#[test]
+fn retention_group_survives_action_close_refresh_and_exceeds_action_slots() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let owner = test_peer(1);
+    let other = test_peer(2);
+    let group = service.open_retention(owner)?;
+    let mut retained = Vec::new();
+    let key = request()?.action_fingerprint()?.key()?;
+    // More results than the entire action ticket capacity. Repeated refresh
+    // of one action must not replace already-retained immutable output bytes.
+    for value in 0_u8..24 {
+        let bytes = [value; 8];
+        let result = manifest(&bytes);
+        let blob = result.outputs["obj"].test_file_blob();
+        let NativeAdmission::Compile { ticket } = service.admit(
+            request()?,
+            Publisher::Client,
+            ActionMode::Refresh,
+            BTreeMap::new(),
+        )?
+        else {
+            bail!("expected fresh action");
+        };
+        assert!(
+            service
+                .retain_result(group, ticket, result.id()?, owner)
+                .is_err()
+        );
+        service.begin(ticket, Publisher::Client, result.clone())?;
+        upload_encoded(&service, ticket, Publisher::Client, blob, &bytes)?;
+        service.commit(ticket, Publisher::Client)?;
+        assert!(
+            service
+                .retain_result(group, ticket, result.id()?, other)
+                .is_err()
+        );
+        service.retain_result(group, ticket, result.id()?, owner)?;
+        service.retain_result(group, ticket, result.id()?, owner)?;
+        service.close(ticket, Publisher::Client)?;
+        retained.push((blob, bytes));
+    }
+    assert_eq!(service.store().evict(key)?, Eviction::Pinned);
+    for (blob, bytes) in retained {
+        assert!(service.download_retained(group, other, blob).is_err());
+        let (file, encoding) = service.download_retained(group, owner, blob)?;
+        let mut reader = crate::BlobReader::open(file, encoding)?;
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual)?;
+        assert_eq!(actual, bytes);
+    }
+    assert!(service.renew_retention(group, other).is_err());
+    assert!(service.close_retention(group, other).is_err());
+    service.close_retention(group, owner)?;
+    assert!(!matches!(service.store().evict(key)?, Eviction::Pinned));
+    Ok(())
+}

@@ -35,7 +35,8 @@ use crate::{
     dist::native::{
         BlobSourceRequest, CloseRequest, CommitRequest, DownloadRequest, ExecutionRequest,
         InputPrefetchRequest, ManifestRequest, OpenTreeRequest, PackageAcquisition, PackageLocator,
-        PackagePlanRequest, ScheduleRequest, StatusRequest, codec,
+        PackagePlanRequest, RetainRequest, RetainedDownloadRequest, ScheduleRequest, StatusRequest,
+        codec,
     },
 };
 
@@ -746,10 +747,36 @@ fn dispatch(
             sessions.close(ticket, publisher)?;
             encode(&(), limit)
         }
-        "blob_sources" => {
+        "retain_open" if publisher == Publisher::Client => {
+            let (): () = metadata(request, limit)?;
+            encode(&sessions.open_retention(request.id())?, limit)
+        }
+        "retain_add" if publisher == Publisher::Client => {
+            let RetainRequest {
+                group,
+                action,
+                result,
+            } = metadata(request, limit)?;
+            sessions.retain_result(group, action, result, request.id())?;
+            encode(&(), limit)
+        }
+        "retain_renew" if publisher == Publisher::Client => {
+            sessions.renew_retention(metadata(request, limit)?, request.id())?;
+            encode(&(), limit)
+        }
+        "retain_close" if publisher == Publisher::Client => {
+            sessions.close_retention(metadata(request, limit)?, request.id())?;
+            encode(&(), limit)
+        }
+        "blob_sources" | "retain_sources" => {
             let BlobSourceRequest { ticket, blobs } = metadata(request, limit)?;
-            let (producer, availability) =
-                sessions.authorize_blob_sources(ticket, publisher, &blobs)?;
+            let (producer, availability) = if operation == "retain_sources" {
+                ensure!(publisher == Publisher::Client, "retention is client-owned");
+                sessions.retained_sources(ticket, request.id(), &blobs)?;
+                (None, vec![true; blobs.len()])
+            } else {
+                sessions.authorize_blob_sources(ticket, publisher, &blobs)?
+            };
             let recipient = match publisher {
                 Publisher::Client => BlobRecipient::Client(request.id()),
                 Publisher::Worker { peer, .. } => BlobRecipient::Worker(peer),
@@ -767,9 +794,15 @@ fn dispatch(
                 .collect::<Result<Vec<_>>>()?;
             encode(&plans, limit)
         }
-        "download" => {
-            let DownloadRequest { ticket, id } = metadata(request, limit)?;
-            let (file, encoding) = sessions.download(ticket, publisher, id)?;
+        "download" | "retain_download" => {
+            let (file, encoding) = if operation == "retain_download" {
+                ensure!(publisher == Publisher::Client, "retention is client-owned");
+                let RetainedDownloadRequest { group, blob } = metadata(request, limit)?;
+                sessions.download_retained(group, request.id(), blob)?
+            } else {
+                let DownloadRequest { ticket, id } = metadata(request, limit)?;
+                sessions.download(ticket, publisher, id)?
+            };
             let logical =
                 crate::build_runtime::BlobReader::open(file.try_clone()?, encoding)?.len();
             let size = file.metadata()?.len();

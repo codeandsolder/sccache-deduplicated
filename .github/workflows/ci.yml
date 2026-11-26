@@ -288,7 +288,7 @@ jobs:
       runner: ubuntu-26.04
       command: |
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends gcc clang bubblewrap ripgrep
+        sudo apt-get install -y --no-install-recommends gcc clang bubblewrap ripgrep fuse3
         # Canonical Rust integration tests execute the bundled compiler through
         # bwrap, just like the managed Linux hosts.
         command -v bwrap

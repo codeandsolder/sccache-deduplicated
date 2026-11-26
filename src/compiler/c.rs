@@ -700,6 +700,7 @@ where
             rewrite_includes_only,
             storage,
             cache_control,
+            ..
         } = context;
         let start_of_compilation = std::time::SystemTime::now();
         let mut parsed_args = self.parsed_args.clone();
@@ -3067,6 +3068,8 @@ mod test {
                     <CCompilerHasher<Gcc> as CompilerHasher<ProcessCommandCreator>>::generate_hash_key(
                         &mut hasher,
                         GenerateHashKeyContext {
+                            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                            native: None,
                             creator: &creator,
                             cwd: cwd.clone(),
                             env_vars: env,

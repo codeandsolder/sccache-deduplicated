@@ -23,10 +23,27 @@ impl NativeCacheClient {
         ticket: Ticket,
         blobs: &[BlobRef],
     ) -> BTreeMap<ContentId, BlobSourcePlan> {
+        self.source_plans_for("blob_sources", ticket, blobs)
+    }
+
+    pub(super) fn retained_source_plans(
+        &self,
+        group: Ticket,
+        blobs: &[BlobRef],
+    ) -> BTreeMap<ContentId, BlobSourcePlan> {
+        self.source_plans_for("retain_sources", group, blobs)
+    }
+
+    fn source_plans_for(
+        &self,
+        operation: &str,
+        ticket: Ticket,
+        blobs: &[BlobRef],
+    ) -> BTreeMap<ContentId, BlobSourcePlan> {
         let mut plans = BTreeMap::new();
         for batch in blobs.chunks(MAX_SOURCE_BATCH) {
             let reply: Result<Vec<BlobSourcePlan>> = self.control(
-                "blob_sources",
+                operation,
                 &BlobSourceRequest {
                     ticket,
                     blobs: batch.to_vec(),

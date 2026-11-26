@@ -1171,7 +1171,9 @@ enum ConnectionRole {
         peer: Arc<shared::Peer>,
     },
     #[cfg(target_os = "linux")]
-    PrivateExecutor,
+    PrivateExecutor {
+        uid: u32,
+    },
 }
 
 impl ConnectionRole {
@@ -1181,6 +1183,7 @@ impl ConnectionRole {
             #[cfg(target_os = "linux")]
             Self::SharedPublic { peer, .. } => match request {
                 Request::Compile(_) | Request::GetStats | Request::DistStatus => true,
+                Request::Transfer(request) if request.is_intermediate() => true,
                 Request::ZeroStats
                 | Request::Shutdown
                 | Request::ActiveCompiles
@@ -1188,7 +1191,7 @@ impl ConnectionRole {
                 _ => false,
             },
             #[cfg(target_os = "linux")]
-            Self::PrivateExecutor => matches!(
+            Self::PrivateExecutor { .. } => matches!(
                 request,
                 Request::StorageHandshake
                     | Request::Transfer(_)
@@ -1411,6 +1414,33 @@ where
             drop(self.tx.clone().start_send(ServerMessage::Request));
             self.stats.lock().await.compile_requests += 1;
             return Ok(Arc::clone(executor).response(self.clone(), Arc::clone(peer), compile));
+        }
+        #[cfg(all(target_os = "linux", feature = "dist-client"))]
+        {
+            let uid = match role {
+                ConnectionRole::SharedPublic { peer, .. } => peer.uid(),
+                ConnectionRole::PrivateExecutor { uid } => *uid,
+                // Ordinary listeners run under the same UID as their clients.
+                ConnectionRole::Ordinary => {
+                    // SAFETY: geteuid only queries process credentials.
+                    unsafe { libc::geteuid() }
+                }
+            };
+            transfers.set_uid(uid);
+            if let Message::WithoutBody(Request::Transfer(ref request)) = req
+                && request.is_intermediate()
+            {
+                drop(self.tx.clone().start_send(ServerMessage::Request));
+                let Message::WithoutBody(Request::Transfer(request)) = req else {
+                    unreachable!()
+                };
+                let result = transfers
+                    .handle_intermediate(request, self.dist_client.native.clone())
+                    .await;
+                return Ok(Message::WithoutBody(Response::Transfer(
+                    result.map_err(|error| format!("{error:#}")),
+                )));
+            }
         }
         let _ = role;
         self.dispatch(req, transfers).await

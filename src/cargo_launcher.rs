@@ -73,6 +73,19 @@ fn reap(path: &Path) -> Result<bool> {
         named.is_dir() && (named.dev(), named.ino()) == (opened.dev(), opened.ino()),
         "Cargo scratch directory changed during reclamation"
     );
+    // A killed launcher closes the FUSE connection but may leave a dead
+    // mountpoint. Only reclaim it after the inherited build lease is gone.
+    let mount = path.join("intermediates");
+    if fs::metadata(&mount).is_err_and(|error| error.raw_os_error() == Some(libc::ENOTCONN)) {
+        ensure!(
+            Command::new("fusermount3")
+                .arg("-u")
+                .arg(&mount)
+                .status()?
+                .success(),
+            "could not detach expired Cargo mount"
+        );
+    }
     fs::remove_dir_all(path)?;
     Ok(true)
 }
@@ -103,6 +116,15 @@ impl ScratchLease {
         })
     }
 
+    #[cfg(feature = "dist-client")]
+    fn wait_for_descendants(&mut self) -> Result<()> {
+        drop(self.lock.take());
+        let file = open_directory(&self.path)?;
+        file.lock()?;
+        self.lock = Some(file);
+        Ok(())
+    }
+
     fn configure(&self, command: &mut Command) -> Result<()> {
         let fd = self
             .lock
@@ -113,7 +135,9 @@ impl ScratchLease {
         // subcommands using Cargo's own build-dir template expansion.
         command.env(
             "CARGO_BUILD_BUILD_DIR",
-            self.path.join("{workspace-path-hash}"),
+            self.path
+                .join("intermediates")
+                .join("{workspace-path-hash}"),
         );
         // SAFETY: the child hook performs only an async-signal-safe fcntl
         // on a live descriptor inherited from the parent; no allocations.
@@ -214,11 +238,49 @@ fn run(final_only: bool, args: Vec<OsString>) -> Result<i32> {
     if !final_only {
         return Err(command.exec()).context("execute upstream Cargo");
     }
-    let scratch = ScratchLease::create(&scratch_base()?)?;
-    scratch.configure(&mut command)?;
-    let status = command.status().context("execute upstream Cargo")?;
-    drop(scratch);
-    exit_code(status)
+    #[cfg(feature = "dist-client")]
+    {
+        // The launcher owns the mount and one connection-owned retention
+        // lease. It is not a compiler or another cache daemon.
+        // Each active FUSE inode has a backing descriptor. Match the
+        // inherited hard limit, rather than the shell's small soft limit.
+        // SAFETY: rlimit is initialized by getrlimit before being read.
+        unsafe {
+            let mut limit = std::mem::zeroed::<libc::rlimit>();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == -1 {
+                return Err(std::io::Error::last_os_error()).context("query descriptor limit");
+            }
+            limit.rlim_cur = limit.rlim_max;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == -1 {
+                return Err(std::io::Error::last_os_error()).context("raise descriptor limit");
+            }
+        }
+        let mut scratch = ScratchLease::create(&scratch_base()?)?;
+        let mount = scratch.path.join("intermediates");
+        let backing = scratch.path.join("namespace");
+        let spool = scratch.path.join("spool");
+        for path in [&mount, &backing, &spool] {
+            fs::create_dir(path)?;
+        }
+        let (token, connection) = crate::dist::native::intermediate::open()?;
+        let filesystem = crate::build_runtime::intermediate_fs::mount_intermediates(
+            &mount,
+            &backing,
+            &spool,
+            token,
+            crate::dist::native::intermediate::content(),
+        )
+        .context("mount leased Cargo intermediates")?;
+        scratch.configure(&mut command)?;
+        let status = command.status().context("execute upstream Cargo")?;
+        scratch.wait_for_descendants()?;
+        drop(filesystem);
+        drop(connection);
+        drop(scratch);
+        exit_code(status)
+    }
+    #[cfg(not(feature = "dist-client"))]
+    anyhow::bail!("Cargo final-only mode requires native distributed compilation")
 }
 
 /// The launcher is selected explicitly, before compiler argument parsing.

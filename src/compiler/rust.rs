@@ -2635,6 +2635,8 @@ where
         context: GenerateHashKeyContext<'_, T>,
     ) -> Result<HashResult<T>> {
         let GenerateHashKeyContext {
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            native,
             creator,
             cwd,
             env_vars,
@@ -2980,6 +2982,15 @@ where
             .iter()
             .map(|e| cwd.join(e))
             .collect::<Vec<_>>();
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        let extern_hashes = async {
+            if let Some(native) = &native {
+                native.hash_files(&abs_externs, pool).await
+            } else {
+                hash_all(&abs_externs, pool).await
+            }
+        };
+        #[cfg(not(all(feature = "dist-client", target_os = "linux")))]
         let extern_hashes = hash_all(&abs_externs, pool);
         // Hash the contents of the staticlibs listed on the commandline.
         trace!(
@@ -6544,6 +6555,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             let pool = runtime.handle().clone();
             let result = hasher
                 .generate_hash_key(GenerateHashKeyContext {
+                    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                    native: None,
                     creator: &creator,
                     cwd: f.tempdir.path().to_owned(),
                     env_vars: vec![],
@@ -6632,6 +6645,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let pool = runtime.handle().clone();
         let res = hasher
             .generate_hash_key(GenerateHashKeyContext {
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                native: None,
                 creator: &creator,
                 cwd: f.tempdir.path().to_owned(),
                 env_vars: vec![],
@@ -6737,6 +6752,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let pool = runtime.handle().clone();
         let res = hasher
             .generate_hash_key(GenerateHashKeyContext {
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                native: None,
                 creator: &creator,
                 cwd: f.tempdir.path().to_owned(),
                 env_vars: [
@@ -6920,6 +6937,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             let pool = runtime.handle().clone();
             let res = hasher
                 .generate_hash_key(GenerateHashKeyContext {
+                    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                    native: None,
                     creator: &creator,
                     cwd: f.tempdir.path().to_owned(),
                     env_vars: vec![],
@@ -7013,6 +7032,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         }
         let result = hasher
             .generate_hash_key(GenerateHashKeyContext {
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                native: None,
                 creator: &creator,
                 cwd: f.tempdir.path().to_owned(),
                 env_vars: env_vars.to_owned(),
@@ -7506,6 +7527,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             mock_file_names(&creator, &["foo.rlib"]);
             hasher
                 .generate_hash_key(GenerateHashKeyContext {
+                    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                    native: None,
                     creator: &creator,
                     cwd: f.tempdir.path().to_owned(),
                     env_vars: vec![],
@@ -7814,6 +7837,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
 
             let result = hasher
                 .generate_hash_key(GenerateHashKeyContext {
+                    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                    native: None,
                     creator: &creator,
                     cwd: manifest,
                     env_vars: env,
@@ -7946,6 +7971,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
 
         let result = hasher
             .generate_hash_key(GenerateHashKeyContext {
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                native: None,
                 creator: &creator,
                 cwd: f.tempdir.path().to_owned(),
                 env_vars: env,

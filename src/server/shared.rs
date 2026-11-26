@@ -331,9 +331,10 @@ impl SharedExecutor {
         };
         broker.set_nonblocking(true)?;
         let broker = tokio::net::UnixStream::from_std(broker)?;
-        let broker_task = crate::util::spawn(
-            service.bind_with_role(broker, super::ConnectionRole::PrivateExecutor),
-        );
+        let broker_task = crate::util::spawn(service.bind_with_role(
+            broker,
+            super::ConnectionRole::PrivateExecutor { uid: peer.uid() },
+        ));
 
         let mut input = child.stdin.take().context("missing executor input")?;
         let job = Job {
