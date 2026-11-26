@@ -335,7 +335,7 @@ mod transport_tests {
 }
 
 impl NativeCacheClient {
-    pub(super) fn reconstruct_packages(
+    pub(super) async fn reconstruct_packages(
         &self,
         ticket: Ticket,
         missing: &[BlobRef],
@@ -344,47 +344,45 @@ impl NativeCacheClient {
         transport: &PackageTransportTracker,
         check: &LeaseCheck<'_>,
     ) -> Result<Vec<VerifiedPackage>> {
-        crate::http_client::io_runtime()?.block_on(async {
-            let plan = self
-                .control_with_timeout_async(
-                    "package_plan",
-                    &PackagePlanRequest {
-                        ticket,
-                        missing: missing.to_vec(),
-                        max_archive_bytes: limits.max_archive_bytes,
-                        cost: transport.estimate(),
-                    },
-                    self.timeout,
-                )
-                .await;
-            let offers: Vec<PackageArchive> = match plan {
-                Ok(offers) => offers,
+        let plan = self
+            .control_with_timeout_async(
+                "package_plan",
+                &PackagePlanRequest {
+                    ticket,
+                    missing: missing.to_vec(),
+                    max_archive_bytes: limits.max_archive_bytes,
+                    cost: transport.estimate(),
+                },
+                self.timeout,
+            )
+            .await;
+        let offers: Vec<PackageArchive> = match plan {
+            Ok(offers) => offers,
+            Err(error) => {
+                warn!("native original package plan unavailable: {error:#}");
+                return Ok(Vec::new());
+            }
+        };
+        let jobs = NonZeroUsize::new(limits.max_concurrent_imports)
+            .context("zero package acquisition concurrency")?;
+        let packages = ingress::map_bounded(offers, jobs, |offer| async move {
+            check()?;
+            match self
+                .reconstruct_package(ticket, offer, store, limits, transport, check)
+                .await
+            {
+                Ok(package) => Ok(Some(package)),
                 Err(error) => {
-                    warn!("native original package plan unavailable: {error:#}");
-                    return Ok(Vec::new());
+                    check()?;
+                    // Package transport is optional. Verify all remaining
+                    // input bytes by retrieving the missing blobs directly.
+                    warn!("native package reconstruction unavailable: {error:#}");
+                    Ok(None)
                 }
-            };
-            let jobs = NonZeroUsize::new(limits.max_concurrent_imports)
-                .context("zero package acquisition concurrency")?;
-            let packages = ingress::map_bounded(offers, jobs, |offer| async move {
-                check()?;
-                match self
-                    .reconstruct_package(ticket, offer, store, limits, transport, check)
-                    .await
-                {
-                    Ok(package) => Ok(Some(package)),
-                    Err(error) => {
-                        check()?;
-                        // Package transport is optional. Verify all remaining
-                        // input bytes by retrieving the missing blobs directly.
-                        warn!("native package reconstruction unavailable: {error:#}");
-                        Ok(None)
-                    }
-                }
-            })
-            .await?;
-            Ok(packages.into_iter().flatten().collect())
+            }
         })
+        .await?;
+        Ok(packages.into_iter().flatten().collect())
     }
 
     async fn reconstruct_package(
@@ -472,15 +470,19 @@ impl NativeCacheClient {
     /// Acquire and pin an admitted worker action before it enters the compiler queue.
     /// # Errors
     /// Returns an error if the lease, execution contract or staging fails.
-    pub fn prepare_on_worker(
+    pub async fn prepare_on_worker<A, F>(
         &self,
         ticket: Ticket,
         spec: &ExecutionSpec,
         store: &NativeStore,
         policy: &ExecutionPolicy,
         delivery: WorkerDelivery<'_>,
-        preparation: WorkerPreparation<'_>,
-    ) -> Result<PreparedWorker> {
+        preparation: WorkerPreparation<'_, A>,
+    ) -> Result<PreparedWorker>
+    where
+        A: FnOnce() -> F + Send,
+        F: std::future::Future<Output = Result<()>> + Send,
+    {
         let started = Instant::now();
         let lease = WorkerLease::start(
             self.clone(),
@@ -489,34 +491,107 @@ impl NativeCacheClient {
             policy.timeout,
             delivery.renewal_interval,
             preparation.cancelled,
-        )?;
+        )
+        .await?;
         lease.check()?;
-        (preparation.on_authorized)()?;
+        (preparation.on_authorized)().await?;
         lease.check()?;
-        let mut prepared = self.prepare_execution(
-            ExecutionContext {
-                ticket,
-                spec,
-                store,
-                policy,
-            },
-            Some((
-                delivery.artifact_grace,
-                preparation
-                    .estimated_result_bytes
-                    .unwrap_or(policy.max_result_bytes)
-                    .clamp(1, policy.max_result_bytes),
-            )),
-            |id, check, on_tree| self.fetch_tree(ticket, id, store, delivery, check, on_tree),
-            &|| lease.check(),
-            preparation.on_tree,
-        )?;
-        if prepared.warm_staging.is_some() {
-            prepared.warm_staging = Some(started.elapsed());
+        let mut warm = true;
+        let request = spec.action_request()?;
+        ensure!(
+            spec.platform == policy.platform,
+            "native executor platform mismatch"
+        );
+        let owned_store = store.clone();
+        let grace = delivery.artifact_grace.clone();
+        tokio::task::spawn_blocking(move || {
+            grace.reap();
+            maintain_executor_space(&owned_store)
+        })
+        .await??;
+        let predicted = preparation
+            .estimated_result_bytes
+            .unwrap_or(policy.max_result_bytes)
+            .clamp(1, policy.max_result_bytes);
+        let reservation_started = Instant::now();
+        let reservation = loop {
+            lease.check()?;
+            let grace = delivery.artifact_grace.clone();
+            if let Some(reservation) =
+                tokio::task::spawn_blocking(move || grace.reserve(predicted)).await??
+            {
+                break reservation;
+            }
+            ensure!(
+                reservation_started.elapsed() < policy.timeout,
+                "native artifact grace admission timed out"
+            );
+            warm = false;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let output = {
+            let store = store.clone();
+            let limit = policy.max_result_bytes;
+            let budget =
+                tokio::task::spawn_blocking(move || store.reserve_staging(limit)).await??;
+            Some((reservation, budget))
+        };
+        let mut inputs = Vec::new();
+        let on_tree = preparation.on_tree;
+        let check = &|| lease.check();
+        for &id in &request.input_trees {
+            check()?;
+            let owned_store = store.clone();
+            let cached = tokio::task::spawn_blocking(move || owned_store.lookup_tree(id)).await??;
+            let (tree, hit) = if let Some(tree) = cached {
+                (Arc::new(tree), true)
+            } else {
+                warm = false;
+                let deadline = Instant::now()
+                    .checked_add(policy.timeout)
+                    .context("input staging deadline overflow")?;
+                let cancelled = async {
+                    loop {
+                        check()?;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                };
+                let tree = Box::pin(store.acquire_tree_async(id, deadline, cancelled, || {
+                    self.fetch_tree(ticket, id, store, delivery, check, on_tree)
+                }))
+                .await?;
+                (tree, false)
+            };
+            trace_tree_access(id, &tree, hit)?;
+            on_tree(&tree);
+            inputs.push(tree);
+        }
+        let announced = Instant::now();
+        loop {
+            check()?;
+            match self
+                .control_with_timeout_async::<_, ()>("inputs_staged", &ticket, self.timeout)
+                .await
+            {
+                Ok(()) => break,
+                Err(error)
+                    if retryable_transport_error(&error)
+                        && announced.elapsed() < policy.timeout =>
+                {
+                    warm = false;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(PreparedWorker {
             lease,
-            prepared,
+            prepared: PreparedExecution {
+                request,
+                _inputs: inputs,
+                output,
+                warm_staging: warm.then(|| started.elapsed()),
+            },
             spec: spec.clone(),
         })
     }
@@ -574,12 +649,7 @@ impl NativeCacheClient {
         if let Some((grace, _)) = grace {
             grace.reap();
         }
-        if let Some(report) = store.maintain_space()? {
-            ensure!(
-                report.minimum_satisfied,
-                "native executor store lacks allocatable space: {report:?}"
-            );
-        }
+        maintain_executor_space(store)?;
         let request = spec.action_request()?;
         ensure!(
             spec.platform == policy.platform,
@@ -614,24 +684,7 @@ impl NativeCacheClient {
                 warm = false;
                 store.acquire_tree(*id, check, || fetch(*id, check, on_tree))?
             };
-            if log::log_enabled!(target: "native_cas_replay", log::Level::Trace) {
-                let blobs = tree
-                    .manifest()
-                    .blobs()?
-                    .into_iter()
-                    .map(|(id, size)| BlobRef { id, size })
-                    .collect::<Vec<_>>();
-                log::trace!(
-                target: "native_cas_replay",
-                "{}",
-                serde_json::json!({
-                    "kind": "tree_access",
-                    "tree": id,
-                    "hit": hit,
-                    "blobs": blobs,
-                })
-                );
-            }
+            trace_tree_access(*id, &tree, hit)?;
             on_tree(&tree);
             inputs.push(tree);
         }
@@ -750,6 +803,31 @@ impl NativeCacheClient {
     }
 }
 
+fn maintain_executor_space(store: &NativeStore) -> Result<()> {
+    if let Some(report) = store.maintain_space()? {
+        ensure!(
+            report.minimum_satisfied,
+            "native executor store lacks allocatable space: {report:?}"
+        );
+    }
+    Ok(())
+}
+
+fn trace_tree_access(id: TreeId, tree: &TreeLease, hit: bool) -> Result<()> {
+    if log::log_enabled!(target: "native_cas_replay", log::Level::Trace) {
+        let blobs = tree
+            .manifest()
+            .blobs()?
+            .into_iter()
+            .map(|(id, size)| BlobRef { id, size })
+            .collect::<Vec<_>>();
+        log::trace!(target: "native_cas_replay", "{}", serde_json::json!({
+            "kind": "tree_access", "tree": id, "hit": hit, "blobs": blobs,
+        }));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct ExecutionContext<'a> {
     ticket: Ticket,
@@ -806,7 +884,7 @@ struct WorkerLease {
 }
 
 impl WorkerLease {
-    fn start(
+    async fn start(
         client: NativeCacheClient,
         ticket: Ticket,
         spec: &ExecutionSpec,
@@ -823,7 +901,7 @@ impl WorkerLease {
         // Verification is the delegation barrier: the scheduler cannot
         // authorize this worker until its assignment RPC has returned and
         // the session has installed the delegated publisher.
-        let result = (|| {
+        let result = async {
             let started = Instant::now();
             let mut delay = Duration::from_millis(10);
             loop {
@@ -836,11 +914,22 @@ impl WorkerLease {
                     !remaining.is_zero(),
                     "native assignment authorization timed out"
                 );
-                match lease.client.verify_execution(ticket, spec.clone()) {
+                match lease
+                    .client
+                    .control_with_timeout_async::<_, ()>(
+                        "verify",
+                        &super::ExecutionRequest {
+                            ticket,
+                            spec: spec.clone(),
+                        },
+                        remaining,
+                    )
+                    .await
+                {
                     Ok(()) => break,
                     Err(error) if retryable_transport_error(&error) => {
                         debug!("retrying native assignment authorization: {error:#}");
-                        std::thread::sleep(delay.min(remaining));
+                        tokio::time::sleep(delay.min(remaining)).await;
                         delay = (delay * 2).min(Duration::from_millis(200));
                     }
                     Err(error) => return Err(error),
@@ -849,14 +938,18 @@ impl WorkerLease {
             let renewals = super::renewal::Renewals::start(lease.client.clone(), interval)?;
             renewals.add(ticket)?;
             Ok(renewals)
-        })();
+        }
+        .await;
         match result {
             Ok(renewals) => {
                 lease.renewals = Some(renewals);
                 Ok(lease)
             }
             Err(error) => {
-                let _ = lease.client.fail(ticket);
+                let _ = lease
+                    .client
+                    .control_with_timeout_async::<_, ()>("fail", &ticket, lease.client.timeout)
+                    .await;
                 Err(error)
             }
         }
@@ -886,17 +979,25 @@ impl Drop for WorkerLease {
     fn drop(&mut self) {
         if let Some(renewals) = self.renewals.take() {
             drop(renewals);
-            let _ = self.client.fail(self.ticket);
+            let client = self.client.clone();
+            let ticket = self.ticket;
+            if let Ok(runtime) = crate::http_client::io_runtime() {
+                runtime.spawn(async move {
+                    let _ = client
+                        .control_with_timeout_async::<_, ()>("fail", &ticket, client.timeout)
+                        .await;
+                });
+            }
         }
     }
 }
 
 /// Cancellation and verified-tree progress for worker-side preparation.
-pub struct WorkerPreparation<'a> {
+pub struct WorkerPreparation<'a, A> {
     pub estimated_result_bytes: Option<u64>,
     pub cancelled: Arc<AtomicBool>,
-    pub on_tree: &'a mut dyn FnMut(&TreeLease),
-    pub on_authorized: &'a dyn Fn() -> Result<()>,
+    pub on_tree: &'a mut (dyn FnMut(&TreeLease) + Send),
+    pub on_authorized: A,
 }
 
 /// A ready action owns its verified input closure and output reservation.

@@ -187,21 +187,29 @@ impl NativeWorker {
         }
     }
 
-    pub(super) fn prepare(
+    pub(super) async fn prepare<A, F>(
         &self,
         job: JobId,
         assignment: &NativeAssignment,
         queue: &sccache::dist::execution_queue::ExecutionQueue,
-        preparation: WorkerPreparation<'_>,
-    ) -> Result<PreparedWorker> {
-        self.client.clone().for_worker(job).prepare_on_worker(
-            assignment.ticket,
-            &assignment.spec,
-            &self.store,
-            &self.policy,
-            self.delivery(queue),
-            preparation,
-        )
+        preparation: WorkerPreparation<'_, A>,
+    ) -> Result<PreparedWorker>
+    where
+        A: FnOnce() -> F + Send,
+        F: std::future::Future<Output = Result<()>> + Send,
+    {
+        self.client
+            .clone()
+            .for_worker(job)
+            .prepare_on_worker(
+                assignment.ticket,
+                &assignment.spec,
+                &self.store,
+                &self.policy,
+                self.delivery(queue),
+                preparation,
+            )
+            .await
     }
 
     pub(super) fn execute(

@@ -2493,8 +2493,8 @@ impl Server {
         let Some(assigned) = assigned else {
             return Ok(None);
         };
-        let transition = requester
-            .do_update_job_state(job_id, JobState::Started)
+        let transition = sccache::http_client::io_runtime()?
+            .block_on(requester.do_update_job_state(job_id, JobState::Started))
             .and_then(|reply| match reply {
                 UpdateJobStateResult::Success => Ok(()),
                 UpdateJobStateResult::Fail { msg } => {
@@ -2726,8 +2726,8 @@ impl ServerIncoming for Server {
         {
             return Ok(SubmitToolchainResult::JobNotFound);
         }
-        requester
-            .do_update_job_state(job_id, JobState::Ready)
+        sccache::http_client::io_runtime()?
+            .block_on(requester.do_update_job_state(job_id, JobState::Ready))
             .context("Updating job state failed")?;
         Ok(SubmitToolchainResult::Success)
     }
@@ -2785,8 +2785,8 @@ impl ServerIncoming for Server {
                 );
                 error.context("run build failed")
             });
-        requester
-            .do_update_job_state(job_id, JobState::Complete)
+        sccache::http_client::io_runtime()?
+            .block_on(requester.do_update_job_state(job_id, JobState::Complete))
             .context("Updating job state failed")?;
         res
     }
@@ -4671,8 +4671,9 @@ mod server_upload_tests {
 
     struct RecordingRequester(Mutex<Vec<JobState>>);
 
+    #[async_trait::async_trait]
     impl ServerOutgoing for RecordingRequester {
-        fn do_update_job_state(
+        async fn do_update_job_state(
             &self,
             _job_id: JobId,
             state: JobState,
@@ -4867,8 +4868,9 @@ mod server_upload_tests {
     }
 
     struct RejectStartRequester;
+    #[async_trait::async_trait]
     impl ServerOutgoing for RejectStartRequester {
-        fn do_update_job_state(
+        async fn do_update_job_state(
             &self,
             _job_id: JobId,
             _state: JobState,

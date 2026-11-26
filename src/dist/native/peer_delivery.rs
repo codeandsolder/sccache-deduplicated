@@ -44,15 +44,30 @@ impl NativeCacheClient {
         ticket: Ticket,
         blobs: &[BlobRef],
     ) -> BTreeMap<ContentId, BlobSourcePlan> {
+        crate::http_client::io_runtime().map_or_else(
+            |_| BTreeMap::new(),
+            |runtime| runtime.block_on(self.source_plans_async(operation, ticket, blobs)),
+        )
+    }
+
+    pub(super) async fn source_plans_async(
+        &self,
+        operation: &str,
+        ticket: Ticket,
+        blobs: &[BlobRef],
+    ) -> BTreeMap<ContentId, BlobSourcePlan> {
         let mut plans = BTreeMap::new();
         for batch in blobs.chunks(MAX_SOURCE_BATCH) {
-            let reply: Result<Vec<BlobSourcePlan>> = self.control(
-                operation,
-                &BlobSourceRequest {
-                    ticket,
-                    blobs: batch.to_vec(),
-                },
-            );
+            let reply: Result<Vec<BlobSourcePlan>> = self
+                .control_with_timeout_async(
+                    operation,
+                    &BlobSourceRequest {
+                        ticket,
+                        blobs: batch.to_vec(),
+                    },
+                    self.timeout,
+                )
+                .await;
             match reply {
                 Ok(reply) => {
                     for plan in reply {
@@ -112,14 +127,48 @@ impl NativeCacheClient {
         candidates
     }
 
-    pub(super) fn has_direct_source(&self, plan: &BlobSourcePlan) -> bool {
-        !plan.sources.is_empty()
-            && !self
-                .direct_candidates(
-                    plan,
-                    plan.scheduler_present.then(|| self.cache_routes()).as_ref(),
-                )
-                .is_empty()
+    pub(super) async fn plan_prefetch(
+        &self,
+        plans: &BTreeMap<ContentId, BlobSourcePlan>,
+        blobs: &[BlobRef],
+    ) -> Vec<BlobRef> {
+        self.routes
+            .probe_routes_async(
+                plans
+                    .values()
+                    .flat_map(|plan| {
+                        plan.sources
+                            .iter()
+                            .map(|source| (source.peer, Role::Worker, &source.routes))
+                    })
+                    .collect(),
+            )
+            .await;
+        let routes = if plans
+            .values()
+            .any(|plan| plan.scheduler_present && !plan.sources.is_empty())
+        {
+            Some(self.cache_routes_async().await)
+        } else {
+            None
+        };
+        blobs
+            .iter()
+            .copied()
+            .filter(|blob| {
+                plans.get(&blob.id).is_none_or(|plan| {
+                    self.direct_candidates(
+                        plan,
+                        if plan.scheduler_present {
+                            routes.as_ref()
+                        } else {
+                            None
+                        },
+                    )
+                    .is_empty()
+                })
+            })
+            .collect()
     }
 
     /// Synchronous compiler/IPC sinks remain at the synchronous boundary.

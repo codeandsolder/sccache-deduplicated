@@ -1014,11 +1014,16 @@ pub trait SchedulerOutgoing: Send + Sync {
 }
 
 #[cfg(feature = "dist-server")]
+#[async_trait]
 pub trait ServerOutgoing: Send + Sync {
     // To Scheduler
     /// # Errors
     /// The scheduler could not accept or acknowledge the state update.
-    fn do_update_job_state(&self, job_id: JobId, state: JobState) -> Result<UpdateJobStateResult>;
+    async fn do_update_job_state(
+        &self,
+        job_id: JobId,
+        state: JobState,
+    ) -> Result<UpdateJobStateResult>;
 }
 
 // Trait to handle the creation and verification of job authorization tokens

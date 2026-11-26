@@ -2223,33 +2223,40 @@ mod server {
         }
     }
 
+    #[async_trait::async_trait]
     impl dist::ServerOutgoing for ServerRequester {
-        fn do_update_job_state(
+        async fn do_update_job_state(
             &self,
             job_id: JobId,
             state: JobState,
         ) -> Result<UpdateJobStateResult> {
-            let publish = || {
+            let publish = || async {
                 let (client, base) = self.endpoint()?;
                 let url = urls::scheduler_job_state(&base, job_id)?;
-                crate::http_client::io_runtime()?.block_on(send_control(
+                send_control(
                     client
                         .post(url.as_str())
                         // Never retain an execution slot forever on a stalled ACK.
                         .timeout(HEARTBEAT_TIMEOUT)
                         .bincode(&state)?,
-                ))
+                )
+                .await
             };
             // A lost response may follow a successful scheduler transition.
             // The scheduler accepts repeated state updates and terminal acks.
-            publish().or_else(|first_error| {
-                warn!(
-                    "Retrying job {job_id} state {state} after scheduler response failure: {first_error:#}"
-                );
-                publish().with_context(|| {
-                    format!("POST to scheduler job_state failed; first attempt: {first_error:#}")
-                })
-            })
+            match publish().await {
+                Ok(result) => Ok(result),
+                Err(first_error) => {
+                    warn!(
+                        "Retrying job {job_id} state {state} after scheduler response failure: {first_error:#}"
+                    );
+                    publish().await.with_context(|| {
+                        format!(
+                            "POST to scheduler job_state failed; first attempt: {first_error:#}"
+                        )
+                    })
+                }
+            }
         }
     }
     #[cfg(test)]

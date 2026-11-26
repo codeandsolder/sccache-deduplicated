@@ -82,8 +82,13 @@ struct RecordingRequester {
     states: mpsc::Sender<(JobId, JobState)>,
 }
 
+#[async_trait::async_trait]
 impl ServerOutgoing for RecordingRequester {
-    fn do_update_job_state(&self, id: JobId, state: JobState) -> Result<UpdateJobStateResult> {
+    async fn do_update_job_state(
+        &self,
+        id: JobId,
+        state: JobState,
+    ) -> Result<UpdateJobStateResult> {
         self.states.send((id, state))?;
         Ok(UpdateJobStateResult::Success)
     }

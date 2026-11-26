@@ -928,103 +928,95 @@ impl NativeCacheClient {
     /// # Errors
     /// Returns an error for an invalid manifest or failed transfer.
     #[cfg(all(target_os = "linux", feature = "native-store"))]
-    fn fetch_tree(
+    async fn fetch_tree(
         &self,
         action: Ticket,
         id: TreeId,
         store: &crate::build_runtime::NativeStore,
         delivery: worker::WorkerDelivery<'_>,
         action_check: &LeaseCheck<'_>,
-        on_tree: &mut dyn FnMut(&crate::build_runtime::TreeLease),
+        on_tree: &mut (dyn FnMut(&crate::build_runtime::TreeLease) + Send),
     ) -> Result<crate::build_runtime::TreeLease> {
         action_check()?;
         let transport = delivery.transport;
-        let read = self.open_tree(action, id)?;
-        let result = self.with_renewal(read.ticket, delivery.renewal_interval, |tree_check| {
-            let check = &|| {
-                action_check()?;
-                tree_check()
-            };
+        let read: crate::build_runtime::wire::TreeRead = self
+            .control_with_timeout_async(
+                "tree_open",
+                &OpenTreeRequest { action, tree: id },
+                self.timeout,
+            )
+            .await?;
+        let ticket = read.ticket;
+        let result = async {
+            self.control_with_timeout_async::<_, ()>("renew", &ticket, self.timeout).await?;
+            let renewals = renewal::Renewals::start(self.clone(), delivery.renewal_interval)?;
+            renewals.add(ticket)?;
+            let check = &|| { action_check()?; renewals.check() };
             check()?;
-            ensure!(
-                read.manifest.id()? == id,
-                "native tree download identity mismatch"
-            );
-            let reserved = store.reserve_tree_upload(&read.manifest)?;
-            #[cfg(target_os = "linux")]
+            ensure!(read.manifest.id()? == id, "native tree download identity mismatch");
+            let manifest = read.manifest;
+            let reserved = {
+                let store = store.clone();
+                let manifest = manifest.clone();
+                tokio::task::spawn_blocking(move || store.reserve_tree_upload(&manifest)).await??
+            };
             let packages = match delivery.package_import {
                 Some(limits) if !reserved.missing().is_empty() => self.reconstruct_packages(
-                    read.ticket,
-                    reserved.missing(),
-                    store,
-                    limits,
-                    transport,
-                    check,
-                )?,
+                    ticket, reserved.missing(), store, limits, transport, check
+                ).await?,
                 _ => Vec::new(),
             };
-            let updated = store.reserve_tree_upload(&read.manifest)?;
+            let updated = {
+                let store = store.clone();
+                let manifest = manifest.clone();
+                tokio::task::spawn_blocking(move || store.reserve_tree_upload(&manifest)).await??
+            };
             drop(reserved);
-            debug!(
-                "native tree {id:?}: downloading {} raw bytes in at most {} concurrent requests after package reconstruction",
-                updated
-                    .missing()
-                    .iter()
-                    .map(|blob| u128::from(blob.size))
-                    .sum::<u128>(),
-                transport.parallelism()
-            );
             let mut raw_missing = updated.missing().to_vec();
             raw_missing.sort_unstable_by_key(|blob| std::cmp::Reverse(blob.size));
             let mut acquired = Vec::new();
-            // Register a bounded lookahead before download slots start waiting.
-            // The origin can stream subsequent misses while these are consumed.
             let lookahead = transport.parallelism().get().saturating_mul(8).min(256);
             for chunk in raw_missing.chunks(lookahead) {
-                let plans = self.source_plans(read.ticket, chunk);
-                self.probe_sources(plans.values());
-                let prefetch = chunk.iter().copied().filter(|blob| {
-                    plans.get(&blob.id).is_none_or(|plan| !self.has_direct_source(plan))
-                }).collect::<Vec<_>>();
+                let plans = self.source_plans_async("blob_sources", ticket, chunk).await;
+                let prefetch = self.plan_prefetch(&plans, chunk).await;
                 if !prefetch.is_empty() {
-                    self.control::<_, ()>("input_prefetch", &InputPrefetchRequest {
-                        ticket: read.ticket,
-                        missing: prefetch,
-                    })?;
+                    self.control_with_timeout_async::<_, ()>("input_prefetch", &InputPrefetchRequest {
+                        ticket, missing: prefetch,
+                    }, self.timeout).await?;
                 }
-                let leases = crate::http_client::io_runtime()?.block_on(ingress::map_bounded(
+                let leases = ingress::map_bounded(
                     chunk.iter().copied(), transport.parallelism(), |blob| {
-                        self.fetch_input_blob(read.ticket, blob, plans.get(&blob.id), store, transport, check)
+                        self.fetch_input_blob(ticket, blob, plans.get(&blob.id), store, transport, check)
                     },
-                ))?;
-                for lease in &leases {
-                    on_tree(lease);
-                }
+                ).await?;
+                for lease in &leases { on_tree(lease); }
                 acquired.extend(leases);
             }
-            let tree = store.publish_tree_pinned(&read.manifest, Vec::new())?;
-            drop(acquired);
+            let store = store.clone();
+            let tree = tokio::task::spawn_blocking(move || {
+                let tree = store.publish_tree_pinned(&manifest, Vec::new())?;
+                drop((acquired, packages, updated));
+                Ok::<_, anyhow::Error>(tree)
+            }).await??;
             if log::log_enabled!(target: "native_cas_replay", log::Level::Trace) {
-                log::trace!(
-                    target: "native_cas_replay",
-                    "{}",
-                    serde_json::json!({
-                        "kind": "tree_transfer",
-                        "tree": id,
-                        "raw_missing_blobs": raw_missing.len(),
-                        "raw_missing_bytes": raw_missing
-                            .iter()
-                            .map(|blob| u128::from(blob.size))
-                            .sum::<u128>(),
-                    })
-                );
+                log::trace!(target: "native_cas_replay", "{}", serde_json::json!({
+                    "kind": "tree_transfer", "tree": id, "raw_missing_blobs": raw_missing.len(),
+                    "raw_missing_bytes": raw_missing.iter().map(|blob| u128::from(blob.size)).sum::<u128>(),
+                }));
             }
-            #[cfg(target_os = "linux")]
-            drop(packages);
+            renewals.finish_async().await?;
             Ok(tree)
-        });
-        // Best effort: the remote pin also expires automatically.
-        let _ = self.close(read.ticket);
+        }.await;
+        let _ = self
+            .control_with_timeout_async::<_, ()>(
+                "close",
+                &CloseRequest {
+                    ticket,
+                    delivery: None,
+                },
+                self.timeout,
+            )
+            .await;
         result
     }
 

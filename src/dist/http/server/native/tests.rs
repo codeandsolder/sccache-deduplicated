@@ -1023,7 +1023,7 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
             artifact_grace: &artifact_grace,
         };
         let busy = execution_queue.acquire(|| Ok(()))?;
-        let prepared = worker.prepare_on_worker(
+        let prepared = crate::http_client::io_runtime()?.block_on(worker.prepare_on_worker(
             ticket,
             &spec,
             &worker_store,
@@ -1033,9 +1033,9 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
                 estimated_result_bytes: None,
                 cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 on_tree: &mut |_| {},
-                on_authorized: &|| Ok(()),
+                on_authorized: || std::future::ready(Ok(())),
             },
-        )?;
+        ))?;
         assert_eq!(execution_queue.active(), 1);
         drop(busy);
         let completed = prepared.execute(&worker_store, &policy, delivery, || {

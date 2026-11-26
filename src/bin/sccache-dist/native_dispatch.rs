@@ -190,12 +190,13 @@ impl Shared {
         }
     }
 
-    fn finish(&self, job: &Job, result: Result<CapturedExecution>) {
+    async fn finish(&self, job: &Job, result: Result<CapturedExecution>) {
         // A lost completion acknowledgement must not discard successfully
         // published outputs or the original compiler diagnostics.
         match job
             .requester
             .do_update_job_state(job.id, JobState::Complete)
+            .await
         {
             Ok(UpdateJobStateResult::Success) => (),
             Ok(UpdateJobStateResult::Fail { msg }) => {
@@ -209,7 +210,17 @@ impl Shared {
         self.terminal(job.id, Terminal::from_result(result));
     }
 
-    fn stage(&self, staging: Staging, ready: &SyncSender<Ready>) {
+    fn finish_blocking(&self, job: &Job, result: Result<CapturedExecution>) {
+        match sccache::http_client::io_runtime() {
+            Ok(runtime) => runtime.block_on(self.finish(job, result)),
+            Err(error) => {
+                warn!("Native completion runtime unavailable: {error:#}");
+                self.terminal(job.id, Terminal::from_result(result));
+            }
+        }
+    }
+
+    async fn stage(&self, staging: Staging, ready: &SyncSender<Ready>) {
         let Staging { job, assignment } = staging;
         let missing = assignment.pins.blobs.missing();
         let mut remaining = RemainingInputs::from_missing(missing);
@@ -223,43 +234,54 @@ impl Shared {
             }
             self.remaining(job.id, remaining);
         };
-        let result = self.worker.prepare(
-            job.id,
-            &assignment.spec,
-            &self.queue,
-            WorkerPreparation {
-                estimated_result_bytes: assignment.spec.estimated_result_bytes,
-                cancelled: Arc::clone(&job.cancelled),
-                on_tree: &mut on_tree,
-                on_authorized: &|| match job
-                    .requester
-                    .do_update_job_state(job.id, JobState::Started)?
-                {
-                    UpdateJobStateResult::Success => {
-                        self.phase(job.id, NativeJobPhase::Staging);
-                        Ok(())
-                    }
-                    UpdateJobStateResult::Fail { msg } => {
-                        anyhow::bail!("scheduler rejected native job start: {msg}")
-                    }
+        let result = self
+            .worker
+            .prepare(
+                job.id,
+                &assignment.spec,
+                &self.queue,
+                WorkerPreparation {
+                    estimated_result_bytes: assignment.spec.estimated_result_bytes,
+                    cancelled: Arc::clone(&job.cancelled),
+                    on_tree: &mut on_tree,
+                    on_authorized: || async {
+                        match job
+                            .requester
+                            .do_update_job_state(job.id, JobState::Started)
+                            .await?
+                        {
+                            UpdateJobStateResult::Success => {
+                                self.phase(job.id, NativeJobPhase::Staging);
+                                Ok(())
+                            }
+                            UpdateJobStateResult::Fail { msg } => {
+                                anyhow::bail!("scheduler rejected native job start: {msg}")
+                            }
+                        }
+                    },
                 },
-            },
-        );
+            )
+            .await;
         match result {
             Ok(prepared) => {
                 // PreparedWorker owns every complete input tree. Drop the
                 // assignment's partial pins only after this handoff.
                 drop(assignment);
                 self.phase(job.id, NativeJobPhase::Ready);
-                if let Err(error) = ready.send(Ready { job, prepared }) {
-                    let Ready { job, prepared } = error.0;
+                if let Err(error) = ready.try_send(Ready { job, prepared }) {
+                    let Ready { job, prepared } = match error {
+                        mpsc::TrySendError::Full(task) | mpsc::TrySendError::Disconnected(task) => {
+                            task
+                        }
+                    };
                     drop(prepared);
-                    self.finish(&job, Err(anyhow::anyhow!("native compiler pool stopped")));
+                    self.finish(&job, Err(anyhow::anyhow!("native compiler pool stopped")))
+                        .await;
                 }
             }
             Err(error) => {
                 drop(assignment);
-                self.finish(&job, Err(error));
+                self.finish(&job, Err(error)).await;
             }
         }
     }
@@ -273,7 +295,7 @@ impl Shared {
         if let Err(error) = publishing.send(Publishing { job, completed }) {
             let Publishing { job, completed } = error.0;
             drop(completed);
-            self.finish(
+            self.finish_blocking(
                 &job,
                 Err(anyhow::anyhow!("native publication pool stopped")),
             );
@@ -284,7 +306,7 @@ impl Shared {
         let Publishing { job, completed } = publishing;
         self.phase(job.id, NativeJobPhase::Publishing);
         let result = self.worker.publish(completed);
-        self.finish(&job, result);
+        self.finish_blocking(&job, result);
     }
 }
 
@@ -325,7 +347,8 @@ fn spawn_pool<T: Send + 'static>(
 
 pub struct NativeDispatcher {
     shared: Arc<Shared>,
-    staging: Option<SyncSender<Staging>>,
+    staging: Option<tokio::sync::mpsc::Sender<Staging>>,
+    staging_task: Option<tokio::task::JoinHandle<()>>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -351,7 +374,8 @@ impl NativeDispatcher {
             capacity,
             io_width,
         });
-        let (staging, staging_rx) = mpsc::sync_channel(capacity);
+        let (staging, mut staging_rx) = tokio::sync::mpsc::channel(capacity);
+        let runtime = sccache::http_client::io_runtime()?;
         let (ready, ready_rx) = mpsc::sync_channel(capacity);
         let (publishing, publishing_rx) = mpsc::sync_channel(capacity);
         let mut threads = {
@@ -369,18 +393,36 @@ impl NativeDispatcher {
                 move |task| shared.compile(task, &publishing),
             )?);
         }
-        {
+        let staging_task = {
             let shared = Arc::clone(&shared);
-            threads.extend(spawn_pool(
-                "native-stage",
-                io_width,
-                staging_rx,
-                move |task| shared.stage(task, &ready),
-            )?);
-        }
+            runtime.spawn(async move {
+                use futures::{StreamExt, stream::FuturesUnordered};
+                let mut active = FuturesUnordered::new();
+                let mut closed = false;
+                loop {
+                    if closed && active.is_empty() {
+                        break;
+                    }
+                    tokio::select! {
+                        task = staging_rx.recv(), if !closed && active.len() < io_width => {
+                            match task {
+                                Some(task) => {
+                                    let shared = &shared;
+                                    let ready = &ready;
+                                    active.push(async move { shared.stage(task, ready).await });
+                                }
+                                None => closed = true,
+                            }
+                        }
+                        _ = active.next(), if !active.is_empty() => {}
+                    }
+                }
+            })
+        };
         Ok(Self {
             shared,
             staging: Some(staging),
+            staging_task: Some(staging_task),
             threads,
         })
     }
@@ -541,6 +583,18 @@ impl Drop for NativeDispatcher {
             }
         }
         drop(self.staging.take());
+        // Drain staging before joining compiler/publication threads: it owns
+        // the ready sender. Cancellation prevents new execution on shutdown.
+        if let Some(task) = self.staging_task.take() {
+            match sccache::http_client::io_runtime() {
+                Ok(runtime) => {
+                    if let Err(error) = runtime.block_on(task) {
+                        error!("Native staging task failed: {error:#}");
+                    }
+                }
+                Err(error) => error!("Native staging runtime unavailable: {error:#}"),
+            }
+        }
         // Closing each upstream channel releases the downstream senders.
         for thread in self.threads.drain(..) {
             if thread.join().is_err() {

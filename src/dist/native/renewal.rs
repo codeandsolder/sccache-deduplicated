@@ -113,12 +113,14 @@ impl Renewals {
         Ok(())
     }
 
-    pub(super) fn finish(mut self) -> Result<()> {
+    pub(super) fn finish(self) -> Result<()> {
+        crate::http_client::io_runtime()?.block_on(self.finish_async())
+    }
+
+    pub(super) async fn finish_async(mut self) -> Result<()> {
         self.stop.cancel();
         if let Some(task) = self.task.take() {
-            crate::http_client::io_runtime()?
-                .block_on(task)
-                .context("native renewal task terminated")??;
+            task.await.context("native renewal task terminated")??;
         }
         self.check()
     }
