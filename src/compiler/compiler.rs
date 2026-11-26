@@ -700,7 +700,7 @@ where
                 creator,
                 cwd,
                 compilation,
-                cache_control,
+                (cache_control, &key),
                 &pool,
             )
             .await;
@@ -1358,6 +1358,12 @@ where
         path_transformer: &mut dist::PathTransformer,
         transport: CompileTransport,
     ) -> GenerateCompileCommandsResult<T>;
+
+    /// Compiler-specific result identity policy for the native CAS.
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    fn native_result_policy(&self) -> super::ResultIdentityPolicy {
+        super::ResultIdentityPolicy::Exact
+    }
 
     /// The original Rust native link stage's local namespace, if this
     /// compilation uses an independently cacheable codegen action.

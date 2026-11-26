@@ -32,7 +32,7 @@ mod msvc;
 #[cfg(all(feature = "dist-client", target_os = "linux"))]
 mod native;
 #[cfg(all(feature = "dist-client", target_os = "linux"))]
-pub use native::NativeCompilerClient;
+pub use native::{NativeCompilerClient, ResultIdentityPolicy};
 mod nvcc;
 mod nvhpc;
 mod preprocessor_cache;
