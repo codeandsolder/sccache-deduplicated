@@ -185,6 +185,13 @@ mod tests {
 
     #[tokio::test]
     async fn positional_io_preserves_exact_bytes_and_short_read() -> Result<()> {
+        let driver = run(|| async {
+            Ok(compio_runtime::Runtime::with_current(
+                compio_runtime::Runtime::driver_type,
+            ))
+        })
+        .await?;
+        eprintln!("CAS filesystem completion driver: {driver:?}");
         let file = Arc::new(tempfile::tempfile()?);
         let expected: Vec<_> = (0..262_181_u32).map(|i| i.to_le_bytes()[0]).collect();
         let written = expected.clone();

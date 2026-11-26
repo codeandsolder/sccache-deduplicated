@@ -84,9 +84,15 @@ impl Request {
         file_body(file, length, meter, Arc::clone(&self.admission))
     }
 
-    pub(super) fn compressed_file_body(&self, file: File, length: u64) -> Result<Response> {
+    pub(super) fn compressed_file_body(
+        &self,
+        file: File,
+        length: u64,
+        meter: Option<TransferMeter>,
+    ) -> Result<Response> {
         let (encoder, header) = crate::build_runtime::BlobWireEncoder::new(length)?;
-        let body = compressed_reader_body(file, encoder, header, Arc::clone(&self.admission));
+        let body =
+            compressed_reader_body(file, encoder, header, meter, Arc::clone(&self.admission));
         Ok((
             [(http::header::CONTENT_TYPE, "application/octet-stream")],
             body,
@@ -515,13 +521,26 @@ fn compressed_reader_body(
     file: File,
     encoder: crate::build_runtime::BlobWireEncoder,
     header: [u8; 32],
+    meter: Option<TransferMeter>,
     permit: Arc<OwnedSemaphorePermit>,
 ) -> Body {
-    let frames = stream::try_unfold(
-        (Arc::new(file), 0_u64, encoder, permit),
-        |(file, offset, mut encoder, permit)| async move {
+    Body::from_stream(stream::try_unfold(
+        (Arc::new(file), 0_u64, encoder, meter, permit, Some(header)),
+        |(file, offset, mut encoder, mut meter, permit, header)| async move {
+            if let Some(header) = header {
+                if let Some(meter) = &mut meter {
+                    meter.observe(header.len() as u64);
+                }
+                return Ok(Some((
+                    Bytes::copy_from_slice(&header),
+                    (file, offset, encoder, meter, permit, None),
+                )));
+            }
             let count = encoder.next_frame_size();
             if count == 0 {
+                if let Some(meter) = &mut meter {
+                    meter.eof();
+                }
                 return Ok(None);
             }
             let (bytes, permit) =
@@ -532,15 +551,15 @@ fn compressed_reader_body(
                 Ok((frame, encoder, file, permit))
             })
             .await?;
+            if let Some(meter) = &mut meter {
+                meter.observe(frame.len() as u64);
+            }
             Ok::<_, anyhow::Error>(Some((
                 Bytes::from(frame),
-                (file, offset + count as u64, encoder, permit),
+                (file, offset + count as u64, encoder, meter, permit, None),
             )))
         },
-    );
-    Body::from_stream(
-        stream::once(std::future::ready(Ok(Bytes::copy_from_slice(&header)))).chain(frames),
-    )
+    ))
 }
 
 pub(super) fn binary(data: Vec<u8>) -> Response {

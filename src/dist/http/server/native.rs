@@ -442,7 +442,7 @@ pub(super) fn physical_blob_response(
     let mut response = if encoding == BlobEncoding::Raw {
         // A raw ZFS replica is compressed on demand for the wire, without
         // pre-reading or spooling the complete physical blob.
-        request.compressed_file_body(file, length)?
+        request.compressed_file_body(file, length, None)?
     } else {
         request.file_body(file, length, None)
     };
@@ -1035,7 +1035,7 @@ fn dispatch(
             encode(&plans, limit)
         }
         "download" | "retain_download" => {
-            let (file, encoding) = if operation == "retain_download" {
+            let download = if operation == "retain_download" {
                 ensure!(publisher == Publisher::Client, "retention is client-owned");
                 let RetainedDownloadRequest { group, blob } = metadata(request, limit)?;
                 sessions.download_retained(group, request.id(), blob)?
@@ -1043,11 +1043,31 @@ fn dispatch(
                 let DownloadRequest { ticket, id } = metadata(request, limit)?;
                 sessions.download(ticket, publisher, id)?
             };
-            let logical =
-                crate::build_runtime::BlobReader::open(file.try_clone()?, encoding)?.len();
-            let size = file.metadata()?.len();
-            let meter = network.transfer(Direction::Send, peer, logical, Some(size));
-            let mut response = request.file_body(file, size, Some(meter));
+            let size = download.file.metadata()?.len();
+            let (mut response, encoding) = if download.encoding == BlobEncoding::Raw
+                && !download.original_archive
+            {
+                ensure!(
+                    size == download.logical_size,
+                    "raw CAS length differs from declared size"
+                );
+                let meter = network.transfer(Direction::Send, peer, download.logical_size, None);
+                (
+                    request.compressed_file_body(
+                        download.file,
+                        download.logical_size,
+                        Some(meter),
+                    )?,
+                    BlobEncoding::ZstdChunks,
+                )
+            } else {
+                let meter =
+                    network.transfer(Direction::Send, peer, download.logical_size, Some(size));
+                (
+                    request.file_body(download.file, size, Some(meter)),
+                    download.encoding,
+                )
+            };
             response.headers_mut().insert(
                 "x-sccache-cas-encoding",
                 http::HeaderValue::from_static(encoding.http_value()),

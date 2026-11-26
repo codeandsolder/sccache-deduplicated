@@ -54,8 +54,8 @@ fn decoded_download(
     id: ContentId,
 ) -> Result<crate::BlobReader> {
     {
-        let (file, encoding) = service.download(ticket, publisher, id)?;
-        crate::BlobReader::open(file, encoding)
+        let download = service.download(ticket, publisher, id)?;
+        crate::BlobReader::open(download.file, download.encoding)
     }
 }
 
@@ -1836,8 +1836,9 @@ fn retention_group_survives_action_close_refresh_and_exceeds_action_slots() -> R
     assert_eq!(service.store().evict(key)?, Eviction::Pinned);
     for (blob, bytes) in retained {
         assert!(service.download_retained(group, other, blob).is_err());
-        let (file, encoding) = service.download_retained(group, owner, blob)?;
-        let mut reader = crate::BlobReader::open(file, encoding)?;
+        let download = service.download_retained(group, owner, blob)?;
+        assert_eq!(download.logical_size, blob.size);
+        let mut reader = crate::BlobReader::open(download.file, download.encoding)?;
         let mut actual = Vec::new();
         reader.read_to_end(&mut actual)?;
         assert_eq!(actual, bytes);

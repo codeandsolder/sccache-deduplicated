@@ -1934,6 +1934,13 @@ impl ResultLease {
         &self.manifest
     }
 
+    pub(crate) fn blob_size(&self, id: ContentId) -> Result<u64> {
+        self.blobs
+            .get(&id)
+            .copied()
+            .context("undeclared result content")
+    }
+
     /// Open a file for transport. Its inode remains valid after unlinking,
     /// so a response can own it independently of this lease.
     ///

@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::File,
-    io::{Read, Seek},
+    io::Read,
     path::Path,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, Weak,
@@ -1715,40 +1715,45 @@ impl NativeSessions {
         ticket: Ticket,
         reader: Publisher,
         id: ContentId,
-    ) -> Result<(File, BlobEncoding)> {
+    ) -> Result<NativeDownload> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.authorize_reader(&mut state, reader)?;
-        // A negotiated result may already share content with the durable
-        // CAS. Permit reads of those verified files, not staged uploads.
+        // A negotiated result may already share content with the durable CAS.
         if let Some(manifest) = state.negotiated_result() {
             let size = *manifest
                 .blobs()?
                 .get(&id)
                 .context("undeclared negotiated result blob")?;
             drop(state);
-            let file = self
+            let physical = self
                 .store()
                 .open_available_physical(BlobRef { id, size })?
                 .ok_or(NativeContentPending)?;
-            return encode_delivery(file, false);
+            return Ok(NativeDownload::blob(physical, size));
         }
         let Phase::Ready(lease) = &mut state.phase else {
             bail!("native content not available");
         };
-        let original = matches!(lease, Ready::Tree(tree) if tree.packages.contains_key(&id));
-        let (file, encoding) = match lease {
-            Ready::Result(lease) => {
-                Ok::<_, anyhow::Error>((lease.open_file(id)?, lease.physical_encoding(id)?))
-            }
+        let download = match lease {
+            Ready::Result(lease) => NativeDownload::blob(
+                (lease.open_file(id)?, lease.physical_encoding(id)?),
+                lease.blob_size(id)?,
+            ),
             Ready::Tree(delivery) => {
                 if let Some(package) = delivery.packages.get(&id) {
-                    return Ok((package.open_file()?, BlobEncoding::Raw));
+                    return Ok(NativeDownload {
+                        file: package.open_file()?,
+                        encoding: BlobEncoding::Raw,
+                        logical_size: package.archive().blob.size,
+                        original_archive: true,
+                    });
                 }
                 match &delivery.source {
-                    TreeSource::Stored(tree) => {
-                        Ok((tree.open_file(id)?, tree.physical_encoding(id)?))
-                    }
+                    TreeSource::Stored(tree) => NativeDownload::blob(
+                        (tree.open_file(id)?, tree.physical_encoding(id)?),
+                        *tree.blobs().get(&id).context("undeclared tree content")?,
+                    ),
                     TreeSource::Action {
                         ticket,
                         id: tree,
@@ -1764,7 +1769,7 @@ impl NativeSessions {
                             if requested {
                                 self.finish_backfills(action, reader, [id])?;
                             }
-                            return encode_delivery(file, false);
+                            return Ok(NativeDownload::blob(file, size));
                         }
                         delivery.requested.insert(id);
                         drop(state);
@@ -1773,9 +1778,9 @@ impl NativeSessions {
                     }
                 }
             }
-        }?;
+        };
         drop(state);
-        encode_delivery((file, encoding), original)
+        Ok(download)
     }
 
     /// Prefetch only the blobs the worker actually lacks. Protect those
@@ -2401,15 +2406,22 @@ pub use telemetry::{ManifestStatus, RecoveryStatus, SessionStatus, TicketStatus}
 #[cfg(test)]
 mod tests;
 
-fn encode_delivery(
-    (mut file, encoding): (File, BlobEncoding),
-    original: bool,
-) -> Result<(File, BlobEncoding)> {
-    if original || encoding == BlobEncoding::ZstdChunks {
-        return Ok((file, encoding));
+/// Open, authorized physical content. Transport chooses wire encoding without
+/// rewriting the complete object or scanning its compressed frame index.
+pub struct NativeDownload {
+    pub file: File,
+    pub encoding: BlobEncoding,
+    pub logical_size: u64,
+    pub original_archive: bool,
+}
+
+impl NativeDownload {
+    fn blob((file, encoding): (File, BlobEncoding), logical_size: u64) -> Self {
+        Self {
+            file,
+            encoding,
+            logical_size,
+            original_archive: false,
+        }
     }
-    let mut wire = tempfile::tempfile()?;
-    crate::encode_native_blob(&mut file, &mut wire, None)?;
-    wire.rewind()?;
-    Ok((wire, BlobEncoding::ZstdChunks))
 }
