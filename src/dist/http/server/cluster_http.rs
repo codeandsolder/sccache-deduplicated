@@ -855,12 +855,7 @@ impl Listener {
             let process_connection = Arc::clone(&process_connections).acquire_owned().await?;
             let socket = match socket.accept().await {
                 Ok((socket, _)) => socket,
-                Err(error)
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(libc::EMFILE) | Some(libc::ENFILE)
-                    ) =>
-                {
+                Err(error) if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) => {
                     warn!("distributed listener descriptor exhaustion: {error}");
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     continue;

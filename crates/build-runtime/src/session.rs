@@ -781,7 +781,7 @@ impl NativeSessions {
         identity: PackageIdentity,
         length: ArchiveLength,
         limits: PackageImportLimits,
-    ) -> Result<PackagePreparation<impl Send + 'static>> {
+    ) -> Result<PackagePreparation<impl Send + 'static + use<>>> {
         self.store().prepare_package(identity, length, limits, || {
             self.upload_slot(UploadSource::Direct)
         })
