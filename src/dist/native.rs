@@ -25,6 +25,11 @@ use crate::dist::{
     cluster_routes::{MeasuredReader, Transfer},
 };
 
+#[cfg(any(
+    feature = "dist-server",
+    all(target_os = "linux", feature = "native-store")
+))]
+pub(in crate::dist) mod ingress;
 mod package;
 #[cfg(all(target_os = "linux", feature = "native-store"))]
 mod peer_delivery;
@@ -967,9 +972,11 @@ impl NativeCacheClient {
                         missing: prefetch,
                     })?;
                 }
-                let leases = map_packages(chunk, transport.parallelism(), |blob| {
-                    self.fetch_input_blob(read.ticket, *blob, plans.get(&blob.id), store, transport, check)
-                })?;
+                let leases = crate::http_client::io_runtime()?.block_on(ingress::map_bounded(
+                    chunk.iter().copied(), transport.parallelism(), |blob| {
+                        self.fetch_input_blob(read.ticket, blob, plans.get(&blob.id), store, transport, check)
+                    },
+                ))?;
                 for lease in &leases {
                     on_tree(lease);
                 }
@@ -1002,7 +1009,7 @@ impl NativeCacheClient {
     }
 
     #[cfg(all(target_os = "linux", feature = "native-store"))]
-    fn fetch_input_blob(
+    async fn fetch_input_blob(
         &self,
         ticket: Ticket,
         blob: BlobRef,
@@ -1013,65 +1020,88 @@ impl NativeCacheClient {
     ) -> Result<std::sync::Arc<crate::build_runtime::TreeLease>> {
         check()?;
         let manifest = crate::build_runtime::NativeStore::blob_retention_manifest(blob)?;
-        let (lease, _) = store.acquire_tree(manifest.id()?, check, || {
-            let reservation = store.reserve_tree_upload(&manifest)?;
+        let id = manifest.id()?;
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .context("native input deadline overflow")?;
+        let cancelled = async {
+            loop {
+                check()?;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        store.acquire_tree_async(id, deadline, cancelled, || async {
+            check()?;
+            let (manifest, reservation) = {
+                let store = store.clone();
+                tokio::task::spawn_blocking(move || {
+                    let reservation = store.reserve_tree_upload(&manifest)?;
+                    Ok::<_, anyhow::Error>((manifest, reservation))
+                }).await??
+            };
             let staged = if reservation.missing().is_empty() {
                 Vec::new()
             } else {
-                if let Some(plan) = plan.filter(|plan| self.has_direct_source(plan)) {
-                    let slot = transport.raw_slot(check)?;
+                let mut direct = None;
+                if let Some(plan) = plan.filter(|plan| !plan.sources.is_empty()) {
+                    let slot = transport.raw_slot(check).await?;
                     let started = Instant::now();
-                    let staged = self.try_peer_blob(plan, |reader, encoding| store.stage_expected_physical(blob, encoding, reader));
+                    direct = self.try_peer_blob_async(plan, |mut reader, encoding| async move {
+                        ingress::stage_blob(store.clone(), blob, encoding, &mut reader, None).await
+                    }).await;
                     drop(slot);
-                    if let Some(staged) = staged {
+                    if direct.is_some() {
                         transport.observe_raw(blob.size, started.elapsed());
-                        return store.publish_tree_pinned(&manifest, vec![staged]);
                     }
                 }
-                let start = Instant::now();
-                let mut delay = Duration::from_millis(10);
-                loop {
-                    check()?;
-                    let slot = transport.raw_slot(check)?;
-                    let remaining = self.timeout.checked_sub(start.elapsed())
-                        .filter(|remaining| !remaining.is_zero())
-                        .context("native input backfill timed out")?;
-                    let transfer = Instant::now();
-                    match self.try_download_response(ticket, blob, remaining) {
-                        Ok(Some((response, encoding))) => {
-                            let length = response.content_length().unwrap_or(0);
-                            let mut stream = InputDownload {
-                                reader: response,
-                                remaining: length,
-                                interrupted: false,
-                            };
-                            match store.stage_expected_physical(blob, encoding, &mut stream) {
-                                Ok(staged) => {
-                                    transport.observe_raw(blob.size, transfer.elapsed());
-                                    break vec![staged];
+                if let Some(staged) = direct {
+                    vec![staged]
+                } else {
+                    let start = Instant::now();
+                    let mut delay = Duration::from_millis(10);
+                    loop {
+                        check()?;
+                        let slot = transport.raw_slot(check).await?;
+                        let remaining = self.timeout.checked_sub(start.elapsed())
+                            .filter(|remaining| !remaining.is_zero())
+                            .context("native input backfill timed out")?;
+                        let transfer = Instant::now();
+                        match self.try_download_response_async(ticket, blob, remaining).await {
+                            Ok(Some((response, encoding))) => {
+                                let length = response.content_length().unwrap_or(0);
+                                let mut stream = InputDownload { reader: response, remaining: length, interrupted: false };
+                                match ingress::stage_blob(store.clone(), blob, encoding, &mut stream, None).await {
+                                    Ok(staged) => {
+                                        transport.observe_raw(blob.size, transfer.elapsed());
+                                        break vec![staged];
+                                    }
+                                    Err(error) if stream.interrupted => {
+                                        debug!("retrying interrupted native blob transfer {blob:?}: {error:#}");
+                                    }
+                                    Err(error) => return Err(error),
                                 }
-                                Err(error) if stream.interrupted => {
-                                    debug!("retrying interrupted native blob transfer {blob:?}: {error:#}");
-                                }
-                                Err(error) => return Err(error),
                             }
+                            Ok(None) => {}
+                            Err(error) if retryable_transport_error(&error) => {
+                                debug!("retrying native blob request {blob:?}: {error:#}");
+                            }
+                            Err(error) => return Err(error),
                         }
-                        Ok(None) => {}
-                        Err(error) if retryable_transport_error(&error) => {
-                            debug!("retrying native blob request {blob:?}: {error:#}");
-                        }
-                        Err(error) => return Err(error),
+                        drop(slot);
+                        let remaining = self.timeout.saturating_sub(start.elapsed());
+                        ensure!(!remaining.is_zero(), "native input backfill timed out");
+                        tokio::time::sleep(delay.min(remaining)).await;
+                        delay = (delay * 2).min(Duration::from_millis(200));
                     }
-                    drop(slot);
-                    let remaining = self.timeout.saturating_sub(start.elapsed());
-                    ensure!(!remaining.is_zero(), "native input backfill timed out");
-                    std::thread::sleep(delay.min(remaining));
-                    delay = (delay * 2).min(Duration::from_millis(200));
                 }
             };
-            store.publish_tree_pinned(&manifest, staged)
-        })?;
-        Ok(lease)
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || {
+                let tree = store.publish_tree_pinned(&manifest, staged)?;
+                drop(reservation);
+                Ok(tree)
+            }).await?
+        }).await
     }
 
     /// Negotiate missing content for a successful result.
@@ -1466,12 +1496,76 @@ impl NativeCacheClient {
             BlobEncoding,
         )>,
     > {
-        let (response, address) = self.send_to_cache(
-            operation,
-            request,
-            timeout,
-            Some(Transfer::Download(blob.size)),
-        )?;
+        let response = crate::http_client::io_runtime()?
+            .block_on(self.receive_blob_response(operation, request, blob, timeout))?;
+        response
+            .map(|(response, address, encoding)| {
+                Ok((
+                    self.routes.measure_response(
+                        self.peer.scheduler_id(),
+                        sccache_cluster_identity::Role::Scheduler,
+                        address,
+                        response,
+                    )?,
+                    encoding,
+                ))
+            })
+            .transpose()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-store"))]
+    async fn try_download_response_async(
+        &self,
+        ticket: Ticket,
+        blob: BlobRef,
+        timeout: Duration,
+    ) -> Result<
+        Option<(
+            MeasuredReader<crate::dist::cluster::AsyncResponseReader>,
+            BlobEncoding,
+        )>,
+    > {
+        let request = codec().serialize(&DownloadRequest {
+            ticket,
+            id: blob.id,
+        })?;
+        let response = self
+            .receive_blob_response("download", request, blob, timeout)
+            .await?;
+        Ok(response.map(|(response, address, encoding)| {
+            (
+                self.routes.measure_response_async(
+                    self.peer.scheduler_id(),
+                    sccache_cluster_identity::Role::Scheduler,
+                    address,
+                    response,
+                ),
+                encoding,
+            )
+        }))
+    }
+
+    async fn receive_blob_response(
+        &self,
+        operation: &str,
+        request: Vec<u8>,
+        blob: BlobRef,
+        timeout: Duration,
+    ) -> Result<
+        Option<(
+            wreq::Response,
+            crate::dist::cluster_routes::Route,
+            BlobEncoding,
+        )>,
+    > {
+        let (response, address) = self
+            .send_to_cache_async(
+                operation,
+                request,
+                timeout,
+                Some(Transfer::Download(blob.size)),
+            )
+            .await?;
         if response.status() == http::StatusCode::ACCEPTED {
             return Ok(None);
         }
@@ -1483,13 +1577,7 @@ impl NativeCacheClient {
                 .context("native response missing encoding")?
                 .to_str()?,
         )?;
-        let response = self.routes.measure_response(
-            self.peer.scheduler_id(),
-            sccache_cluster_identity::Role::Scheduler,
-            address,
-            response,
-        )?;
-        Ok(Some((response, encoding)))
+        Ok(Some((response, address, encoding)))
     }
 }
 
@@ -1503,22 +1591,32 @@ struct InputDownload<R> {
 }
 
 #[cfg(all(target_os = "linux", feature = "native-store"))]
-impl<R: Read> Read for InputDownload<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        match self.reader.read(buffer) {
-            Ok(count) => {
-                if count == 0 && !buffer.is_empty() && self.remaining != 0 {
-                    self.interrupted = true;
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for InputDownload<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::{pin::Pin, task::Poll};
+        let this = self.get_mut();
+        let before = buffer.filled().len();
+        let nonempty = buffer.remaining() > 0;
+        match Pin::new(&mut this.reader).poll_read(cx, buffer) {
+            Poll::Ready(Ok(())) => {
+                let count = buffer.filled().len() - before;
+                if count == 0 && nonempty && this.remaining != 0 {
+                    this.interrupted = true;
                 }
-                self.remaining = self.remaining.saturating_sub(count as u64);
-                Ok(count)
+                this.remaining = this.remaining.saturating_sub(count as u64);
+                Poll::Ready(Ok(()))
             }
-            Err(error) => {
+            Poll::Ready(Err(error)) => {
                 if error.kind() != io::ErrorKind::Interrupted {
-                    self.interrupted = true;
+                    this.interrupted = true;
                 }
-                Err(error)
+                Poll::Ready(Err(error))
             }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -1546,15 +1644,16 @@ fn retryable_transport_error(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(all(test, target_os = "linux", feature = "native-store"))]
-#[test]
-fn native_input_stream_distinguishes_truncation_from_complete_transfer() -> Result<()> {
+#[tokio::test]
+async fn native_input_stream_distinguishes_truncation_from_complete_transfer() -> Result<()> {
+    use tokio::io::AsyncReadExt;
     let mut short = InputDownload {
         reader: Cursor::new(b"short"),
         remaining: 8,
         interrupted: false,
     };
     let mut bytes = Vec::new();
-    short.read_to_end(&mut bytes)?;
+    short.read_to_end(&mut bytes).await?;
     assert!(short.interrupted);
     assert_eq!(short.remaining, 3);
     let mut complete = InputDownload {
@@ -1563,7 +1662,7 @@ fn native_input_stream_distinguishes_truncation_from_complete_transfer() -> Resu
         interrupted: false,
     };
     bytes.clear();
-    complete.read_to_end(&mut bytes)?;
+    complete.read_to_end(&mut bytes).await?;
     assert!(!complete.interrupted);
     assert_eq!(complete.remaining, 0);
     Ok(())

@@ -803,7 +803,10 @@ impl<R: Read> Read for MeasuredReader<R> {
     }
 }
 
-#[cfg(feature = "dist-server")]
+#[cfg(any(
+    feature = "dist-server",
+    all(target_os = "linux", feature = "native-store")
+))]
 impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for MeasuredReader<R> {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,

@@ -7,7 +7,7 @@ use std::{
     io::{self, Read},
     num::NonZeroUsize,
     sync::{
-        Arc, Condvar, Mutex, PoisonError,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -37,19 +37,7 @@ pub struct PackageTransportTracker {
 
 struct RawDownloadSlots {
     limit: NonZeroUsize,
-    active: Mutex<usize>,
-    wake: Condvar,
-}
-
-pub(super) struct RawDownloadPermit<'a>(&'a RawDownloadSlots);
-
-impl Drop for RawDownloadPermit<'_> {
-    fn drop(&mut self) {
-        let mut active = self.0.active.lock().unwrap_or_else(PoisonError::into_inner);
-        *active -= 1;
-        drop(active);
-        self.0.wake.notify_one();
-    }
+    permits: tokio::sync::Semaphore,
 }
 
 impl PackageTransportTracker {
@@ -65,8 +53,7 @@ impl PackageTransportTracker {
             timing: Arc::new(Mutex::new(initial)),
             slots: Arc::new(RawDownloadSlots {
                 limit,
-                active: Mutex::new(0),
-                wake: Condvar::new(),
+                permits: tokio::sync::Semaphore::new(limit.get()),
             }),
         })
     }
@@ -81,27 +68,17 @@ impl PackageTransportTracker {
     /// waiting. A slot is released on every return path, including failures.
     /// # Errors
     /// Returns an error if cancellation or lease renewal failed.
-    pub(super) fn raw_slot(&self, check: &LeaseCheck<'_>) -> Result<RawDownloadPermit<'_>> {
+    pub(super) async fn raw_slot(
+        &self,
+        check: &LeaseCheck<'_>,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        let mut acquire = std::pin::pin!(self.slots.permits.acquire());
         loop {
             check()?;
-            let (mut active, _) = self
-                .slots
-                .wake
-                .wait_timeout_while(
-                    self.slots
-                        .active
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner),
-                    Duration::from_millis(50),
-                    |in_use| *in_use >= self.slots.limit.get(),
-                )
-                .unwrap_or_else(PoisonError::into_inner);
-            if *active < self.slots.limit.get() {
-                *active += 1;
-                drop(active);
-                return Ok(RawDownloadPermit(&self.slots));
+            tokio::select! {
+                permit = &mut acquire => return Ok(permit?),
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
             }
-            drop(active);
         }
     }
 
@@ -247,12 +224,9 @@ mod transport_tests {
         BlobRef, ContentId, PackageCompression, PackageIdentity, PackageSource, TreeId,
     };
 
-    #[test]
-    fn slots_bound_parallel_downloads_and_restore_admission_on_drop() -> Result<()> {
-        use std::sync::{
-            Barrier,
-            atomic::{AtomicUsize, Ordering},
-        };
+    #[tokio::test]
+    async fn slots_bound_parallel_downloads_and_restore_admission_on_drop() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let tracker = PackageTransportTracker::new(WorkerTiming {
             transfer: PackageTransferCost {
                 raw_parallelism: 2,
@@ -260,41 +234,26 @@ mod transport_tests {
             },
             ..Default::default()
         })?;
-        let barrier = Barrier::new(8);
         let running = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
-        std::thread::scope(|scope| -> Result<()> {
-            let threads = (0..8)
-                .map(|_| {
-                    let tracker = tracker.clone();
-                    let barrier = &barrier;
-                    let running = &running;
-                    let peak = &peak;
-                    scope.spawn(move || -> Result<()> {
-                        barrier.wait();
-                        let _permit = tracker.raw_slot(&|| Ok(()))?;
-                        let count = running.fetch_add(1, Ordering::SeqCst) + 1;
-                        peak.fetch_max(count, Ordering::SeqCst);
-                        std::thread::sleep(Duration::from_millis(30));
-                        running.fetch_sub(1, Ordering::SeqCst);
-                        Ok(())
-                    })
-                })
-                .collect::<Vec<_>>();
-            for thread in threads {
-                thread
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("raw limiter worker panicked"))??;
-            }
-            Ok(())
-        })?;
+        futures::future::try_join_all((0..8).map(|_| async {
+            let _permit = tracker.raw_slot(&|| Ok(())).await?;
+            let count = running.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(count, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            running.fetch_sub(1, Ordering::SeqCst);
+            Ok::<_, anyhow::Error>(())
+        }))
+        .await?;
         assert_eq!(peak.load(Ordering::SeqCst), 2);
         assert_eq!(running.load(Ordering::SeqCst), 0);
         assert!(
             tracker
                 .raw_slot(&|| anyhow::bail!("expired session"))
+                .await
                 .is_err()
         );
+        assert_eq!(tracker.slots.permits.available_permits(), 2);
         let initial = tracker.estimate().raw_request_nanoseconds;
         tracker.observe_raw(8192, Duration::from_millis(35));
         assert!(tracker.estimate().raw_request_nanoseconds > initial);

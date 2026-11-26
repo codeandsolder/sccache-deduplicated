@@ -500,9 +500,12 @@ async fn asynchronous_tree_waiters_share_the_synchronous_owner_and_honor_deadlin
     });
     waiting.await?;
     let timeout = store
-        .acquire_tree_async(id, Instant::now() + Duration::from_millis(20), || async {
-            anyhow::bail!("waiter must not duplicate an active acquisition")
-        })
+        .acquire_tree_async(
+            id,
+            Instant::now() + Duration::from_millis(20),
+            std::future::pending(),
+            || async { anyhow::bail!("waiter must not duplicate an active acquisition") },
+        )
         .await
         .err()
         .context("active flight must outlast the waiter's deadline")?;
@@ -510,9 +513,12 @@ async fn asynchronous_tree_waiters_share_the_synchronous_owner_and_honor_deadlin
     let follower_store = store.clone();
     let follower = tokio::spawn(async move {
         follower_store
-            .acquire_tree_async(id, Instant::now() + Duration::from_secs(5), || async {
-                anyhow::bail!("synchronous owner must publish the only tree")
-            })
+            .acquire_tree_async(
+                id,
+                Instant::now() + Duration::from_secs(5),
+                std::future::pending(),
+                || async { anyhow::bail!("synchronous owner must publish the only tree") },
+            )
             .await
     });
     resume.send(())?;

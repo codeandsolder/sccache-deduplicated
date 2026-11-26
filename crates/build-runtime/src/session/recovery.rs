@@ -298,31 +298,36 @@ impl NativeSessions {
         let store = self.store();
         let retention = NativeStore::blob_retention_manifest(blob)?;
         store
-            .acquire_tree_async(retention.id()?, deadline, || async move {
-                let owned = store.clone();
-                let manifest = retention.clone();
-                let reservation =
-                    tokio::task::spawn_blocking(move || owned.reserve_tree_upload(&manifest))
-                        .await??;
-                let staged = if reservation.missing().is_empty() {
-                    Vec::new()
-                } else {
-                    let staged = fetch(blob, store.clone(), deadline)
-                        .await?
-                        .context("no peer has the required blob")?;
-                    ensure!(
-                        staged.reference() == blob,
-                        "peer returned unrelated staged content"
-                    );
-                    vec![staged]
-                };
-                let owned = store.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _reservation = reservation;
-                    owned.publish_tree_pinned(&retention, staged)
-                })
-                .await?
-            })
+            .acquire_tree_async(
+                retention.id()?,
+                deadline,
+                std::future::pending(),
+                || async move {
+                    let owned = store.clone();
+                    let manifest = retention.clone();
+                    let reservation =
+                        tokio::task::spawn_blocking(move || owned.reserve_tree_upload(&manifest))
+                            .await??;
+                    let staged = if reservation.missing().is_empty() {
+                        Vec::new()
+                    } else {
+                        let staged = fetch(blob, store.clone(), deadline)
+                            .await?
+                            .context("no peer has the required blob")?;
+                        ensure!(
+                            staged.reference() == blob,
+                            "peer returned unrelated staged content"
+                        );
+                        vec![staged]
+                    };
+                    let owned = store.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _reservation = reservation;
+                        owned.publish_tree_pinned(&retention, staged)
+                    })
+                    .await?
+                },
+            )
             .await
     }
 }

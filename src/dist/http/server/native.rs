@@ -11,8 +11,7 @@ use std::{
 };
 
 use super::cluster_http::{
-    AdmissionClass, Listener, ListenerRole, Request, async_route, binary, compute, path_route,
-    routes,
+    AdmissionClass, Listener, ListenerRole, Request, async_route, binary, path_route, routes,
 };
 use anyhow::{Context, Result, ensure};
 use axum::{
@@ -33,10 +32,10 @@ use crate::{
     build_runtime::{
         ActionMode, ArchiveLength, BlobEncoding, BlobRef, Direction, ExecutionSpec,
         NativeContentPending, NativeInputRejected, NativePackagePreparation, NativePackageUpload,
-        NativeServiceBusy, NativeSessions, NativeStore, NativeUpload, NetworkMeter,
-        NetworkSnapshot, PackageCatalog, PackageIdentity, PackageImportLimits, PackageSource, Peer,
-        PhysicalStager, SchedulePreparation, ScheduleReservation, StagedBlob, TransferMeter,
-        TreeId, TreeManifest, VerifiedPackage,
+        NativeServiceBusy, NativeSessions, NativeStore, NetworkMeter, NetworkSnapshot,
+        PackageCatalog, PackageIdentity, PackageImportLimits, PackageSource, Peer,
+        SchedulePreparation, ScheduleReservation, StagedBlob, TransferMeter, TreeId, TreeManifest,
+        VerifiedPackage,
         wire::{BlobRecipient, BlobSource, BlobSourcePlan, Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
@@ -45,6 +44,7 @@ use crate::{
         InputPrefetchRequest, ManifestRequest, OpenTreeRequest, PackageAcquisition, PackageLocator,
         PackagePlanRequest, RetainRequest, RetainedDownloadRequest, ScheduleRequest, StatusRequest,
         codec,
+        ingress::{receive_blob, stage_blob},
     },
 };
 
@@ -698,11 +698,8 @@ pub(super) async fn fetch_peer(
             .routes
             .measure_response_async(source.server, Role::Worker, address, response);
     let meter = network.transfer(Direction::Receive, peer, blob.size, size);
-    let staging =
-        tokio::task::spawn_blocking(move || store.prepare_physical(blob, encoding)).await??;
-    let staging = receive_blob(staging, &mut input, meter, anyhow::Error::from).await?;
     Ok(Some(
-        tokio::task::spawn_blocking(move || staging.finish()).await??,
+        stage_blob(store, blob, encoding, &mut input, Some(meter)).await?,
     ))
 }
 
@@ -760,90 +757,6 @@ fn request_publisher(request: &Request, role: &str) -> std::result::Result<Publi
     })
 }
 
-trait BlobIngress: Send + Sized + 'static {
-    fn requires_codec_pool(&self) -> bool;
-    fn encode_pending(&mut self, bytes: &[u8]) -> Result<()>;
-    fn finish_encoding(&mut self) -> Result<()>;
-    fn flush_pending_async(self) -> impl Future<Output = Result<Self>> + Send;
-    fn finish_file_async(self) -> impl Future<Output = Result<Self>> + Send;
-}
-
-macro_rules! blob_ingress {
-    ($type:ty) => {
-        impl BlobIngress for $type {
-            fn requires_codec_pool(&self) -> bool {
-                <$type>::requires_codec_pool(self)
-            }
-            fn encode_pending(&mut self, bytes: &[u8]) -> Result<()> {
-                <$type>::encode_pending(self, bytes)
-            }
-            fn finish_encoding(&mut self) -> Result<()> {
-                <$type>::finish_encoding(self)
-            }
-            async fn flush_pending_async(self) -> Result<Self> {
-                <$type>::flush_pending_async(self).await
-            }
-            async fn finish_file_async(self) -> Result<Self> {
-                <$type>::finish_file_async(self).await
-            }
-        }
-    };
-}
-blob_ingress!(NativeUpload);
-blob_ingress!(PhysicalStager);
-
-async fn receive_blob<T: BlobIngress>(
-    mut upload: T,
-    input: &mut (impl AsyncRead + Unpin),
-    mut meter: TransferMeter,
-    read_error: impl Fn(std::io::Error) -> anyhow::Error,
-) -> Result<T> {
-    // Batch at the CAS frame size rather than dispatch work for each TLS record.
-    let mut buffer = vec![0; 256 * 1024];
-    let codec_pool = upload.requires_codec_pool();
-    loop {
-        let mut count = 0;
-        while count < buffer.len() {
-            let read = input
-                .read(&mut buffer[count..])
-                .await
-                .map_err(&read_error)?;
-            if read == 0 {
-                meter.eof();
-                break;
-            }
-            count += read;
-            meter.observe(read as u64);
-        }
-        if count == 0 {
-            break;
-        }
-        if codec_pool {
-            (upload, buffer) = compute(move || {
-                upload.encode_pending(&buffer[..count])?;
-                Ok((upload, buffer))
-            })
-            .await?;
-        } else {
-            upload.encode_pending(&buffer[..count])?;
-        }
-        upload = upload.flush_pending_async().await?;
-        if count < buffer.len() {
-            break;
-        }
-    }
-    if codec_pool {
-        upload = compute(move || {
-            upload.finish_encoding()?;
-            Ok(upload)
-        })
-        .await?;
-    } else {
-        upload.finish_encoding()?;
-    }
-    upload.finish_file_async().await
-}
-
 async fn upload_response(
     mut request: Request,
     role: &str,
@@ -887,7 +800,7 @@ async fn upload_response(
             .await??
         };
         let meter = network.transfer(Direction::Receive, peer, header.blob.size, None);
-        let upload = receive_blob(upload, &mut input, meter, |error| {
+        let upload = receive_blob(upload, &mut input, Some(meter), |error| {
             let error = anyhow::Error::from(error);
             if backfill {
                 error.context(NativeServiceBusy)

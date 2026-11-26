@@ -5,6 +5,7 @@ use bincode::Options;
 use sccache_cluster_identity::Role;
 use std::{
     collections::BTreeMap,
+    future::Future,
     time::{Duration, Instant},
 };
 
@@ -14,7 +15,10 @@ use crate::{
         BlobEncoding, BlobRef, ContentId,
         wire::{BlobSource, BlobSourcePlan, MAX_BLOB_SOURCES, MAX_SOURCE_BATCH, Ticket},
     },
-    dist::cluster_routes::{MeasuredReader, Transfer},
+    dist::{
+        cluster::AsyncResponseReader,
+        cluster_routes::{MeasuredReader, Transfer},
+    },
 };
 
 impl NativeCacheClient {
@@ -74,19 +78,18 @@ impl NativeCacheClient {
         }));
     }
 
-    fn direct_candidates<'a>(&self, plan: &'a BlobSourcePlan) -> Vec<(u128, &'a BlobSource)> {
+    fn direct_candidates<'a>(
+        &self,
+        plan: &'a BlobSourcePlan,
+        routes: &sccache_peer_identity::RouteSet,
+    ) -> Vec<(u128, &'a BlobSource)> {
         if plan.sources.is_empty() {
             return Vec::new();
         }
         let transfer = Transfer::Download(plan.blob.size);
         let scheduler_cost = if plan.scheduler_present {
             self.routes
-                .estimated_cost(
-                    self.peer.scheduler_id(),
-                    Role::Scheduler,
-                    &self.cache_routes(),
-                    transfer,
-                )
+                .estimated_cost(self.peer.scheduler_id(), Role::Scheduler, routes, transfer)
                 .unwrap_or_else(|| {
                     50_000_000 + u128::from(plan.blob.size) * 1_000_000_000 / (16 << 20)
                 })
@@ -113,23 +116,60 @@ impl NativeCacheClient {
     }
 
     pub(super) fn has_direct_source(&self, plan: &BlobSourcePlan) -> bool {
-        !self.direct_candidates(plan).is_empty()
+        !plan.sources.is_empty()
+            && !self
+                .direct_candidates(plan, &self.cache_routes())
+                .is_empty()
     }
 
-    /// The consumer stages and verifies before returning success. Each retry
-    /// starts with a fresh consumer invocation; no unverified prefix escapes.
+    /// Synchronous compiler/IPC sinks remain at the synchronous boundary.
+    /// Routing, HTTP bodies and worker CAS consumers use the same async path.
     pub(in crate::dist) fn try_peer_blob<T>(
         &self,
         plan: &BlobSourcePlan,
         mut consume: impl FnMut(
-            MeasuredReader<crate::http_client::ResponseReader>,
+            tokio_util::io::SyncIoBridge<MeasuredReader<AsyncResponseReader>>,
             BlobEncoding,
         ) -> Result<T>,
     ) -> Option<T> {
-        self.probe_sources([plan]);
+        crate::http_client::io_runtime()
+            .ok()?
+            .block_on(self.try_peer_blob_async(plan, |reader, encoding| {
+                let reader = tokio_util::io::SyncIoBridge::new(reader);
+                std::future::ready(tokio::task::block_in_place(|| consume(reader, encoding)))
+            }))
+    }
+
+    /// The consumer verifies before success. A rejected transfer starts with
+    /// a fresh consumer, and never exposes its unverified prefix.
+    #[expect(
+        clippy::future_not_send,
+        reason = "also serves synchronous non-Send IPC output sinks; worker consumers are Send"
+    )]
+    pub(super) async fn try_peer_blob_async<T, F, Fut>(
+        &self,
+        plan: &BlobSourcePlan,
+        mut consume: F,
+    ) -> Option<T>
+    where
+        F: FnMut(MeasuredReader<AsyncResponseReader>, BlobEncoding) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        if plan.sources.is_empty() {
+            return None;
+        }
+        self.routes
+            .probe_routes_async(
+                plan.sources
+                    .iter()
+                    .map(|source| (source.peer, Role::Worker, &source.routes))
+                    .collect(),
+            )
+            .await;
+        let cache_routes = self.cache_routes_async().await;
         let blob = plan.blob;
         let started = Instant::now();
-        for (cost, source) in self.direct_candidates(plan) {
+        for (cost, source) in self.direct_candidates(plan, &cache_routes) {
             let budget =
                 self.timeout
                     .min(Duration::from_secs(5).saturating_add(Duration::from_nanos(
@@ -146,11 +186,14 @@ impl NativeCacheClient {
                     break;
                 }
                 let attempt = Instant::now();
-                match self.receive_peer_blob(blob, source, address, remaining) {
+                match self
+                    .receive_peer_blob(blob, source, address, remaining)
+                    .await
+                {
                     Ok(Some((reader, encoding))) => {
                         let encoded_length = reader.content_length();
                         let (mut connection, evidence) = reader.connection_evidence();
-                        match consume(reader, encoding) {
+                        match consume(reader, encoding).await {
                             Ok(value) => {
                                 if connection.reported.is_some() {
                                     connection.quality = evidence
@@ -184,28 +227,22 @@ impl NativeCacheClient {
         None
     }
 
-    fn receive_peer_blob(
+    async fn receive_peer_blob(
         &self,
         blob: BlobRef,
         source: &BlobSource,
         address: crate::dist::cluster_routes::Route,
         remaining: Duration,
-    ) -> Result<
-        Option<(
-            MeasuredReader<crate::http_client::ResponseReader>,
-            BlobEncoding,
-        )>,
-    > {
+    ) -> Result<Option<(MeasuredReader<AsyncResponseReader>, BlobEncoding)>> {
         let (client, base) = self.routes.endpoint(source.peer, Role::Worker, address)?;
-        let response = crate::http_client::io_runtime()?.block_on(
-            client
-                .post(crate::dist::http::urls::server_native_blob(&base)?.as_str())
-                .bearer_auth(&source.token)
-                .header(http::header::CONTENT_TYPE, "application/octet-stream")
-                .timeout(remaining)
-                .body(codec().serialize(&blob)?)
-                .send(),
-        )?;
+        let response = client
+            .post(crate::dist::http::urls::server_native_blob(&base)?.as_str())
+            .bearer_auth(&source.token)
+            .header(http::header::CONTENT_TYPE, "application/octet-stream")
+            .timeout(remaining)
+            .body(codec().serialize(&blob)?)
+            .send()
+            .await?;
         if matches!(
             response.status(),
             http::StatusCode::NOT_FOUND
@@ -222,9 +259,9 @@ impl NativeCacheClient {
                 .context("missing peer encoding")?
                 .to_str()?,
         )?;
-        let reader = self
-            .routes
-            .measure_response(source.peer, Role::Worker, address, response)?;
+        let reader =
+            self.routes
+                .measure_response_async(source.peer, Role::Worker, address, response);
         Ok(Some((reader, encoding)))
     }
 }

@@ -198,29 +198,37 @@ impl NativeStore {
         tokio::task::spawn_blocking(move || store.lookup_tree(id)).await?
     }
 
-    // The same flight is shared with synchronous worker acquisitions. Async
-    // consumers wait on notification, never on a condition-variable thread.
-    pub(crate) async fn acquire_tree_async<Fut>(
+    /// Share a tree flight with synchronous or asynchronous producers.
+    /// A follower waits for notification, deadline or cancellation, without
+    /// occupying a condition-variable thread. A producer owns the flight
+    /// until its fetch future completes or is dropped.
+    ///
+    /// # Errors
+    /// Returns an error for cancellation, timeout, invalid content or failed acquisition.
+    pub async fn acquire_tree_async<Fut, Cancel>(
         &self,
         id: TreeId,
         deadline: Instant,
-        fetch: impl FnOnce() -> Fut,
+        cancelled: Cancel,
+        fetch: impl FnOnce() -> Fut + Send,
     ) -> Result<Arc<TreeLease>>
     where
-        Fut: std::future::Future<Output = Result<TreeLease>>,
+        Fut: std::future::Future<Output = Result<TreeLease>> + Send,
+        Cancel: std::future::Future<Output = Result<()>> + Send,
     {
         ensure!(
             Instant::now() < deadline,
-            "native peer recovery deadline exceeded"
+            "native tree acquisition deadline exceeded"
         );
         if let Some(tree) = self.lookup_tree_async(id).await? {
             return Ok(Arc::new(tree));
         }
         let flight = self.tree_flight(id);
+        let mut cancelled = std::pin::pin!(cancelled);
         loop {
             ensure!(
                 Instant::now() < deadline,
-                "native peer recovery deadline exceeded"
+                "native tree acquisition deadline exceeded"
             );
             let mut notified = std::pin::pin!(flight.async_wake.notified());
             notified.as_mut().enable();
@@ -243,9 +251,15 @@ impl NativeStore {
                 };
                 return self.complete_flight(id, &flight, lease);
             }
-            tokio::time::timeout_at(deadline.into(), notified)
-                .await
-                .context("native peer recovery deadline exceeded")?;
+            tokio::select! {
+                result = tokio::time::timeout_at(deadline.into(), notified) => {
+                    result.context("native tree acquisition deadline exceeded")?;
+                }
+                result = &mut cancelled => {
+                    result?;
+                    anyhow::bail!("native tree acquisition cancelled");
+                }
+            }
         }
     }
 

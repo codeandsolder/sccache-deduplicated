@@ -206,7 +206,7 @@ gha = [
   "http-client",
 ]
 memcached = ["opendal/services-memcached", "opendal-layer-logging"]
-native-store = ["sccache-build/store"]
+native-store = ["sccache-build/async-io", "dep:rayon-core", "tokio-util/io-util"]
 oss = [
   "opendal/services-oss",
   "opendal-layer-logging",
@@ -253,12 +253,9 @@ dist-client = [
 ]
 # Enables the sccache-dist binary
 dist-server = [
-  "sccache-build/async-io",
-  "dep:rayon-core",
   "dep:rustix",
   "dep:socket2",
   "dep:sccache-cluster-identity",
-  "tokio-util/io-util",
   "native-store",
   "url/serde",
   "jwt",

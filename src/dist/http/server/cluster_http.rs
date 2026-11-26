@@ -35,6 +35,7 @@ use crate::{
         Transfer,
         interface::{self, TrackedReader},
     },
+    dist::native::ingress::compute,
     errors::{Context, Result},
 };
 
@@ -266,33 +267,6 @@ async fn blocking_reply(
         })
         .await,
     )
-}
-
-/// Process-wide CPU executor. Queued tasks are bounded by admitted requests,
-/// and no blocking I/O thread waits for a codec task. Cancellation drops the
-/// returned state if the receiver has gone away.
-pub(super) async fn compute<T: Send + 'static>(
-    operation: impl FnOnce() -> Result<T> + Send + 'static,
-) -> Result<T> {
-    static POOL: OnceLock<
-        std::result::Result<rayon_core::ThreadPool, rayon_core::ThreadPoolBuildError>,
-    > = OnceLock::new();
-    let pool = POOL
-        .get_or_init(|| {
-            rayon_core::ThreadPoolBuilder::new()
-                .num_threads(crate::util::num_cpus())
-                .thread_name(|index| format!("sccache-codec-{index}"))
-                .build()
-        })
-        .as_ref()
-        .map_err(|error| anyhow::anyhow!("cannot initialize codec pool: {error}"))?;
-    let (send, receive) = tokio::sync::oneshot::channel();
-    pool.spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("native codec task panicked")));
-        let _ = send.send(result);
-    });
-    receive.await.context("native codec task lost")?
 }
 
 fn joined_reply(result: std::result::Result<Response, tokio::task::JoinError>) -> Response {
