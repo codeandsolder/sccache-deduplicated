@@ -2,9 +2,8 @@
 //! state machine never waits for input and buffers at most one codec frame.
 
 use super::{
-    BlobEncoding, BlobRef, CHUNK, ChunkWidths, ContentId, MAGIC, Result, Write,
-    decode_transport_chunk, validate_transport_header, validate_transport_widths,
-    write_encoded_chunk,
+    BlobEncoding, BlobRef, CHUNK, ChunkWidths, ContentId, Result, Write, decode_transport_chunk,
+    transport_header, validate_transport_header, validate_transport_widths, write_encoded_chunk,
 };
 use crate::store::BlobIntegrityError;
 use anyhow::{Context, ensure};
@@ -35,12 +34,8 @@ impl BlobIngest {
         target: BlobEncoding,
     ) -> Result<Self> {
         if source == BlobEncoding::Raw && target == BlobEncoding::ZstdChunks {
-            file.write_all(&MAGIC)?;
-            // The expected logical size is already negotiated. Emit the final
-            // header now rather than seeking back during finalization.
-            file.write_all(&expected.size.to_le_bytes())?;
-            file.write_all(&u32::try_from(CHUNK)?.to_le_bytes())?;
-            file.write_all(&u32::try_from(expected.size.div_ceil(CHUNK as u64))?.to_le_bytes())?;
+            // The negotiated size fixes the header before the first frame.
+            file.write_all(&transport_header(expected.size)?)?;
         }
         Ok(Self {
             expected,

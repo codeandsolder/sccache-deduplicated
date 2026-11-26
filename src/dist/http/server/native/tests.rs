@@ -983,11 +983,13 @@ async fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> 
         raw.rewind()?;
         let response = physical_blob_response(&request, raw, BlobEncoding::Raw)?;
         assert_eq!(response.headers()["X-Sccache-CAS-Encoding"], "zstd-chunks");
-        let size = response.headers()[http::header::CONTENT_LENGTH]
-            .to_str()?
-            .parse::<u64>()?;
+        assert!(
+            !response
+                .headers()
+                .contains_key(http::header::CONTENT_LENGTH)
+        );
         let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024).await?;
-        assert_eq!(u64::try_from(bytes.len())?, size);
+        let size = u64::try_from(bytes.len())?;
         let stream = std::io::Cursor::new(bytes);
         let mut encoded = tempfile::tempfile()?;
         let mut decoded = Vec::new();

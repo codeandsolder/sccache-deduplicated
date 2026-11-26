@@ -375,6 +375,57 @@ fn write_encoded_chunk(file: &mut impl Write, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn transport_header(size: u64) -> Result<[u8; 32]> {
+    let mut header = [0_u8; 32];
+    header[..16].copy_from_slice(&MAGIC);
+    header[16..24].copy_from_slice(&size.to_le_bytes());
+    header[24..28].copy_from_slice(&u32::try_from(CHUNK)?.to_le_bytes());
+    header[28..].copy_from_slice(&u32::try_from(size.div_ceil(CHUNK as u64))?.to_le_bytes());
+    Ok(header)
+}
+
+/// Demand-driven canonical wire compression of an already verified raw file.
+/// The logical size is known before the first byte, so no temporary archive
+/// or seek-back operation is necessary.
+pub struct BlobWireEncoder {
+    remaining: u64,
+}
+
+impl BlobWireEncoder {
+    /// Start a stream and return its final canonical header.
+    ///
+    /// # Errors
+    /// Returns an error if the stream exceeds the format's chunk count.
+    pub fn new(size: u64) -> Result<(Self, [u8; 32])> {
+        Ok((Self { remaining: size }, transport_header(size)?))
+    }
+
+    /// Exact number of input bytes required for the next frame. Zero means EOF.
+    #[must_use]
+    pub const fn next_frame_size(&self) -> usize {
+        if self.remaining < CHUNK as u64 {
+            self.remaining as usize
+        } else {
+            CHUNK
+        }
+    }
+
+    /// Encode a single independent frame, with no filesystem or network I/O.
+    ///
+    /// # Errors
+    /// Returns an error for a noncanonical input length or codec failure.
+    pub fn frame(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
+        ensure!(
+            !bytes.is_empty() && bytes.len() == self.next_frame_size(),
+            "noncanonical CAS frame length"
+        );
+        let mut encoded = Vec::with_capacity(bytes.len().saturating_add(8));
+        write_encoded_chunk(&mut encoded, bytes)?;
+        self.remaining -= u64::try_from(bytes.len())?;
+        Ok(encoded)
+    }
+}
+
 fn write_encoded_header(file: &mut File, size: u64, chunks: u32) -> Result<()> {
     write_at(file, &size.to_le_bytes(), 16)?;
     write_at(file, &u32::try_from(CHUNK)?.to_le_bytes(), 24)?;

@@ -5,7 +5,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     future::Future,
-    io::{Read, Seek},
+    io::Read,
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -435,19 +435,18 @@ pub(super) fn serve_peer_blob(
 
 pub(super) fn physical_blob_response(
     request: &Request,
-    mut file: File,
+    file: File,
     encoding: BlobEncoding,
 ) -> Result<Response> {
-    let (file, encoding) = if encoding == BlobEncoding::Raw {
-        let mut encoded = tempfile::tempfile()?;
-        crate::build_runtime::encode_native_blob(&mut file, &mut encoded, None)?;
-        encoded.rewind()?;
-        (encoded, BlobEncoding::ZstdChunks)
-    } else {
-        (file, encoding)
-    };
     let length = file.metadata()?.len();
-    let mut response = request.file_body(file, length);
+    let mut response = if encoding == BlobEncoding::Raw {
+        // A raw ZFS replica is compressed on demand for the wire, without
+        // pre-reading or spooling the complete physical blob.
+        request.compressed_file_body(file, length)?
+    } else {
+        request.file_body(file, length)
+    };
+    let encoding = BlobEncoding::ZstdChunks;
     response.headers_mut().insert(
         "x-sccache-cas-encoding",
         http::HeaderValue::from_static(encoding.http_value()),

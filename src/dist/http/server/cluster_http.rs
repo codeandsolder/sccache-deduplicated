@@ -4,6 +4,7 @@
 use std::{
     cell::RefCell,
     collections::BTreeSet,
+    fs::File,
     future::Future,
     io::{self, Read},
     net::{SocketAddr, TcpListener},
@@ -75,6 +76,16 @@ impl Request {
 
     pub(super) fn file_body(&self, reader: impl Read + Send + 'static, length: u64) -> Response {
         file_body(reader, length, Arc::clone(&self.admission))
+    }
+
+    pub(super) fn compressed_file_body(&self, file: File, length: u64) -> Result<Response> {
+        let (encoder, header) = crate::build_runtime::BlobWireEncoder::new(length)?;
+        let body = compressed_reader_body(file, encoder, header, Arc::clone(&self.admission));
+        Ok((
+            [(http::header::CONTENT_TYPE, "application/octet-stream")],
+            body,
+        )
+            .into_response())
     }
 
     pub(super) fn method(&self) -> &str {
@@ -486,6 +497,40 @@ fn reader_body(reader: impl Read + Send + 'static, permit: Arc<OwnedSemaphorePer
     ))
 }
 
+/// Emit the final header immediately and encode at most one frame per demand.
+/// Slow receivers retain file/codec state, never an encoder or I/O thread.
+fn compressed_reader_body(
+    file: File,
+    encoder: crate::build_runtime::BlobWireEncoder,
+    header: [u8; 32],
+    permit: Arc<OwnedSemaphorePermit>,
+) -> Body {
+    let frames = stream::try_unfold(
+        (file, encoder, permit),
+        |(mut file, mut encoder, permit)| async move {
+            let count = encoder.next_frame_size();
+            if count == 0 {
+                return Ok(None);
+            }
+            let (file, bytes, permit) = tokio::task::spawn_blocking(move || {
+                let mut bytes = vec![0; count];
+                file.read_exact(&mut bytes)?;
+                Ok::<_, io::Error>((file, bytes, permit))
+            })
+            .await??;
+            let (frame, encoder, file, permit) = compute(move || {
+                let frame = encoder.frame(&bytes)?;
+                Ok((frame, encoder, file, permit))
+            })
+            .await?;
+            Ok::<_, anyhow::Error>(Some((Bytes::from(frame), (file, encoder, permit))))
+        },
+    );
+    Body::from_stream(
+        stream::once(std::future::ready(Ok(Bytes::copy_from_slice(&header)))).chain(frames),
+    )
+}
+
 pub(super) fn binary(data: Vec<u8>) -> Response {
     (
         [(http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -743,7 +788,7 @@ impl Listener {
     #[cfg(test)]
     pub(super) fn run_until(self, stop: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(crate::util::num_cpus())
+            .worker_threads(2)
             .max_blocking_threads(
                 AdmissionPools::total_capacity(self.threads)
                     .saturating_mul(2)
