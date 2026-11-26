@@ -12,7 +12,7 @@ use redb::{ReadTransaction, ReadableDatabase, ReadableTable};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use super::{
-    super::{BLOB_LAYOUTS, BLOBS, PENDING_DELETIONS},
+    super::{Attachment, BLOB_LAYOUTS, BLOBS, BlobIndex, PENDING_DELETIONS},
     ContentId, NativeStore, Publication, Root, StagedBlob, TREES, TreeId, TreeLease, TreeManifest,
     TreePin, encoding,
 };
@@ -196,6 +196,7 @@ impl Drain {
                 let mut state = queue.state.lock().unwrap_or_else(PoisonError::into_inner);
                 if state.pending.is_empty() {
                     state.running = false;
+                    drop(state);
                     self.armed = false;
                     return;
                 }
@@ -241,7 +242,9 @@ impl Drop for Drain {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 state.running = false;
-                std::mem::take(&mut state.pending)
+                let pending = std::mem::take(&mut state.pending);
+                drop(state);
+                pending
             };
             for request in pending {
                 request.completion.send(Err(anyhow::anyhow!(
@@ -294,30 +297,19 @@ impl PreparedTree {
         let live = read.open_table(BLOBS)?;
         let pending = read.open_table(PENDING_DELETIONS)?;
         let layouts = read.open_table(BLOB_LAYOUTS)?;
+        let index = BlobIndex {
+            live: &live,
+            pending: &pending,
+            layouts: &layouts,
+        };
         let mut complete = true;
         for (&id, &size) in &self.blobs {
-            let present = if let Some(indexed) = live.get(&id.0)? {
-                ensure!(indexed.value() == size, "indexed content length mismatch");
-                store.inner.blob_present(&layouts, id, size)?
-            } else {
-                ensure!(!exists, "indexed tree is missing content");
-                if let Some(indexed) = pending.get(&id.0)? {
-                    ensure!(indexed.value() == size, "pending content length mismatch");
-                    store
-                        .inner
-                        .blob_present(&layouts, id, size)
-                        .unwrap_or(false)
-                } else {
-                    false
-                }
-            };
-            if !present {
-                ensure!(
-                    self.staged.contains_key(&id),
-                    "missing staged tree content {id:?}"
-                );
-                complete = false;
-            }
+            complete &= index.inspect(
+                &store.inner,
+                crate::BlobRef { id, size },
+                exists,
+                self.staged.get(&id),
+            )? == Attachment::Live;
         }
         Ok(exists && complete)
     }

@@ -504,7 +504,7 @@ enum UploadPublication {
     Direct(UploadGuard),
     Backfill {
         manifest: TreeManifest,
-        _reserved: UploadReservation,
+        reserved: UploadReservation,
         guard: BackfillUpload,
     },
 }
@@ -1506,7 +1506,7 @@ impl NativeSessions {
             UploadPublication::Direct(guard) => guard,
             UploadPublication::Backfill {
                 manifest,
-                _reserved,
+                reserved: _reserved,
                 guard,
             } => {
                 return (|| {
@@ -1543,14 +1543,14 @@ impl NativeSessions {
                 }
                 UploadPublication::Backfill {
                     manifest,
-                    _reserved,
+                    reserved,
                     guard,
                 } => {
                     let result = async {
                         let staged = tokio::task::spawn_blocking(move || stager.finish()).await??;
                         let lease = sessions
                             .store()
-                            .publish_tree_pinned_async(manifest, vec![staged], _reserved)
+                            .publish_tree_pinned_async(manifest, vec![staged], reserved)
                             .await?;
                         guard.complete(Arc::new(lease))
                     }
@@ -1866,7 +1866,7 @@ impl NativeSessions {
         }
         let action = *action;
         let tree = *tree;
-        let reservation = self.store().reserve_blobs(blobs)?;
+        let reservation = self.store().reserve_blobs(&blobs)?;
         let absent = reservation.missing().to_vec();
         delivery.requested.extend(absent.iter().map(|blob| blob.id));
         delivery.reservation = Some(reservation);
@@ -2311,7 +2311,7 @@ impl NativeSessions {
                 stager,
                 publication: UploadPublication::Backfill {
                     manifest,
-                    _reserved: reserved,
+                    reserved,
                     guard,
                 },
             })

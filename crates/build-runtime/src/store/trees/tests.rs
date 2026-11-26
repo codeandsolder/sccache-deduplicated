@@ -246,7 +246,7 @@ fn benchmark_cas_metadata_contention() -> Result<()> {
                             let tree = store.lookup_tree(id)?.context("benchmark tree missing")?;
                             let result =
                                 store.lookup(action)?.context("benchmark result missing")?;
-                            let reserved = store.reserve_blobs(blobs.clone())?;
+                            let reserved = store.reserve_blobs(&blobs)?;
                             anyhow::ensure!(
                                 reserved.missing().is_empty(),
                                 "benchmark input missing"
@@ -872,7 +872,7 @@ fn pending_gc_content_is_still_available_until_last_pin_releases() -> Result<()>
     let blob = staged.reference();
     let tree = sample_tree(blob)?;
     let id = store.publish_tree(&tree, vec![staged])?;
-    let reservation = store.reserve_blobs(BTreeMap::from([(blob.id, blob.size)]))?;
+    let reservation = store.reserve_blobs(&BTreeMap::from([(blob.id, blob.size)]))?;
     assert!(reservation.missing().is_empty());
     assert!(matches!(store.evict_tree(id)?, Eviction::Removed { .. }));
     assert!(store.lookup_tree(id)?.is_none());

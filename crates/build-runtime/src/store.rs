@@ -601,6 +601,69 @@ struct Inner {
     result_history_limit: AtomicU64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Attachment {
+    Live,
+    Repair,
+    Resurrect,
+    Insert,
+}
+
+/// One consistent index view, shared by publication preflight and attachment.
+struct BlobIndex<'a, L, P, E> {
+    live: &'a L,
+    pending: &'a P,
+    layouts: &'a E,
+}
+
+impl<L, P, E> BlobIndex<'_, L, P, E>
+where
+    L: ReadableTable<&'static [u8; 32], u64>,
+    P: ReadableTable<&'static [u8; 32], u64>,
+    E: ReadableTable<&'static [u8; 32], u8>,
+{
+    fn inspect(
+        &self,
+        inner: &Inner,
+        blob: BlobRef,
+        existing_root: bool,
+        staged: Option<&StagedBlob>,
+    ) -> Result<Attachment> {
+        let BlobRef { id, size } = blob;
+        let live = self.live.get(&id.0)?.map(|entry| entry.value());
+        if let Some(existing_size) = live {
+            ensure!(existing_size == size, "content length mismatch for {id:?}");
+            if inner.blob_present(self.layouts, id, size)? {
+                return Ok(Attachment::Live);
+            }
+            Self::require_stage(blob, staged)?;
+            return Ok(Attachment::Repair);
+        }
+        ensure!(!existing_root, "indexed result is missing content {id:?}");
+        let pending = self.pending.get(&id.0)?.map(|entry| entry.value());
+        if let Some(old_size) = pending {
+            ensure!(
+                old_size == size,
+                "pending content length mismatch for {id:?}"
+            );
+            if inner.blob_present(self.layouts, id, size).unwrap_or(false) {
+                return Ok(Attachment::Resurrect);
+            }
+        }
+        Self::require_stage(blob, staged)?;
+        Ok(Attachment::Insert)
+    }
+
+    fn require_stage(blob: BlobRef, staged: Option<&StagedBlob>) -> Result<()> {
+        let staged = staged.with_context(|| format!("missing staged content {:?}", blob.id))?;
+        ensure!(
+            staged.reference == blob,
+            "staged content reference mismatch"
+        );
+        Ok(())
+    }
+}
+
 /// Files and staging accounting remain owned by a transaction until its
 /// durable index commit. Multiple roots and original archives share this set.
 #[derive(Default)]
@@ -1361,7 +1424,7 @@ impl NativeStore {
     /// # Errors
     /// Returns an error for malformed manifests, inconsistent metadata or I/O.
     pub fn reserve_upload(&self, manifest: &ResultManifest) -> Result<UploadReservation> {
-        self.reserve_blobs(manifest.blobs()?)
+        self.reserve_blobs(&manifest.blobs()?)
     }
 
     /// Pin the existing portion of an exact input closure, regardless of which
@@ -1369,17 +1432,17 @@ impl NativeStore {
     ///
     /// # Errors
     /// Returns an error for inconsistent lengths or storage failure.
-    pub fn reserve_blobs(&self, blobs: BTreeMap<ContentId, u64>) -> Result<UploadReservation> {
+    pub fn reserve_blobs(&self, blobs: &BTreeMap<ContentId, u64>) -> Result<UploadReservation> {
         // Live references can be pinned under the same lock used by GC's
         // candidate selection. Only pending-only references require exclusion
         // of a collector that may already have selected their files.
-        let mut reservation = match self.reserve_indexed_blobs(&blobs, false)? {
-            Some(reservation) => reservation,
-            None => {
-                let _mutation = self.inner.lock_mutations()?;
-                self.reserve_indexed_blobs(&blobs, true)?
-                    .context("pending reservation unexpectedly declined")?
-            }
+        let live = self.reserve_indexed_blobs(blobs, false)?;
+        let mut reservation = if let Some(reservation) = live {
+            reservation
+        } else {
+            let _mutation = self.inner.lock_mutations()?;
+            self.reserve_indexed_blobs(blobs, true)?
+                .context("pending reservation unexpectedly declined")?
         };
         let read = self.inner.db.begin_read()?;
         let layouts = read.open_table(BLOB_LAYOUTS)?;
@@ -1416,15 +1479,15 @@ impl NativeStore {
         let mut missing = Vec::new();
         let mut reserved = Vec::new();
         for (&id, &size) in blobs {
-            let indexed = if let Some(entry) = live.get(&id.0)? {
-                Some(entry.value())
-            } else if let Some(entry) = pending.get(&id.0)? {
-                if !allow_pending {
+            let live_size = live.get(&id.0)?.map(|entry| entry.value());
+            let indexed = if live_size.is_some() {
+                live_size
+            } else {
+                let pending_size = pending.get(&id.0)?.map(|entry| entry.value());
+                if pending_size.is_some() && !allow_pending {
                     return Ok(None);
                 }
-                Some(entry.value())
-            } else {
-                None
+                pending_size
             };
             if let Some(indexed_size) = indexed {
                 ensure!(indexed_size == size, "inconsistent indexed content length");
@@ -1470,7 +1533,7 @@ impl NativeStore {
             let _ = publications.borrow_and_update();
             let count = blobs.len();
             let store = self.clone();
-            let ready = tokio::task::spawn_blocking(move || store.reserve_blobs(blobs)).await??;
+            let ready = tokio::task::spawn_blocking(move || store.reserve_blobs(&blobs)).await??;
             blobs = ready
                 .missing()
                 .iter()
@@ -1698,69 +1761,61 @@ impl NativeStore {
         let mut blob_roots = write.open_multimap_table(BLOB_ROOTS)?;
         let mut pending = write.open_table(PENDING_DELETIONS)?;
         let mut accounting = write.open_table(ACCOUNTING)?;
-        let mut resurrected = Vec::new();
-        let mut repair = BTreeSet::new();
-        for (&id, &size) in blobs {
-            if let Some(existing_size) = blob_table.get(&id.0)?.map(|entry| entry.value()) {
-                ensure!(existing_size == size, "content length mismatch for {id:?}");
-                if !self.inner.blob_present(&layouts, id, size)? {
-                    let blob = staged.get(&id).context("missing staged repair content")?;
-                    ensure!(blob.reference.size == size, "staged repair length mismatch");
-                    repair.insert(id);
-                }
-            } else {
-                ensure!(!existing_result, "indexed result is missing content {id:?}");
-                if let Some(old_size) = pending.get(&id.0)?.map(|entry| entry.value()) {
-                    ensure!(
-                        old_size == size,
-                        "pending content length mismatch for {id:?}"
-                    );
-                    if self.inner.blob_present(&layouts, id, size).unwrap_or(false) {
-                        resurrected.push(id);
-                        continue;
-                    }
-                }
-                let blob = staged
-                    .get(&id)
-                    .with_context(|| format!("missing staged content {id:?}"))?;
-                ensure!(
-                    blob.reference.size == size,
-                    "staged length mismatch for {id:?}"
-                );
-            }
-        }
+        let plans = {
+            let index = BlobIndex {
+                live: &blob_table,
+                pending: &pending,
+                layouts: &layouts,
+            };
+            blobs
+                .iter()
+                .map(|(&id, &size)| {
+                    let disposition = index.inspect(
+                        &self.inner,
+                        BlobRef { id, size },
+                        existing_result,
+                        staged.get(&id),
+                    )?;
+                    Ok((id, size, disposition))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         let mut added = 0_u64;
         let mut pending_removed = 0_u64;
-        for (&id, &size) in blobs {
-            if repair.contains(&id) {
-                let blob = staged.remove(&id).context("validated repair disappeared")?;
-                layouts.insert(&id.0, blob.encoding as u8)?;
-                publication.reservations.push(
-                    self.inner
-                        .install_blob(blob, &mut publication.directories)?,
-                );
-            } else if blob_table.get(&id.0)?.is_none() {
-                if resurrected.binary_search(&id).is_err() {
-                    let blob = staged
-                        .remove(&id)
-                        .context("validated staged content disappeared")?;
-                    let encoding = blob.encoding;
+        for (id, size, disposition) in plans {
+            match disposition {
+                Attachment::Live => {}
+                Attachment::Repair => {
+                    let blob = staged.remove(&id).context("validated repair disappeared")?;
+                    layouts.insert(&id.0, blob.encoding as u8)?;
                     publication.reservations.push(
                         self.inner
                             .install_blob(blob, &mut publication.directories)?,
                     );
-                    let previous_layout = layouts.insert(&id.0, encoding as u8)?;
-                    ensure!(
-                        previous_layout.is_none() || pending.get(&id.0)?.is_some(),
-                        "physical encoding already indexed for new CAS content"
-                    );
                 }
-                blob_table.insert(&id.0, size)?;
-                added = added.checked_add(size).context("store size overflow")?;
-                if let Some(old) = pending.remove(&id.0)? {
-                    pending_removed = pending_removed
-                        .checked_add(old.value())
-                        .context("pending GC size overflow")?;
+                Attachment::Resurrect | Attachment::Insert => {
+                    if disposition == Attachment::Insert {
+                        let blob = staged
+                            .remove(&id)
+                            .context("validated staged content disappeared")?;
+                        let encoding = blob.encoding;
+                        publication.reservations.push(
+                            self.inner
+                                .install_blob(blob, &mut publication.directories)?,
+                        );
+                        let previous_layout = layouts.insert(&id.0, encoding as u8)?;
+                        ensure!(
+                            previous_layout.is_none() || pending.get(&id.0)?.is_some(),
+                            "physical encoding already indexed for new CAS content"
+                        );
+                    }
+                    blob_table.insert(&id.0, size)?;
+                    added = added.checked_add(size).context("store size overflow")?;
+                    if let Some(old) = pending.remove(&id.0)? {
+                        pending_removed = pending_removed
+                            .checked_add(old.value())
+                            .context("pending GC size overflow")?;
+                    }
                 }
             }
             if !existing_result {

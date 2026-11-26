@@ -263,7 +263,7 @@ impl NativeStore {
     /// Returns an error for an invalid manifest or storage failure.
     pub fn reserve_tree_upload(&self, manifest: &TreeManifest) -> Result<UploadReservation> {
         manifest.validate()?;
-        self.reserve_blobs(manifest.blobs()?)
+        self.reserve_blobs(&manifest.blobs()?)
     }
 
     /// Retain one immutable tree root using the shared file-content index.

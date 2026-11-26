@@ -847,7 +847,7 @@ fn live_reservations_do_not_wait_for_publication_but_pending_content_is_protecte
         let (send, receive) = mpsc::channel();
         let store = &store;
         let references = references.clone();
-        let worker = scope.spawn(move || send.send(store.reserve_blobs(references)));
+        let worker = scope.spawn(move || send.send(store.reserve_blobs(&references)));
         let observed = receive.recv_timeout(Duration::from_secs(2));
         drop(mutation);
         worker
@@ -864,7 +864,7 @@ fn live_reservations_do_not_wait_for_publication_but_pending_content_is_protecte
     let pending = thread::scope(|scope| -> Result<_> {
         let (send, receive) = mpsc::channel();
         let store = &store;
-        let worker = scope.spawn(move || send.send(store.reserve_blobs(references)));
+        let worker = scope.spawn(move || send.send(store.reserve_blobs(&references)));
         assert!(matches!(
             receive.recv_timeout(Duration::from_millis(50)),
             Err(mpsc::RecvTimeoutError::Timeout)
