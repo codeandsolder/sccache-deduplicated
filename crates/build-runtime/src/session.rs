@@ -547,6 +547,36 @@ impl NativeUpload {
         self.classify(result)
     }
 
+    /// Submit a verified physical batch to the completion driver.
+    ///
+    /// # Errors
+    /// Returns an error for storage failure or a failed codec.
+    #[cfg(feature = "async-io")]
+    pub async fn flush_pending_async(self) -> Result<Self> {
+        crate::disk::run(move || async move {
+            let mut upload = self;
+            let result = upload.stager.flush_pending_io().await;
+            upload.classify(result)?;
+            Ok(upload)
+        })
+        .await
+    }
+
+    /// Flush and synchronize a completely verified staging file.
+    ///
+    /// # Errors
+    /// Returns an error for storage failure or an unfinished codec.
+    #[cfg(feature = "async-io")]
+    pub async fn finish_file_async(self) -> Result<Self> {
+        crate::disk::run(move || async move {
+            let mut upload = self;
+            let result = upload.stager.finalize_io().await;
+            upload.classify(result)?;
+            Ok(upload)
+        })
+        .await
+    }
+
     /// Complete codec validation and produce any final physical bytes.
     ///
     /// # Errors

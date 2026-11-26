@@ -46,6 +46,11 @@ pub use blob_codec::{
     encode_raw as encode_native_raw_blob, transfer as transfer_native_blob,
 };
 
+#[cfg(all(unix, feature = "async-io"))]
+mod disk;
+#[cfg(all(unix, feature = "async-io"))]
+pub use disk::{initialize_async_disk, read_file_at};
+
 #[cfg(all(unix, feature = "store"))]
 mod coordinator;
 #[cfg(all(unix, feature = "store"))]

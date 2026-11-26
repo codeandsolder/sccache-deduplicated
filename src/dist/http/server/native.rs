@@ -444,7 +444,7 @@ pub(super) fn physical_blob_response(
         // pre-reading or spooling the complete physical blob.
         request.compressed_file_body(file, length)?
     } else {
-        request.file_body(file, length)
+        request.file_body(file, length, None)
     };
     let encoding = BlobEncoding::ZstdChunks;
     response.headers_mut().insert(
@@ -660,11 +660,7 @@ async fn upload_response(
             } else {
                 upload.encode_pending(&buffer[..count])?;
             }
-            upload = tokio::task::spawn_blocking(move || {
-                upload.flush_pending()?;
-                Ok::<_, anyhow::Error>(upload)
-            })
-            .await??;
+            upload = upload.flush_pending_async().await?;
             if count < buffer.len() {
                 break;
             }
@@ -678,6 +674,7 @@ async fn upload_response(
         } else {
             upload.finish_encoding()?;
         }
+        upload = upload.finish_file_async().await?;
         tokio::task::spawn_blocking(move || sessions.finish_upload(upload)).await??;
         encode(&(), limit)
     }
@@ -1049,8 +1046,8 @@ fn dispatch(
             let logical =
                 crate::build_runtime::BlobReader::open(file.try_clone()?, encoding)?.len();
             let size = file.metadata()?.len();
-            let reader = network.meter(Direction::Send, peer, file, logical, Some(size));
-            let mut response = request.file_body(reader, size);
+            let meter = network.transfer(Direction::Send, peer, logical, Some(size));
+            let mut response = request.file_body(file, size, Some(meter));
             response.headers_mut().insert(
                 "x-sccache-cas-encoding",
                 http::HeaderValue::from_static(encoding.http_value()),

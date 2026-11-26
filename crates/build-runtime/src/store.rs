@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::{FileExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
@@ -233,12 +233,35 @@ pub struct StagedBlob {
 /// can move it between short blocking-pool operations.
 pub(crate) struct PhysicalStager {
     store: NativeStore,
-    file: NamedTempFile,
+    file: Arc<File>,
+    path: TempPath,
+    written: u64,
+    synced: bool,
     budget: StageBudget,
     ingest: Option<blob_codec::BlobIngest>,
     encoded: Vec<u8>,
     expected: BlobRef,
     failed: bool,
+}
+
+struct StagingWriter<'a> {
+    file: &'a File,
+    offset: &'a mut u64,
+}
+
+impl Write for StagingWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let count = self.file.write_at(bytes, *self.offset)?;
+        *self.offset = self
+            .offset
+            .checked_add(count as u64)
+            .ok_or_else(|| io::Error::other("CAS file offset overflow"))?;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl PhysicalStager {
@@ -252,7 +275,13 @@ impl PhysicalStager {
             .ingest
             .as_mut()
             .context("native staging codec finalized")?
-            .feed(self.file.as_file_mut(), bytes);
+            .feed(
+                &mut StagingWriter {
+                    file: &self.file,
+                    offset: &mut self.written,
+                },
+                bytes,
+            );
         self.failed = result.is_err();
         result
     }
@@ -282,10 +311,45 @@ impl PhysicalStager {
 
     pub(crate) fn flush_pending(&mut self) -> Result<()> {
         ensure!(!self.failed, "native staging already failed");
-        let result = self.file.as_file_mut().write_all(&self.encoded);
+        let result = StagingWriter {
+            file: &self.file,
+            offset: &mut self.written,
+        }
+        .write_all(&self.encoded);
         self.failed = result.is_err();
         self.encoded.clear();
         result?;
+        Ok(())
+    }
+
+    #[cfg(feature = "async-io")]
+    pub(crate) async fn flush_pending_io(&mut self) -> Result<()> {
+        ensure!(!self.failed, "native staging already failed");
+        let buffer = std::mem::take(&mut self.encoded);
+        let end = self
+            .written
+            .checked_add(buffer.len() as u64)
+            .context("CAS file offset overflow")?;
+        let result = crate::disk::write_all(Arc::clone(&self.file), self.written, buffer).await;
+        self.failed = result.is_err();
+        self.encoded = result?;
+        self.encoded.clear();
+        self.written = end;
+        Ok(())
+    }
+
+    #[cfg(feature = "async-io")]
+    pub(crate) async fn finalize_io(&mut self) -> Result<()> {
+        ensure!(self.ingest.is_none(), "native staging codec not finalized");
+        self.flush_pending_io().await?;
+        let file = Arc::clone(&self.file);
+        compio_runtime::spawn_blocking(move || {
+            file.set_permissions(fs::Permissions::from_mode(0o400))
+        })
+        .await
+        .map_err(|error| anyhow!("staging permission task failed: {error:?}"))??;
+        crate::disk::sync_all(Arc::clone(&self.file)).await?;
+        self.synced = true;
         Ok(())
     }
 
@@ -318,17 +382,21 @@ impl PhysicalStager {
 
     pub(crate) fn finish(mut self) -> Result<StagedBlob> {
         ensure!(!self.failed, "native staging already failed");
-        self.flush_pending()?;
-        if let Some(ingest) = self.ingest.take() {
-            ingest.finish(self.file.as_file_mut())?;
+        if !self.synced {
+            self.flush_pending()?;
+            if let Some(ingest) = self.ingest.take() {
+                ingest.finish(&mut StagingWriter {
+                    file: &self.file,
+                    offset: &mut self.written,
+                })?;
+            }
+            self.file
+                .set_permissions(fs::Permissions::from_mode(0o400))?;
+            self.file.sync_all()?;
         }
-        self.file
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(0o400))?;
-        self.file.as_file().sync_all()?;
-        let metadata = self.file.as_file().metadata()?;
+        let metadata = self.file.metadata()?;
         Ok(StagedBlob {
-            path: self.file.into_temp_path(),
+            path: self.path,
             metadata,
             reference: self.expected,
             encoding: self.store.physical_encoding,
@@ -1126,16 +1194,23 @@ impl NativeStore {
     ) -> Result<PhysicalStager> {
         let mut budget = space::StageBudget::new(self);
         budget.grow_to(expected.size)?;
-        let mut file = NamedTempFile::new_in(self.inner.root.join("staging"))?;
+        let (file, path) = NamedTempFile::new_in(self.inner.root.join("staging"))?.into_parts();
+        let mut written = 0;
         let ingest = blob_codec::BlobIngest::new(
-            file.as_file_mut(),
+            &mut StagingWriter {
+                file: &file,
+                offset: &mut written,
+            },
             expected,
             encoding,
             self.physical_encoding,
         )?;
         Ok(PhysicalStager {
             store: self.clone(),
-            file,
+            file: Arc::new(file),
+            path,
+            written,
+            synced: false,
             budget,
             ingest: Some(ingest),
             encoded: Vec::new(),

@@ -480,6 +480,137 @@ fn verify_peer_delivery(
 }
 
 #[test]
+fn stalled_bulk_uploads_leave_lease_and_dispatch_lanes_available() -> Result<()> {
+    use crate::build_runtime::{TreeEntry, TreePath};
+    use bytes::Bytes;
+    use futures::{StreamExt, stream};
+
+    with_native_service(|endpoint, _, network, _| {
+        let client = make_client(endpoint, "client-token")?;
+        let worker = make_client(endpoint, "worker-token")?.for_worker(JobId(42));
+        let metadata = TreeMetadata {
+            mode: 0o755,
+            modified: TreeTimestamp {
+                seconds: 1,
+                nanoseconds: 0,
+            },
+        };
+        let root = TreeManifest {
+            root: metadata,
+            entries: BTreeMap::new(),
+        };
+        let offer = client.offer_tree(&root)?;
+        client.commit_tree(offer.ticket)?;
+        let spec = action(&root)?;
+        let NativeAdmission::Compile { ticket } = client.admit(
+            &spec,
+            crate::build_runtime::ActionMode::Reuse,
+            &BTreeMap::new(),
+        )?
+        else {
+            anyhow::bail!("expected compilation");
+        };
+
+        let (http, base) = endpoint.raw(&endpoint.client)?;
+        let upload_url = base.join("/api/v5/native/client/upload")?;
+        let runtime = crate::http_client::io_runtime()?;
+        let mut uploads = Vec::new();
+        const PAYLOAD: usize = 256 * 1024;
+        for byte in 0_u8..4 {
+            let bytes = vec![byte; PAYLOAD];
+            let blob = BlobRef {
+                id: ContentId::of(&bytes),
+                size: PAYLOAD as u64,
+            };
+            let tree = TreeManifest {
+                root: metadata,
+                entries: BTreeMap::from([(
+                    TreePath::new(b"input".to_vec())?,
+                    TreeEntry::File { blob, metadata },
+                )]),
+            };
+            let offer = client.offer_tree(&tree)?;
+            assert_eq!(offer.missing, vec![blob]);
+            let header = codec().serialize(&UploadHeader {
+                ticket: offer.ticket,
+                blob,
+                encoding: BlobEncoding::Raw as u8,
+            })?;
+            let (resume, paused) = tokio::sync::oneshot::channel::<()>();
+            let stream = stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(header)) })
+                .chain(stream::once(async move {
+                    paused.await.map_err(std::io::Error::other)?;
+                    Ok(Bytes::from(bytes))
+                }));
+            let request = http
+                .post(upload_url.as_str())
+                .header("Content-Type", "application/octet-stream")
+                .body(wreq::Body::wrap_stream(stream))
+                .timeout(Duration::from_secs(20));
+            uploads.push((
+                resume,
+                runtime.spawn(async move { request.send().await }),
+                offer.ticket,
+                tree.id()?,
+            ));
+        }
+
+        // The transfer meters are installed only after the authenticated
+        // upload header has been parsed and its staging reservation acquired.
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let remaining: u64 = network
+                        .snapshot()
+                        .receive
+                        .peers
+                        .values()
+                        .map(|peer| peer.active_remaining_bytes)
+                        .sum();
+                    if remaining >= 4 * PAYLOAD as u64 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+        })?;
+
+        let rejected = runtime.block_on(
+            http.post(upload_url.as_str())
+                .header("Content-Type", "application/octet-stream")
+                .body(Vec::new())
+                .timeout(Duration::from_secs(3))
+                .send(),
+        )?;
+        assert_eq!(rejected.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(client.status(ticket)?, NativeStatus::Compiling);
+        client.renew(ticket)?;
+        assert!(matches!(
+            client.schedule(ticket, spec)?,
+            ScheduleReply::Assigned(_)
+        ));
+        worker.renew(ticket)?;
+
+        // Resume each valid upload, and verify all four reservations can publish.
+        let tasks = uploads
+            .into_iter()
+            .map(|(resume, task, ticket, id)| {
+                resume
+                    .send(())
+                    .map_err(|()| anyhow::anyhow!("upload stopped before resume"))?;
+                Ok((task, ticket, id))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (task, ticket, id) in tasks {
+            runtime.block_on(task)??.error_for_status()?;
+            assert_eq!(client.commit_tree(ticket)?, id);
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
     with_native_service(|url, sessions, network, observations| {
         let client = make_client(url, "client-token")?;

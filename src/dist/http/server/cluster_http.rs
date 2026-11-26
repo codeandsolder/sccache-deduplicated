@@ -30,6 +30,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::io::{StreamReader, SyncIoBridge};
 
 use crate::{
+    build_runtime::TransferMeter,
     dist::cluster_routes::{
         Transfer,
         interface::{self, TrackedReader},
@@ -74,8 +75,13 @@ impl Request {
         }
     }
 
-    pub(super) fn file_body(&self, reader: impl Read + Send + 'static, length: u64) -> Response {
-        file_body(reader, length, Arc::clone(&self.admission))
+    pub(super) fn file_body(
+        &self,
+        file: File,
+        length: u64,
+        meter: Option<TransferMeter>,
+    ) -> Response {
+        file_body(file, length, meter, Arc::clone(&self.admission))
     }
 
     pub(super) fn compressed_file_body(&self, file: File, length: u64) -> Result<Response> {
@@ -473,26 +479,32 @@ pub(super) fn routes<S: Send + Sync + 'static>(router: Router<Arc<S>>, state: S)
 /// blocking-pool thread; cancellation can leave at most one read in flight.
 const RESPONSE_CHUNK: usize = 128 * 1024;
 
-fn reader_body(reader: impl Read + Send + 'static, permit: Arc<OwnedSemaphorePermit>) -> Body {
+fn reader_body(
+    file: File,
+    length: u64,
+    meter: Option<TransferMeter>,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> Body {
     Body::from_stream(stream::try_unfold(
-        (reader, permit),
-        |(mut reader, permit)| async move {
-            tokio::task::spawn_blocking(move || {
-                let mut buffer = vec![0; RESPONSE_CHUNK];
-                loop {
-                    match reader.read(&mut buffer) {
-                        Ok(0) => return Ok(None),
-                        Ok(size) => {
-                            buffer.truncate(size);
-                            return Ok(Some((Bytes::from(buffer), (reader, permit))));
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        Err(error) => return Err(error),
-                    }
+        (Arc::new(file), 0_u64, meter, permit),
+        move |(file, offset, mut meter, permit)| async move {
+            let count = (length - offset).min(RESPONSE_CHUNK as u64) as usize;
+            if count == 0 {
+                if let Some(meter) = &mut meter {
+                    meter.eof();
                 }
-            })
-            .await
-            .map_err(io::Error::other)?
+                return Ok(None);
+            }
+            let (bytes, permit) =
+                crate::build_runtime::read_file_at(Arc::clone(&file), offset, count, permit)
+                    .await?;
+            if let Some(meter) = &mut meter {
+                meter.observe(count as u64);
+            }
+            Ok::<_, anyhow::Error>(Some((
+                Bytes::from(bytes),
+                (file, offset + count as u64, meter, permit),
+            )))
         },
     ))
 }
@@ -506,24 +518,24 @@ fn compressed_reader_body(
     permit: Arc<OwnedSemaphorePermit>,
 ) -> Body {
     let frames = stream::try_unfold(
-        (file, encoder, permit),
-        |(mut file, mut encoder, permit)| async move {
+        (Arc::new(file), 0_u64, encoder, permit),
+        |(file, offset, mut encoder, permit)| async move {
             let count = encoder.next_frame_size();
             if count == 0 {
                 return Ok(None);
             }
-            let (file, bytes, permit) = tokio::task::spawn_blocking(move || {
-                let mut bytes = vec![0; count];
-                file.read_exact(&mut bytes)?;
-                Ok::<_, io::Error>((file, bytes, permit))
-            })
-            .await??;
+            let (bytes, permit) =
+                crate::build_runtime::read_file_at(Arc::clone(&file), offset, count, permit)
+                    .await?;
             let (frame, encoder, file, permit) = compute(move || {
                 let frame = encoder.frame(&bytes)?;
                 Ok((frame, encoder, file, permit))
             })
             .await?;
-            Ok::<_, anyhow::Error>(Some((Bytes::from(frame), (file, encoder, permit))))
+            Ok::<_, anyhow::Error>(Some((
+                Bytes::from(frame),
+                (file, offset + count as u64, encoder, permit),
+            )))
         },
     );
     Body::from_stream(
@@ -540,8 +552,9 @@ pub(super) fn binary(data: Vec<u8>) -> Response {
 }
 
 fn file_body(
-    reader: impl Read + Send + 'static,
+    file: File,
     length: u64,
+    meter: Option<TransferMeter>,
     permit: Arc<OwnedSemaphorePermit>,
 ) -> Response {
     (
@@ -552,7 +565,7 @@ fn file_body(
             ),
             (http::header::CONTENT_LENGTH, length.to_string()),
         ],
-        reader_body(reader, permit),
+        reader_body(file, length, meter, permit),
     )
         .into_response()
 }
@@ -818,6 +831,7 @@ impl Listener {
     }
 
     async fn run_async(self) -> Result<()> {
+        crate::build_runtime::initialize_async_disk()?;
         let Self {
             socket,
             tls,
@@ -939,7 +953,7 @@ mod revocation_tests {
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::io::Write;
 
     #[tokio::test(start_paused = true)]
     async fn unfinished_request_body_releases_reader_at_idle_deadline() -> Result<()> {
@@ -1015,27 +1029,6 @@ mod streaming_tests {
         Ok(())
     }
 
-    struct InfiniteReader {
-        bytes: Arc<AtomicUsize>,
-        stopped: Option<tokio::sync::oneshot::Sender<()>>,
-    }
-
-    impl Read for InfiniteReader {
-        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            buffer.fill(0x5a);
-            self.bytes.fetch_add(buffer.len(), Ordering::Relaxed);
-            Ok(buffer.len())
-        }
-    }
-
-    impl Drop for InfiniteReader {
-        fn drop(&mut self) {
-            if let Some(stopped) = self.stopped.take() {
-                let _ = stopped.send(());
-            }
-        }
-    }
-
     #[test]
     fn socket_budget_is_independent_of_request_capacity() {
         assert_eq!(connection_capacity(2_048), 1_024);
@@ -1073,51 +1066,6 @@ mod streaming_tests {
         Ok(())
     }
 
-    struct PausedRead {
-        started: Option<tokio::sync::oneshot::Sender<()>>,
-        resume: std::sync::mpsc::Receiver<()>,
-    }
-
-    impl Read for PausedRead {
-        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            if let Some(started) = self.started.take() {
-                let _ = started.send(());
-            }
-            self.resume
-                .recv_timeout(Duration::from_secs(5))
-                .map_err(io::Error::other)?;
-            Ok(0)
-        }
-    }
-
-    #[tokio::test]
-    async fn cancelled_read_retains_admission_until_blocking_io_finishes() -> Result<()> {
-        let pools = AdmissionPools::new(1);
-        let (started, reading) = tokio::sync::oneshot::channel();
-        let (resume, paused) = std::sync::mpsc::channel();
-        let body = reader_body(
-            PausedRead {
-                started: Some(started),
-                resume: paused,
-            },
-            pools.acquire(AdmissionClass::Bulk).context("bulk permit")?,
-        );
-        let task = tokio::spawn(async move { body.into_data_stream().next().await });
-        tokio::time::timeout(Duration::from_secs(5), reading).await??;
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert!(pools.acquire(AdmissionClass::Bulk).is_none());
-        assert!(pools.acquire(AdmissionClass::Control).is_some());
-        resume.send(())?;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while pools.acquire(AdmissionClass::Bulk).is_none() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await?;
-        Ok(())
-    }
-
     #[test]
     fn stalled_response_does_not_occupy_blocking_pool() -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1125,32 +1073,30 @@ mod streaming_tests {
             .enable_all()
             .build()?;
         runtime.block_on(async {
-            let bytes = Arc::new(AtomicUsize::new(0));
-            let (stopped, done) = tokio::sync::oneshot::channel();
-            let permit = AdmissionPools::new(1)
-                .acquire(AdmissionClass::Bulk)
-                .context("test permit")?;
-            let mut body = reader_body(
-                InfiniteReader {
-                    bytes: Arc::clone(&bytes),
-                    stopped: Some(stopped),
-                },
-                permit,
-            )
-            .into_data_stream();
-            assert_eq!(bytes.load(Ordering::Relaxed), 0);
+            let file = tempfile::tempfile()?;
+            let length = (2 * RESPONSE_CHUNK) as u64;
+            file.set_len(length)?;
+            let truncate = file.try_clone()?;
+            let pools = AdmissionPools::new(1);
+            let permit = pools.acquire(AdmissionClass::Bulk).context("test permit")?;
+            let mut body = reader_body(file, length, None, permit).into_data_stream();
             let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
                 .await?
                 .context("missing response chunk")??;
             assert_eq!(chunk.len(), RESPONSE_CHUNK);
-            // The only blocking thread must remain available while the peer
-            // consumes nothing further.
             tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| ()))
                 .await??;
-            assert_eq!(bytes.load(Ordering::Relaxed), RESPONSE_CHUNK);
+            assert!(pools.acquire(AdmissionClass::Bulk).is_none());
+            // No read-ahead: truncating after the first demand must make the next read fail.
+            truncate.set_len(RESPONSE_CHUNK as u64)?;
+            assert!(
+                body.next()
+                    .await
+                    .context("missing truncated chunk")?
+                    .is_err()
+            );
             drop(body);
-            tokio::time::timeout(Duration::from_secs(5), done).await??;
-            assert_eq!(bytes.load(Ordering::Relaxed), RESPONSE_CHUNK);
+            assert!(pools.acquire(AdmissionClass::Bulk).is_some());
             Ok(())
         })
     }
@@ -1158,9 +1104,13 @@ mod streaming_tests {
     #[tokio::test]
     async fn demand_driven_response_preserves_exact_bytes_and_eof() -> Result<()> {
         let expected = vec![0xa5; RESPONSE_CHUNK + 17];
+        let mut file = tempfile::tempfile()?;
+        file.write_all(&expected)?;
         let actual = axum::body::to_bytes(
             reader_body(
-                io::Cursor::new(expected.clone()),
+                file,
+                expected.len() as u64,
+                None,
                 AdmissionPools::new(1)
                     .acquire(AdmissionClass::Bulk)
                     .context("test permit")?,
