@@ -24,6 +24,8 @@ use bincode::Options;
 use http::StatusCode;
 use sccache_cluster_identity::{ClusterListener, Role, SchedulerEnrollment};
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::io::AsyncReadExt;
+use tokio_util::io::StreamReader;
 
 use super::{SchedulerRequester, role_error};
 use crate::{
@@ -245,6 +247,8 @@ where
     let retained_sessions = Arc::clone(&sessions);
     let schedule_sessions = Arc::clone(&sessions);
     let schedule_network = Arc::clone(&network);
+    let upload_sessions = Arc::clone(&sessions);
+    let upload_network = Arc::clone(&network);
     let allocate = Arc::new(allocate);
     let server = Listener::from_socket(
         socket,
@@ -273,6 +277,15 @@ where
                     Arc::clone(&schedule_sessions),
                     Arc::clone(&schedule_network),
                     Arc::clone(&allocate),
+                    metadata_limit,
+                )
+            },
+            move |request, role| {
+                upload_response(
+                    request,
+                    role,
+                    Arc::clone(&upload_sessions),
+                    Arc::clone(&upload_network),
                     metadata_limit,
                 )
             },
@@ -322,12 +335,16 @@ fn native_admission_class((_, operation): &(String, String)) -> AdmissionClass {
     }
 }
 
-fn native_router<F, A, Fut>(handler: F, schedule: A) -> Router
+fn native_router<F, A, Fut, U, UFut>(handler: F, schedule: A, upload: U) -> Router
 where
     F: Fn(&Request, &str, &str) -> Response + Send + Sync + 'static,
     A: Fn(Request) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Response> + Send + 'static,
+    U: Fn(Request, &'static str) -> UFut + Send + Sync + 'static,
+    UFut: Future<Output = Response> + Send + 'static,
 {
+    let upload = Arc::new(upload);
+    let client_upload = Arc::clone(&upload);
     routes(
         Router::new()
             .route(
@@ -336,6 +353,22 @@ where
                     MethodFilter::POST,
                     AdmissionClass::Dispatch,
                     move |_: Arc<F>, request| schedule(request),
+                ),
+            )
+            .route(
+                "/api/v5/native/client/upload",
+                async_route(
+                    MethodFilter::POST,
+                    AdmissionClass::Bulk,
+                    move |_: Arc<F>, request| client_upload(request, "client"),
+                ),
+            )
+            .route(
+                "/api/v5/native/worker/upload",
+                async_route(
+                    MethodFilter::POST,
+                    AdmissionClass::Bulk,
+                    move |_: Arc<F>, request| upload(request, "worker"),
                 ),
             )
             .route(
@@ -492,35 +525,96 @@ fn respond(
     services: NativeServices<'_>,
     limit: usize,
 ) -> Response {
+    let publisher = match request_publisher(request, role) {
+        Ok(publisher) => publisher,
+        Err(response) => return response,
+    };
+    native_response(
+        operation,
+        dispatch(request, services, publisher, operation, limit),
+    )
+}
+
+fn request_publisher(request: &Request, role: &str) -> std::result::Result<Publisher, Response> {
     if request.header("Content-Type") != Some("application/octet-stream") {
-        return StatusCode::BAD_REQUEST.into_response();
+        return Err(StatusCode::BAD_REQUEST.into_response());
     }
-    let publisher = match role {
+    Ok(match role {
         "client" => {
             if let Some(response) = role_error(request, Role::Client) {
-                return response;
+                return Err(response);
             }
             Publisher::Client
         }
         "worker" => {
             if let Some(response) = role_error(request, Role::Worker) {
-                return response;
+                return Err(response);
             }
             let server = request.id();
             let Some(job) = request
                 .header("X-Sccache-Native-Job")
                 .and_then(|job| job.parse::<u64>().ok())
             else {
-                return StatusCode::BAD_REQUEST.into_response();
+                return Err(StatusCode::BAD_REQUEST.into_response());
             };
             Publisher::Worker { peer: server, job }
         }
-        _ => return StatusCode::NOT_FOUND.into_response(),
+        _ => return Err(StatusCode::NOT_FOUND.into_response()),
+    })
+}
+
+async fn upload_response(
+    mut request: Request,
+    role: &str,
+    sessions: Arc<NativeSessions>,
+    network: Arc<NetworkMeter>,
+    limit: usize,
+) -> Response {
+    let publisher = match request_publisher(&request, role) {
+        Ok(publisher) => publisher,
+        Err(response) => return response,
     };
-    native_response(
-        operation,
-        dispatch(request, services, publisher, operation, limit),
-    )
+    let peer = match publisher {
+        Publisher::Client => Peer::Client(request.id()),
+        Publisher::Worker { peer, .. } => Peer::Worker(peer),
+    }
+    .on_path(request.path());
+    let result = async {
+        let stream = request
+            .body_stream()
+            .context("missing native upload body")?;
+        let mut input = StreamReader::new(Box::pin(stream));
+        let mut header = [0; 73];
+        input.read_exact(&mut header).await?;
+        let header: UploadHeader = codec().with_limit(73).deserialize(&header)?;
+        let encoding = BlobEncoding::try_from(header.encoding)?;
+        let mut upload = {
+            let sessions = Arc::clone(&sessions);
+            tokio::task::spawn_blocking(move || {
+                sessions.prepare_upload(header.ticket, publisher, header.blob, encoding)
+            })
+            .await??
+        };
+        let mut meter = network.transfer(Direction::Receive, peer, header.blob.size, None);
+        let mut buffer = vec![0; 128 * 1024];
+        loop {
+            let count = input.read(&mut buffer).await?;
+            if count == 0 {
+                meter.eof();
+                break;
+            }
+            meter.observe(count as u64);
+            (upload, buffer) = tokio::task::spawn_blocking(move || {
+                upload.feed(&buffer[..count])?;
+                Ok::<_, anyhow::Error>((upload, buffer))
+            })
+            .await??;
+        }
+        tokio::task::spawn_blocking(move || sessions.finish_upload(upload)).await??;
+        encode(&(), limit)
+    }
+    .await;
+    native_response("upload", result)
 }
 
 // Prepare immutable placement inputs on the blocking pool; the worker RPC
@@ -944,20 +1038,6 @@ fn dispatch(
                 );
             }
             encode(&reply, limit)
-        }
-        "upload" => {
-            let mut body = request.data().context("missing native upload body")?;
-            // Fixed-width header, never deserialize or buffer the actual blob.
-            let header: UploadHeader = codec().with_limit(73).deserialize_from(&mut body)?;
-            let reader = network.meter(Direction::Receive, peer, body, header.blob.size, None);
-            sessions.upload(
-                header.ticket,
-                publisher,
-                header.blob,
-                BlobEncoding::try_from(header.encoding)?,
-                reader,
-            )?;
-            encode(&(), limit)
         }
         "commit" => {
             let CommitRequest {

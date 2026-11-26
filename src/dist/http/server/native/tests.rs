@@ -181,6 +181,8 @@ fn with_native_service(
             let sources = Arc::clone(&sources);
             let schedule_sessions = Arc::clone(&sessions);
             let schedule_network = Arc::clone(&network);
+            let upload_sessions = Arc::clone(&sessions);
+            let upload_network = Arc::clone(&network);
             native_router(
                 move |request, role, operation| {
                     respond(
@@ -239,6 +241,15 @@ fn with_native_service(
                                 auth: "allocation-proof".into(),
                             }))
                         }),
+                        1024 * 1024,
+                    )
+                },
+                move |request, role| {
+                    upload_response(
+                        request,
+                        role,
+                        Arc::clone(&upload_sessions),
+                        Arc::clone(&upload_network),
                         1024 * 1024,
                     )
                 },

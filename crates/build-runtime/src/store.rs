@@ -228,6 +228,57 @@ pub struct StagedBlob {
     _reservation: space::StagingReservation,
 }
 
+/// An admitted staging file and its incremental verifier. No I/O is
+/// performed until the caller supplies bytes, so asynchronous transports
+/// can move it between short blocking-pool operations.
+pub(crate) struct PhysicalStager {
+    store: NativeStore,
+    file: NamedTempFile,
+    budget: StageBudget,
+    ingest: blob_codec::BlobIngest,
+    expected: BlobRef,
+    failed: bool,
+}
+
+impl PhysicalStager {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Result<()> {
+        ensure!(!self.failed, "native staging already failed");
+        let result = self.ingest.feed(self.file.as_file_mut(), bytes);
+        self.failed = result.is_err();
+        result
+    }
+
+    pub(crate) fn read_from(&mut self, mut reader: impl Read) -> Result<()> {
+        let mut buffer = vec![0_u8; 128 * 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(count) => self.feed(&buffer[..count])?,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Result<StagedBlob> {
+        ensure!(!self.failed, "native staging already failed");
+        self.ingest.finish(self.file.as_file_mut())?;
+        self.file
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o400))?;
+        self.file.as_file().sync_all()?;
+        let metadata = self.file.as_file().metadata()?;
+        Ok(StagedBlob {
+            path: self.file.into_temp_path(),
+            metadata,
+            reference: self.expected,
+            encoding: self.store.physical_encoding,
+            owner: Arc::clone(&self.store.inner),
+            _reservation: self.budget.finish(self.expected.size)?,
+        })
+    }
+}
+
 impl StagedBlob {
     #[must_use = "the reference identifies the staged content"]
     pub const fn reference(&self) -> BlobRef {
@@ -1004,32 +1055,32 @@ impl NativeStore {
         encoding: BlobEncoding,
         reader: impl Read,
     ) -> Result<StagedBlob> {
-        // Convert physical storage at ingress, instead of persisting the
-        // sender's encoding on an incompatible backing filesystem.
-        if encoding == BlobEncoding::Raw {
-            return self.stage_expected(expected, reader);
-        }
+        let mut stager = self.prepare_physical(expected, encoding)?;
+        stager.read_from(reader)?;
+        stager.finish()
+    }
+
+    pub(crate) fn prepare_physical(
+        &self,
+        expected: BlobRef,
+        encoding: BlobEncoding,
+    ) -> Result<PhysicalStager> {
         let mut budget = space::StageBudget::new(self);
         budget.grow_to(expected.size)?;
-        let mut staged = NamedTempFile::new_in(self.inner.root.join("staging"))?;
-        if self.physical_encoding == encoding {
-            blob_codec::transfer(reader, staged.as_file_mut(), io::sink(), expected, encoding)?;
-        } else {
-            // ZFS receives compressed content, but stores decoded ordinary files.
-            blob_codec::transfer(reader, io::sink(), staged.as_file_mut(), expected, encoding)?;
-        }
-        staged
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(0o400))?;
-        staged.as_file().sync_all()?;
-        let metadata = staged.as_file().metadata()?;
-        Ok(StagedBlob {
-            path: staged.into_temp_path(),
-            metadata,
-            reference: expected,
-            encoding: self.physical_encoding,
-            owner: Arc::clone(&self.inner),
-            _reservation: budget.finish(expected.size)?,
+        let mut file = NamedTempFile::new_in(self.inner.root.join("staging"))?;
+        let ingest = blob_codec::BlobIngest::new(
+            file.as_file_mut(),
+            expected,
+            encoding,
+            self.physical_encoding,
+        )?;
+        Ok(PhysicalStager {
+            store: self.clone(),
+            file,
+            budget,
+            ingest,
+            expected,
+            failed: false,
         })
     }
 

@@ -108,38 +108,39 @@ impl Request {
         }
     }
 
-    pub(super) async fn read_bounded(
+    pub(super) fn body_stream(
         &mut self,
-        limit: usize,
-    ) -> std::result::Result<Vec<u8>, super::super::transport::BoundedReadError> {
-        use super::super::transport::BoundedReadError;
-        let body = match self
-            .body
-            .get_mut()
-            .take()
-            .ok_or(BoundedReadError::AlreadyExtracted)?
-        {
+    ) -> Option<impl futures::Stream<Item = io::Result<Bytes>> + Send + use<>> {
+        let body = match self.body.get_mut().take()? {
             RequestBody::Network(body) => body,
             #[cfg(test)]
-            RequestBody::InMemory(bytes) => {
-                if bytes.len() > limit {
-                    return Err(BoundedReadError::TooLarge);
-                }
-                return Ok(bytes);
-            }
+            RequestBody::InMemory(bytes) => Body::from(bytes),
         };
         let mut activity = interface::activity(
             Some(self.path.local),
             Transfer::Download(self.body_length()),
             Some(self.path),
         );
+        Some(idle_bounded_body(body).map(move |chunk| {
+            if let (Ok(bytes), Some(activity)) = (&chunk, &mut activity) {
+                activity.bytes(bytes.len() as u64);
+            }
+            chunk
+        }))
+    }
+
+    pub(super) async fn read_bounded(
+        &mut self,
+        limit: usize,
+    ) -> std::result::Result<Vec<u8>, super::super::transport::BoundedReadError> {
+        use super::super::transport::BoundedReadError;
         let mut bytes = Vec::new();
-        let mut stream = std::pin::pin!(idle_bounded_body(body));
+        let mut stream = std::pin::pin!(
+            self.body_stream()
+                .ok_or(BoundedReadError::AlreadyExtracted)?
+        );
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(BoundedReadError::Io)?;
-            if let Some(activity) = &mut activity {
-                activity.bytes(chunk.len() as u64);
-            }
             if chunk.len() > limit.saturating_sub(bytes.len()) {
                 return Err(BoundedReadError::TooLarge);
             }

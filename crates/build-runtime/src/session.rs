@@ -480,6 +480,42 @@ impl Drop for AllocationClaim {
     }
 }
 
+/// Keeps one negotiated upload and its space reservation alive across
+/// incremental I/O. Cancellation clears the active marker and discards
+/// the incomplete staging file, rather than stranding the transfer.
+pub struct NativeUpload {
+    stager: crate::store::PhysicalStager,
+    guard: UploadGuard,
+}
+
+impl NativeUpload {
+    /// Accept the next bounded physical bytes.
+    ///
+    /// # Errors
+    /// Returns an error for malformed input or storage failure.
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<()> {
+        self.stager.feed(bytes)
+    }
+}
+
+struct UploadGuard {
+    session: SharedSession,
+    publisher: Publisher,
+    blob: BlobRef,
+    _slot: UploadSlot,
+}
+
+impl Drop for UploadGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.session.lock()
+            && let Phase::Pending(pending) = &mut state.phase
+            && let Some(transfer) = pending.transfer_mut()
+        {
+            transfer.active.remove(&self.blob.id);
+        }
+    }
+}
+
 /// A replayed allocation or the exclusive right to dispatch a new action.
 pub enum SchedulePreparation {
     Replay(ScheduleReply),
@@ -1305,7 +1341,23 @@ impl NativeSessions {
         encoding: BlobEncoding,
         reader: impl Read,
     ) -> Result<()> {
-        let _slot = self.upload_slot(UploadSource::Direct)?;
+        let mut upload = self.prepare_upload(ticket, publisher, blob, encoding)?;
+        upload.stager.read_from(reader)?;
+        self.finish_upload(upload)
+    }
+
+    /// Reserve a negotiated upload before reading any untrusted payload.
+    ///
+    /// # Errors
+    /// Returns an error for unauthorized, unexpected, busy or unavailable uploads.
+    pub fn prepare_upload(
+        &self,
+        ticket: Ticket,
+        publisher: Publisher,
+        blob: BlobRef,
+        encoding: BlobEncoding,
+    ) -> Result<NativeUpload> {
+        let slot = self.upload_slot(UploadSource::Direct)?;
         let session = self.get(ticket)?;
         {
             let mut state = Self::lock(&session)?;
@@ -1317,23 +1369,36 @@ impl NativeSessions {
                 .transfer_mut()
                 .context("no negotiated native upload")?
                 .start(blob, self.limits.max_concurrent_uploads)?;
-            drop(state);
         }
-        let result = self.store().stage_expected_physical(blob, encoding, reader);
-        let mut state = Self::lock(&session)?;
-        // Clear the active marker even if this upload exceeded its lease.
-        if let Phase::Pending(pending) = &mut state.phase
-            && let Some(transfer) = pending.transfer_mut()
-        {
-            transfer.active.remove(&blob.id);
-        }
-        self.authorize(&mut state, publisher)?;
+        let guard = UploadGuard {
+            session,
+            publisher,
+            blob,
+            _slot: slot,
+        };
+        let stager = self.store().prepare_physical(blob, encoding)?;
+        Ok(NativeUpload { guard, stager })
+    }
+
+    /// Finish verification and attach the immutable staged file to the
+    /// still-authorized transfer.
+    ///
+    /// # Errors
+    /// Returns an error if the bytes are invalid or the lease ended.
+    pub fn finish_upload(&self, upload: NativeUpload) -> Result<()> {
+        let NativeUpload { guard, stager } = upload;
+        let staged = stager.finish()?;
+        let mut state = Self::lock(&guard.session)?;
+        self.authorize(&mut state, guard.publisher)?;
         let Phase::Pending(pending) = &mut state.phase else {
             bail!("native upload cancelled");
         };
         let transfer = pending.transfer_mut().context("native upload cancelled")?;
-        transfer.staged.insert(blob.id, result?);
+        transfer.staged.insert(guard.blob.id, staged);
+        transfer.active.remove(&guard.blob.id);
+        // The guard also clears the marker on error paths.
         drop(state);
+        drop(guard);
         Ok(())
     }
 

@@ -1857,3 +1857,39 @@ fn retention_group_survives_action_close_refresh_and_exceeds_action_slots() -> R
     assert!(!matches!(service.store().evict(key)?, Eviction::Pinned));
     Ok(())
 }
+
+#[test]
+fn interrupted_incremental_upload_releases_claim_and_rejects_failed_finish() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
+    let NativeAdmission::Compile { ticket } =
+        service.admit(request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("expected compilation")
+    };
+    let output = manifest(b"object");
+    let blob = output.outputs["obj"].test_file_blob();
+    service.begin(ticket, worker, output.clone())?;
+    let mut interrupted = service.prepare_upload(ticket, worker, blob, BlobEncoding::Raw)?;
+    interrupted.feed(b"obj")?;
+    assert!(
+        service
+            .prepare_upload(ticket, worker, blob, BlobEncoding::Raw)
+            .is_err()
+    );
+    drop(interrupted);
+    let mut failed = service.prepare_upload(ticket, worker, blob, BlobEncoding::Raw)?;
+    failed.feed(b"object")?;
+    assert!(failed.feed(b"x").is_err());
+    assert!(service.finish_upload(failed).is_err());
+    let mut complete = service.prepare_upload(ticket, worker, blob, BlobEncoding::Raw)?;
+    complete.feed(b"ob")?;
+    complete.feed(b"ject")?;
+    service.finish_upload(complete)?;
+    assert_eq!(service.commit(ticket, worker)?, output);
+    Ok(())
+}

@@ -13,7 +13,7 @@ mod network;
 pub use network::{
     ConcurrentCapacity, Direction, DirectionSnapshot, MeteredReader, NetworkCheckpoint,
     NetworkMeter, NetworkPath, NetworkSnapshot, Peer, PeerCapacity, ResultTransferEstimate,
-    SharedCapacity, TransferDemand, transfer_seconds,
+    SharedCapacity, TransferDemand, TransferMeter, transfer_seconds,
 };
 mod package;
 mod placement_class;
@@ -53,8 +53,8 @@ mod session;
 #[cfg(all(unix, feature = "store"))]
 pub use session::{
     DeliveryReceipt, ManifestStatus, NativeContentPending, NativeInputRejected, NativeServiceBusy,
-    NativeSessions, PeerInputClaim, RecoveryStatus, SchedulePreparation, ScheduleReservation,
-    SessionLimits, SessionStatus, TicketStatus,
+    NativeSessions, NativeUpload, PeerInputClaim, RecoveryStatus, SchedulePreparation,
+    ScheduleReservation, SessionLimits, SessionStatus, TicketStatus,
 };
 #[cfg(all(unix, feature = "store"))]
 mod store;
