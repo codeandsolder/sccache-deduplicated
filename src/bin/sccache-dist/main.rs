@@ -383,7 +383,7 @@ fn run(command: Command) -> Result<i32> {
 
         Command::Auth(auth) => run_auth(auth),
         Command::Scheduler(config) => start_scheduler(*config),
-        Command::Server(config) => start_worker(*config),
+        Command::Server(config) => start_worker(*config, None),
     }
 }
 
@@ -637,6 +637,7 @@ fn start_scheduler(config: scheduler_config::Config) -> Result<i32> {
         maintenance_drain_file,
         job_slack,
         native_cache,
+        local_worker,
     } = config;
 
     let check_client_auth: Box<dyn dist::http::ClientAuthCheck> = match client_auth {
@@ -716,7 +717,26 @@ fn start_scheduler(config: scheduler_config::Config) -> Result<i32> {
         dashboard,
     );
     // A running server never exits successfully (Result<Infallible>).
-    match http_scheduler.start()? {}
+    let local_worker = local_worker.map(colocated_worker_start);
+    match http_scheduler.start(local_worker)? {}
+}
+
+fn colocated_worker_start(config: Box<server_config::Config>) -> dist::http::LocalWorkerStart {
+    Box::new(move |store| {
+        std::thread::Builder::new()
+            .name("colocated-native-worker".into())
+            .spawn(move || match start_worker(*config, Some(store)) {
+                Ok(code) => {
+                    error!("colocated worker unexpectedly returned {code}");
+                    std::process::exit(1);
+                }
+                Err(error) => {
+                    error!("colocated worker failed: {error:#}");
+                    std::process::exit(1);
+                }
+            })?;
+        Ok(())
+    })
 }
 
 fn worker_bootstrap_token(
@@ -742,7 +762,10 @@ fn worker_bootstrap_token(
     })
 }
 
-fn start_worker(config: server_config::Config) -> Result<i32> {
+fn start_worker(
+    config: server_config::Config,
+    shared_store: Option<sccache::build_runtime::NativeStore>,
+) -> Result<i32> {
     let server_config::Config {
         cluster,
         builder,
@@ -816,10 +839,10 @@ fn start_worker(config: server_config::Config) -> Result<i32> {
     )?;
     #[cfg(target_os = "linux")]
     let native_worker = native_worker
-        .map(|config| NativeWorker::new(config, std::sync::Arc::clone(&peer)))
+        .map(|config| NativeWorker::new(config, std::sync::Arc::clone(&peer), shared_store))
         .transpose()?;
     #[cfg(not(target_os = "linux"))]
-    if native_worker.is_some() {
+    if native_worker.is_some() || shared_store.is_some() {
         bail!("native worker requires Linux");
     }
     let server = Server::new(archive);
@@ -2729,13 +2752,17 @@ impl ServerIncoming for Server {
         );
         let started = Instant::now();
         let archive = self.archive.as_ref().context("archive worker disabled")?;
-        let res = self
-            .execution_queue
-            .acquire(|| Ok(()))
-            .and_then(|_permit| {
+        // Receiving input must not depend on toolchain extraction or compiler
+        // admission. In particular, a cold extraction can keep a TCP receive
+        // window closed long enough for the client to abandon a healthy upload.
+        let res = inputs_rdr
+            .stage(&archive.staging_dir)
+            .context("Receiving compiler inputs failed")
+            .and_then(|inputs| {
+                let _permit = self.execution_queue.acquire(|| Ok(()))?;
                 archive
                     .builder
-                    .run_build(job_id, toolchain, command, outputs, inputs_rdr, &archive.cache)
+                    .run_build(job_id, toolchain, command, outputs, inputs, &archive.cache)
             })
             .map(|res| {
                 info!(
@@ -4699,6 +4726,61 @@ mod server_upload_tests {
         )?;
         assert!(matches!(result, RunJobResult::JobNotFound));
         assert!(requester.0.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn archive_input_failure_finishes_without_waiting_for_execution_capacity() -> Result<()> {
+        struct FailedUpload;
+
+        impl Read for FailedUpload {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "input disconnected",
+                ))
+            }
+        }
+
+        let (_dir, server) = test_server()?;
+        let job_id = JobId(81);
+        server.handle_assign_job(job_id, tc(b"cold toolchain")?)?;
+        // Saturate the shared execution queue without any build running. The
+        // upload must still be consumed and failed, without entering the builder.
+        let permits = (0..server.execution_queue.width().get())
+            .map(|_| server.execution_queue.acquire(|| Ok(())))
+            .collect::<Result<Vec<_>>>()?;
+        let uploader = Arc::clone(&server);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let upload = thread::spawn(move || {
+            let requester = RecordingRequester(Mutex::new(Vec::new()));
+            let result = uploader.handle_run_job(
+                &requester,
+                job_id,
+                CompileCommand {
+                    umask: Some(0o022),
+                    executable: "cc".to_owned(),
+                    arguments: Vec::new(),
+                    env_vars: Vec::new(),
+                    cwd: "/tmp".to_owned(),
+                },
+                OutputRequest {
+                    paths: Vec::new(),
+                    compression_level: 3,
+                },
+                InputsReader::new(Box::new(FailedUpload)),
+            );
+            let states = requester.0.lock().unwrap().clone();
+            finished_tx.send((result, states)).unwrap();
+        });
+        let finished = finished_rx.recv_timeout(Duration::from_secs(5));
+        drop(permits);
+        upload.join().unwrap();
+        let (result, states) = finished.context("upload was blocked by compiler admission")?;
+        let error = result.err().context("disconnected input must fail")?;
+        assert!(format!("{error:#}").contains("input disconnected"));
+        assert_eq!(states, vec![JobState::Started, JobState::Complete]);
+        assert_eq!(server.execution_queue.active(), 0);
         Ok(())
     }
 

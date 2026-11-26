@@ -675,7 +675,11 @@ where
             Err(e) => {
                 return match e.downcast::<ProcessError>() {
                     Ok(ProcessError(output)) => {
-                        debug!("[{out_pretty}]: process error: {output:?}");
+                        warn!(
+                            "[{out_pretty}]: input discovery failed: {}: {}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
                         Ok((CompileResult::Error, output))
                     }
                     Err(e) => Err(e),
@@ -784,7 +788,7 @@ where
                     Ok(()) => Ok(CacheLookupResult::Success(hit, output)),
                     Err(e) => {
                         if e.downcast_ref::<DecompressionFailure>().is_some() {
-                            debug!("[{out_pretty}]: Failed to decompress object");
+                            warn!("[{out_pretty}]: failed to decompress cached object: {e:#}");
                             Ok(CacheLookupResult::Miss(MissType::CacheReadError))
                         } else {
                             Err(e)

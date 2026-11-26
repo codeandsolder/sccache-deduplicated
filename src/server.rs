@@ -2177,7 +2177,7 @@ where
                             stats.non_cacheable_compilations += 1;
                         }
                         CompileResult::CompileFailed(dt, duration) => {
-                            debug!("[{out_pretty}]: compile result: compile failed");
+                            warn!("[{out_pretty}]: compiler exited {}: {}", out.status, String::from_utf8_lossy(&out.stderr));
                             dist_type = dt;
                             stats.compilations += 1;
                             stats.compiler_write_duration += duration;
@@ -2223,7 +2223,7 @@ where
                 Err(err) => {
                     match err.downcast::<ProcessError>() {
                         Ok(ProcessError(output)) => {
-                            debug!("Compilation failed: {output:?}");
+                            warn!("[{out_pretty}]: compiler exited {}: {}", output.status, String::from_utf8_lossy(&output.stderr));
                             stats.compile_fails += 1;
                             // Make sure the write guard has been dropped ASAP.
                             drop(stats);

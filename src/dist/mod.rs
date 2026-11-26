@@ -934,6 +934,22 @@ impl<'a> InputsReader<'a> {
 }
 #[cfg(feature = "dist-server")]
 impl<'a> InputsReader<'a> {
+    /// Receive the complete compressed input archive before preparing a toolchain
+    /// or waiting for a compiler slot. The anonymous file is owned by the job
+    /// and removed on every completion, cancellation or I/O failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if receiving, staging or rewinding the archive fails.
+    pub fn stage(mut self, directory: &Path) -> io::Result<InputsReader<'static>> {
+        use std::io::Seek;
+
+        let mut file = tempfile::tempfile_in(directory)?;
+        io::copy(&mut self.0, &mut file)?;
+        file.rewind()?;
+        Ok(InputsReader::new(Box::new(file)))
+    }
+
     /// Create the decoder on the thread consuming the transport stream.
     ///
     /// # Errors

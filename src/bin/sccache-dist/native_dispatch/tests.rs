@@ -16,15 +16,15 @@ fn worker(
     NativeWorker::new(
         NativeWorkerConfig {
             cache_url: HTTPUrl::from_url(url),
-            directory: root.join("store"),
-            space: SpacePolicy {
+            directory: Some(root.join("store")),
+            space: Some(SpacePolicy {
                 min_available_bytes: 1 << 20,
                 target_available_bytes: 2 << 20,
                 max_resident_bytes: 1 << 30,
                 target_resident_bytes: 1 << 29,
                 max_evictions_per_pass: 8,
                 gc_batch: 16,
-            },
+            }),
             scratch: root.join("scratch"),
             bubblewrap: "/usr/bin/bwrap".into(),
             platform_contract: "dispatch-test".into(),
@@ -40,6 +40,7 @@ fn worker(
             package_transfer: Default::default(),
         },
         peer,
+        None,
     )
 }
 
