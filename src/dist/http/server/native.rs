@@ -5,7 +5,6 @@ use std::{
     collections::BTreeMap,
     fs::File,
     future::Future,
-    io::Read,
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -34,10 +33,10 @@ use crate::{
     build_runtime::{
         ActionMode, ArchiveLength, BlobEncoding, BlobRef, Direction, ExecutionSpec,
         NativeContentPending, NativeInputRejected, NativePackagePreparation, NativePackageUpload,
-        NativeServiceBusy, NativeSessions, NativeStore, NetworkMeter, NetworkSnapshot,
-        PackageCatalog, PackageIdentity, PackageImportLimits, PackageSource, Peer,
-        SchedulePreparation, ScheduleReservation, StagedBlob, TransferMeter, TreeId, TreeManifest,
-        VerifiedPackage,
+        NativeServiceBusy, NativeSessions, NativeStore, NativeUpload, NetworkMeter,
+        NetworkSnapshot, PackageCatalog, PackageIdentity, PackageImportLimits, PackageSource, Peer,
+        PhysicalStager, SchedulePreparation, ScheduleReservation, StagedBlob, TransferMeter,
+        TreeId, TreeManifest, VerifiedPackage,
         wire::{BlobRecipient, BlobSource, BlobSourcePlan, Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
@@ -280,18 +279,13 @@ pub(super) struct PublicationCallbacks<S, O> {
     clippy::too_many_lines,
     reason = "native listener startup owns the shared session lifetime and starts its coordinated acquisition and maintenance workers"
 )]
-pub(super) fn spawn<Fut>(
+pub(super) fn spawn<Fut, PeerFut>(
     config: &NativeCacheConfig,
     allocate: impl Fn(crate::dist::NativeAssignment, NetworkSnapshot, Arc<PackageCatalog>) -> Fut
     + Send
     + Sync
     + 'static,
-    fetch_peer: impl Fn(
-        BlobRef,
-        Option<crate::dist::ServerId>,
-        &NativeStore,
-        Instant,
-    ) -> Result<Option<StagedBlob>>
+    fetch_peer: impl Fn(BlobRef, Option<crate::dist::ServerId>, NativeStore, Instant) -> PeerFut
     + Send
     + Sync
     + 'static,
@@ -311,6 +305,7 @@ pub(super) fn spawn<Fut>(
 ) -> Result<(std::net::SocketAddr, Arc<NativeSessions>)>
 where
     Fut: Future<Output = Result<ScheduleReply>> + Send + 'static,
+    PeerFut: Future<Output = Result<Option<StagedBlob>>> + Send + 'static,
 {
     let PublicationCallbacks {
         source_plan,
@@ -327,55 +322,55 @@ where
     let fetch_peer = Arc::new(fetch_peer);
     // Keep source acquisition bounded separately from compiler execution
     // and leave capacity for originating-client uploads.
-    let peer_threads = config.max_total_uploads.saturating_sub(1).clamp(1, 4);
-    for index in 0..peer_threads {
+    let peer_concurrency = config.max_total_uploads.saturating_sub(1).clamp(1, 4);
+    let runtime = crate::http_client::io_runtime()?;
+    for _ in 0..peer_concurrency {
         let sessions = Arc::downgrade(&sessions);
         let fetch_peer = Arc::clone(&fetch_peer);
-        thread::Builder::new()
-            .name(format!("native-peer-backfill-{index}"))
-            .spawn(move || {
-                while let Some(sessions) = sessions.upgrade() {
-                    match sessions.claim_peer_input(Duration::from_millis(100)) {
-                        Ok(Some(claim)) => {
-                            let requester = claim.requester();
-                            let deadline = Instant::now() + limits.idle_timeout;
-                            if let Err(error) = sessions.recover_peer_input(
-                                claim,
-                                deadline,
-                                |blob, store, deadline| {
-                                    fetch_peer(blob, Some(requester), store, deadline)
-                                },
-                            ) {
-                                debug!("native peer backfill unavailable: {error:#}");
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            warn!("native peer claim failed: {error:#}");
-                            thread::sleep(Duration::from_millis(100));
+        runtime.spawn(async move {
+            while let Some(sessions) = sessions.upgrade() {
+                match sessions.claim_peer_input(Duration::from_millis(100)).await {
+                    Ok(Some(claim)) => {
+                        let requester = claim.requester();
+                        let deadline = Instant::now() + limits.idle_timeout;
+                        let fetch = Arc::clone(&fetch_peer);
+                        if let Err(error) = sessions
+                            .recover_peer_input(claim, deadline, move |blob, store, deadline| {
+                                fetch(blob, Some(requester), store, deadline)
+                            })
+                            .await
+                        {
+                            debug!("native peer backfill unavailable: {error:#}");
                         }
                     }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!("native peer claim failed: {error:#}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
                 }
-            })?;
+            }
+        });
     }
-    // Result recovery holds the action permit but no compiler slot. It
-    // runs outside HTTP and uses the same bounded upload budget as inputs.
+    // Result recovery holds the action permit but no compiler slot or thread
+    // while waiting for a source or a shared upload slot.
     {
         let sessions = Arc::downgrade(&sessions);
-        thread::Builder::new()
-            .name("native-result-recovery".into())
-            .spawn(move || {
-                while let Some(sessions) = sessions.upgrade() {
-                    if let Err(error) = sessions
-                        .recover_next_result(Duration::from_millis(100), |blob, store, deadline| {
-                            fetch_peer(blob, None, store, deadline)
-                        })
-                    {
-                        warn!("native result recovery failed: {error:#}");
-                        thread::sleep(Duration::from_millis(100));
-                    }
+        runtime.spawn(async move {
+            while let Some(sessions) = sessions.upgrade() {
+                let fetch = Arc::clone(&fetch_peer);
+                if let Err(error) = sessions
+                    .recover_next_result(
+                        Duration::from_millis(100),
+                        move |blob, store, deadline| fetch(blob, None, store, deadline),
+                    )
+                    .await
+                {
+                    warn!("native result recovery failed: {error:#}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-            })?;
+            }
+        });
     }
     let metadata_limit = config.max_metadata_bytes;
     let packages = PackageService::new(config)?.map(Arc::new);
@@ -648,15 +643,14 @@ fn observed_response_peer(response: &wreq::Response, peer: Peer) -> Peer {
 }
 
 /// Retrieve a blob from a specific authenticated worker using its exact-content capability.
-pub(super) fn fetch_peer(
+pub(super) async fn fetch_peer(
     routes: &SchedulerRequester,
     source: &crate::dist::NativeBlobSource,
     blob: BlobRef,
+    store: NativeStore,
     network: &NetworkMeter,
     deadline: Instant,
-) -> Result<Option<(impl Read + Send + use<>, BlobEncoding)>> {
-    // Bounded source probe: allow roughly 4 MiB/s plus setup time,
-    // with an absolute ceiling; a slow peer falls back to the origin.
+) -> Result<Option<StagedBlob>> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     ensure!(!remaining.is_zero(), "native peer deadline expired");
     let timeout = Duration::from_secs((5 + blob.size.div_ceil(1024 * 1024)).min(60)).min(remaining);
@@ -667,15 +661,14 @@ pub(super) fn fetch_peer(
             break;
         }
         let (client, base) = routes.endpoint(source.server, address)?;
-        let response = crate::http_client::io_runtime()?.block_on(
-            client
-                .post(super::super::urls::server_native_blob(&base)?.as_str())
-                .timeout(timeout.min(remaining))
-                .bearer_auth(&source.token)
-                .header("Content-Type", "application/octet-stream")
-                .body(codec().serialize(&blob)?)
-                .send(),
-        );
+        let response = client
+            .post(super::super::urls::server_native_blob(&base)?.as_str())
+            .timeout(timeout.min(remaining))
+            .bearer_auth(&source.token)
+            .header("Content-Type", "application/octet-stream")
+            .body(codec().serialize(&blob)?)
+            .send()
+            .await;
         match response {
             Err(error) if error.is_connect() => routes.failed(source.server, address),
             result => {
@@ -700,14 +693,17 @@ pub(super) fn fetch_peer(
     )?;
     let size = response.content_length();
     let peer = observed_response_peer(&response, Peer::Worker(source.server));
-    let response = routes.routes.measure_response(
-        source.server,
-        sccache_cluster_identity::Role::Worker,
-        address,
-        response,
-    )?;
-    let response = network.meter(Direction::Receive, peer, response, blob.size, size);
-    Ok(Some((response, encoding)))
+    let mut input =
+        routes
+            .routes
+            .measure_response_async(source.server, Role::Worker, address, response);
+    let meter = network.transfer(Direction::Receive, peer, blob.size, size);
+    let staging =
+        tokio::task::spawn_blocking(move || store.prepare_physical(blob, encoding)).await??;
+    let staging = receive_blob(staging, &mut input, meter, anyhow::Error::from).await?;
+    Ok(Some(
+        tokio::task::spawn_blocking(move || staging.finish()).await??,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -764,6 +760,90 @@ fn request_publisher(request: &Request, role: &str) -> std::result::Result<Publi
     })
 }
 
+trait BlobIngress: Send + Sized + 'static {
+    fn requires_codec_pool(&self) -> bool;
+    fn encode_pending(&mut self, bytes: &[u8]) -> Result<()>;
+    fn finish_encoding(&mut self) -> Result<()>;
+    fn flush_pending_async(self) -> impl Future<Output = Result<Self>> + Send;
+    fn finish_file_async(self) -> impl Future<Output = Result<Self>> + Send;
+}
+
+macro_rules! blob_ingress {
+    ($type:ty) => {
+        impl BlobIngress for $type {
+            fn requires_codec_pool(&self) -> bool {
+                <$type>::requires_codec_pool(self)
+            }
+            fn encode_pending(&mut self, bytes: &[u8]) -> Result<()> {
+                <$type>::encode_pending(self, bytes)
+            }
+            fn finish_encoding(&mut self) -> Result<()> {
+                <$type>::finish_encoding(self)
+            }
+            async fn flush_pending_async(self) -> Result<Self> {
+                <$type>::flush_pending_async(self).await
+            }
+            async fn finish_file_async(self) -> Result<Self> {
+                <$type>::finish_file_async(self).await
+            }
+        }
+    };
+}
+blob_ingress!(NativeUpload);
+blob_ingress!(PhysicalStager);
+
+async fn receive_blob<T: BlobIngress>(
+    mut upload: T,
+    input: &mut (impl AsyncRead + Unpin),
+    mut meter: TransferMeter,
+    read_error: impl Fn(std::io::Error) -> anyhow::Error,
+) -> Result<T> {
+    // Batch at the CAS frame size rather than dispatch work for each TLS record.
+    let mut buffer = vec![0; 256 * 1024];
+    let codec_pool = upload.requires_codec_pool();
+    loop {
+        let mut count = 0;
+        while count < buffer.len() {
+            let read = input
+                .read(&mut buffer[count..])
+                .await
+                .map_err(&read_error)?;
+            if read == 0 {
+                meter.eof();
+                break;
+            }
+            count += read;
+            meter.observe(read as u64);
+        }
+        if count == 0 {
+            break;
+        }
+        if codec_pool {
+            (upload, buffer) = compute(move || {
+                upload.encode_pending(&buffer[..count])?;
+                Ok((upload, buffer))
+            })
+            .await?;
+        } else {
+            upload.encode_pending(&buffer[..count])?;
+        }
+        upload = upload.flush_pending_async().await?;
+        if count < buffer.len() {
+            break;
+        }
+    }
+    if codec_pool {
+        upload = compute(move || {
+            upload.finish_encoding()?;
+            Ok(upload)
+        })
+        .await?;
+    } else {
+        upload.finish_encoding()?;
+    }
+    upload.finish_file_async().await
+}
+
 async fn upload_response(
     mut request: Request,
     role: &str,
@@ -791,7 +871,7 @@ async fn upload_response(
         input.read_exact(&mut header).await?;
         let header: UploadHeader = codec().with_limit(73).deserialize(&header)?;
         let encoding = BlobEncoding::try_from(header.encoding)?;
-        let mut upload = {
+        let upload = {
             let sessions = Arc::clone(&sessions);
             tokio::task::spawn_blocking(move || {
                 if backfill {
@@ -806,56 +886,16 @@ async fn upload_response(
             })
             .await??
         };
-        let mut meter = network.transfer(Direction::Receive, peer, header.blob.size, None);
-        // Batch at the CAS frame size, rather than dispatching work for
-        // every TLS record. A raw-to-raw batch only needs a bounded hash/copy.
-        let mut buffer = vec![0; 256 * 1024];
-        let codec_pool = upload.requires_codec_pool();
-        loop {
-            let mut count = 0;
-            while count < buffer.len() {
-                let read = input.read(&mut buffer[count..]).await.map_err(|error| {
-                    let error = anyhow::Error::from(error);
-                    if backfill {
-                        error.context(NativeServiceBusy)
-                    } else {
-                        error
-                    }
-                })?;
-                if read == 0 {
-                    meter.eof();
-                    break;
-                }
-                count += read;
-                meter.observe(read as u64);
-            }
-            if count == 0 {
-                break;
-            }
-            if codec_pool {
-                (upload, buffer) = compute(move || {
-                    upload.encode_pending(&buffer[..count])?;
-                    Ok((upload, buffer))
-                })
-                .await?;
+        let meter = network.transfer(Direction::Receive, peer, header.blob.size, None);
+        let upload = receive_blob(upload, &mut input, meter, |error| {
+            let error = anyhow::Error::from(error);
+            if backfill {
+                error.context(NativeServiceBusy)
             } else {
-                upload.encode_pending(&buffer[..count])?;
+                error
             }
-            upload = upload.flush_pending_async().await?;
-            if count < buffer.len() {
-                break;
-            }
-        }
-        if codec_pool {
-            upload = compute(move || {
-                upload.finish_encoding()?;
-                Ok(upload)
-            })
-            .await?;
-        } else {
-            upload.finish_encoding()?;
-        }
-        upload = upload.finish_file_async().await?;
+        })
+        .await?;
         tokio::task::spawn_blocking(move || sessions.finish_upload(upload)).await??;
         encode(&(), limit)
     }

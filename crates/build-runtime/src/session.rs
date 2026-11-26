@@ -3,9 +3,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::File,
+    future::Future,
     io::Read,
     sync::{
-        Arc, Condvar, Mutex, MutexGuard, Weak,
+        Arc, Mutex, MutexGuard, Weak,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -739,7 +740,7 @@ pub struct NativeSessions {
     retained: retention::RetentionGroups,
     active_uploads: Arc<AtomicUsize>,
     backfills: Mutex<HashMap<ContentId, Weak<Backfill>>>,
-    peer_wake: Condvar,
+    peer_wake: Arc<tokio::sync::Notify>,
     manifests: Mutex<ManifestCatalog>,
     recovery: recovery::RecoveryQueue,
 }
@@ -797,7 +798,7 @@ impl NativeSessions {
             retained: retention::RetentionGroups::default(),
             active_uploads: Arc::new(AtomicUsize::new(0)),
             backfills: Mutex::new(HashMap::new()),
-            peer_wake: Condvar::new(),
+            peer_wake: Arc::new(tokio::sync::Notify::new()),
             manifests: Mutex::new(ManifestCatalog::default()),
             recovery: recovery::RecoveryQueue::default(),
         })
@@ -1294,7 +1295,12 @@ impl NativeSessions {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(UploadSlot(Arc::clone(&self.active_uploads))),
+                Ok(_) => {
+                    return Ok(UploadSlot(
+                        Arc::clone(&self.active_uploads),
+                        Arc::clone(&self.peer_wake),
+                    ));
+                }
                 Err(observed) => active = observed,
             }
         }
@@ -1942,7 +1948,7 @@ impl NativeSessions {
         }
         drop(flights);
         drop(state);
-        self.peer_wake.notify_all();
+        self.peer_wake.notify_waiters();
         Ok(())
     }
 
@@ -1951,77 +1957,95 @@ impl NativeSessions {
     ///
     /// # Errors
     /// Returns an error for poisoned state or a resource accounting failure.
-    pub fn claim_peer_input(&self, wait: Duration) -> Result<Option<PeerInputClaim>> {
-        let start = Instant::now();
-        let mut flights = self
-            .backfills
-            .lock()
-            .map_err(|_| anyhow!("native backfill map poisoned"))?;
+    pub async fn claim_peer_input(&self, wait: Duration) -> Result<Option<PeerInputClaim>> {
+        let deadline = Instant::now() + wait;
         loop {
-            let now = Instant::now();
-            for flight in flights.values().filter_map(Weak::upgrade) {
-                let Ok(mut pending) = flight.state.try_lock() else {
-                    continue;
-                };
-                if pending.uploading || pending.ready.is_some() || pending.claim.is_some() {
-                    continue;
-                }
-                if pending.peer_retry_at.is_some_and(|at| at <= now) {
-                    pending.peer_until = Some(now + self.limits.peer_discovery_timeout);
-                    pending.peer_retry_at = Some(now + Duration::from_secs(1));
-                }
-                let Some(until) = pending.peer_until else {
-                    continue;
-                };
-                if until <= now {
-                    pending.peer_until = None;
-                    continue;
-                }
-                match self.upload_slot(UploadSource::Peer) {
-                    Ok(slot) => {
-                        pending.peer_until = None;
-                        pending.uploading = true;
-                        drop(pending);
-                        return Ok(Some(PeerInputClaim(BackfillUpload {
-                            flight,
-                            _slot: slot,
-                        })));
-                    }
-                    Err(error) if error.is::<NativeServiceBusy>() => break,
-                    Err(error) => return Err(error),
-                }
+            let mut notified = std::pin::pin!(self.peer_wake.notified());
+            notified.as_mut().enable();
+            if let Some(claim) = self.try_claim_peer_input()? {
+                return Ok(Some(claim));
             }
-            let remaining = wait.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
+            if Instant::now() >= deadline
+                || tokio::time::timeout_at(deadline.into(), notified)
+                    .await
+                    .is_err()
+            {
                 return Ok(None);
             }
-            let (guard, _) = self
-                .peer_wake
-                .wait_timeout(flights, remaining)
-                .map_err(|_| anyhow!("native backfill map poisoned"))?;
-            flights = guard;
         }
     }
 
+    fn try_claim_peer_input(&self) -> Result<Option<PeerInputClaim>> {
+        let flights = self
+            .backfills
+            .lock()
+            .map_err(|_| anyhow!("native backfill map poisoned"))?;
+        let now = Instant::now();
+        for flight in flights.values().filter_map(Weak::upgrade) {
+            let Ok(mut pending) = flight.state.try_lock() else {
+                continue;
+            };
+            if pending.uploading || pending.ready.is_some() || pending.claim.is_some() {
+                continue;
+            }
+            if pending.peer_retry_at.is_some_and(|at| at <= now) {
+                pending.peer_until = Some(now + self.limits.peer_discovery_timeout);
+                pending.peer_retry_at = Some(now + Duration::from_secs(1));
+            }
+            let Some(until) = pending.peer_until else {
+                continue;
+            };
+            if until <= now {
+                pending.peer_until = None;
+                continue;
+            }
+            match self.upload_slot(UploadSource::Peer) {
+                Ok(slot) => {
+                    pending.peer_until = None;
+                    pending.uploading = true;
+                    drop(pending);
+                    return Ok(Some(PeerInputClaim(BackfillUpload {
+                        flight,
+                        _slot: slot,
+                    })));
+                }
+                Err(error) if error.is::<NativeServiceBusy>() => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
     /// Recover verified peer content using the same durable blob acquisition
-    /// flight as result recovery. A failed peer releases the origin claim.
+    /// flight as result recovery. The owned task holds the input and upload
+    /// claims through publication even if its caller stops awaiting it.
     ///
     /// # Errors
     /// Returns an error for unavailable or invalid content or storage failure.
-    pub fn recover_peer_input(
-        &self,
+    pub async fn recover_peer_input<F, Fut>(
+        self: &Arc<Self>,
         claim: PeerInputClaim,
         deadline: Instant,
-        fetch: impl Fn(BlobRef, &NativeStore, Instant) -> Result<Option<StagedBlob>>,
-    ) -> Result<()> {
-        let lease = self.acquire_peer_blob(claim.blob(), deadline, &fetch)?;
-        let mut pending = claim.0.flight.lock()?;
-        pending.ready = Some(lease);
-        pending.peer_until = None;
-        pending.peer_retry_at = None;
-        drop(pending);
-        drop(claim);
-        Ok(())
+        fetch: F,
+    ) -> Result<()>
+    where
+        F: Fn(BlobRef, NativeStore, Instant) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<StagedBlob>>> + Send + 'static,
+    {
+        let sessions = Arc::clone(self);
+        tokio::spawn(async move {
+            let lease = sessions
+                .acquire_peer_blob(claim.blob(), deadline, &fetch)
+                .await?;
+            let mut pending = claim.0.flight.lock()?;
+            pending.ready = Some(lease);
+            pending.peer_until = None;
+            pending.peer_retry_at = None;
+            drop(pending);
+            drop(claim);
+            Ok(())
+        })
+        .await?
     }
 
     fn finish_backfills(
@@ -2233,7 +2257,7 @@ impl NativeSessions {
         }
         drop(pending);
         drop(state);
-        self.peer_wake.notify_all();
+        self.peer_wake.notify_waiters();
         Ok(())
     }
 
@@ -2440,11 +2464,12 @@ enum UploadSource {
     Peer,
 }
 
-struct UploadSlot(Arc<AtomicUsize>);
+struct UploadSlot(Arc<AtomicUsize>, Arc<tokio::sync::Notify>);
 
 impl Drop for UploadSlot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+        self.1.notify_waiters();
     }
 }
 

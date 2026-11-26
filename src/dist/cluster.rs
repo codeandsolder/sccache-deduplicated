@@ -251,6 +251,31 @@ impl ClusterRoutes {
         ))
     }
 
+    #[cfg(feature = "dist-server")]
+    pub(super) fn measure_response_async(
+        &self,
+        peer: PeerId,
+        role: Role,
+        address: Route,
+        response: wreq::Response,
+    ) -> MeasuredReader<impl tokio::io::AsyncRead + Unpin + Send + use<>> {
+        use futures::TryStreamExt;
+        let length = response.content_length();
+        let path = ConnectionPath::from_response(&response);
+        let reader = tokio_util::io::StreamReader::new(Box::pin(
+            response.bytes_stream().map_err(std::io::Error::other),
+        ));
+        MeasuredReader::new(
+            reader,
+            Arc::clone(&self.book),
+            peer,
+            role,
+            address,
+            length,
+            path,
+        )
+    }
+
     pub(super) fn local_source(
         &self,
         peer: PeerId,

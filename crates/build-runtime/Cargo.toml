@@ -18,7 +18,7 @@ zstd = { version = "0.14", optional = true }
 compio-buf = { version = "0.8.3", optional = true }
 compio-driver = { version = "0.12.5", default-features = false, features = ["io-uring", "polling"], optional = true }
 compio-runtime = { version = "0.12.6", optional = true }
-tokio = { version = "1", features = ["sync"], optional = true }
+tokio = { version = "1", features = ["sync", "rt", "time"], optional = true }
 flate2 = { version = "1", optional = true, default-features = false, features = ["zlib-rs"] }
 log = { version = "0.4", optional = true }
 rand = { version = "0.10", optional = true }
@@ -41,9 +41,9 @@ serde_json = ">=1.0, <1.0.155"
 
 [features]
 default = ["store"]
-async-io = ["store", "dep:compio-buf", "dep:compio-driver", "dep:compio-runtime", "dep:tokio"]
+async-io = ["store", "dep:compio-buf", "dep:compio-driver", "dep:compio-runtime"]
 mapping = ["dep:tempfile", "dep:log"]
-store = ["mapping", "dep:rand", "dep:redb", "dep:flate2", "dep:lzma-rust2", "dep:sha2", "dep:tar", "dep:zstd", "dep:fuser", "dep:libc"]
+store = ["mapping", "dep:tokio", "dep:rand", "dep:redb", "dep:flate2", "dep:lzma-rust2", "dep:sha2", "dep:tar", "dep:zstd", "dep:fuser", "dep:libc"]
 
 [lints]
 workspace = true

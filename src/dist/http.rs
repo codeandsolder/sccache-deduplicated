@@ -1737,37 +1737,40 @@ mod server {
                             }
                         }
                     },
-                    move |blob, requester, store, deadline| {
-                        let mut snapshot = peer_network.snapshot();
-                        snapshot.interfaces = crate::dist::cluster::interface_report();
-                        for source in peer_handler.native_blob_sources(
-                            blob,
-                            requester,
-                            crate::build_runtime::wire::BlobRecipient::Scheduler,
-                            None,
-                            Some(&snapshot),
-                        )? {
-                            if std::time::Instant::now() >= deadline {
-                                break;
-                            }
-                            match native::fetch_peer(
-                                &peer_routes,
-                                &source,
+                    move |blob, requester, store: crate::build_runtime::NativeStore, deadline| {
+                        let peer_network = Arc::clone(&peer_network);
+                        let peer_handler = Arc::clone(&peer_handler);
+                        let peer_routes = Arc::clone(&peer_routes);
+                        async move {
+                            let mut snapshot = peer_network.snapshot();
+                            snapshot.interfaces = crate::dist::cluster::interface_report();
+                            for source in peer_handler.native_blob_sources(
                                 blob,
-                                &peer_network,
-                                deadline,
-                            ) {
-                                Ok(Some((reader, encoding))) => match store
-                                    .stage_expected_physical(blob, encoding, reader)
+                                requester,
+                                crate::build_runtime::wire::BlobRecipient::Scheduler,
+                                None,
+                                Some(&snapshot),
+                            )? {
+                                if std::time::Instant::now() >= deadline {
+                                    break;
+                                }
+                                match native::fetch_peer(
+                                    &peer_routes,
+                                    &source,
+                                    blob,
+                                    store.clone(),
+                                    &peer_network,
+                                    deadline,
+                                )
+                                .await
                                 {
-                                    Ok(staged) => return Ok(Some(staged)),
-                                    Err(error) => debug!("native peer content rejected: {error:#}"),
-                                },
-                                Ok(None) => {}
-                                Err(error) => debug!("native peer lookup failed: {error:#}"),
+                                    Ok(Some(staged)) => return Ok(Some(staged)),
+                                    Ok(None) => {}
+                                    Err(error) => debug!("native peer lookup failed: {error:#}"),
+                                }
                             }
+                            Ok(None)
                         }
-                        Ok(None)
                     },
                     native::PublicationCallbacks {
                         source_plan: move |blob, recipient, producer| {

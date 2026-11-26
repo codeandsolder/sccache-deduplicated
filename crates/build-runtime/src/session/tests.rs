@@ -1496,12 +1496,13 @@ fn exercise_source_release(staged: bool) -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
+#[tokio::test]
+async fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     use crate::{TreeEntry, TreePath};
     let directory = tempfile::tempdir()?;
     let mut service = service(directory.path())?;
     service.limits.peer_discovery_timeout = Duration::from_secs(1);
+    let service = Arc::new(service);
     let root = empty_root().root;
     let first = BlobRef {
         id: ContentId::of(b"peer bytes"),
@@ -1563,17 +1564,49 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     service.request_inputs(delivery, worker, vec![first])?;
     assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
     let claim = service
-        .claim_peer_input(Duration::ZERO)?
+        .claim_peer_input(Duration::ZERO)
+        .await?
         .context("peer claim missing")?;
     assert_eq!(claim.blob(), first);
     assert_eq!(claim.requester(), peer);
     assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
-    assert!(service.claim_peer_input(Duration::ZERO)?.is_none());
-    service.recover_peer_input(
-        claim,
-        Instant::now() + Duration::from_secs(1),
-        |blob, store, _| Ok(Some(store.stage_expected(blob, &b"peer bytes"[..])?)),
-    )?;
+    assert!(service.claim_peer_input(Duration::ZERO).await?.is_none());
+    let started = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let recovery = {
+        let sessions = Arc::clone(&service);
+        let started = Arc::clone(&started);
+        let resume = Arc::clone(&resume);
+        tokio::spawn(async move {
+            sessions
+                .recover_peer_input(
+                    claim,
+                    Instant::now() + Duration::from_secs(5),
+                    move |blob, store, _| {
+                        let started = Arc::clone(&started);
+                        let resume = Arc::clone(&resume);
+                        async move {
+                            started.notify_one();
+                            resume.notified().await;
+                            Ok(Some(store.stage_expected(blob, &b"peer bytes"[..])?))
+                        }
+                    },
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), started.notified()).await?;
+    recovery.abort();
+    assert!(recovery.await.unwrap_err().is_cancelled());
+    assert_eq!(service.active_uploads.load(Ordering::Acquire), 1);
+    assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
+    resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while service.active_uploads.load(Ordering::Acquire) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
     let mut bytes = Vec::new();
     decoded_download(&service, delivery, worker, first.id)?.read_to_end(&mut bytes)?;
     assert_eq!(bytes, b"peer bytes");
@@ -1581,7 +1614,8 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
 
     service.request_inputs(delivery, worker, vec![second])?;
     let claim = service
-        .claim_peer_input(Duration::ZERO)?
+        .claim_peer_input(Duration::ZERO)
+        .await?
         .context("peer claim missing")?;
     assert_eq!(claim.blob(), second);
     // A wrong peer payload must not become visible; the failed claim
@@ -1591,8 +1625,9 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
             .recover_peer_input(
                 claim,
                 Instant::now() + Duration::from_secs(1),
-                |_, store, _| { Ok(Some(store.stage(&b"wrong bytes!"[..])?)) }
+                |_, store, _| async move { Ok(Some(store.stage(&b"wrong bytes!"[..])?)) }
             )
+            .await
             .is_err()
     );
     assert!(service.store().open_available_blob(second)?.is_none());
@@ -1611,7 +1646,8 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     service.request_inputs(delivery, worker, vec![third])?;
     drop(
         service
-            .claim_peer_input(Duration::ZERO)?
+            .claim_peer_input(Duration::ZERO)
+            .await?
             .context("initial peer claim missing")?,
     );
     assert_eq!(
@@ -1630,7 +1666,8 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
 
     assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
     let claim = service
-        .claim_peer_input(Duration::ZERO)?
+        .claim_peer_input(Duration::ZERO)
+        .await?
         .context("renewed peer claim missing")?;
     drop(claim);
     let flight = service
@@ -1642,13 +1679,14 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
         .context("missing flight")?;
     flight.lock()?.peer_retry_at = Some(Instant::now());
     let claim = service
-        .claim_peer_input(Duration::ZERO)?
+        .claim_peer_input(Duration::ZERO)
+        .await?
         .context("periodic peer retry missing")?;
     service.recover_peer_input(
         claim,
         Instant::now() + Duration::from_secs(1),
-        |blob, store, _| Ok(Some(store.stage_expected(blob, &b"late peer"[..])?)),
-    )?;
+        |blob, store, _| async move { Ok(Some(store.stage_expected(blob, &b"late peer"[..])?)) },
+    ).await?;
     bytes.clear();
     decoded_download(&service, delivery, worker, third.id)?.read_to_end(&mut bytes)?;
     assert_eq!(bytes, b"late peer");
@@ -1658,8 +1696,8 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Result<()> {
+#[tokio::test]
+async fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let req = request()?;
     let fingerprint = req.action_fingerprint()?;
@@ -1684,6 +1722,7 @@ fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Result<()> 
     }
     let mut service = service(dir.path())?;
     service.limits.peer_discovery_timeout = Duration::from_millis(25);
+    let service = Arc::new(service);
     for _ in 0..2 {
         assert_eq!(
             service.admit(
@@ -1695,16 +1734,26 @@ fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Result<()> 
             NativeAdmission::InFlight
         );
     }
-    let calls = std::cell::Cell::new(0);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let expected = output.outputs["obj"].test_file_blob();
     assert!(
-        service.recover_next_result(Duration::ZERO, |blob, store, _| {
-            calls.set(calls.get() + 1);
-            assert_eq!(blob, output.outputs["obj"].test_file_blob());
-            Ok(Some(store.stage_expected(blob, &b"peer object"[..])?))
-        })?
+        service
+            .recover_next_result(Duration::ZERO, move |blob, store, _| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    assert_eq!(blob, expected);
+                    Ok(Some(store.stage_expected(blob, &b"peer object"[..])?))
+                }
+            })
+            .await?
     );
-    assert_eq!(calls.get(), 1);
-    assert!(!service.recover_next_result(Duration::ZERO, |_, _, _| unreachable!())?);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(
+        !service
+            .recover_next_result(Duration::ZERO, |_, _, _| async { unreachable!() })
+            .await?
+    );
     let NativeAdmission::Hit { ticket, manifest } =
         service.admit(req, Publisher::Client, ActionMode::Reuse, BTreeMap::new())?
     else {
@@ -1725,11 +1774,12 @@ fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Result<()> 
     Ok(())
 }
 
-#[test]
-fn failed_result_recovery_preserves_partial_content_and_allows_compilation() -> Result<()> {
+#[tokio::test]
+async fn failed_result_recovery_preserves_partial_content_and_allows_compilation() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let mut service = service(dir.path())?;
     service.limits.peer_discovery_timeout = Duration::from_millis(25);
+    let service = Arc::new(service);
     let req = request()?;
     let fingerprint = req.action_fingerprint()?;
     let key = fingerprint.key()?;
@@ -1762,14 +1812,16 @@ fn failed_result_recovery_preserves_partial_content_and_allows_compilation() -> 
         NativeAdmission::InFlight
     );
     assert!(
-        service.recover_next_result(Duration::ZERO, |blob, store, _| {
-            if blob == object {
-                Ok(Some(store.stage_expected(blob, &b"larger object"[..])?))
-            } else {
-                assert_eq!(blob, missing);
-                Ok(None)
-            }
-        })?
+        service
+            .recover_next_result(Duration::ZERO, move |blob, store, _| async move {
+                if blob == object {
+                    Ok(Some(store.stage_expected(blob, &b"larger object"[..])?))
+                } else {
+                    assert_eq!(blob, missing);
+                    Ok(None)
+                }
+            })
+            .await?
     );
     assert!(store.open_available_blob(object)?.is_some());
     assert!(store.open_available_blob(missing)?.is_none());

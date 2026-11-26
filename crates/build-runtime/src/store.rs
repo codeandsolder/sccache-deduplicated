@@ -231,7 +231,7 @@ pub struct StagedBlob {
 /// An admitted staging file and its incremental verifier. No I/O is
 /// performed until the caller supplies bytes, so asynchronous transports
 /// can move it between short blocking-pool operations.
-pub(crate) struct PhysicalStager {
+pub struct PhysicalStager {
     store: NativeStore,
     file: Arc<File>,
     path: TempPath,
@@ -286,15 +286,19 @@ impl PhysicalStager {
         result
     }
 
-    pub(crate) fn requires_codec_pool(&self) -> bool {
+    /// Whether a batch may perform compression or decompression.
+    #[must_use]
+    pub fn requires_codec_pool(&self) -> bool {
         self.ingest
             .as_ref()
             .is_some_and(blob_codec::BlobIngest::requires_codec_pool)
     }
 
-    // The codec and the filesystem write are separate operations. Keep the
-    // output private so callers cannot substitute unverified physical bytes.
-    pub(crate) fn encode_pending(&mut self, bytes: &[u8]) -> Result<()> {
+    /// Verify and encode a bounded batch without filesystem I/O.
+    ///
+    /// # Errors
+    /// Returns an error for malformed input or an unflushed previous batch.
+    pub fn encode_pending(&mut self, bytes: &[u8]) -> Result<()> {
         ensure!(!self.failed, "native staging already failed");
         ensure!(
             self.encoded.is_empty(),
@@ -347,7 +351,11 @@ impl PhysicalStager {
         Ok(())
     }
 
-    pub(crate) fn finish_encoding(&mut self) -> Result<()> {
+    /// Validate the complete logical digest and flush the last codec frame.
+    ///
+    /// # Errors
+    /// Returns an error for invalid content or pending unflushed bytes.
+    pub fn finish_encoding(&mut self) -> Result<()> {
         ensure!(!self.failed, "native staging already failed");
         ensure!(
             self.encoded.is_empty(),
@@ -362,6 +370,32 @@ impl PhysicalStager {
         result
     }
 
+    /// Submit the pending encoded bytes to the completion driver.
+    ///
+    /// # Errors
+    /// Returns an error for failed staging or storage errors.
+    #[cfg(feature = "async-io")]
+    pub async fn flush_pending_async(mut self) -> Result<Self> {
+        crate::disk::run(move || async move {
+            self.flush_pending_io().await?;
+            Ok(self)
+        })
+        .await
+    }
+
+    /// Flush and synchronize a fully verified staging file.
+    ///
+    /// # Errors
+    /// Returns an error for failed staging or storage errors.
+    #[cfg(feature = "async-io")]
+    pub async fn finish_file_async(mut self) -> Result<Self> {
+        crate::disk::run(move || async move {
+            self.finalize_io().await?;
+            Ok(self)
+        })
+        .await
+    }
+
     pub(crate) fn read_from(&mut self, mut reader: impl Read) -> Result<()> {
         let mut buffer = vec![0_u8; 128 * 1024];
         loop {
@@ -374,7 +408,11 @@ impl PhysicalStager {
         }
     }
 
-    pub(crate) fn finish(mut self) -> Result<StagedBlob> {
+    /// Finish an immutable verified staging file.
+    ///
+    /// # Errors
+    /// Returns an error for failed validation or storage errors.
+    pub fn finish(mut self) -> Result<StagedBlob> {
         ensure!(!self.failed, "native staging already failed");
         if !self.synced {
             self.flush_pending()?;
@@ -1181,7 +1219,11 @@ impl NativeStore {
         stager.finish()
     }
 
-    pub(crate) fn prepare_physical(
+    /// Reserve storage and begin incremental verified physical ingestion.
+    ///
+    /// # Errors
+    /// Returns an error for invalid metadata or insufficient storage.
+    pub fn prepare_physical(
         &self,
         expected: BlobRef,
         encoding: BlobEncoding,

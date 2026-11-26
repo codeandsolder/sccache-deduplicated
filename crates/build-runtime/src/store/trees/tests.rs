@@ -464,6 +464,68 @@ fn failed_tree_acquisition_can_be_retried_without_losing_the_waiting_consumer() 
     Ok(())
 }
 
+#[tokio::test]
+async fn asynchronous_tree_waiters_share_the_synchronous_owner_and_honor_deadlines() -> Result<()> {
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    let directory = tempfile::tempdir()?;
+    let store = NativeStore::open(directory.path())?;
+    let bytes = b"shared mixed execution tree";
+    let blob = BlobRef {
+        id: ContentId::of(bytes),
+        size: bytes.len() as u64,
+    };
+    let tree = sample_tree(blob)?;
+    let id = tree.id()?;
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let (resume, paused) = mpsc::channel();
+    let leader_store = store.clone();
+    let leader = tokio::task::spawn_blocking(move || {
+        leader_store.acquire_tree(
+            id,
+            || Ok(()),
+            || {
+                started
+                    .send(())
+                    .map_err(|()| anyhow::anyhow!("waiter dropped"))?;
+                paused.recv_timeout(Duration::from_secs(5))?;
+                leader_store.publish_tree_pinned(
+                    &tree,
+                    vec![leader_store.stage_expected(blob, &bytes[..])?],
+                )
+            },
+        )
+    });
+    waiting.await?;
+    assert!(
+        store
+            .acquire_tree_async(id, Instant::now() + Duration::from_millis(20), || async {
+                anyhow::bail!("waiter must not duplicate an active acquisition")
+            })
+            .await
+            .is_err()
+    );
+    let follower_store = store.clone();
+    let follower = tokio::spawn(async move {
+        follower_store
+            .acquire_tree_async(id, Instant::now() + Duration::from_secs(5), || async {
+                anyhow::bail!("synchronous owner must publish the only tree")
+            })
+            .await
+    });
+    resume.send(())?;
+    let (owner, reused) = leader.await??;
+    assert!(!reused);
+    let follower = follower.await??;
+    assert_eq!(owner.id(), follower.id());
+    assert_eq!(store.evict_tree(id)?, Eviction::Pinned);
+    drop((owner, follower));
+    assert!(matches!(store.evict_tree(id)?, Eviction::Removed { .. }));
+    Ok(())
+}
+
 #[test]
 fn indexed_tree_repairs_only_physically_missing_content() -> Result<()> {
     let directory = tempfile::tempdir()?;
