@@ -323,19 +323,8 @@ impl NativeStore {
         }
         let write = self.inner.db.begin_write()?;
         let mut publication = Publication::default();
+        self.attach_tree(&write, id, manifest, &blobs, staged, &mut publication)?;
         {
-            let mut trees = write.open_table(TREES)?;
-            let exists = if let Some(stored) = trees.get(&id.0)? {
-                let stored: TreeManifest = encoding().deserialize(stored.value())?;
-                ensure!(stored == *manifest, "conflicting native tree");
-                true
-            } else {
-                false
-            };
-            self.attach_blobs(&write, &id.0, &blobs, staged, exists, &mut publication)?;
-            if !exists {
-                trees.insert(&id.0, encoding().serialize(manifest)?.as_slice())?;
-            }
             if let Some((package, source, original)) = package {
                 let mut packages = write.open_table(PACKAGES)?;
                 let previous = packages
@@ -401,6 +390,30 @@ impl NativeStore {
         publication.commit(&self.inner, write)?;
         self.inner.lock_pins()?.touch(Root::Tree(id));
         Ok(id)
+    }
+
+    fn attach_tree(
+        &self,
+        write: &redb::WriteTransaction,
+        id: TreeId,
+        manifest: &TreeManifest,
+        blobs: &BTreeMap<ContentId, u64>,
+        staged: BTreeMap<ContentId, StagedBlob>,
+        publication: &mut Publication,
+    ) -> Result<()> {
+        let mut trees = write.open_table(TREES)?;
+        let exists = if let Some(stored) = trees.get(&id.0)? {
+            let stored: TreeManifest = encoding().deserialize(stored.value())?;
+            ensure!(stored == *manifest, "conflicting native tree");
+            true
+        } else {
+            false
+        };
+        self.attach_blobs(write, &id.0, blobs, staged, exists, publication)?;
+        if !exists {
+            trees.insert(&id.0, encoding().serialize(manifest)?.as_slice())?;
+        }
+        Ok(())
     }
 
     fn attach_package_archive(
@@ -657,6 +670,9 @@ impl Drop for TreePin {
         }
     }
 }
+
+mod publication;
+pub(super) use publication::TreePublicationQueue;
 
 #[cfg(target_os = "linux")]
 mod capture;
