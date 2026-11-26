@@ -25,7 +25,7 @@ use http::StatusCode;
 use sccache_cluster_identity::{
     AuthenticatedPeer, ClusterListener, PeerId, Role, SchedulerEnrollment,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::io::{StreamReader, SyncIoBridge};
 
 use crate::{
@@ -227,35 +227,28 @@ pub(super) fn routes<S: Send + Sync + 'static>(router: Router<Arc<S>>, state: S)
         .with_state(Arc::new(state))
 }
 
-/// Stream a blocking file/codec reader with a two-chunk bounded queue. Closing
-/// the response closes the receiver and stops the producer without buffering
-/// the entire artifact.
+/// Read one chunk per downstream poll. A slow peer holds the reader, not a
+/// blocking-pool thread; cancellation can leave at most one read in flight.
 const RESPONSE_CHUNK: usize = 128 * 1024;
-const RESPONSE_QUEUE: usize = 2;
 
-pub(super) fn reader_body(mut reader: impl Read + Send + 'static) -> Body {
-    let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(RESPONSE_QUEUE);
-    tokio::task::spawn_blocking(move || {
-        while !tx.is_closed() {
+pub(super) fn reader_body(reader: impl Read + Send + 'static) -> Body {
+    Body::from_stream(stream::try_unfold(reader, |mut reader| async move {
+        tokio::task::spawn_blocking(move || {
             let mut buffer = vec![0; RESPONSE_CHUNK];
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(size) => {
-                    buffer.truncate(size);
-                    if tx.blocking_send(Ok(Bytes::from(buffer))).is_err() {
-                        break;
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => return Ok(None),
+                    Ok(size) => {
+                        buffer.truncate(size);
+                        return Ok(Some((Bytes::from(buffer), reader)));
                     }
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => {
-                    let _ = tx.blocking_send(Err(error));
-                    break;
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
                 }
             }
-        }
-    });
-    Body::from_stream(stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|chunk| (chunk, rx))
+        })
+        .await
+        .map_err(io::Error::other)?
     }))
 }
 
@@ -647,29 +640,46 @@ mod streaming_tests {
         }
     }
 
-    #[tokio::test]
-    async fn abandoned_response_stops_bounded_reader() {
-        let bytes = Arc::new(AtomicUsize::new(0));
-        let (stopped, done) = tokio::sync::oneshot::channel();
-        let body = reader_body(InfiniteReader {
-            bytes: Arc::clone(&bytes),
-            stopped: Some(stopped),
-        });
-        // Two queued chunks plus the producer's in-flight chunk.
-        let maximum = (RESPONSE_QUEUE + 1) * RESPONSE_CHUNK;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while bytes.load(Ordering::Relaxed) < maximum {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+    #[test]
+    fn stalled_response_does_not_occupy_blocking_pool() -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let bytes = Arc::new(AtomicUsize::new(0));
+            let (stopped, done) = tokio::sync::oneshot::channel();
+            let mut body = reader_body(InfiniteReader {
+                bytes: Arc::clone(&bytes),
+                stopped: Some(stopped),
+            })
+            .into_data_stream();
+            assert_eq!(bytes.load(Ordering::Relaxed), 0);
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await?
+                .context("missing response chunk")??;
+            assert_eq!(chunk.len(), RESPONSE_CHUNK);
+            // The only blocking thread must remain available while the peer
+            // consumes nothing further.
+            tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| ()))
+                .await??;
+            assert_eq!(bytes.load(Ordering::Relaxed), RESPONSE_CHUNK);
+            drop(body);
+            tokio::time::timeout(Duration::from_secs(5), done).await??;
+            assert_eq!(bytes.load(Ordering::Relaxed), RESPONSE_CHUNK);
+            Ok(())
         })
-        .await
-        .expect("reader did not fill bounded queue");
-        assert_eq!(bytes.load(Ordering::Relaxed), maximum);
-        drop(body);
-        tokio::time::timeout(Duration::from_secs(5), done)
-            .await
-            .expect("reader did not stop after cancellation")
-            .expect("reader exited without signalling");
-        assert_eq!(bytes.load(Ordering::Relaxed), maximum);
+    }
+
+    #[tokio::test]
+    async fn demand_driven_response_preserves_exact_bytes_and_eof() -> Result<()> {
+        let expected = vec![0xa5; RESPONSE_CHUNK + 17];
+        let actual = axum::body::to_bytes(
+            reader_body(io::Cursor::new(expected.clone())),
+            expected.len(),
+        )
+        .await?;
+        assert_eq!(actual.as_ref(), expected.as_slice());
+        Ok(())
     }
 }
