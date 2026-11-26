@@ -2,7 +2,11 @@ use sccache_cluster_identity::{
     ClusterCa, EnrollmentAuthority, Identity, PeerConfig, PeerCredentials, Registry, Role,
     TlsCredentials,
 };
-use std::{collections::BTreeMap, io::Cursor, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    io::{Cursor, Seek},
+    sync::Mutex,
+};
 
 use super::*;
 use crate::{

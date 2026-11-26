@@ -2408,6 +2408,7 @@ mod tests;
 
 /// Open, authorized physical content. Transport chooses wire encoding without
 /// rewriting the complete object or scanning its compressed frame index.
+#[derive(Debug)]
 pub struct NativeDownload {
     pub file: File,
     pub encoding: BlobEncoding,
