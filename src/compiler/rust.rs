@@ -4534,7 +4534,7 @@ fn canonical_native_generated_inputs_have_stable_metadata_across_leases() -> Res
         fs::create_dir(&generated)?;
         let artifact = generated.join("libdep-123.rmeta");
         fs::write(&artifact, content)?;
-        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o640))?;
+        std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o640))?;
         fs::File::open(&artifact)?.set_times(
             std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(timestamp)),
         )?;
