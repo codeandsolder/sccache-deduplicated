@@ -27,6 +27,8 @@ const MAX_BATCH_ENTRIES: usize = 16_384;
 pub(in crate::store) struct TreePublicationQueue {
     slots: Arc<Semaphore>,
     state: Mutex<QueueState>,
+    #[cfg(test)]
+    pub(super) committed_batches: std::sync::atomic::AtomicU64,
 }
 
 impl Default for TreePublicationQueue {
@@ -34,6 +36,8 @@ impl Default for TreePublicationQueue {
         Self {
             slots: Arc::new(Semaphore::new(QUEUE_CAPACITY)),
             state: Mutex::default(),
+            #[cfg(test)]
+            committed_batches: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -163,6 +167,12 @@ impl NativeStore {
             )?;
         }
         publication.commit(&self.inner, write)?;
+        log::trace!(target: "native_cas_publication", "committed tree batch with {} requests", prepared.len());
+        #[cfg(test)]
+        self.inner
+            .tree_publications
+            .committed_batches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for (tree, completion) in prepared.drain(..) {
             completion.send(tree.lease(self));
         }

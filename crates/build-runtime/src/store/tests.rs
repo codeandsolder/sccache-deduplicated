@@ -741,6 +741,33 @@ fn restart_reclaims_pending_garbage_including_empty_files() -> Result<()> {
 }
 
 #[test]
+fn physically_missing_pending_blob_can_be_repaired_before_gc() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let staged = store.stage(&b"pending repair"[..])?;
+    let blob = staged.reference();
+    let published = store.publish(
+        &action("old"),
+        &result(blob),
+        vec![staged],
+        ActionMode::Reuse,
+    )?;
+    store.evict(published.action)?;
+    fs::remove_file(store.inner.blob_path(blob.id))?;
+    let staged = store.stage_expected(blob, &b"pending repair"[..])?;
+    let new = store.publish_pinned(
+        &action("new"),
+        &result(blob),
+        vec![staged],
+        ActionMode::Reuse,
+    )?;
+    assert_eq!(new.manifest(), &result(blob));
+    assert_eq!(store.stats()?.pending_gc_blobs, 0);
+    assert_eq!(store.stats()?.logical_bytes, blob.size);
+    Ok(())
+}
+
+#[test]
 fn garbage_collection_failures_remain_queued() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = NativeStore::open(dir.path())?;

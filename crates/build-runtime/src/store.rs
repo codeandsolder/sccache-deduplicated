@@ -1749,8 +1749,9 @@ impl NativeStore {
                         self.inner
                             .install_blob(blob, &mut publication.directories)?,
                     );
+                    let previous_layout = layouts.insert(&id.0, encoding as u8)?;
                     ensure!(
-                        layouts.insert(&id.0, encoding as u8)?.is_none(),
+                        previous_layout.is_none() || pending.get(&id.0)?.is_some(),
                         "physical encoding already indexed for new CAS content"
                     );
                 }
