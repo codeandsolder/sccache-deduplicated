@@ -485,7 +485,32 @@ impl Drop for AllocationClaim {
 /// the incomplete staging file, rather than stranding the transfer.
 pub struct NativeUpload {
     stager: crate::store::PhysicalStager,
-    guard: UploadGuard,
+    publication: UploadPublication,
+}
+
+enum UploadPublication {
+    Direct(UploadGuard),
+    Backfill {
+        manifest: TreeManifest,
+        _reserved: UploadReservation,
+        guard: BackfillUpload,
+    },
+}
+
+fn backfill_error(error: anyhow::Error) -> anyhow::Error {
+    use crate::store::BlobIntegrityError;
+    match error.downcast_ref::<BlobIntegrityError>() {
+        Some(BlobIntegrityError::Digest) => error.context(NativeInputRejected),
+        Some(BlobIntegrityError::Length { expected, actual }) if actual > expected => {
+            error.context(NativeInputRejected)
+        }
+        // Short/truncated bodies and local storage failures leave the
+        // claim retryable; another source may still satisfy it.
+        _ => {
+            log::debug!("native backfill publication interrupted: {error:#}");
+            error.context(NativeServiceBusy)
+        }
+    }
 }
 
 impl NativeUpload {
@@ -494,7 +519,15 @@ impl NativeUpload {
     /// # Errors
     /// Returns an error for malformed input or storage failure.
     pub fn feed(&mut self, bytes: &[u8]) -> Result<()> {
-        self.stager.feed(bytes)
+        let result = self.stager.feed(bytes);
+        self.classify(result)
+    }
+
+    fn classify<T>(&self, result: Result<T>) -> Result<T> {
+        match &self.publication {
+            UploadPublication::Direct(_) => result,
+            UploadPublication::Backfill { .. } => result.map_err(backfill_error),
+        }
     }
 }
 
@@ -1377,7 +1410,10 @@ impl NativeSessions {
             _slot: slot,
         };
         let stager = self.store().prepare_physical(blob, encoding)?;
-        Ok(NativeUpload { guard, stager })
+        Ok(NativeUpload {
+            stager,
+            publication: UploadPublication::Direct(guard),
+        })
     }
 
     /// Finish verification and attach the immutable staged file to the
@@ -1386,7 +1422,32 @@ impl NativeSessions {
     /// # Errors
     /// Returns an error if the bytes are invalid or the lease ended.
     pub fn finish_upload(&self, upload: NativeUpload) -> Result<()> {
-        let NativeUpload { guard, stager } = upload;
+        let NativeUpload {
+            stager,
+            publication,
+        } = upload;
+        let guard = match publication {
+            UploadPublication::Direct(guard) => guard,
+            UploadPublication::Backfill {
+                manifest,
+                _reserved,
+                guard,
+            } => {
+                return (|| {
+                    let lease = self
+                        .store()
+                        .publish_tree_pinned(&manifest, vec![stager.finish()?])?;
+                    let mut pending = guard.flight.lock()?;
+                    pending.ready = Some(Arc::new(lease));
+                    pending.peer_until = None;
+                    pending.peer_retry_at = None;
+                    drop(pending);
+                    drop(guard);
+                    Ok(())
+                })()
+                .map_err(backfill_error);
+            }
+        };
         let staged = stager.finish()?;
         let mut state = Self::lock(&guard.session)?;
         self.authorize(&mut state, guard.publisher)?;
@@ -2059,6 +2120,17 @@ impl NativeSessions {
     /// # Errors
     /// Returns an error for an unauthorized, unrequested or invalid stream.
     pub fn backfill_input(&self, ticket: Ticket, blob: BlobRef, reader: impl Read) -> Result<()> {
+        let mut upload = self.prepare_backfill(ticket, blob)?;
+        let result = upload.stager.read_from(reader);
+        upload.classify(result)?;
+        self.finish_upload(upload)
+    }
+
+    /// Claim one requested input and reserve its in-place verification state.
+    ///
+    /// # Errors
+    /// Returns an error for an unauthorized, unrequested or busy transfer.
+    pub fn prepare_backfill(&self, ticket: Ticket, blob: BlobRef) -> Result<NativeUpload> {
         let session = self.get(ticket)?;
         let guard = {
             let mut state = Self::lock(&session)?;
@@ -2097,41 +2169,21 @@ impl NativeSessions {
             drop(state);
             upload
         };
-        self.publish_backfill(guard, blob, reader).map_err(|error| {
-            use crate::store::BlobIntegrityError;
-            match error.downcast_ref::<BlobIntegrityError>() {
-                Some(BlobIntegrityError::Digest) => error.context(NativeInputRejected),
-                Some(BlobIntegrityError::Length { expected, actual }) if actual > expected => {
-                    error.context(NativeInputRejected)
-                }
-                // Short/truncated bodies and local storage failures leave the
-                // claim retryable; another source may still satisfy it.
-                _ => {
-                    log::debug!("native backfill publication interrupted: {error:#}");
-                    error.context(NativeServiceBusy)
-                }
-            }
-        })
-    }
-
-    fn publish_backfill(
-        &self,
-        guard: BackfillUpload,
-        blob: BlobRef,
-        reader: impl Read,
-    ) -> Result<()> {
-        let manifest = NativeStore::blob_retention_manifest(blob)?;
-        let _reserved = self.store().reserve_tree_upload(&manifest)?;
-        // Still verify the stream if concurrent publication supplied the same content.
-        let staged = vec![self.store().stage_expected(blob, reader)?];
-        let lease = self.store().publish_tree_pinned(&manifest, staged)?;
-        let mut pending = guard.flight.lock()?;
-        pending.ready = Some(Arc::new(lease));
-        pending.peer_until = None;
-        pending.peer_retry_at = None;
-        drop(pending);
-        drop(guard);
-        Ok(())
+        (|| {
+            let manifest = NativeStore::blob_retention_manifest(blob)?;
+            let reserved = self.store().reserve_tree_upload(&manifest)?;
+            // Still verify the stream if concurrent publication supplied it.
+            let stager = self.store().prepare_physical(blob, BlobEncoding::Raw)?;
+            Ok(NativeUpload {
+                stager,
+                publication: UploadPublication::Backfill {
+                    manifest,
+                    _reserved: reserved,
+                    guard,
+                },
+            })
+        })()
+        .map_err(backfill_error)
     }
 
     /// Record the receiver's successful staging receipt once, while the

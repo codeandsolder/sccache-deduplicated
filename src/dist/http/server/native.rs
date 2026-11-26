@@ -280,10 +280,11 @@ where
                     metadata_limit,
                 )
             },
-            move |request, role| {
+            move |request, role, operation| {
                 upload_response(
                     request,
                     role,
+                    operation,
                     Arc::clone(&upload_sessions),
                     Arc::clone(&upload_network),
                     metadata_limit,
@@ -340,11 +341,12 @@ where
     F: Fn(&Request, &str, &str) -> Response + Send + Sync + 'static,
     A: Fn(Request) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Response> + Send + 'static,
-    U: Fn(Request, &'static str) -> UFut + Send + Sync + 'static,
+    U: Fn(Request, &'static str, &'static str) -> UFut + Send + Sync + 'static,
     UFut: Future<Output = Response> + Send + 'static,
 {
     let upload = Arc::new(upload);
     let client_upload = Arc::clone(&upload);
+    let client_backfill = Arc::clone(&upload);
     routes(
         Router::new()
             .route(
@@ -360,7 +362,7 @@ where
                 async_route(
                     MethodFilter::POST,
                     AdmissionClass::Bulk,
-                    move |_: Arc<F>, request| client_upload(request, "client"),
+                    move |_: Arc<F>, request| client_upload(request, "client", "upload"),
                 ),
             )
             .route(
@@ -368,7 +370,15 @@ where
                 async_route(
                     MethodFilter::POST,
                     AdmissionClass::Bulk,
-                    move |_: Arc<F>, request| upload(request, "worker"),
+                    move |_: Arc<F>, request| upload(request, "worker", "upload"),
+                ),
+            )
+            .route(
+                "/api/v5/native/client/backfill_input",
+                async_route(
+                    MethodFilter::POST,
+                    AdmissionClass::Bulk,
+                    move |_: Arc<F>, request| client_backfill(request, "client", "backfill_input"),
                 ),
             )
             .route(
@@ -566,6 +576,7 @@ fn request_publisher(request: &Request, role: &str) -> std::result::Result<Publi
 async fn upload_response(
     mut request: Request,
     role: &str,
+    operation: &str,
     sessions: Arc<NativeSessions>,
     network: Arc<NetworkMeter>,
     limit: usize,
@@ -579,6 +590,7 @@ async fn upload_response(
         Publisher::Worker { peer, .. } => Peer::Worker(peer),
     }
     .on_path(request.path());
+    let backfill = operation == "backfill_input";
     let result = async {
         let stream = request
             .body_stream()
@@ -591,14 +603,29 @@ async fn upload_response(
         let mut upload = {
             let sessions = Arc::clone(&sessions);
             tokio::task::spawn_blocking(move || {
-                sessions.prepare_upload(header.ticket, publisher, header.blob, encoding)
+                if backfill {
+                    ensure!(
+                        encoding == BlobEncoding::Raw,
+                        "backfill input requires logical bytes"
+                    );
+                    sessions.prepare_backfill(header.ticket, header.blob)
+                } else {
+                    sessions.prepare_upload(header.ticket, publisher, header.blob, encoding)
+                }
             })
             .await??
         };
         let mut meter = network.transfer(Direction::Receive, peer, header.blob.size, None);
         let mut buffer = vec![0; 128 * 1024];
         loop {
-            let count = input.read(&mut buffer).await?;
+            let count = input.read(&mut buffer).await.map_err(|error| {
+                let error = anyhow::Error::from(error);
+                if backfill {
+                    error.context(NativeServiceBusy)
+                } else {
+                    error
+                }
+            })?;
             if count == 0 {
                 meter.eof();
                 break;
@@ -614,7 +641,7 @@ async fn upload_response(
         encode(&(), limit)
     }
     .await;
-    native_response("upload", result)
+    native_response(operation, result)
 }
 
 // Prepare immutable placement inputs on the blocking pool; the worker RPC
@@ -886,17 +913,6 @@ fn dispatch(
         "input_unavailable" if publisher == Publisher::Client => {
             let (ticket, demand) = metadata(request, limit)?;
             sessions.input_unavailable(ticket, demand)?;
-            encode(&(), limit)
-        }
-        "backfill_input" if publisher == Publisher::Client => {
-            let mut body = request.data().context("missing native backfill body")?;
-            let header: UploadHeader = codec().with_limit(73).deserialize_from(&mut body)?;
-            ensure!(
-                header.encoding == BlobEncoding::Raw as u8,
-                "backfill input requires logical bytes"
-            );
-            let reader = network.meter(Direction::Receive, peer, body, header.blob.size, None);
-            sessions.backfill_input(header.ticket, header.blob, reader)?;
             encode(&(), limit)
         }
         "status" if publisher == Publisher::Client => {

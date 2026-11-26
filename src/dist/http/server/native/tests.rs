@@ -244,10 +244,11 @@ fn with_native_service(
                         1024 * 1024,
                     )
                 },
-                move |request, role| {
+                move |request, role, operation| {
                     upload_response(
                         request,
                         role,
+                        operation,
                         Arc::clone(&upload_sessions),
                         Arc::clone(&upload_network),
                         1024 * 1024,
