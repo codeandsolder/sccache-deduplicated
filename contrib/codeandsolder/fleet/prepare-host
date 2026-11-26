@@ -5,6 +5,16 @@ set -euo pipefail
 umask 077
 [[ $EUID == 0 ]]
 role=${1:?acer, asus, cold-storage, or wsl}
+ca_certificate=${2:?authenticated scheduler CA PEM file}
+scheduler_id=${3:?scheduler public-key identity}
+[[ "$scheduler_id" =~ ^[0-9a-f]{64}$ ]]
+openssl x509 -in "$ca_certificate" -noout >/dev/null
+if [[ "$role" == asus ]]; then
+  # The CA and scheduler key must be provisioned by the scheduler account
+  # before staging, not created by a root-owned rollout script.
+  cmp -- "$ca_certificate" /var/lib/sccache-cluster/scheduler/ca.pem
+  [[ $(openssl pkey -in /var/lib/sccache-cluster/scheduler/key.pem -pubout -outform DER | sha256sum | cut -d' ' -f1) == "$scheduler_id" ]]
+fi
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 case "$role" in
   acer) user=jan; source=/etc/sccache/client.conf; worker_gib=32; worker_target=24; minimum=16; target=24 ;;
@@ -16,12 +26,14 @@ esac
 [[ "$(systemctl show sccache-local.service -p User --value)" == "$user" ]]
 uid=$(id -u "$user")
 gid=$(id -g "$user")
-stage=/var/lib/sccache-managed-rollout/epoch5-20261125
+stage=/var/lib/sccache-managed-rollout/epoch6-20261125
 [[ ! -e "$stage" ]] || { echo "stage already exists: $stage"; exit 1; }
 install -d -m 0700 "$stage"
 trap 'rc=$?; if (( rc != 0 )); then rm -rf -- "$stage"; fi' EXIT
+install -m 0600 "$ca_certificate" "$stage/cluster-ca.pem"
 gib=1073741824
-cache_url=http://100.73.74.69:10602
+cache_url=https://100.73.74.69:10602
+scheduler_url=https://100.73.74.69:10600
 platform=linux-x86_64-zen2-explicit-codegen-bwrap-v1
 record_source() { sha256sum -- "$1" >> "$stage/originals.sha256"; }
 assert_absent() {
@@ -30,9 +42,16 @@ assert_absent() {
   [[ $rc == 1 ]] || { echo "existing section or unreadable source: $file"; exit 1; }
 }
 record_source "$source"
-assert_absent '^\s*\[(shared_daemon|dist\.native|compiler_aliases)(\.|\])' "$source"
+assert_absent '^\s*\[(shared_daemon|dist\.native|dist\.cluster|compiler_aliases)(\.|\])' "$source"
 cp -- "$source" "$stage/client-shared.toml"
+[[ $(rg -c '^\s*scheduler_url\s*=' "$stage/client-shared.toml") == 1 ]]
+sed -i -E "s|^\s*scheduler_url\s*=.*$|scheduler_url = \"$scheduler_url\"|" "$stage/client-shared.toml"
 cat >> "$stage/client-shared.toml" <<EOF
+
+[dist.cluster]
+directory = "/var/lib/sccache-cluster/client"
+ca_certificate = "/etc/sccache/cluster-ca.pem"
+scheduler_id = "$scheduler_id"
 
 [shared_daemon]
 socket_gid = $gid
@@ -149,9 +168,10 @@ ROUTING
 # Use the exact reviewed host tooling from the release checkout.
 install -m 0700 "$repo/sccache-client" "$stage/sccache-client"
 install -m 0700 "$repo/sccache-release-update" "$stage/sccache-release-update"
+install -m 0700 "$repo/host-native-metadata" "$stage/host-native-metadata"
 install -m 0700 "$repo/fleet/activate-host" "$stage/activate-host"
 install -m 0600 "$repo/native-action-report.awk" "$stage/native-action-report.awk"
-if [[ -x /usr/local/libexec/cargo-codeandsolder-real && -f /usr/local/bin/cargo ]]; then
+if [[ -x /usr/bin/rustup && -f /usr/local/bin/cargo ]]; then
   install -m 0700 "$repo/cargo-wrapper" "$stage/cargo-wrapper"
 fi
 for helper in sccache-cmake-launcher sccache-dist-client-preflight; do
@@ -165,9 +185,9 @@ case "$role" in
 esac
 chmod 0700 "$stage/sccache-client"
 bash -n "$stage/sccache-client"
-cat > "$stage/zz-epoch5.conf" <<'UPDATER'
+cat > "$stage/zz-epoch6.conf" <<'UPDATER'
 [Service]
-Environment=SCCACHE_AUTOUPDATE_EXPECTED_ROLLOUT_EPOCH=5
+Environment=SCCACHE_AUTOUPDATE_EXPECTED_ROLLOUT_EPOCH=6
 Environment=SCCACHE_AUTOUPDATE_EXPECTED_RUST_TOOLCHAIN=nightly-2026-11-20
 Environment=SCCACHE_AUTOUPDATE_NATIVE_BUNDLE_ROOT=/var/lib/sccache-native-bundles
 Environment=SCCACHE_AUTOUPDATE_LIVE=/usr/local/libexec/sccache-bin/sccache
@@ -177,9 +197,16 @@ UPDATER
 if (( worker_gib > 0 )); then
   worker=/etc/sccache-dist/server.conf
   record_source "$worker"
-  assert_absent '^\s*\[native_worker(\.|\])' "$worker"
+  assert_absent '^\s*\[(native_worker|cluster)(\.|\])' "$worker"
   cp -- "$worker" "$stage/server.conf"
+  [[ $(rg -c '^\s*scheduler_url\s*=' "$stage/server.conf") == 1 ]]
+  sed -i -E "s|^\s*scheduler_url\s*=.*$|scheduler_url = \"$scheduler_url\"|; /^\s*bind_address\s*=/d" "$stage/server.conf"
   cat >> "$stage/server.conf" <<EOF
+
+[cluster]
+directory = "/var/lib/sccache-cluster/worker"
+ca_certificate = "/etc/sccache/cluster-ca.pem"
+scheduler_id = "$scheduler_id"
 
 [native_worker]
 cache_url = "$cache_url"
@@ -227,10 +254,15 @@ ExecStart=/usr/local/libexec/sccache-bin/sccache
 UNIT
   scheduler=/etc/sccache-dist/scheduler.conf
   record_source "$scheduler"
-  assert_absent '^\s*\[(job_slack|native_cache)(\.|\])' "$scheduler"
-  cp -- "$scheduler" "$stage/scheduler.conf"
-  [[ -z "$(ss -Hln 'sport = :10602')" ]]
+  assert_absent '^\s*\[(job_slack|native_cache|dashboard)(\.|\])' "$scheduler"
+  assert_absent '^\s*cluster_directory\s*=' "$scheduler"
+  { printf 'cluster_directory = "/var/lib/sccache-cluster/scheduler"\n'; cat -- "$scheduler"; } > "$stage/scheduler.conf"
+  [[ -z "$(ss -Hln 'sport = :10602')" && -z "$(ss -Hln 'sport = :10604')" ]]
   cat >> "$stage/scheduler.conf" <<EOF
+
+[dashboard]
+bind_address = "127.0.0.1:10604"
+assets = "/var/lib/sccache-dashboard/current"
 
 [job_slack]
 static_jobs = 0
@@ -276,7 +308,7 @@ EOF
 fi
 # Provision only the exact release/CI toolchains and stable smoke toolchain
 # that actually exist on this host. All other toolchains use descriptor memo.
-catalog_dir=/var/lib/sccache-installations/epoch5
+catalog_dir=/var/lib/sccache-installations/epoch6
 : > "$stage/rust-installations.tsv"
 home=$(getent passwd "$user" | cut -d: -f6)
 for base in "$home/.rustup/toolchains" /root/.rustup/toolchains /opt/toolchains/rustup/toolchains /var/lib/sccache-native-builder/rustup/toolchains; do

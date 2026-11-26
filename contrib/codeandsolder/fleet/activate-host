@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Coordinated protocol 3 -> 4 / rollout epoch 4 -> 5 cutover.
+# Coordinated protocol 3 -> 5 / rollout epoch 4 -> 6 cutover.
 # Call phases on every host in order; NEVER complete one host's entire
 # migration while another host still serves protocol 3.
 set -euo pipefail
 umask 077
 [[ $EUID == 0 ]]
-stage=/var/lib/sccache-managed-rollout/epoch5-20261125
+stage=/var/lib/sccache-managed-rollout/epoch6-20261125
 cd "$stage"
 phase=${1:?phase required}
 sha=${2:?exact published source SHA required}
@@ -14,6 +14,7 @@ bundle=/var/lib/sccache-native-bundles/$sha
 state=/var/lib/sccache-autoupdate
 live=/usr/local/libexec/sccache-bin/sccache
 dist=/usr/local/bin/sccache-dist
+dashboard_link=/var/lib/sccache-dashboard/current
 rollback="$stage/rollback"
 drain=/dev/shm/sccache-maintenance-drain
 sched_drain=/run/sccache-scheduler-maintenance-drain
@@ -100,9 +101,11 @@ assert_updaters_paused() {
 field() { sed -n "s/^$1=//p" "$2"; }
 assert_bundle() {
   [[ $(field source_sha "$stage/published-build.txt") == "$sha" ]]
-  [[ $(field dist_protocol "$stage/published-build.txt") == 4 ]]
-  [[ $(field rollout_epoch "$stage/published-build.txt") == 5 ]]
-  /usr/local/libexec/host-native-metadata verify "$bundle" "$stage/published-build.txt"
+  [[ $(field dist_protocol "$stage/published-build.txt") == 5 ]]
+  [[ $(field rollout_epoch "$stage/published-build.txt") == 6 ]]
+  local flags=()
+  if [[ "$role" == asus ]]; then flags+=(--scheduler-dashboard); fi
+  "$stage/host-native-metadata" verify "$bundle" "$stage/published-build.txt" "${flags[@]}"
 }
 assert_prepared() {
   sha256sum --check --status STAGED_SHA256SUMS
@@ -121,7 +124,7 @@ install_atomic() {
   local from="$1" to="$2" mode="$3" owner="${4:-root}" group="${5:-root}"
   [[ -d "$(dirname -- "$to")" ]] || install -d -m 0755 "$(dirname -- "$to")"
   local tmp
-  tmp=$(mktemp "$(dirname -- "$to")/.epoch5.XXXXXX")
+  tmp=$(mktemp "$(dirname -- "$to")/.epoch6.XXXXXX")
   install -o "$owner" -g "$group" -m "$mode" "$from" "$tmp"
   mv -Tf -- "$tmp" "$to"
 }
@@ -182,14 +185,15 @@ case "$phase" in
     updater_guard
     assert_updaters_paused
     assert_prepared
-    files=("$live" "$dist" /usr/local/bin/sccache /usr/local/libexec/sccache-client /usr/local/libexec/sccache-release-update /etc/sccache/client-shared.toml /etc/sccache/wrapper.conf /etc/systemd/system/sccache-local.service.d/90-shared-daemon.conf /etc/systemd/system/sccache-release-update.service.d/zz-epoch5.conf)
+    files=("$live" "$dist" /usr/local/bin/sccache /usr/local/libexec/sccache-client /usr/local/libexec/sccache-release-update /usr/local/libexec/host-native-metadata /etc/sccache/client-shared.toml /etc/sccache/cluster-ca.pem /etc/sccache/wrapper.conf /etc/systemd/system/sccache-local.service.d/90-shared-daemon.conf /etc/systemd/system/sccache-release-update.service.d/zz-epoch6.conf)
     [[ ! -f server.conf ]] || files+=(/etc/sccache-dist/server.conf)
-    [[ ! -f scheduler.conf ]] || files+=(/etc/sccache-dist/scheduler.conf)
+    [[ ! -f scheduler.conf ]] || files+=(/etc/sccache-dist/scheduler.conf "$dashboard_link")
     [[ ! -f 90-real-binary.conf ]] || files+=(/etc/systemd/system/sccache-strict-local.service.d/90-real-binary.conf)
     [[ ! -f cargo-wrapper ]] || files+=(/usr/local/bin/cargo)
     [[ ! -f sccache-cmake-launcher ]] || files+=(/usr/local/libexec/sccache-cmake-launcher)
     [[ ! -f sccache-dist-client-preflight ]] || files+=(/usr/local/libexec/sccache-dist-client-preflight)
     for f in "${state_files[@]}"; do files+=("$state/$f"); done
+    files+=("$state/release.json")
     for f in "${files[@]}"; do snapshot_file "$f"; done
     printf '%s\n' "$sha" > "$rollback/release-sha"
     trap - EXIT
@@ -230,13 +234,17 @@ case "$phase" in
     install_atomic sccache-client /usr/local/bin/sccache 0755
     install_atomic sccache-client /usr/local/libexec/sccache-client 0755
     install_atomic sccache-release-update /usr/local/libexec/sccache-release-update 0755
+    install_atomic host-native-metadata /usr/local/libexec/host-native-metadata 0755
     if [[ -f cargo-wrapper ]]; then install_atomic cargo-wrapper /usr/local/bin/cargo 0755; fi
     if [[ -f sccache-cmake-launcher ]]; then install_atomic sccache-cmake-launcher /usr/local/libexec/sccache-cmake-launcher 0755; fi
     if [[ -f sccache-dist-client-preflight ]]; then install_atomic sccache-dist-client-preflight /usr/local/libexec/sccache-dist-client-preflight 0755; fi
     install_atomic client-shared.toml /etc/sccache/client-shared.toml 0600
+    install_atomic cluster-ca.pem /etc/sccache/cluster-ca.pem 0644
+    install -d -m 0700 /var/lib/sccache-cluster/client
+    if [[ -f server.conf ]]; then install -d -m 0700 /var/lib/sccache-cluster/worker; fi
     install_atomic wrapper.conf /etc/sccache/wrapper.conf 0644
     install_atomic 90-shared-daemon.conf /etc/systemd/system/sccache-local.service.d/90-shared-daemon.conf 0644
-    install_atomic zz-epoch5.conf /etc/systemd/system/sccache-release-update.service.d/zz-epoch5.conf 0644
+    install_atomic zz-epoch6.conf /etc/systemd/system/sccache-release-update.service.d/zz-epoch6.conf 0644
     if [[ -f 90-real-binary.conf ]]; then
       install_atomic 90-real-binary.conf /etc/systemd/system/sccache-strict-local.service.d/90-real-binary.conf 0644
     fi
@@ -248,6 +256,8 @@ case "$phase" in
     fi
     if [[ -f scheduler.conf ]]; then
       install_atomic scheduler.conf /etc/sccache-dist/scheduler.conf 0640 root sccache-scheduler
+      /usr/local/libexec/host-native-metadata dashboard-select "$bundle" "$dashboard_link"
+      runuser -u sccache-scheduler -- test -r "$dashboard_link/sccache-dashboard_bg.wasm"
       install -d -o sccache-scheduler -g sccache-scheduler -m 0700 /var/cache/sccache-native/scheduler
     fi
     systemctl daemon-reload
@@ -258,11 +268,11 @@ case "$phase" in
     if [[ "$role" == asus ]]; then
       systemctl start sccache-dist-scheduler.service
       rm -f "$sched_drain"
-      start_if_previous sccache-scheduler-loopback.socket
-      start_if_previous sccache-scheduler-loopback.service
       systemctl is-active --quiet sccache-dist-scheduler.service
       for ((i=0;i<60;i++)); do
-        if curl -fsS --max-time 2 -H 'Accept: application/json' http://100.73.74.69:10600/api/v1/scheduler/status; then exit 0; fi
+        if "$dist" cluster-status --client-config /etc/sccache/client-shared.toml \
+          && curl --fail --silent --show-error --max-time 5 -o /dev/null http://127.0.0.1:10604/ \
+          && cmp -s "$dashboard_link/sccache-dashboard_bg.wasm" <(curl --fail --silent --show-error --max-time 5 http://127.0.0.1:10604/pkg/sccache-dashboard_bg.wasm); then exit 0; fi
         sleep 1
       done
       echo "scheduler did not become ready" >&2; exit 1
@@ -275,9 +285,9 @@ case "$phase" in
   provision-rust)
     assert_updaters_paused
     [[ -e "$drain" ]]
-    install -d -m 0755 /var/lib/sccache-installations/epoch5
+    install -d -m 0755 /var/lib/sccache-installations/epoch6
     while IFS=$'\t' read -r root catalog; do
-      [[ "$catalog" =~ ^/var/lib/sccache-installations/epoch5/[0-9a-f]{24}\.catalog$ ]]
+      [[ "$catalog" =~ ^/var/lib/sccache-installations/epoch6/[0-9a-f]{24}\.catalog$ ]]
       "$dist" native-sync-rust --root "$root" --client-config /etc/sccache/client-shared.toml \
         --output "$catalog" --recipe-output "${catalog%.catalog}.recipe" --jobs 2
       chmod 0644 "$catalog" "${catalog%.catalog}.recipe"
@@ -296,12 +306,12 @@ case "$phase" in
     wait_shared
     # Run directly against the managed shared endpoint while wrappers remain
     # gated. This is a correctness check, not a benchmark.
-    tmp=$(mktemp -d /var/tmp/sccache-epoch5-smoke.XXXXXX)
+    tmp=$(mktemp -d /var/tmp/sccache-epoch6-smoke.XXXXXX)
     trap 'rm -rf -- "$tmp"' EXIT
     chmod 0755 "$tmp"
     install -d -o "$uid" -g "$gid" -m 0700 "$tmp/build"
     cd "$tmp/build"
-    printf 'int sccache_epoch5_%s(void) { return %s; }\n' "$(date +%s)" "$((RANDOM+1))" > smoke.c
+    printf 'int sccache_epoch6_%s(void) { return %s; }\n' "$(date +%s)" "$((RANDOM+1))" > smoke.c
     chown "$uid:$gid" smoke.c
     chmod 0644 smoke.c
     runuser -u "$user" -- env -u SCCACHE_SERVER_PORT -u SCCACHE_ERROR_LOG -u SCCACHE_RECACHE -u SCCACHE_CLIENT_SIDE SCCACHE_LOG=sccache::native_action=info SCCACHE_SERVER_UDS="$sock" SCCACHE_START_SERVER=0 SCCACHE_NO_AUTO_START_SERVER=1 bash -c 'umask 022; exec "$@"' _ "$live" /usr/bin/gcc -c smoke.c -o smoke.o 2>"$tmp/first.log" || { cat "$tmp/first.log" >&2; exit 1; }
@@ -331,7 +341,10 @@ case "$phase" in
       if active_before "$u"; then verify_running "$u" "$local_hash"; fi
     done
     if active_before sccache-dist-worker.service; then verify_running sccache-dist-worker.service "$dist_hash"; fi
-    if active_before sccache-dist-scheduler.service; then verify_running sccache-dist-scheduler.service "$dist_hash"; fi
+    if active_before sccache-dist-scheduler.service; then
+      verify_running sccache-dist-scheduler.service "$dist_hash"
+      [[ -L "$dashboard_link" && $(readlink "$dashboard_link") == "$bundle/pkg" ]]
+    fi
     if [[ $(systemctl show sccache-local-root.service -p LoadState --value) == loaded ]]; then
       systemctl disable sccache-local-root.service
     fi
@@ -339,22 +352,28 @@ case "$phase" in
       assert_updaters_paused
       systemctl disable "$watchdog_timer"
     fi
-    tag=sccache-ci-$sha
-    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    for f in client_release_tag dist_release_tag release_tag; do printf '%s\n' "$tag" > "$state/$f"; done
-    for f in client_source_sha dist_source_sha source_sha; do printf '%s\n' "$sha" > "$state/$f"; done
-    for f in binary_sha256 client_sha256; do printf '%s\n' "$local_hash" > "$state/$f"; done
-    for f in dist_binary_sha256 dist_sha256; do printf '%s\n' "$dist_hash" > "$state/$f"; done
-    for f in client_updated_at dist_updated_at updated_at; do printf '%s\n' "$now" > "$state/$f"; done
-    printf '4\n' > "$state/dist_protocol"
-    cp "$stage/published-at.txt" "$state/published_at"
-    cp "$bundle/build.txt" "$bundle/SHA256SUMS" "$state/"
+    "$stage/host-native-metadata" state-publish "$state" "$bundle" "sccache-ci-$sha" \
+      "$(cat "$stage/published-at.txt")" "$local_hash" "$dist_hash"
+    # The old flat protocol-3 state is captured in the rollback snapshot.
+    # Do not keep two authoritative release states after the migration.
+    for f in "${state_files[@]}"; do rm -f -- "$state/$f"; done
     echo "committed $role $sha"
     ;;
+  open-clients)
+    # All hosts must have committed before the operator opens this barrier.
+    # Keep the updater-specific guard during full production acceptance.
+    jq -e --arg sha "$sha" ' .schema == 1 and .source_sha == $sha and .dist_protocol == "5" ' "$state/release.json" >/dev/null
+    [[ $(cat "$rollback/smoke-ok") == "$sha" ]]
+    assert_updaters_paused
+    assert_bundle
+    rm -f "$drain" "$client_guard"
+    echo "clients admitted; automatic updates still held on $role"
+    ;;
   resume-updates)
-    [[ $(cat "$state/source_sha") == "$sha" && $(cat "$state/dist_protocol") == 4 ]]
-    rm -f "$drain"
+    jq -e --arg sha "$sha" ' .schema == 1 and .source_sha == $sha and .dist_protocol == "5" ' "$state/release.json" >/dev/null
+    [[ -f "$guard" && ! -e "$drain" && ! -e "$client_guard" ]]
     resume_updaters
+    if systemctl is-enabled --quiet sccache-release-update.timer; then systemctl start sccache-release-update.timer; fi
     ;;
   rollback-stop)
     updater_guard
@@ -370,7 +389,7 @@ case "$phase" in
     while IFS= read -r f; do
       if [[ -e "$rollback/files$f" || -L "$rollback/files$f" ]]; then
         [[ -d "$(dirname -- "$f")" ]] || install -d -m 0755 "$(dirname -- "$f")"
-        cp -a --remove-destination -- "$rollback/files$f" "$f"
+        cp -aT --remove-destination -- "$rollback/files$f" "$f"
       else
         rm -f -- "$f"
       fi

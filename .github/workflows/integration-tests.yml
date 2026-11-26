@@ -190,7 +190,7 @@ jobs:
           rust-toolchain: ${{ steps.rust.outputs.name }}
 
       - name: Build
-        run: cargo build --bin sccache --target $env:TARGET --features=vendored-openssl
+        run: cargo build --bin sccache --target $env:TARGET
 
       - name: Finalize mandatory compiler sccache
         if: always()

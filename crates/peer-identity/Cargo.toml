@@ -1,0 +1,13 @@
+[package]
+name = "sccache-peer-identity"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+description = "Address-independent identity shared by the distributed build wire protocols"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

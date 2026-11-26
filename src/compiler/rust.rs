@@ -31,7 +31,7 @@ use crate::compiler::{
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
-use crate::lru_disk_cache::{LruCache, Meter};
+use crate::lru_disk_cache::{Meter, WeightedLru};
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{Digest, fmt_duration_as_secs, hash_all, hash_all_archives, run_input_output};
 use crate::util::{HashToDigest, OsStrExt};
@@ -42,15 +42,12 @@ use log::Level::Trace;
 #[cfg(feature = "dist-client")]
 use semver::Version;
 use serde::Serialize;
-#[cfg(feature = "dist-client")]
-use std::borrow::Borrow;
 use std::borrow::Cow;
-#[cfg(feature = "dist-client")]
-use std::collections::hash_map::RandomState;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env::consts::DLL_EXTENSION;
 #[cfg(feature = "dist-client")]
 use std::env::consts::DLL_PREFIX;
+#[cfg(feature = "dist-client")]
 use std::env::consts::EXE_EXTENSION;
 #[cfg(feature = "dist-client")]
 use std::env::consts::EXE_SUFFIX;
@@ -2637,6 +2634,8 @@ where
         context: GenerateHashKeyContext<'_, T>,
     ) -> Result<HashResult<T>> {
         let GenerateHashKeyContext {
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            native,
             creator,
             cwd,
             env_vars,
@@ -2982,6 +2981,15 @@ where
             .iter()
             .map(|e| cwd.join(e))
             .collect::<Vec<_>>();
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        let extern_hashes = async {
+            if let Some(native) = &native {
+                native.hash_files(&abs_externs, pool).await
+            } else {
+                hash_all(&abs_externs, pool).await
+            }
+        };
+        #[cfg(not(all(feature = "dist-client", target_os = "linux")))]
         let extern_hashes = hash_all(&abs_externs, pool);
         // Hash the contents of the staticlibs listed on the commandline.
         trace!(
@@ -3844,11 +3852,9 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             // trying to do every single path.
             let mut remapped_disks = HashSet::new();
             for (local_path, dist_path) in get_path_mappings(path_transformer) {
-                if canonical_paths.is_some()
-                    && matches!(
-                        dist_path.as_str(),
-                        "/build" | "/target" | "/cargo" | "/rust"
-                    )
+                if canonical_paths
+                    .as_ref()
+                    .is_some_and(|paths| paths.is_canonical_mapping(&local_path, &dist_path))
                 {
                     continue;
                 }
@@ -4411,7 +4417,7 @@ fn test_dist_dependency_inspection_failure_keeps_all_candidates() -> Result<()> 
     // Metadata reader unavailable for this individual input, even though
     // discovery was enabled when the server initialized the compiler.
     let reader = Arc::new(RlibDepReader {
-        cache: Mutex::new(LruCache::with_meter(1024, DepsSize)),
+        cache: Mutex::new(WeightedLru::new(1024, DepsSize)),
         executable: tmp.path().join("missing-rustc"),
         ls_arg: "ls=root".into(),
     });
@@ -4502,6 +4508,87 @@ fn native_rust_inputs_retain_complete_dependency_artifacts() -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(feature = "dist-client", feature = "native-store", target_os = "linux"))]
+#[test]
+fn canonical_native_generated_inputs_have_stable_metadata_across_leases() -> Result<()> {
+    use crate::build_runtime::{
+        BlobRef, ContentId, NativeStore, ReferenceBlobProvider, TreeEntry, TreePath,
+    };
+    use crate::dist::pkg::InputsPackager as _;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::time::{Duration, UNIX_EPOCH};
+    let tmp = tempfile::tempdir()?;
+    let source = tmp.path().join("project");
+    fs::create_dir(&source)?;
+    let source_file = source.join("main.rs");
+    fs::write(&source_file, b"fn main() {}")?;
+    let source_time = UNIX_EPOCH + Duration::from_secs(123);
+    fs::File::open(&source_file)?.set_times(std::fs::FileTimes::new().set_modified(source_time))?;
+    let content = b"same compiled dependency";
+    let blob = BlobRef {
+        id: ContentId::of(content),
+        size: u64::try_from(content.len())?,
+    };
+    let capture = |lease: &str, timestamp: u64, reference: bool| -> Result<_> {
+        let generated = tmp.path().join(lease);
+        fs::create_dir(&generated)?;
+        let artifact = generated.join("libdep-123.rmeta");
+        fs::write(&artifact, content)?;
+        std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o640))?;
+        fs::File::open(&artifact)?.set_times(
+            std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(timestamp)),
+        )?;
+        let mut transformer = dist::PathTransformer::new();
+        transformer.add_root_mapping(source.clone(), "/build");
+        transformer.add_root_mapping(generated, "/intermediate");
+        let packager = RustInputsPackager {
+            env_vars: Vec::new(),
+            input_dirs: Vec::new(),
+            crate_link_paths: Vec::new(),
+            can_trim_rlibs: false,
+            inputs: vec![source_file.clone(), artifact.clone()],
+            path_transformer: transformer,
+            rlib_dep_reader: None,
+        };
+        let mapping = Box::new(packager).native_mapping()?;
+        let prepared = if reference {
+            mapping.prepare_with_references(&|_, path| {
+                Ok((path == artifact).then(|| {
+                    (
+                        blob,
+                        ReferenceBlobProvider::new(move |_| {
+                            Ok(Box::new(std::io::Cursor::new(content)))
+                        }),
+                    )
+                }))
+            })?
+        } else {
+            mapping.prepare()?
+        };
+        assert_eq!(fs::metadata(&artifact)?.mtime(), i64::try_from(timestamp)?);
+        Ok(prepared)
+    };
+    let first = capture("first-lease", 200, false)?;
+    let second = capture("second-lease", 300, true)?;
+    assert_eq!(first.id(), second.id());
+    let generated_path = TreePath::new(b"intermediate/libdep-123.rmeta".to_vec())?;
+    let TreeEntry::File { metadata, .. } = second.manifest().entries[&generated_path] else {
+        bail!("missing generated dependency")
+    };
+    assert_eq!(metadata.mode, 0o640);
+    let store = NativeStore::open(&tmp.path().join("store"))?;
+    let tree = second.import(&store)?;
+    let view = tree.materialize(tmp.path())?;
+    let actual = fs::metadata(view.root().join("intermediate/libdep-123.rmeta"))?;
+    assert_eq!(actual.mtime(), metadata.modified.seconds);
+    assert_eq!(actual.mode() & 0o777, 0o640);
+    assert_eq!(
+        fs::metadata(view.root().join("build/main.rs"))?.modified()?,
+        source_time
+    );
+    Ok(())
+}
+
 #[test]
 #[cfg(feature = "dist-client")]
 fn test_dist_rlib_trimming_preserves_recognized_metadata() -> Result<()> {
@@ -4557,7 +4644,19 @@ impl pkg::InputsPackager for RustInputsPackager {
     // representation of rlibs merely to reduce a per-job archive.
     #[cfg(target_os = "linux")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        (*self).discover()?.into_native_mapping()
+        // A canonical Cargo output root is a generated-input namespace. Its
+        // physical mtime describes delivery/freshness, not the sandbox input.
+        // Normalize the actual remote inode timestamp, not just the key;
+        // preserve all source-file timestamps and exact permission bits.
+        let generated_roots = self
+            .path_transformer
+            .path_mappings()
+            .filter(|(_, logical)| matches!(logical.as_str(), "/intermediate" | "/target"))
+            .map(|(_, logical)| PathBuf::from(logical))
+            .collect::<std::collections::BTreeSet<_>>();
+        (*self).discover()?.into_native_mapping(|logical| {
+            generated_roots.iter().any(|root| logical.starts_with(root))
+        })
     }
 }
 
@@ -4850,31 +4949,20 @@ struct RlibDepsDetail {
 struct DepsSize;
 #[cfg(feature = "dist-client")]
 impl Meter<PathBuf, RlibDepsDetail> for DepsSize {
-    type Measure = usize;
-    fn measure<Q: ?Sized>(&self, _k: &Q, v: &RlibDepsDetail) -> usize
-    where
-        PathBuf: Borrow<Q>,
-    {
-        use std::mem;
-
-        // TODO: unfortunately there is exactly nothing you can do with the k given the
-        // current trait bounds. Just use some kind of sane value;
-        //let k_size = mem::size_of::<PathBuf>() + k.capacity();
-        let k_size = 3 * 8 + 100;
-
-        let crate_names_size: usize = v.deps.iter().map(std::string::String::capacity).sum();
-        let v_size: usize = mem::size_of::<RlibDepsDetail>() + // Systemtime and vec itself
-            v.deps.capacity() * mem::size_of::<String>() + // Each string in the vec
-            crate_names_size; // Contents of all strings
-
-        k_size + v_size
+    fn measure(&self, key: &PathBuf, value: &RlibDepsDetail) -> u64 {
+        use std::mem::size_of;
+        let key_size = size_of::<PathBuf>() + key.capacity();
+        let names_size = value.deps.iter().map(String::capacity).sum::<usize>();
+        let value_size =
+            size_of::<RlibDepsDetail>() + value.deps.capacity() * size_of::<String>() + names_size;
+        u64::try_from(key_size + value_size).unwrap_or(u64::MAX)
     }
 }
 
 #[cfg(feature = "dist-client")]
 #[derive(Debug)]
 struct RlibDepReader {
-    cache: Mutex<LruCache<PathBuf, RlibDepsDetail, RandomState, DepsSize>>,
+    cache: Mutex<WeightedLru<PathBuf, RlibDepsDetail, DepsSize>>,
     executable: PathBuf,
     ls_arg: String,
 }
@@ -4889,7 +4977,7 @@ impl RlibDepReader {
         // executor cannot establish anything about the actual input metadata.
         let version = Self::parse_rustc_version(rustc_verbose_version.as_bytes())?;
         Ok(Self {
-            cache: Mutex::new(LruCache::with_meter(CACHE_SIZE, DepsSize)),
+            cache: Mutex::new(WeightedLru::new(CACHE_SIZE, DepsSize)),
             executable,
             ls_arg: Self::get_correct_ls_arg(&version),
         })
@@ -6557,6 +6645,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             let pool = runtime.handle().clone();
             let result = hasher
                 .generate_hash_key(GenerateHashKeyContext {
+                    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                    native: None,
                     creator: &creator,
                     cwd: f.tempdir.path().to_owned(),
                     env_vars: vec![],
@@ -6645,6 +6735,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let pool = runtime.handle().clone();
         let res = hasher
             .generate_hash_key(GenerateHashKeyContext {
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                native: None,
                 creator: &creator,
                 cwd: f.tempdir.path().to_owned(),
                 env_vars: vec![],
@@ -6750,6 +6842,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let pool = runtime.handle().clone();
         let res = hasher
             .generate_hash_key(GenerateHashKeyContext {
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                native: None,
                 creator: &creator,
                 cwd: f.tempdir.path().to_owned(),
                 env_vars: [
@@ -6933,6 +7027,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             let pool = runtime.handle().clone();
             let res = hasher
                 .generate_hash_key(GenerateHashKeyContext {
+                    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                    native: None,
                     creator: &creator,
                     cwd: f.tempdir.path().to_owned(),
                     env_vars: vec![],
@@ -7026,6 +7122,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         }
         let result = hasher
             .generate_hash_key(GenerateHashKeyContext {
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                native: None,
                 creator: &creator,
                 cwd: f.tempdir.path().to_owned(),
                 env_vars: env_vars.to_owned(),
@@ -7415,6 +7513,12 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         {
             let distributed = dist_command.context("distributed Clippy command not generated")?;
             assert_eq!(distributed.executable, "/rust/bin/clippy-driver");
+            assert!(
+                distributed
+                    .arguments
+                    .iter()
+                    .all(|arg| !arg.starts_with("--remap-path-prefix=/clippy-config="))
+            );
             assert_eq!(
                 distributed.env_vars.iter().find_map(|(name, value)| {
                     (name == "CLIPPY_CONF_DIR").then_some(value.trim_end_matches('/'))
@@ -7519,6 +7623,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             mock_file_names(&creator, &["foo.rlib"]);
             hasher
                 .generate_hash_key(GenerateHashKeyContext {
+                    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                    native: None,
                     creator: &creator,
                     cwd: f.tempdir.path().to_owned(),
                     env_vars: vec![],
@@ -7827,6 +7933,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
 
             let result = hasher
                 .generate_hash_key(GenerateHashKeyContext {
+                    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                    native: None,
                     creator: &creator,
                     cwd: manifest,
                     env_vars: env,
@@ -7959,6 +8067,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
 
         let result = hasher
             .generate_hash_key(GenerateHashKeyContext {
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                native: None,
                 creator: &creator,
                 cwd: f.tempdir.path().to_owned(),
                 env_vars: env,

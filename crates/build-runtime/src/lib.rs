@@ -6,15 +6,17 @@
 
 #![deny(rust_2018_idioms)]
 
+pub mod analytics;
 mod identity;
 mod installation;
 mod network;
 pub use network::{
     ConcurrentCapacity, Direction, DirectionSnapshot, MeteredReader, NetworkCheckpoint,
-    NetworkMeter, NetworkSnapshot, Peer, PeerCapacity, ResultTransferEstimate, SharedCapacity,
-    TransferDemand, transfer_seconds,
+    NetworkMeter, NetworkPath, NetworkSnapshot, Peer, PeerCapacity, ResultTransferEstimate,
+    SharedCapacity, TransferDemand, transfer_seconds,
 };
 mod package;
+mod placement_class;
 pub use installation::{InstallationManifest, InstallationRecipe, InstalledComponent};
 pub use package::{
     ArchiveLength, PackageArchive, PackageCatalog, PackageCompression, PackageDeliveryLimits,
@@ -50,8 +52,8 @@ mod coordinator;
 mod session;
 #[cfg(all(unix, feature = "store"))]
 pub use session::{
-    NativeContentPending, NativeInputRejected, NativeServiceBusy, NativeSessions, PeerInputClaim,
-    SessionLimits,
+    DeliveryReceipt, ManifestStatus, NativeContentPending, NativeInputRejected, NativeServiceBusy,
+    NativeSessions, PeerInputClaim, RecoveryStatus, SessionLimits, SessionStatus, TicketStatus,
 };
 #[cfg(all(unix, feature = "store"))]
 mod store;
@@ -59,15 +61,15 @@ mod store;
 pub use coordinator::{Admission, BuildCoordinator, CompilePermit};
 #[cfg(all(unix, feature = "store"))]
 pub use store::{
-    CacheStats, ComponentAudit, Eviction, GarbageCollected, NativeIndexAudit, NativeStore,
-    PackageArchiveLease, PackageDecoder, PackageImportLimits, PackagePolicy, PackageSlot,
-    Published, ResultLease, SchemaInventory, SpaceReport, StageBudget, StagedBlob, TreeLease,
-    UploadReservation, VerifiedPackage, decode_package_process,
+    CacheAnalyticsSampler, CacheStats, ComponentAudit, Eviction, GarbageCollected,
+    NativeIndexAudit, NativeStore, PackageArchiveLease, PackageDecoder, PackageImportLimits,
+    PackagePolicy, PackageSlot, Published, ResultLease, SchemaInventory, SpaceReport, SpaceStatus,
+    StageBudget, StagedBlob, TreeLease, UploadReservation, VerifiedPackage, decode_package_process,
 };
 
 #[cfg(all(target_os = "linux", feature = "store"))]
 mod execution;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "mapping"))]
 pub mod sandbox;
 #[cfg(all(target_os = "linux", feature = "store"))]
 pub use execution::{CapturedExecution, ExecutionPolicy, execute};
@@ -86,5 +88,12 @@ mod source;
 #[cfg(all(target_os = "linux", feature = "mapping"))]
 pub use mapped::{
     DescriptorDigestProvider, DescriptorMemo, InstallationCatalog, InstallationReport,
-    MappedMetadata, MappedTree, PreparedTree, SourceDigestCache, hash_descriptor,
+    MappedMetadata, MappedTree, PreparedTree, ReferenceBlobProvider, ReferenceResolver,
+    SourceDigestCache, hash_descriptor,
 };
+
+// Cluster principals are independent of socket endpoints and TLS implementation.
+pub use sccache_peer_identity::PeerId;
+
+#[cfg(all(target_os = "linux", feature = "store"))]
+pub mod intermediate_fs;

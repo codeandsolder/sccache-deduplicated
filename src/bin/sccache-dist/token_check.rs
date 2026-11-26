@@ -1,8 +1,6 @@
 use anyhow::{Context, Result, bail};
-use base64::Engine;
 use sccache::dist::http::{ClientAuthCheck, ClientVisibleMsg};
-use sccache::http_client::{self, new_reqwest_blocking_client};
-use sccache::util::BASE64_URL_SAFE_ENGINE;
+use sccache::http_client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::result::Result as StdResult;
@@ -24,29 +22,12 @@ pub struct Jwk {
 }
 
 impl Jwk {
-    // https://github.com/lawliet89/biscuit/issues/96#issuecomment-399149872
-    pub fn to_der_pkcs1(&self) -> Result<Vec<u8>> {
+    fn decoding_key(&self) -> Result<jwt::DecodingKey> {
         if self.kty != "RSA" {
-            bail!("Cannot handle non-RSA JWK")
+            bail!("Cannot handle non-RSA JWK");
         }
-
-        // JWK is big-endian, openssl bignum from_slice is big-endian
-        let n = BASE64_URL_SAFE_ENGINE
-            .decode(&self.n)
-            .context("Failed to base64 decode n")?;
-        let e = BASE64_URL_SAFE_ENGINE
-            .decode(&self.e)
-            .context("Failed to base64 decode e")?;
-        let n_bn = openssl::bn::BigNum::from_slice(&n)
-            .context("Failed to create openssl bignum from n")?;
-        let e_bn = openssl::bn::BigNum::from_slice(&e)
-            .context("Failed to create openssl bignum from e")?;
-        let pubkey = openssl::rsa::Rsa::from_public_components(n_bn, e_bn)
-            .context("Failed to create pubkey from n and e")?;
-        let der: Vec<u8> = pubkey
-            .public_key_to_der_pkcs1()
-            .context("Failed to convert public key to der pkcs1")?;
-        Ok(der)
+        jwt::DecodingKey::from_rsa_components(&self.n, &self.e)
+            .context("Failed to decode RSA JWK components")
     }
 }
 
@@ -68,12 +49,12 @@ impl ClientAuthCheck for EqCheck {
     }
 }
 
-fn fixed_token_mismatch_log_message() -> &'static str {
+const fn fixed_token_mismatch_log_message() -> &'static str {
     "User token did not match configured fixed token"
 }
 
 impl EqCheck {
-    pub fn new(s: String) -> Self {
+    pub const fn new(s: String) -> Self {
         Self { s }
     }
 }
@@ -81,9 +62,9 @@ impl EqCheck {
 // Don't check a token is valid (it may not even be a JWT) just forward it to
 // an API and check for success
 pub struct ProxyTokenCheck {
-    client: reqwest::blocking::Client,
+    client: wreq::Client,
     maybe_auth_cache: Option<Mutex<(HashMap<String, Instant>, Duration)>>,
-    url: reqwest::Url,
+    url: url::Url,
 }
 
 impl ClientAuthCheck for ProxyTokenCheck {
@@ -91,7 +72,7 @@ impl ClientAuthCheck for ProxyTokenCheck {
         match self.check_token_with_forwarding(token) {
             Ok(()) => Ok(()),
             Err(e) => {
-                warn!("Proxying token validation failed: {}", e);
+                warn!("Proxying token validation failed: {e}");
                 Err(ClientVisibleMsg::from_nonsensitive(
                     "Validation with token forwarding failed".to_owned(),
                 ))
@@ -100,7 +81,7 @@ impl ClientAuthCheck for ProxyTokenCheck {
     }
 }
 
-fn url_without_query(url: &reqwest::Url) -> String {
+fn url_without_query(url: &url::Url) -> String {
     let mut safe = url.clone();
     safe.set_query(None);
     safe.set_fragment(None);
@@ -123,11 +104,13 @@ impl ProxyTokenCheck {
     /// # Errors
     ///
     /// Returns an error if the blocking HTTP client cannot be initialized.
-    pub fn new(url: String, cache_secs: Option<u64>) -> Result<Self> {
+    pub fn new(url: &str, cache_secs: Option<u64>) -> Result<Self> {
         let maybe_auth_cache: Option<Mutex<(HashMap<String, Instant>, Duration)>> =
             cache_secs.map(|secs| Mutex::new((HashMap::new(), Duration::from_secs(secs))));
         Ok(Self {
-            client: new_reqwest_blocking_client()?,
+            client: wreq::Client::builder()
+                .redirect(wreq::redirect::Policy::limited(10))
+                .build()?,
             maybe_auth_cache,
             url: url.parse().context("Invalid proxy token validation URL")?,
         })
@@ -140,21 +123,25 @@ impl ProxyTokenCheck {
         );
         // If the token is cached and not cache has not expired, return it
         if let Some(ref auth_cache) = self.maybe_auth_cache {
-            let mut auth_cache = auth_cache
+            let mut guard = auth_cache
                 .lock()
                 .map_err(|_| anyhow::anyhow!("proxy token auth cache mutex poisoned"))?;
-            let (ref mut auth_cache, cache_duration) = *auth_cache;
-            if cached_token_is_valid(auth_cache, cache_duration, token, Instant::now()) {
+            let (ref mut auth_cache, cache_duration) = *guard;
+            let valid = cached_token_is_valid(auth_cache, cache_duration, token, Instant::now());
+            drop(guard);
+            if valid {
                 return Ok(());
             }
         }
         // Make a request to another API, which as a side effect should actually check the token
-        let res = self
-            .client
-            .get(self.url.clone())
-            .bearer_auth(token)
-            .timeout(http_client::AUTH_REQUEST_TIMEOUT)
-            .send()
+        let res = http_client::io_runtime()?
+            .block_on(
+                self.client
+                    .get(self.url.as_str())
+                    .bearer_auth(token)
+                    .timeout(http_client::AUTH_REQUEST_TIMEOUT)
+                    .send(),
+            )
             .context("Failed to make request to proxying url")?;
         if !res.status().is_success() {
             bail!(
@@ -165,11 +152,12 @@ impl ProxyTokenCheck {
         }
         // Cache the token
         if let Some(ref auth_cache) = self.maybe_auth_cache {
-            let mut auth_cache = auth_cache
+            let mut guard = auth_cache
                 .lock()
                 .map_err(|_| anyhow::anyhow!("proxy token auth cache mutex poisoned"))?;
-            let (ref mut auth_cache, _) = *auth_cache;
+            let (ref mut auth_cache, _) = *guard;
             auth_cache.insert(token.to_owned(), Instant::now());
+            drop(guard);
         }
         Ok(())
     }
@@ -179,7 +167,7 @@ impl ProxyTokenCheck {
 pub struct ValidJWTCheck {
     audience: String,
     issuer: String,
-    kid_to_pkcs1: HashMap<String, Vec<u8>>,
+    keys: HashMap<String, jwt::DecodingKey>,
 }
 
 impl ClientAuthCheck for ValidJWTCheck {
@@ -187,7 +175,7 @@ impl ClientAuthCheck for ValidJWTCheck {
         match self.check_jwt_validity(token) {
             Ok(()) => Ok(()),
             Err(e) => {
-                warn!("JWT validation failed: {}", e);
+                warn!("JWT validation failed: {e}");
                 Err(ClientVisibleMsg::from_nonsensitive(
                     "JWT could not be validated".to_owned(),
                 ))
@@ -198,47 +186,53 @@ impl ClientAuthCheck for ValidJWTCheck {
 
 impl ValidJWTCheck {
     pub fn new(audience: String, issuer: String, jwks_url: &str) -> Result<Self> {
-        let client = new_reqwest_blocking_client()?;
-        let res = client
-            .get(jwks_url)
-            .timeout(http_client::AUTH_REQUEST_TIMEOUT)
-            .send()
+        let client = wreq::Client::builder()
+            .redirect(wreq::redirect::Policy::limited(10))
+            .build()?;
+        let res = http_client::io_runtime()?
+            .block_on(
+                client
+                    .get(jwks_url)
+                    .timeout(http_client::AUTH_REQUEST_TIMEOUT)
+                    .send(),
+            )
             .context("Failed to make request to JWKs url")?;
         if !res.status().is_success() {
             bail!("Could not retrieve JWKs, HTTP error: {}", res.status())
         }
-        let jwks: Jwks = http_client::read_bounded_json(res, http_client::JWKS_LIMIT)
+        let jwks: Jwks = http_client::io_runtime()?
+            .block_on(http_client::read_bounded_json_async(
+                res,
+                http_client::JWKS_LIMIT,
+            ))
             .context("Failed to parse JWKs json")?;
-        let kid_to_pkcs1 = jwks
+        let keys = jwks
             .keys
             .into_iter()
-            .map(|k| k.to_der_pkcs1().map(|pkcs1| (k.kid, pkcs1)))
+            .map(|k| k.decoding_key().map(|key| (k.kid, key)))
             .collect::<Result<_>>()
-            .context("Failed to convert JWKs into pkcs1")?;
+            .context("Failed to decode JWKs")?;
         Ok(Self {
             audience,
             issuer,
-            kid_to_pkcs1,
+            keys,
         })
     }
 
     fn check_jwt_validity(&self, token: &str) -> Result<()> {
+        #[derive(Deserialize)]
+        struct Claims {}
+        jsonwebtoken_btls::install()?;
         let header = jwt::decode_header(token).context("Could not decode jwt header")?;
         trace!("Validating JWT in scheduler");
         // Prepare validation
         let kid = header.kid.context("No kid found")?;
-        let pkcs1 = jwt::DecodingKey::from_rsa_der(
-            self.kid_to_pkcs1
-                .get(&kid)
-                .context("kid not found in jwks")?,
-        );
+        let key = self.keys.get(&kid).context("kid not found in jwks")?;
         let mut validation = jwt::Validation::new(header.alg);
         validation.set_audience(&[&self.audience]);
         validation.set_issuer(&[&self.issuer]);
-        #[derive(Deserialize)]
-        struct Claims {}
         // Decode the JWT, discarding any claims - we just care about validity
-        let _tokendata = jwt::decode::<Claims>(token, &pkcs1, &validation)
+        let _tokendata = jwt::decode::<Claims>(token, key, &validation)
             .context("Unable to validate and decode jwt")?;
         Ok(())
     }
@@ -251,8 +245,51 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn validates_rsa_jwk_components_without_der_conversion() -> anyhow::Result<()> {
+        // Test-only RSA public key and signed JWT; the private key is not retained.
+        let jwk = super::Jwk {
+            kid: "test".to_owned(),
+            kty: "RSA".to_owned(),
+            n: concat!(
+                "plNihBM7dUlJfdSaIFLxbReVSGxLb2-",
+                "9OSrK6Jr7z12UjAe7AhrKexVsxnwvcRNOS0_GFqoAyIGf7JzJwUH7Jk_Ygtpf3ge6SnUFqbqfLcaWpIR",
+                "MVC8zo24qy5M2tIKhT3uC7bqImKO_LJG0SdlCj930p69s8moYcLbOQCzhyCthsMNrWSxKXrO4EfN6f5d",
+                "oaKT8S1cbSj-ApIwobC35GRnDlKeLZNnLboaa3GWSus9_5b8jg1x_vVMz8HUwinq99vIvoJ7hNEAZuje",
+                "4f8hoSnVldhfHEp3Z9VTI-gfly8RnLDruC4LR8xuHbxpH6WNKz10XNVyORN-VUpY9Vsx1Ew",
+            )
+            .to_owned(),
+            e: "AQAB".to_owned(),
+        };
+        let key = jwk.decoding_key()?;
+        let mut checker = super::ValidJWTCheck {
+            audience: "audience".to_owned(),
+            issuer: "issuer".to_owned(),
+            keys: HashMap::from([(jwk.kid, key)]),
+        };
+        let token = concat!(
+            "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3QifQ.eyJhdWQiOiJhdWRpZW5jZSIsImlzcyI6Imlzc3Vlc",
+            "iIsImV4cCI6NDEwMjQ0NDgwMH0.Mgf7ZwwrkTLblGdVqC6HaRABjCQecb0L6cCpvtcT2b9TgryYV_pYa",
+            "mnlCJHEcF6Ae1RGgPh48wf4nNQIli6StcNdVpI5sLytgpZZQ0Eo4hH6_OZrijD7oOu1Lh21ze1DxeSkt",
+            "rUkPIlpf-Z-ecYjPhuGPpKRaIYQJR8ESC_HHwongLhIKIWX2I1_VpX9QMd5AwYO7U1NTDb0Ky7QaGP8M",
+            "5kC3DnuJgJgmioxLJ-",
+            "e9_1AwgBPU6UYfSWZDHmqPMLlCEG6X2aQwZBiRwHfuOzMvFbR2jNeV0gkftDGFfjliInZHTq8JFMIOsD",
+            "yAy3S-YaCE9nc3TPZopV0JCgSPYKXZQ",
+        );
+        checker.check_jwt_validity(token)?;
+        checker.audience = "other".to_owned();
+        assert!(checker.check_jwt_validity(token).is_err());
+        checker.audience = "audience".to_owned();
+        checker.issuer = "other".to_owned();
+        assert!(checker.check_jwt_validity(token).is_err());
+        checker.issuer = "issuer".to_owned();
+        checker.keys.clear();
+        assert!(checker.check_jwt_validity(token).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn proxy_validation_url_logs_without_query_or_fragment() -> anyhow::Result<()> {
-        let url: reqwest::Url = "https://example.test/check?api_key=secret#fragment".parse()?;
+        let url: url::Url = "https://example.test/check?api_key=secret#fragment".parse()?;
         let safe = url_without_query(&url);
         assert_eq!(safe, "https://example.test/check");
         assert!(!safe.contains("secret"));

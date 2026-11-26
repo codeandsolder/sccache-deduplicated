@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{env, ffi::OsString, fmt, net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{env, ffi::OsString, fmt, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, anyhow, bail};
 use clap::{Arg, ArgGroup, Command as ClapCommand, ValueEnum};
@@ -26,7 +26,7 @@ use crate::cmdline::{AuthSubcommand, Command};
 struct TokenLength(usize);
 
 impl TokenLength {
-    fn as_bytes(&self) -> usize {
+    const fn as_bytes(&self) -> usize {
         self.0 / 8
     }
 
@@ -72,7 +72,7 @@ impl FromStr for LogLevel {
             "info" => Self::Info,
             "debug" => Self::Debug,
             "trace" => Self::Trace,
-            _ => bail!("Unknown log level: {:?}", s),
+            _ => bail!("Unknown log level: {s:?}"),
         };
 
         Ok(variant)
@@ -139,9 +139,79 @@ fn get_clap_command() -> ClapCommand {
             .group(ArgGroup::new("installation_input").args(["manifest", "recipe"]).required(true))
             .arg(flag_infer_long("output").value_parser(clap::value_parser!(PathBuf)).required(true)),
     );
+    let command = identity_commands(command, &config_with_help_message);
+    native_package_commands(command)
+        .subcommand(
+            ClapCommand::new("scheduler")
+                .about(
+                    "Launch as a scheduler, to dispatch distributed builds across multiple servers",
+                )
+                .args(&[
+                    config_with_help_message("Use the scheduler config file at PATH")
+                        .required(true),
+                    syslog.clone(),
+                ]),
+        )
+        .subcommand(
+            ClapCommand::new("server")
+                .about("Launch as a server, to handle distributed builds assigned by the scheduler")
+                .args(&[
+                    config_with_help_message("Use the server config file at PATH").required(true),
+                    syslog,
+                ]),
+        )
+}
+
+fn identity_commands(
+    command: ClapCommand,
+    config_with_help_message: &impl Fn(&'static str) -> Arg,
+) -> ClapCommand {
     command
         .version(env!("CARGO_PKG_VERSION"))
         .subcommand_required(true)
+        .subcommand(
+            ClapCommand::new("cluster-init")
+                .about(
+                    "Initialize persistent scheduler CA and identity; print the scheduler peer ID",
+                )
+                .arg(
+                    flag_infer_long("directory")
+                        .value_parser(clap::value_parser!(PathBuf))
+                        .required(true),
+                ),
+        )
+        .subcommand(
+            ClapCommand::new("cluster-id")
+                .about("Initialize a member key and print its stable peer ID")
+                .arg(
+                    flag_infer_long("directory")
+                        .value_parser(clap::value_parser!(PathBuf))
+                        .required(true),
+                ),
+        )
+        .subcommand(
+            ClapCommand::new("cluster-revoke")
+                .about("Permanently revoke a peer in the offline scheduler registry")
+                .arg(
+                    flag_infer_long("directory")
+                        .value_parser(clap::value_parser!(PathBuf))
+                        .required(true),
+                )
+                .arg(
+                    flag_infer_long("peer")
+                        .value_parser(clap::value_parser!(ServerId))
+                        .required(true),
+                ),
+        )
+        .subcommand(
+            ClapCommand::new("cluster-status")
+                .about("Read scheduler status through authenticated cluster HTTPS")
+                .arg(
+                    flag_infer_long("client-config")
+                        .value_parser(clap::value_parser!(PathBuf))
+                        .required(true),
+                ),
+        )
         .subcommand(
             ClapCommand::new("auth")
                 .about("Helper commands to generate authentication tokens")
@@ -152,8 +222,8 @@ fn get_clap_command() -> ClapCommand {
                         .args(&[
                             flag_infer_long("server")
                                 .help("Generate a key for the specified server")
-                                .value_name("SERVER_ADDR")
-                                .value_parser(clap::value_parser!(SocketAddr))
+                                .value_name("PEER_ID")
+                                .value_parser(clap::value_parser!(ServerId))
                                 .required(true),
                             flag_infer_long("secret-key")
                                 .help("Use specified key to create the token")
@@ -178,6 +248,10 @@ fn get_clap_command() -> ClapCommand {
                     ),
                 ),
         )
+}
+
+fn native_package_commands(command: ClapCommand) -> ClapCommand {
+    command
         .subcommand(
             ClapCommand::new("native-decode-package").hide(true)
                 .arg(flag_infer_long("compression").value_parser(["xz", "gzip", "tar", "zstd"]).required(true))
@@ -211,25 +285,6 @@ fn get_clap_command() -> ClapCommand {
                 .arg(flag_infer_long("schema").requires("without"))
                 .arg(flag_infer_long("without").action(clap::ArgAction::Append).requires("schema")),
         )
-        .subcommand(
-            ClapCommand::new("scheduler")
-                .about(
-                    "Launch as a scheduler, to dispatch distributed builds across multiple servers",
-                )
-                .args(&[
-                    config_with_help_message("Use the scheduler config file at PATH")
-                        .required(true),
-                    syslog.clone(),
-                ]),
-        )
-        .subcommand(
-            ClapCommand::new("server")
-                .about("Launch as a server, to handle distributed builds assigned by the scheduler")
-                .args(&[
-                    config_with_help_message("Use the server config file at PATH").required(true),
-                    syslog,
-                ]),
-        )
 }
 
 fn check_init_syslog(name: &str, log_level: LogLevel) {
@@ -244,228 +299,57 @@ pub fn try_parse_from(
     let matches = get_clap_command().try_get_matches_from(args)?;
 
     Ok(match matches.subcommand() {
-        Some(("auth", matches)) => Command::Auth(match matches.subcommand() {
-            // Size based on https://briansmith.org/rustdoc/ring/hmac/fn.recommended_key_len.html
-            Some(("generate-jwt-hs256-key", _)) => AuthSubcommand::Base64 { num_bytes: 256 / 8 },
-            Some(("generate-jwt-hs256-server-token", matches)) => {
-                let server_addr = matches
-                    .get_one("server")
-                    .context("clap did not provide required `server` value")?;
-                let server_id = ServerId::new(*server_addr);
-
-                let secret_key = if matches.contains_id("config") {
-                    let config_path = matches
-                        .get_one::<PathBuf>("config")
-                        .context("clap did not provide required `config` value")?;
-                    if let Some(config) = config::scheduler::from_path(config_path)? {
-                        match config.server_auth {
-                            config::scheduler::ServerAuth::JwtHS256 { secret_key } => secret_key,
-                            config::scheduler::ServerAuth::Insecure
-                            | config::scheduler::ServerAuth::Token { .. } => {
-                                bail!("Scheduler not configured with JWT HS256")
-                            }
-                        }
-                    } else {
-                        bail!("Could not load config")
-                    }
-                } else {
-                    matches
-                        .get_one::<String>("secret-key")
-                        .context("clap did not provide required `secret-key` value")?
-                        .to_string()
-                };
-
-                AuthSubcommand::JwtHS256ServerToken {
-                    secret_key,
-                    server_id,
-                }
-            }
-            Some(("generate-shared-token", matches)) => {
-                let token_bits = matches
-                    .get_one::<TokenLength>("bits")
-                    .context("clap did not provide default `bits` value")?;
-
-                AuthSubcommand::Base64 {
-                    num_bytes: token_bits.as_bytes(),
-                }
-            }
-            _ => unreachable!("Subcommand is enforced by clap"),
-        }),
-        Some(("native-decode-package", matches)) => Command::NativeDecodePackage {
-            compression: package_compression(matches)?,
-            max_tar_bytes: *matches
-                .get_one::<u64>("max-tar-bytes")
-                .context("missing decoded tar limit")?,
-            memory_bytes: *matches
-                .get_one::<u64>("memory-bytes")
-                .context("missing memory limit")?,
+        Some(("cluster-init", matches)) => Command::ClusterInit {
+            directory: matches
+                .get_one::<PathBuf>("directory")
+                .context("missing cluster directory")?
+                .clone(),
         },
-        Some(("native-provision-package", matches)) => {
-            let identity = package_identity(matches)?;
-            let locator = matches
-                .get_one::<String>("upstream")
-                .map(|upstream| {
-                    let locator = sccache::dist::native::PackageLocator {
-                        identity,
-                        expected_size: matches.get_one::<u64>("size").copied(),
-                        upstream: upstream.clone(),
-                        path: matches
-                            .get_one::<String>("path")
-                            .context("missing upstream path")?
-                            .clone(),
-                    };
-                    locator.validate()?;
-                    Ok::<_, anyhow::Error>(locator)
-                })
-                .transpose()?;
-            Command::NativeProvisionPackage {
-                client_config: matches
-                    .get_one::<PathBuf>("client-config")
-                    .context("missing client configuration")?
-                    .clone(),
-                archive: matches.get_one::<PathBuf>("archive").cloned(),
-                identity,
-                expected_size: matches.get_one::<u64>("size").copied(),
-                locator,
-            }
-        }
-        Some(("native-provision-rust", matches)) => Command::NativeProvisionRust {
+        Some(("cluster-id", matches)) => Command::ClusterId {
+            directory: matches
+                .get_one::<PathBuf>("directory")
+                .context("missing member directory")?
+                .clone(),
+        },
+        Some(("cluster-revoke", matches)) => Command::ClusterRevoke {
+            directory: matches
+                .get_one::<PathBuf>("directory")
+                .context("missing cluster directory")?
+                .clone(),
+            peer: *matches
+                .get_one::<ServerId>("peer")
+                .context("missing peer ID")?,
+        },
+        Some(("cluster-status", matches)) => Command::ClusterStatus {
             client_config: matches
                 .get_one::<PathBuf>("client-config")
-                .context("missing client configuration")?
+                .context("missing client config")?
                 .clone(),
-            archive: matches.get_one::<PathBuf>("archive").cloned(),
-            source: package_source(matches)?,
-            manifest_output: matches.get_one::<PathBuf>("manifest-output").cloned(),
         },
-        Some(("native-import-rust", matches)) => {
-            let source = package_source(matches)?;
-            Command::NativeImportRust {
-                store: matches
-                    .get_one::<PathBuf>("store")
-                    .context("missing store path")?
-                    .clone(),
-                archive: matches.get_one::<PathBuf>("archive").cloned(),
-                source,
-                max_entries: *matches
-                    .get_one::<usize>("max-entries")
-                    .context("missing entry limit")?,
-                max_expanded_bytes: *matches
-                    .get_one::<u64>("max-expanded-bytes")
-                    .context("missing expansion limit")?,
-                max_tar_bytes: *matches
-                    .get_one::<u64>("max-tar-bytes")
-                    .context("missing decoded tar limit")?,
-                manifest_output: matches.get_one::<PathBuf>("manifest-output").cloned(),
-            }
-        }
+        Some(("auth", matches)) => Command::Auth(parse_auth(matches)?),
+        Some((
+            name @ ("native-decode-package"
+            | "native-provision-package"
+            | "native-provision-rust"
+            | "native-import-rust"),
+            matches,
+        )) => parse_package(name, matches)?,
         #[cfg(target_os = "linux")]
-        Some(("native-sync-system", matches)) => Command::NativeSyncSystem {
-            client_config: matches
-                .get_one::<PathBuf>("client-config")
-                .context("missing client configuration")?
-                .clone(),
-            paths: matches
-                .get_many::<PathBuf>("path")
-                .context("missing selected paths")?
-                .cloned()
-                .collect(),
-            cache_dir: matches
-                .get_one::<PathBuf>("cache-dir")
-                .context("missing pacman package cache directory")?
-                .clone(),
-            jobs: *matches
-                .get_one::<std::num::NonZeroUsize>("jobs")
-                .context("missing acquisition concurrency")?,
-        },
-        #[cfg(target_os = "linux")]
-        Some(("native-sync-rust", matches)) => Command::NativeSyncRust {
-            root: matches
-                .get_one::<PathBuf>("root")
-                .context("missing installation root")?
-                .clone(),
-            client_config: matches
-                .get_one::<PathBuf>("client-config")
-                .context("missing client configuration")?
-                .clone(),
-            output: matches
-                .get_one::<PathBuf>("output")
-                .context("missing catalog output")?
-                .clone(),
-            recipe_output: matches
-                .get_one::<PathBuf>("recipe-output")
-                .context("missing recipe output")?
-                .clone(),
-            full: matches.get_flag("full"),
-            jobs: *matches
-                .get_one::<std::num::NonZeroUsize>("jobs")
-                .context("missing acquisition concurrency")?,
-        },
-        #[cfg(target_os = "linux")]
-        Some(("native-attest-installation", matches)) => Command::NativeAttestInstallation {
-            root: matches
-                .get_one::<PathBuf>("root")
-                .context("missing installation root")?
-                .clone(),
-            manifests: matches
-                .get_many::<PathBuf>("manifest")
-                .into_iter()
-                .flatten()
-                .cloned()
-                .collect(),
-            recipe: matches.get_one::<PathBuf>("recipe").cloned(),
-            output: matches
-                .get_one::<PathBuf>("output")
-                .context("missing catalog output")?
-                .clone(),
-        },
-        Some(("native-audit", matches)) => Command::NativeAudit {
-            index: matches
-                .get_one::<PathBuf>("index")
-                .context("missing native index path")?
-                .clone(),
-            schema: matches.get_one::<String>("schema").cloned(),
-            without: matches
-                .get_many::<String>("without")
-                .into_iter()
-                .flatten()
-                .cloned()
-                .collect(),
-        },
-        Some(("scheduler", matches)) => {
-            if matches.contains_id("syslog") {
-                let log_level = matches
-                    .get_one::<LogLevel>("syslog")
-                    .context("clap reported `syslog` present without a value")?;
-                check_init_syslog("sccache-scheduler", *log_level);
-            }
-
-            let config_path = matches
-                .get_one::<PathBuf>("config")
-                .context("clap did not provide required `config` value")?;
-            if let Some(config) = config::scheduler::from_path(config_path)? {
-                Command::Scheduler(config)
-            } else {
-                bail!("Could not load config")
-            }
-        }
-        Some(("server", matches)) => {
-            if matches.contains_id("syslog") {
-                let log_level = matches
-                    .get_one::<LogLevel>("syslog")
-                    .context("clap reported `syslog` present without a value")?;
-                check_init_syslog("sccache-buildserver", *log_level);
-            }
-
-            let config_path = matches
-                .get_one::<PathBuf>("config")
-                .context("clap did not provide required `config` value")?;
-            if let Some(config) = config::server::from_path(config_path)? {
-                Command::Server(config)
-            } else {
-                bail!("Could not load config")
-            }
-        }
+        Some((
+            name @ ("native-sync-system" | "native-sync-rust" | "native-attest-installation"),
+            matches,
+        )) => parse_installation(name, matches)?,
+        Some(("native-audit", matches)) => parse_installation("native-audit", matches)?,
+        Some(("scheduler", matches)) => Command::Scheduler(Box::new(load_service_config(
+            matches,
+            "sccache-scheduler",
+            config::scheduler::from_path,
+        )?)),
+        Some(("server", matches)) => Command::Server(Box::new(load_service_config(
+            matches,
+            "sccache-buildserver",
+            config::server::from_path,
+        )?)),
         _ => unreachable!("Subcommand is enforced by clap"),
     })
 }
@@ -512,7 +396,10 @@ mod tests {
 
     #[test]
     fn auth_generate_server_token_needs_key_source() {
-        let server_args = &["--server", "127.0.0.1:4321"];
+        let server_args = &[
+            "--server",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+        ];
 
         let no_key = auth_generate_jwt_hs256_server_token(server_args);
         assert!(try_parse_from(no_key).is_err());
@@ -540,9 +427,9 @@ mod tests {
 
     #[test]
     fn auth_generate_jwt_hs256_server_token_good() {
-        let base = auth_generate_jwt_hs256_server_token(&["--server", "127.0.0.1:4321"]);
-        let server_socket: SocketAddr = "127.0.0.1:4321".parse().unwrap();
-        let server_id = ServerId::new(server_socket);
+        let peer = "0101010101010101010101010101010101010101010101010101010101010101";
+        let base = auth_generate_jwt_hs256_server_token(&["--server", peer]);
+        let server_id: ServerId = peer.parse().unwrap();
 
         let mut secret_key = base.clone();
         secret_key.extend_from_slice(&["--secret-key", "very secret"]);
@@ -622,5 +509,221 @@ fn package_source(
         size: *matches
             .get_one::<u64>("size")
             .context("missing package size")?,
+    })
+}
+
+fn load_service_config<T>(
+    matches: &clap::ArgMatches,
+    syslog_name: &str,
+    load: impl FnOnce(&std::path::Path) -> anyhow::Result<Option<T>>,
+) -> anyhow::Result<T> {
+    if let Some(log_level) = matches.get_one::<LogLevel>("syslog") {
+        check_init_syslog(syslog_name, *log_level);
+    }
+    let path = matches
+        .get_one::<PathBuf>("config")
+        .context("missing service configuration")?;
+    load(path)?.context("Could not load config")
+}
+
+fn parse_auth(matches: &clap::ArgMatches) -> anyhow::Result<AuthSubcommand> {
+    Ok(match matches.subcommand() {
+        // Size based on https://briansmith.org/rustdoc/ring/hmac/fn.recommended_key_len.html
+        Some(("generate-jwt-hs256-key", _)) => AuthSubcommand::Base64 { num_bytes: 256 / 8 },
+        Some(("generate-jwt-hs256-server-token", matches)) => {
+            let server_id = *matches
+                .get_one("server")
+                .context("clap did not provide required `server` value")?;
+
+            let secret_key = if matches.contains_id("config") {
+                let config_path = matches
+                    .get_one::<PathBuf>("config")
+                    .context("clap did not provide required `config` value")?;
+                if let Some(config) = config::scheduler::from_path(config_path)? {
+                    match config.server_auth {
+                        config::scheduler::ServerAuth::JwtHS256 { secret_key } => secret_key,
+                        config::scheduler::ServerAuth::Insecure
+                        | config::scheduler::ServerAuth::Token { .. } => {
+                            bail!("Scheduler not configured with JWT HS256")
+                        }
+                    }
+                } else {
+                    bail!("Could not load config")
+                }
+            } else {
+                matches
+                    .get_one::<String>("secret-key")
+                    .context("clap did not provide required `secret-key` value")?
+                    .clone()
+            };
+
+            AuthSubcommand::JwtHS256ServerToken {
+                secret_key,
+                server_id,
+            }
+        }
+        Some(("generate-shared-token", matches)) => {
+            let token_bits = matches
+                .get_one::<TokenLength>("bits")
+                .context("clap did not provide default `bits` value")?;
+
+            AuthSubcommand::Base64 {
+                num_bytes: token_bits.as_bytes(),
+            }
+        }
+        _ => unreachable!("Subcommand is enforced by clap"),
+    })
+}
+
+fn parse_package(name: &str, matches: &clap::ArgMatches) -> anyhow::Result<Command> {
+    Ok(match name {
+        "native-decode-package" => Command::NativeDecodePackage {
+            compression: package_compression(matches)?,
+            max_tar_bytes: *matches
+                .get_one::<u64>("max-tar-bytes")
+                .context("missing decoded tar limit")?,
+            memory_bytes: *matches
+                .get_one::<u64>("memory-bytes")
+                .context("missing memory limit")?,
+        },
+        "native-provision-package" => {
+            let identity = package_identity(matches)?;
+            let locator = matches
+                .get_one::<String>("upstream")
+                .map(|upstream| {
+                    let locator = sccache::dist::native::PackageLocator {
+                        identity,
+                        expected_size: matches.get_one::<u64>("size").copied(),
+                        upstream: upstream.clone(),
+                        path: matches
+                            .get_one::<String>("path")
+                            .context("missing upstream path")?
+                            .clone(),
+                    };
+                    locator.validate()?;
+                    Ok::<_, anyhow::Error>(locator)
+                })
+                .transpose()?;
+            Command::NativeProvisionPackage {
+                client_config: matches
+                    .get_one::<PathBuf>("client-config")
+                    .context("missing client configuration")?
+                    .clone(),
+                archive: matches.get_one::<PathBuf>("archive").cloned(),
+                identity,
+                expected_size: matches.get_one::<u64>("size").copied(),
+                locator,
+            }
+        }
+        "native-provision-rust" => Command::NativeProvisionRust {
+            client_config: matches
+                .get_one::<PathBuf>("client-config")
+                .context("missing client configuration")?
+                .clone(),
+            archive: matches.get_one::<PathBuf>("archive").cloned(),
+            source: package_source(matches)?,
+            manifest_output: matches.get_one::<PathBuf>("manifest-output").cloned(),
+        },
+        "native-import-rust" => {
+            let source = package_source(matches)?;
+            Command::NativeImportRust {
+                store: matches
+                    .get_one::<PathBuf>("store")
+                    .context("missing store path")?
+                    .clone(),
+                archive: matches.get_one::<PathBuf>("archive").cloned(),
+                source,
+                max_entries: *matches
+                    .get_one::<usize>("max-entries")
+                    .context("missing entry limit")?,
+                max_expanded_bytes: *matches
+                    .get_one::<u64>("max-expanded-bytes")
+                    .context("missing expansion limit")?,
+                max_tar_bytes: *matches
+                    .get_one::<u64>("max-tar-bytes")
+                    .context("missing decoded tar limit")?,
+                manifest_output: matches.get_one::<PathBuf>("manifest-output").cloned(),
+            }
+        }
+        _ => bail!("Unknown package command {name}"),
+    })
+}
+
+fn parse_installation(name: &str, matches: &clap::ArgMatches) -> anyhow::Result<Command> {
+    Ok(match name {
+        #[cfg(target_os = "linux")]
+        "native-sync-system" => Command::NativeSyncSystem {
+            client_config: matches
+                .get_one::<PathBuf>("client-config")
+                .context("missing client configuration")?
+                .clone(),
+            paths: matches
+                .get_many::<PathBuf>("path")
+                .context("missing selected paths")?
+                .cloned()
+                .collect(),
+            cache_dir: matches
+                .get_one::<PathBuf>("cache-dir")
+                .context("missing pacman package cache directory")?
+                .clone(),
+            jobs: *matches
+                .get_one::<std::num::NonZeroUsize>("jobs")
+                .context("missing acquisition concurrency")?,
+        },
+        #[cfg(target_os = "linux")]
+        "native-sync-rust" => Command::NativeSyncRust {
+            root: matches
+                .get_one::<PathBuf>("root")
+                .context("missing installation root")?
+                .clone(),
+            client_config: matches
+                .get_one::<PathBuf>("client-config")
+                .context("missing client configuration")?
+                .clone(),
+            output: matches
+                .get_one::<PathBuf>("output")
+                .context("missing catalog output")?
+                .clone(),
+            recipe_output: matches
+                .get_one::<PathBuf>("recipe-output")
+                .context("missing recipe output")?
+                .clone(),
+            full: matches.get_flag("full"),
+            jobs: *matches
+                .get_one::<std::num::NonZeroUsize>("jobs")
+                .context("missing acquisition concurrency")?,
+        },
+        #[cfg(target_os = "linux")]
+        "native-attest-installation" => Command::NativeAttestInstallation {
+            root: matches
+                .get_one::<PathBuf>("root")
+                .context("missing installation root")?
+                .clone(),
+            manifests: matches
+                .get_many::<PathBuf>("manifest")
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect(),
+            recipe: matches.get_one::<PathBuf>("recipe").cloned(),
+            output: matches
+                .get_one::<PathBuf>("output")
+                .context("missing catalog output")?
+                .clone(),
+        },
+        "native-audit" => Command::NativeAudit {
+            index: matches
+                .get_one::<PathBuf>("index")
+                .context("missing native index path")?
+                .clone(),
+            schema: matches.get_one::<String>("schema").cloned(),
+            without: matches
+                .get_many::<String>("without")
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect(),
+        },
+        _ => bail!("Unknown installation command {name}"),
     })
 }

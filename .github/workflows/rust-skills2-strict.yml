@@ -24,3 +24,18 @@ jobs:
     with:
       working-directory: tools/cpu-target-profile
       python-ci-paths: tools
+
+  strict-dashboard-ssr:
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@7d0552029497cf094787c3593f804d5bce137c4b # main
+    with:
+      # Check the exact native scheduler release composition, not only the UI crate.
+      cargo-args: "--locked -p sccache -p sccache-dashboard --no-default-features --features sccache/s3,sccache/gha,sccache/dist-client,sccache/dist-server,sccache/direct-metrics,sccache/scheduler-dashboard,sccache-dashboard/ssr --lib --bins"
+      python-ci-paths: tools
+      allow-test-panics: true
+
+  strict-dashboard-wasm:
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@7d0552029497cf094787c3593f804d5bce137c4b # main
+    with:
+      cargo-args: "--locked -p sccache-dashboard --no-default-features --features hydrate --target wasm32-unknown-unknown --lib"
+      rust-targets: wasm32-unknown-unknown
+      python-ci-paths: tools

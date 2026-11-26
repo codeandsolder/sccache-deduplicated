@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Build an immutable, host-specific bundle; never install it into live services.
-if [[ $# != 1 ]]; then
-    echo "usage: $0 ABSENT_OUTPUT_DIRECTORY" >&2
+if [[ $# -lt 1 || $# -gt 2 || ( $# == 2 && $2 != --scheduler-dashboard ) ]]; then
+    echo "usage: $0 ABSENT_OUTPUT_DIRECTORY [--scheduler-dashboard]" >&2
     exit 2
 fi
 repo="$(cd -- "$(dirname -- "$0")/../.." && pwd -P)"
@@ -15,7 +15,12 @@ cd "$repo"
 source_sha="$(git rev-parse HEAD)"
 source contrib/codeandsolder/release-protocol.env
 host_fingerprint="$(contrib/codeandsolder/host-native-metadata fingerprint)"
-features=s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl
+features=s3,gha,dist-client,dist-server,direct-metrics
+dashboard=0
+if [[ ${2:-} == --scheduler-dashboard ]]; then
+    dashboard=1
+    features+=,scheduler-dashboard
+fi
 target="$(rustc +"$rust_toolchain" -vV | sed -n 's/^host: //p')"
 [[ -n "$target" ]]
 tmp="$(mktemp -d)"
@@ -25,12 +30,18 @@ export CARGO_TARGET_DIR="$tmp/target"
 # Force the codegen configuration rather than inherit a portable CI target.
 unset CARGO_ENCODED_RUSTFLAGS
 export RUSTFLAGS='-C target-cpu=native'
-# Native code in zstd-sys and vendored OpenSSL should be host-tuned too.
+# Native code in zstd-sys and BoringSSL should be host-tuned too.
 export CFLAGS="-march=native" CXXFLAGS="-march=native"
 export SCCACHE_START_SERVER=0 SCCACHE_NO_AUTO_START_SERVER=1
-cargo +"$rust_toolchain" build --locked --release --target "$target" --no-default-features --features "$features" --bin sccache --bin sccache-dist
+env -u RUSTC -u RUSTDOC cargo +"$rust_toolchain" build --locked --release --target "$target" --no-default-features --features "$features" --bin sccache --bin sccache-dist
 install -m 0755 "$CARGO_TARGET_DIR/$target/release/sccache" "$stage/sccache"
 install -m 0755 "$CARGO_TARGET_DIR/$target/release/sccache-dist" "$stage/sccache-dist"
+if (( dashboard )); then
+    rustup target add --toolchain "$rust_toolchain" wasm32-unknown-unknown
+    scripts/install-scheduler-dashboard-tools.sh "$tmp/dashboard-tools"
+    env -u RUSTFLAGS -u CFLAGS -u CXXFLAGS scripts/build-scheduler-dashboard.sh "$tmp/dashboard-tools/wasm-bindgen" "$tmp/dashboard-tools/stylance"
+    cp -a "$CARGO_TARGET_DIR/scheduler-dashboard/pkg" "$stage/pkg"
+fi
 "$stage/sccache" --version
 "$stage/sccache-dist" --version
 capabilities="$("$stage/sccache" --capabilities | paste -sd, -)"
@@ -38,11 +49,16 @@ capabilities="$("$stage/sccache" --capabilities | paste -sd, -)"
 {
     printf 'build_kind=host-native\nsource_sha=%s\nhost=%s\ntarget=%s\nhost_fingerprint=%s\n' "$source_sha" "$(hostname)" "$target" "$host_fingerprint"
     printf 'rust_toolchain=%s\nrustflags=%s\nfeatures=%s\n' "$rust_toolchain" "$RUSTFLAGS" "$features"
-    printf 'dist_protocol=%s\nrollout_epoch=%s\nopenssl_linkage=vendored-static\ncapabilities=%s\n' "$dist_protocol" "$rollout_epoch" "$capabilities"
+    printf 'dist_protocol=%s\nrollout_epoch=%s\ntls_backend=boringssl-static\ncapabilities=%s\n' "$dist_protocol" "$rollout_epoch" "$capabilities"
     printf 'cflags=%s\ncxxflags=%s\n' "$CFLAGS" "$CXXFLAGS"
     printf 'native_target_features=%s\n' "$(rustc +"$rust_toolchain" --print cfg --target "$target" -C target-cpu=native | sed -n 's/^target_feature="\(.*\)"$/\1/p' | paste -sd, -)"
 } > "$stage/build.txt"
-(cd "$stage" && sha256sum sccache sccache-dist build.txt > SHA256SUMS && sha256sum -c SHA256SUMS)
+(cd "$stage"
+ sha256sum sccache sccache-dist build.txt > SHA256SUMS
+ if (( dashboard )); then find pkg -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum >> SHA256SUMS; fi
+ sha256sum --strict -c SHA256SUMS
+)
+chmod 0755 "$stage"
 [[ "$(contrib/codeandsolder/host-native-metadata fingerprint)" == "$host_fingerprint" ]]
 mv -T -- "$stage" "$output"
 printf 'HOST_NATIVE_BUNDLE=%s\n' "$output"

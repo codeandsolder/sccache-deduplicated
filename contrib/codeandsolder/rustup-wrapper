@@ -5,7 +5,7 @@ REAL_RUSTUP="${CODEANDSOLDER_REAL_RUSTUP:-/usr/bin/rustup}"
 CARGO_WRAPPER="${CODEANDSOLDER_CARGO_WRAPPER:-/usr/local/bin/cargo}"
 
 # `rustup run TOOLCHAIN cargo ...` normally executes rustup's stock Cargo from
-# the selected toolchain, bypassing the machine-wide cargo-ephemeral policy.
+# the selected toolchain, bypassing the machine-wide Cargo scratch policy.
 # Route only that exact case through the maintained Cargo launcher. Everything
 # else remains ordinary rustup behavior. Set CODEANDSOLDER_RUSTUP_STOCK_CARGO=1
 # when intentionally testing the stock Cargo binary.

@@ -43,6 +43,7 @@ const DIST_SERVER_TOKEN: &str = "THIS IS THE TEST TOKEN";
 
 pub const CUSTOM_SERVER_ADDR_ENV: &str = "SCCACHE_TEST_CUSTOM_SERVER_ADDR";
 pub const CUSTOM_SERVER_SCHEDULER_ENV: &str = "SCCACHE_TEST_CUSTOM_SERVER_SCHEDULER";
+pub const CUSTOM_SERVER_CLUSTER_ENV: &str = "SCCACHE_TEST_CUSTOM_SERVER_CLUSTER";
 pub const CUSTOM_SERVER_TOKEN_ENV: &str = "SCCACHE_TEST_CUSTOM_SERVER_TOKEN";
 
 #[cfg(feature = "dist-server")]
@@ -252,6 +253,7 @@ pub fn sccache_client_cfg(
             multilevel: None,
         },
         dist: sccache::config::DistConfig {
+            cluster: None,
             auth: Default::default(), // dangerously_insecure
             scheduler_url: None,
             cache_dir: tmpdir.join(dist_cache_relpath),
@@ -273,7 +275,9 @@ pub fn sccache_client_cfg(
 #[cfg(feature = "dist-server")]
 fn sccache_scheduler_cfg(address: SocketAddr) -> sccache::config::scheduler::Config {
     sccache::config::scheduler::Config {
+        cluster_directory: Path::new(CONFIGS_CONTAINER_PATH).join("cluster"),
         maintenance_drain_file: None,
+        dashboard: None,
         native_cache: None,
         job_slack: Default::default(),
         public_addr: address,
@@ -291,9 +295,19 @@ fn sccache_server_cfg(
     server_addr: SocketAddr,
 ) -> sccache::config::server::Config {
     let relpath = "server-cache";
+    let scheduler_id = sccache_cluster_identity::Identity::open(&tmpdir.join("cluster/key.pem"))
+        .unwrap()
+        .id()
+        .unwrap();
     fs::create_dir(tmpdir.join(relpath)).unwrap();
 
     sccache::config::server::Config {
+        cluster: sccache_peer_identity::PeerConfig {
+            directory: Path::new(CONFIGS_CONTAINER_PATH)
+                .join(format!("worker-{}", server_addr.port())),
+            ca_certificate: Path::new(CONFIGS_CONTAINER_PATH).join("cluster/ca.pem"),
+            scheduler_id,
+        },
         builder: sccache::config::server::BuilderType::Overlay {
             build_dir: BUILD_DIR_CONTAINER_PATH.into(),
             bwrap_path: DIST_IMAGE_BWRAP_PATH.into(),
@@ -316,7 +330,7 @@ fn sccache_server_cfg(
 // code so that it can be included here
 #[cfg(feature = "dist-server")]
 fn create_server_token(server_id: ServerId, auth_token: &str) -> String {
-    format!("{} {}", server_id.addr(), auth_token)
+    format!("{} {}", server_id, auth_token)
 }
 
 #[cfg(feature = "dist-server")]
@@ -378,6 +392,13 @@ impl DistSystem {
 
         let tmpdir = tmpdir.join("distsystem");
         fs::create_dir(&tmpdir).unwrap();
+        let cluster = tmpdir.join("cluster");
+        fs::create_dir_all(&cluster).unwrap();
+        drop(sccache_cluster_identity::scheduler_registry(&cluster).unwrap());
+        let ca = sccache_cluster_identity::ClusterCa::open(&cluster.join("ca-key.pem")).unwrap();
+        sccache_cluster_identity::Identity::open(&cluster.join("key.pem")).unwrap();
+        sccache_cluster_identity::publish_trust_anchor(ca.certificate(), &cluster.join("ca.pem"))
+            .unwrap();
 
         let scheduler_listener = loopback_listener();
         let scheduler_addr = scheduler_listener.local_addr().unwrap();
@@ -538,8 +559,7 @@ impl DistSystem {
         drop(listener);
         fs::File::create(format!("{}.ready", server_cfg_path.to_str().unwrap())).unwrap();
 
-        let url =
-            HTTPUrl::from_url(reqwest::Url::parse(&format!("https://{server_addr}")).unwrap());
+        let url = HTTPUrl::from_url(url::Url::parse(&format!("https://{server_addr}")).unwrap());
         let handle = ServerHandle::Container {
             cid: server_name,
             url,
@@ -551,7 +571,17 @@ impl DistSystem {
     pub fn add_custom_server_process(&mut self, test_name: &str) -> ServerHandle {
         let listener = loopback_listener();
         let server_addr = listener.local_addr().unwrap();
-        let token = create_server_token(ServerId::new(server_addr), DIST_SERVER_TOKEN);
+        let cluster = sccache_peer_identity::PeerConfig {
+            directory: self
+                .tmpdir
+                .join(format!("custom-worker-{}", server_addr.port())),
+            ..self.cluster_config()
+        };
+        let peer_id = sccache_cluster_identity::open_identity(&cluster)
+            .unwrap()
+            .id()
+            .unwrap();
+        let token = create_server_token(peer_id, DIST_SERVER_TOKEN);
         let scheduler_url = self.scheduler_url().to_url().to_string();
         drop(listener);
         let child = Command::new(env::current_exe().unwrap())
@@ -559,14 +589,17 @@ impl DistSystem {
             .env(CUSTOM_SERVER_ADDR_ENV, server_addr.to_string())
             .env(CUSTOM_SERVER_SCHEDULER_ENV, scheduler_url)
             .env(CUSTOM_SERVER_TOKEN_ENV, token)
+            .env(
+                CUSTOM_SERVER_CLUSTER_ENV,
+                serde_json::to_string(&cluster).unwrap(),
+            )
             .env("SCCACHE_LOG", "sccache=trace")
             .spawn()
             .unwrap();
         let pid = child.id();
         self.server_processes.push(child);
 
-        let url =
-            HTTPUrl::from_url(reqwest::Url::parse(&format!("https://{}", server_addr)).unwrap());
+        let url = HTTPUrl::from_url(url::Url::parse(&format!("https://{}", server_addr)).unwrap());
         let handle = ServerHandle::Process { pid, url };
         self.wait_server_ready(&handle);
         handle
@@ -643,18 +676,60 @@ impl DistSystem {
     }
 
     pub fn scheduler_url(&self) -> HTTPUrl {
-        let url = format!("http://{}", self.scheduler_addr);
-        HTTPUrl::from_url(reqwest::Url::parse(&url).unwrap())
+        let url = format!("https://{}", self.scheduler_addr);
+        HTTPUrl::from_url(url::Url::parse(&url).unwrap())
+    }
+
+    pub fn cluster_config(&self) -> sccache_peer_identity::PeerConfig {
+        sccache_peer_identity::PeerConfig {
+            directory: self.tmpdir.join("client-identity"),
+            ca_certificate: self.tmpdir.join("cluster/ca.pem"),
+            scheduler_id: sccache_cluster_identity::Identity::open(
+                &self.tmpdir.join("cluster/key.pem"),
+            )
+            .unwrap()
+            .id()
+            .unwrap(),
+        }
     }
 
     fn scheduler_status(&self) -> Result<SchedulerStatusResult, String> {
-        let url = dist::http::urls::scheduler_status(&self.scheduler_url().to_url())
+        let config = self.cluster_config();
+        let id = config.scheduler_id;
+        let peer = sccache::dist::cluster::open_peer(
+            config,
+            &self.scheduler_url().to_url(),
+            sccache_cluster_identity::Role::Client,
+            || Ok(sccache::config::INSECURE_DIST_CLIENT_TOKEN.to_owned()),
+        )
+        .map_err(|error| error.to_string())?;
+        let credentials = peer.current().map_err(|error| error.to_string())?;
+        let transport = sccache_cluster_identity::ClusterHttpClient::new(
+            &credentials,
+            id,
+            sccache_cluster_identity::Role::Scheduler,
+            self.scheduler_addr,
+        )
+        .map_err(|error| error.to_string())?;
+        let url = dist::http::urls::scheduler_status(transport.base())
             .map_err(|error| error.to_string())?;
-        let res = reqwest::blocking::get(url).map_err(|error| error.to_string())?;
+        let runtime = sccache::http_client::io_runtime().map_err(|error| error.to_string())?;
+        let res = runtime
+            .block_on(
+                transport
+                    .client()
+                    .get(url.as_str())
+                    .timeout(Duration::from_secs(2))
+                    .send(),
+            )
+            .map_err(|error| error.to_string())?;
         if !res.status().is_success() {
             return Err(format!("scheduler status request failed: {}", res.status()));
         }
-        bincode::deserialize_from(res).map_err(|error| error.to_string())
+        let bytes = runtime
+            .block_on(res.bytes())
+            .map_err(|error| error.to_string())?;
+        bincode::deserialize(&bytes).map_err(|error| error.to_string())
     }
 }
 

@@ -68,6 +68,13 @@ impl Storage for ReadOnlyStorage {
         self.0.max_size().await
     }
 
+    async fn tier_observations(
+        &self,
+        _allow_refresh: bool,
+    ) -> Vec<crate::cache::CacheTierObservation> {
+        self.0.tier_observations(false).await
+    }
+
     /// Return the config for preprocessor cache mode if applicable
     fn preprocessor_cache_mode_config(&self) -> PreprocessorCacheModeConfig {
         self.0.preprocessor_cache_mode_config()

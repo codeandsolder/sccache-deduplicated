@@ -106,10 +106,11 @@ jobs:
       - name: Validate managed host scripts
         run: |
           bash -n contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers
-          shellcheck -x contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers contrib/codeandsolder/build-host-native contrib/codeandsolder/host-native-metadata contrib/codeandsolder/test-host-native-metadata contrib/codeandsolder/test-release-update-plan
+          shellcheck -x contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers contrib/codeandsolder/build-host-native contrib/codeandsolder/host-native-metadata contrib/codeandsolder/test-host-native-metadata contrib/codeandsolder/test-release-update-plan contrib/codeandsolder/test-release-update-transaction
           shellcheck -x contrib/codeandsolder/sccache-dist-client-preflight contrib/codeandsolder/test-dist-client-preflight
           contrib/codeandsolder/test-dist-client-preflight
           contrib/codeandsolder/test-release-update-plan
+          sudo contrib/codeandsolder/test-release-update-transaction
           shellcheck -x contrib/codeandsolder/sccache-client contrib/codeandsolder/sccache-cmake-launcher contrib/codeandsolder/test-sccache-router
           contrib/codeandsolder/test-wrappers
           contrib/codeandsolder/test-sccache-router
@@ -287,7 +288,7 @@ jobs:
       runner: ubuntu-26.04
       command: |
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends gcc clang bubblewrap ripgrep
+        sudo apt-get install -y --no-install-recommends gcc clang bubblewrap ripgrep fuse3
         # Canonical Rust integration tests execute the bundled compiler through
         # bwrap, just like the managed Linux hosts.
         command -v bwrap
@@ -313,12 +314,25 @@ jobs:
         export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
         cargo test --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
         cargo test --locked --target x86_64-unknown-linux-gnu -p sccache-build -- --include-ignored --skip benchmark_native_zfs_clones_against_reuse --skip benchmark_native_zfs_clones_against_fuse_views
+        cargo test --locked --target x86_64-unknown-linux-gnu -p sccache-cluster-identity
         cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --test native_dist -- --include-ignored --skip shared_daemon_credential_isolation
         cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --test native_dist -- --ignored --exact shared_daemon_credential_isolation
         # The default feature set omits dist-server: explicitly run all
         # scheduler/worker binary tests, including job resource telemetry.
         cargo test --locked --target x86_64-unknown-linux-gnu \
           --no-default-features --features=dist-server --bin sccache-dist
+        cargo test --locked --target x86_64-unknown-linux-gnu -p sccache-dashboard --features ssr
+        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=scheduler-dashboard --bin sccache-dist scheduler_status
+        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=scheduler-dashboard --bin sccache-dist status_counts_assignment_rpc_reservations
+        rustup target add wasm32-unknown-unknown
+        env -u RUSTFLAGS cargo check --locked -p sccache-dashboard --no-default-features --features hydrate --target wasm32-unknown-unknown
+        source contrib/codeandsolder/release-protocol.env
+        rustup toolchain install "$rust_toolchain" --profile minimal --target wasm32-unknown-unknown
+        target_dir="$(cargo metadata --locked --no-deps --format-version 1 | jq -r .target_directory)"
+        scripts/install-scheduler-dashboard-tools.sh "$target_dir/dashboard-tools"
+        env -u RUSTFLAGS scripts/build-scheduler-dashboard.sh "$target_dir/dashboard-tools/wasm-bindgen" "$target_dir/dashboard-tools/stylance"
+        cargo build --locked --target x86_64-unknown-linux-gnu --no-default-features --features=scheduler-dashboard --bin sccache-dist
+        scripts/test-scheduler-dashboard-browser.sh "$target_dir/x86_64-unknown-linux-gnu/debug/sccache-dist" "$target_dir/scheduler-dashboard/pkg"
         # Reuse the already-initialized mandatory sccache for the standalone
         # destination-profile tests. Strict compiler lints run in rust-skills2.
         cargo test --locked --manifest-path tools/cpu-target-profile/Cargo.toml
@@ -387,8 +401,32 @@ jobs:
         shell: bash
         run: |
           cargo +${{ steps.compiler.outputs.channel }} check --release --locked --no-default-features \
-            --features s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl \
+            --features s3,gha,dist-client,dist-server,direct-metrics \
             --bin sccache --bin sccache-dist
+      - name: Verify normalized scheduler dependency graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages="$(cargo +${{ steps.compiler.outputs.channel }} tree --locked --no-default-features \
+            --features s3,gha,dist-client,dist-server,direct-metrics,scheduler-dashboard \
+            --edges normal --prefix none --format '{p}')"
+          # These alternate application stacks were deliberately removed.
+          printf '%s\n' "$packages" | awk '
+            $1 ~ /^(rouille|tiny_http|ureq|ureq-proto|native-tls|hyper-tls|tokio-native-tls|ring|aws-lc-rs|aws-lc-sys|rsa|openssl|openssl-sys|rustls|tokio-rustls|hyper-rustls|reqwest|miniz_oxide|libmount|version-compare)$/ {
+              print "Unexpected release dependency: " $0 > "/dev/stderr"; invalid=1
+            }
+            END { exit invalid }'
+          zlib="$(printf '%s\n' "$packages" | awk '$1 == "zlib-rs" { sub(/ \(\*\)$/, ""); print }' | sort -u)"
+          [[ "$zlib" == *"github.com/codeandsolder/zlib-rs-fast"* && "$zlib" != *$'\n'* ]]
+          btls="$(printf '%s\n' "$packages" | awk '$1 == "btls-sys" { sub(/ \(\*\)$/, ""); print }' | sort -u)"
+          [[ "$btls" == *"github.com/codeandsolder/btls-fast"* && "$btls" != *$'\n'* ]]
+      - name: Check exact scheduler release feature profile
+        shell: bash
+        run: |
+          cargo +${{ steps.compiler.outputs.channel }} check --release --locked --no-default-features \
+            --features s3,gha,dist-client,dist-server,direct-metrics,scheduler-dashboard \
+            --bin sccache-dist
+
       - name: Finalize mandatory sccache
         if: always()
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ff6fd7c37922135c22ee83c77d3e8e91fc9ebac1 # main
@@ -434,17 +472,9 @@ jobs:
         run: |
           rustup component add rust-src --toolchain ${{ steps.rust.outputs.name }}
 
-      - name: fix build openssl error on s390x
-        if: ${{  matrix.target  == 's390x-unknown-linux-musl' }}
-        run: |
-          # see https://github.com/openssl/openssl/issues/27323
-          echo CFLAGS="-march=z10 -mzarch" >> $GITHUB_ENV
-          echo CXXFLAGS="$CFLAGS" >> $GITHUB_ENV
-          echo RUSTFLAGS="-C target-cpu=z10" >> $GITHUB_ENV
-
       - name: Build (s390x-musl with build-std)
         if: ${{ matrix.target == 's390x-unknown-linux-musl' }}
-        run: cargo +${{ steps.rust.outputs.name }} build --locked --release --bin ${{ matrix.binary || 'sccache' }} --target ${{ matrix.target }} --features=openssl/vendored ${{ matrix.extra_args }} -Zbuild-std
+        run: cargo +${{ steps.rust.outputs.name }} build --locked --release --bin ${{ matrix.binary || 'sccache' }} --target ${{ matrix.target }} ${{ matrix.extra_args }} -Zbuild-std
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
           DEVELOPER_DIR: ${{ matrix.developer_dir }}
@@ -454,7 +484,7 @@ jobs:
 
       - name: Build
         if: ${{ matrix.target != 's390x-unknown-linux-musl' }}
-        run: cargo build --locked --release --bin ${{ matrix.binary || 'sccache' }} --target ${{ matrix.target }} --features=openssl/vendored ${{ matrix.extra_args }}
+        run: cargo build --locked --release --bin ${{ matrix.binary || 'sccache' }} --target ${{ matrix.target }} ${{ matrix.extra_args }}
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
           DEVELOPER_DIR: ${{ matrix.developer_dir }}

@@ -17,9 +17,6 @@
 
 #[macro_use]
 extern crate log;
-#[cfg(feature = "rouille")]
-#[macro_use(router)]
-extern crate rouille;
 // To get macros in scope, this has to be first.
 #[cfg(test)]
 #[macro_use]
@@ -30,6 +27,8 @@ pub mod errors;
 
 pub use sccache_build as build_runtime;
 pub mod cache;
+#[cfg(target_os = "linux")]
+mod cargo_launcher;
 mod client;
 mod cmdline;
 mod commands;
@@ -40,7 +39,7 @@ pub use compiler::rust_link;
 pub mod compression;
 pub mod config;
 pub mod dist;
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-client")]
 pub mod http_client;
 mod jobserver;
 pub mod lru_disk_cache;
@@ -100,6 +99,17 @@ pub fn main() {
     }
 
     init_logging();
+
+    #[cfg(target_os = "linux")]
+    if let Some(result) = cargo_launcher::run_if_requested() {
+        std::process::exit(match result {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!("sccache Cargo launcher: {error:#}");
+                2
+            }
+        });
+    }
 
     let command = match cmdline::try_parse() {
         Ok(cmd) => cmd,

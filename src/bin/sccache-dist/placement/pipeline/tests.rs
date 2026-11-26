@@ -30,6 +30,7 @@ fn publication_start(
             wire_per_mille: 1000,
             contention,
         },
+        None,
     )
     .ready_at
 }
@@ -240,12 +241,14 @@ fn native_pipeline_uses_each_reservations_learned_service_time() {
         phase: Default::default(),
         execution_nanoseconds: 8_000_000_000,
         output_bytes: 400,
+        result_bytes: 400,
         output_requests: 0,
     };
     let small = ActionCost {
         phase: Default::default(),
         execution_nanoseconds: 200_000_000,
         output_bytes: 0,
+        result_bytes: 0,
         output_requests: 0,
     };
     let assigned = Assignments::from([(
@@ -301,6 +304,7 @@ fn native_pipeline_charges_warm_preparation_and_publication_without_uploads() {
         },
         execution_nanoseconds: 30_000_000,
         output_bytes: 0,
+        result_bytes: 0,
         output_requests: 0,
     };
     let assigned = Assignments::from([(
@@ -331,10 +335,44 @@ fn native_pipeline_charges_warm_preparation_and_publication_without_uploads() {
             wire_per_mille: 1000,
             contention: 1.0,
         },
+        None,
     );
     // One staging slot: 10ms per job. One compiler: first runs
     // from 10–40ms, second 40–70ms; first publication 40–60ms.
     assert_eq!(pipeline.inputs_ready_at, 0.020);
     assert_eq!(pipeline.ready_at, 0.070);
     assert_eq!(pipeline.traffic.wire_bytes, 0);
+}
+
+#[test]
+fn direct_input_is_not_charged_to_scheduler_shared_link() {
+    let mut placement = placement();
+    placement.timing.transfer.raw_request_nanoseconds = 0;
+    let assigned = Assignments::default();
+    let recent = RecentResidency::default();
+    let direct_id = ContentId::of(b"resident on peer");
+    let cold_id = ContentId::of(b"only scheduler");
+    let requested = NativeInputBlobs::from([(direct_id, 1000), (cold_id, 1000)]);
+    let forecast = super::super::WorkerForecast {
+        capacity: 4.0,
+        assigned: &assigned,
+        placement: &placement,
+        recent: &recent,
+        cost: ActionCost::baseline(&placement),
+    };
+    let rates = DeliveryRates {
+        raw: 1000,
+        archive: 1000,
+        wire_per_mille: 1000,
+        contention: 2.0,
+    };
+    let direct = DirectInputs::from([(direct_id, 10_000)]);
+    let result = publication_forecast(forecast, &requested, None, rates, Some(&direct));
+    assert_eq!(result.traffic.wire_bytes, 1000);
+    assert_eq!(result.traffic.direct_bytes, 1000);
+    assert_eq!(result.traffic.wire_time, Duration::from_secs(1));
+    assert_eq!(result.traffic.direct_time, Duration::from_millis(100));
+    let baseline = publication_forecast(forecast, &requested, None, rates, None);
+    assert_eq!(baseline.traffic.wire_bytes, 2000);
+    assert!(result.inputs_ready_at < baseline.inputs_ready_at);
 }

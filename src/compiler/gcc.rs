@@ -16,12 +16,12 @@ use crate::compiler::args::{
     ArgDisposition, ArgInfo, ArgToStringResult, ArgsIter, Argument, FromArg, IntoArg,
     NormalizedDisposition, PathTransformerFn, SearchableArgInfo,
 };
-#[cfg(feature = "dist-client")]
-use crate::compiler::c::is_native_codegen_arg;
 use crate::compiler::c::{
     ArtifactDescriptor, CCompileCommands, CCompileContext, CCompilerImpl, CCompilerKind,
-    CPreprocessContext, ParsedArguments, assembler_include_dirs,
+    CPreprocessContext, ParsedArguments,
 };
+#[cfg(feature = "dist-client")]
+use crate::compiler::c::{assembler_include_dirs, is_native_codegen_arg};
 use crate::compiler::response_files::ResponseFileExpansion;
 use crate::compiler::{
     Cacheable, ColorMode, CompilerArguments, Language, SingleCompileCommand, clang,
@@ -861,8 +861,7 @@ fn module_artifact_descriptor(
             let mut path = output.with_file_name(input_file_name);
             let mut ext = path
                 .extension()
-                .map(std::ffi::OsStr::to_os_string)
-                .unwrap_or_default();
+                .map_or_default(std::ffi::OsStr::to_os_string);
             ext.push(".pcm");
             path.set_extension(ext);
             path

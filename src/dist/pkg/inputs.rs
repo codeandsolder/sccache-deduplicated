@@ -89,7 +89,10 @@ impl CompilerInputs {
     }
 
     #[cfg(target_os = "linux")]
-    pub fn into_native_mapping(self) -> Result<crate::build_runtime::MappedTree> {
+    pub fn into_native_mapping(
+        self,
+        normalize_timestamp: impl Fn(&Path) -> bool,
+    ) -> Result<crate::build_runtime::MappedTree> {
         use crate::build_runtime::{
             MappedMetadata, MappedTree, TreeMetadata, TreePath, TreeTimestamp,
         };
@@ -101,7 +104,9 @@ impl CompilerInputs {
             TreePath::new(path.strip_prefix("/")?.as_os_str().as_bytes().to_vec())
         };
         for (destination, input) in self.files {
-            let path = relative(Path::new(&destination))?;
+            let logical = Path::new(&destination);
+            let normalize = normalize_timestamp(logical);
+            let path = relative(logical)?;
             let source = input.source.canonicalize()?;
             if let Some(bytes) = input.generated {
                 let metadata = fs::metadata(&source)?;
@@ -110,14 +115,23 @@ impl CompilerInputs {
                     bytes,
                     TreeMetadata {
                         mode: metadata.mode() & 0o7777,
-                        modified: TreeTimestamp {
-                            seconds: metadata.mtime(),
-                            nanoseconds: u32::try_from(metadata.mtime_nsec())?,
+                        modified: if normalize {
+                            directories.modified
+                        } else {
+                            TreeTimestamp {
+                                seconds: metadata.mtime(),
+                                nanoseconds: u32::try_from(metadata.mtime_nsec())?,
+                            }
                         },
                     },
                 )?;
             } else {
-                mapping.add_file(path, source, MappedMetadata::Preserve)?;
+                let policy = if normalize {
+                    MappedMetadata::NormalizeTimestamp(directories.modified)
+                } else {
+                    MappedMetadata::Preserve
+                };
+                mapping.add_file(path, source, policy)?;
             }
         }
         for directory in self.paths.directories.keys() {

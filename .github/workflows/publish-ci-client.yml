@@ -112,25 +112,45 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo +${{ steps.protocol.outputs.rust_toolchain }} build --release --locked \
+          release_cargo=(env -u RUSTC -u RUSTDOC cargo +${{ steps.protocol.outputs.rust_toolchain }})
+          target_dir="$("${release_cargo[@]}" metadata --locked --no-deps --format-version 1 | jq -r .target_directory)"
+          "${release_cargo[@]}" build --release --locked \
             --no-default-features \
-            --features s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl \
+            --features s3,gha,dist-client,dist-server,direct-metrics \
             --bin sccache --bin sccache-dist
 
-          install -D -m 0755 target/release/sccache dist/sccache-linux-x86_64-v2
-          install -D -m 0755 target/release/sccache-dist dist/sccache-dist-linux-x86_64-v2
+          install -D -m 0755 "$target_dir/release/sccache" dist/sccache-linux-x86_64-v2
+          install -D -m 0755 "$target_dir/release/sccache-dist" dist/sccache-dist-linux-x86_64-v2
           sha256sum dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2 > dist/SHA256SUMS
           {
             echo "source_sha=${{ steps.rev.outputs.sha }}"
             echo "rust_toolchain=${{ steps.protocol.outputs.rust_toolchain }}"
             echo "rustflags=-C target-cpu=x86-64-v2"
-            echo "features=s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl"
+            echo "features=s3,gha,dist-client,dist-server,direct-metrics"
             echo "dist_protocol=${{ steps.protocol.outputs.dist_protocol }}"
             echo "rollout_epoch=${{ steps.protocol.outputs.rollout_epoch }}"
             echo "glibc_abi_max=${{ steps.protocol.outputs.glibc_abi_max }}"
-            echo "openssl_linkage=vendored-static"
-            echo "capabilities=$(target/release/sccache --capabilities | paste -sd, -)"
+            echo "tls_backend=boringssl-static"
+            echo "capabilities=$(dist/sccache-linux-x86_64-v2 --capabilities | paste -sd, -)"
           } > dist/build.txt
+
+      - name: Build matching dashboard scheduler and browser package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add --toolchain "${{ steps.protocol.outputs.rust_toolchain }}" wasm32-unknown-unknown
+          release_cargo=(env -u RUSTC -u RUSTDOC cargo +${{ steps.protocol.outputs.rust_toolchain }})
+          target_dir="$("${release_cargo[@]}" metadata --locked --no-deps --format-version 1 | jq -r .target_directory)"
+          scripts/install-scheduler-dashboard-tools.sh "$target_dir/dashboard-tools"
+          env -u RUSTFLAGS scripts/build-scheduler-dashboard.sh "$target_dir/dashboard-tools/wasm-bindgen" "$target_dir/dashboard-tools/stylance"
+          "${release_cargo[@]}" build --release --locked \
+            --no-default-features \
+            --features s3,gha,dist-client,dist-server,direct-metrics,scheduler-dashboard \
+            --bin sccache-dist
+          install -D -m 0755 "$target_dir/release/sccache-dist" dist/sccache-scheduler-dashboard-linux-x86_64-v2
+          scripts/package-scheduler-dashboard.sh \
+            dist/sccache-scheduler-dashboard-linux-x86_64-v2 "$target_dir/scheduler-dashboard/pkg" \
+            dist/sccache-scheduler-dashboard-linux-x86_64-v2.tar.gz
 
       - name: Install native release validation tools
         shell: bash
@@ -146,7 +166,7 @@ jobs:
         run: |
           set -euo pipefail
           max_supported="GLIBC_${{ steps.protocol.outputs.glibc_abi_max }}"
-          for binary in dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2; do
+          for binary in dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2 dist/sccache-scheduler-dashboard-linux-x86_64-v2; do
             abi_report="$RUNNER_TEMP/$(basename "$binary").glibc-versions"
             readelf -W --version-info "$binary" > "$abi_report"
             # rg exit 1 means no matches (valid for a fully static binary);
@@ -171,7 +191,7 @@ jobs:
         shell: bash
         run: >-
           bash contrib/codeandsolder/verify-release-native-abi.sh
-          dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2
+          dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2 dist/sccache-scheduler-dashboard-linux-x86_64-v2
 
       - name: Finalize mandatory sccache before publishing binaries
         if: always()
@@ -198,4 +218,5 @@ jobs:
             --target "${{ steps.rev.outputs.sha }}" \
             --title "CI sccache bundle ${{ steps.rev.outputs.sha }}" \
             --notes "Pinned Linux x86-64-v2 sccache client + direct sccache-dist worker bundle for centrally managed CI." \
-            dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2 dist/SHA256SUMS dist/build.txt
+            dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2 dist/SHA256SUMS dist/build.txt \
+            dist/sccache-scheduler-dashboard-linux-x86_64-v2.tar.gz dist/sccache-scheduler-dashboard-linux-x86_64-v2.tar.gz.sha256

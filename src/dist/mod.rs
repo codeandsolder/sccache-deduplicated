@@ -19,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::str::FromStr;
@@ -39,11 +38,17 @@ mod cache;
 #[cfg(feature = "dist-client")]
 pub mod client_auth;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
+pub mod cluster;
+#[cfg(any(feature = "dist-client", feature = "dist-server"))]
+mod cluster_routes;
+#[cfg(any(feature = "dist-client", feature = "dist-server"))]
 pub mod execution_queue;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 pub mod http;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 pub mod native;
+#[cfg(all(target_os = "linux", feature = "dist-server"))]
+pub mod rooted_fs;
 #[cfg(test)]
 mod test;
 
@@ -652,25 +657,7 @@ impl FromStr for JobId {
         u64::from_str(s).map(JobId)
     }
 }
-#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServerId(SocketAddr);
-impl ServerId {
-    #[must_use = "the returned server identifier contains the selected address"]
-    pub const fn new(addr: SocketAddr) -> Self {
-        Self(addr)
-    }
-    #[must_use = "the address is returned without changing the server identity"]
-    pub const fn addr(&self) -> SocketAddr {
-        self.0
-    }
-}
-impl FromStr for ServerId {
-    type Err = <SocketAddr as FromStr>::Err;
-    fn from_str(s: &str) -> ::std::result::Result<Self, Self::Err> {
-        SocketAddr::from_str(s).map(ServerId)
-    }
-}
+pub use sccache_peer_identity::PeerId as ServerId;
 #[derive(Eq, PartialEq, Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerNonce(u64);
@@ -981,6 +968,11 @@ pub struct NativeAssignment {
     pub input_blobs: NativeInputBlobs,
     /// Scheduler's advisory logical result-size forecast, never a hard limit.
     pub estimated_result_bytes: Option<u64>,
+    /// Scheduler-local authenticated requester and advisory delivery telemetry.
+    #[serde(skip)]
+    pub receiver: Option<(ServerId, crate::build_runtime::wire::ClientDeliveryRates)>,
+    #[serde(skip)]
+    pub delivery_profile: Option<crate::build_runtime::ContentId>,
 }
 
 /// One scheduler assignment routed through the common capacity accounting.
@@ -993,6 +985,8 @@ pub enum JobAssignment {
 #[cfg(feature = "dist-server")]
 pub trait SchedulerOutgoing {
     // To Server
+    /// # Errors
+    /// The worker could not be contacted or rejected the assignment.
     fn do_assign_job(
         &self,
         server_id: ServerId,
@@ -1005,16 +999,35 @@ pub trait SchedulerOutgoing {
 #[cfg(feature = "dist-server")]
 pub trait ServerOutgoing: Send + Sync {
     // To Scheduler
+    /// # Errors
+    /// The scheduler could not accept or acknowledge the state update.
     fn do_update_job_state(&self, job_id: JobId, state: JobState) -> Result<UpdateJobStateResult>;
 }
 
 // Trait to handle the creation and verification of job authorization tokens
 #[cfg(feature = "dist-server")]
 pub trait JobAuthorizer: Send {
+    /// # Errors
+    /// The job capability could not be signed.
     fn generate_token(&self, job_id: JobId) -> Result<String>;
+    /// # Errors
+    /// The supplied capability is invalid for the job.
     fn verify_token(&self, job_id: JobId, token: &str) -> Result<()>;
-    fn generate_blob_token(&self, blob: crate::build_runtime::BlobRef) -> Result<String>;
-    fn verify_blob_token(&self, blob: crate::build_runtime::BlobRef, token: &str) -> Result<()>;
+    /// # Errors
+    /// The exact-content capability could not be signed.
+    fn generate_blob_token(
+        &self,
+        blob: crate::build_runtime::BlobRef,
+        recipient: crate::build_runtime::wire::BlobRecipient,
+    ) -> Result<String>;
+    /// # Errors
+    /// The supplied capability is invalid for the requested content and recipient.
+    fn verify_blob_token(
+        &self,
+        blob: crate::build_runtime::BlobRef,
+        recipient: crate::build_runtime::wire::BlobRecipient,
+        token: &str,
+    ) -> Result<()>;
 }
 
 /// A narrowly scoped peer-source capability; never log its token.
@@ -1113,9 +1126,13 @@ impl Default for NativeQueueSnapshot {
 #[cfg(feature = "dist-server")]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativePlacement {
+    pub cache_analytics: Option<crate::build_runtime::analytics::CacheSiteSummary>,
     pub package_limits: Option<crate::build_runtime::PackageDeliveryLimits>,
     pub residency: Option<crate::build_runtime::BlobResidency>,
     pub timing: crate::build_runtime::wire::WorkerTiming,
+    pub cache_path_rates: crate::build_runtime::wire::CachePathRates,
+    pub peer_download_rates: Vec<crate::build_runtime::wire::PeerDownloadRate>,
+    pub interfaces: crate::build_runtime::wire::InterfaceReport,
     pub queue: NativeQueueSnapshot,
 }
 
@@ -1123,6 +1140,7 @@ pub struct NativePlacement {
 /// the corresponding session operation has succeeded.
 #[cfg(feature = "dist-server")]
 pub enum NativeLifecycleEvent<'a> {
+    Delivered(crate::build_runtime::DeliveryReceipt),
     InputsStaged,
     Negotiated,
     Committed {
@@ -1153,6 +1171,8 @@ impl WorkerCapabilities {
 #[cfg(feature = "dist-server")]
 pub trait SchedulerIncoming: Send + Sync {
     // From Client
+    /// # Errors
+    /// Worker selection or assignment failed.
     fn handle_alloc_job(
         &self,
         requester: &dyn SchedulerOutgoing,
@@ -1170,10 +1190,15 @@ pub trait SchedulerIncoming: Send + Sync {
         packages: std::sync::Arc<crate::build_runtime::PackageCatalog>,
     ) -> ExtResult<AllocJobResult, Error>;
     /// Select likely sources for a missing exact blob without allocating a job.
+    /// # Errors
+    /// The scheduler could not access worker state or sign a source capability.
     fn native_blob_sources(
         &self,
         blob: crate::build_runtime::BlobRef,
-        requester: Option<std::net::SocketAddr>,
+        requester: Option<ServerId>,
+        recipient: crate::build_runtime::wire::BlobRecipient,
+        producer: Option<ServerId>,
+        recovery_network: Option<&crate::build_runtime::NetworkSnapshot>,
     ) -> ExtResult<Vec<NativeBlobSource>, Error>;
     /// Record advisory producer residency for the current worker epoch.
     fn observe_native_lifecycle(
@@ -1183,6 +1208,8 @@ pub trait SchedulerIncoming: Send + Sync {
         event: NativeLifecycleEvent<'_>,
     );
     // From Server
+    /// # Errors
+    /// Worker state could not be validated or updated.
     fn handle_heartbeat_server(
         &self,
         server_id: ServerId,
@@ -1193,6 +1220,8 @@ pub trait SchedulerIncoming: Send + Sync {
         capabilities: WorkerCapabilities,
     ) -> ExtResult<HeartbeatServerResult, Error>;
     // From Server, best-effort observability metadata.
+    /// # Errors
+    /// Worker metadata could not be updated.
     fn handle_update_worker_name(
         &self,
         _server_id: ServerId,
@@ -1202,10 +1231,14 @@ pub trait SchedulerIncoming: Send + Sync {
         Ok(())
     }
     // From Client, best-effort observability metadata.
+    /// # Errors
+    /// Worker metadata could not be read.
     fn handle_get_worker_name(&self, _server_id: ServerId) -> ExtResult<Option<String>, Error> {
         Ok(None)
     }
     // From Server
+    /// # Errors
+    /// The job is unknown or its state transition is invalid.
     fn handle_update_job_state(
         &self,
         job_id: JobId,
@@ -1213,7 +1246,20 @@ pub trait SchedulerIncoming: Send + Sync {
         job_state: JobState,
     ) -> ExtResult<UpdateJobStateResult, Error>;
     // From anyone
+    /// # Errors
+    /// Scheduler state could not be read.
     fn handle_status(&self) -> ExtResult<SchedulerStatusResult, Error>;
+    #[cfg(feature = "scheduler-dashboard")]
+    /// # Errors
+    /// Scheduler status could not be collected.
+    fn handle_dashboard_snapshot(&self) -> ExtResult<sccache_dashboard::Snapshot, Error>;
+    #[cfg(feature = "scheduler-dashboard")]
+    /// # Errors
+    /// The dashboard wake channel could not be registered.
+    fn install_dashboard_waker(
+        &self,
+        sender: std::sync::mpsc::SyncSender<()>,
+    ) -> ExtResult<(), Error>;
     // Additive maintenance metadata. Existing scheduler implementations remain
     // non-draining unless they explicitly opt into a drain source.
     fn handle_is_draining(&self) -> bool {
@@ -1226,10 +1272,14 @@ pub trait ServerIncoming: Send + Sync {
     /// Compiler slots in use, excluding jobs waiting for input or a slot.
     fn executing_jobs(&self) -> usize;
     // From Scheduler
+    /// # Errors
+    /// The worker could not reserve the assignment.
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> ExtResult<AssignJobResult, Error>;
     fn capabilities(&self) -> WorkerCapabilities;
     fn native_metadata_limit(&self) -> Option<usize>;
     /// Open an exact local CAS blob for an authenticated scheduler request.
+    /// # Errors
+    /// The local content store could not read the exact blob.
     fn handle_native_blob(
         &self,
         blob: crate::build_runtime::BlobRef,
@@ -1255,12 +1305,16 @@ pub trait ServerIncoming: Send + Sync {
     ) -> ExtResult<crate::build_runtime::wire::NativeRunResult, Error>;
     // Reconcile scheduler-side reservations against local unclaimed jobs.
     // The cutoff predates the heartbeat request; later assignments must survive.
+    /// # Errors
+    /// Worker reservations could not be reconciled.
     fn handle_reconcile_assignments(
         &self,
         assigned_job_ids: &[JobId],
         heartbeat_started_at: std::time::Instant,
     ) -> ExtResult<usize, Error>;
     // From Client
+    /// # Errors
+    /// The uploaded toolchain could not be validated or installed.
     fn handle_submit_toolchain(
         &self,
         requester: &dyn ServerOutgoing,
@@ -1268,6 +1322,8 @@ pub trait ServerIncoming: Send + Sync {
         tc_rdr: ToolchainReader<'_>,
     ) -> ExtResult<SubmitToolchainResult, Error>;
     // From Client
+    /// # Errors
+    /// The worker could not execute or report the assigned build.
     fn handle_run_job(
         &self,
         requester: &dyn ServerOutgoing,
@@ -1281,6 +1337,8 @@ pub trait ServerIncoming: Send + Sync {
 #[cfg(feature = "dist-server")]
 pub trait BuilderIncoming: Send + Sync {
     // From Server
+    /// # Errors
+    /// The builder could not prepare or execute the compilation.
     fn run_build(
         &self,
         job_id: JobId,
@@ -1314,7 +1372,7 @@ pub trait Client: Send + Sync {
         inputs_packager: Box<dyn pkg::InputsPackager>,
     ) -> Result<RunJobResult>;
     async fn worker_label(&self, server_id: ServerId) -> String {
-        server_id.addr().to_string()
+        server_id.to_string()
     }
     async fn put_toolchain(
         &self,

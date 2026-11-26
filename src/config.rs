@@ -183,7 +183,7 @@ pub fn parse_size(val: &str) -> Option<u64> {
 
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HTTPUrl(reqwest::Url);
+pub struct HTTPUrl(url::Url);
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 impl Serialize for HTTPUrl {
     fn serialize<S>(&self, serializer: S) -> StdResult<S::Ok, S::Error>
@@ -206,13 +206,13 @@ impl<'a> Deserialize<'a> for HTTPUrl {
     }
 }
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
-fn parse_http_url(url: &str) -> Result<reqwest::Url> {
+fn parse_http_url(url: &str) -> Result<url::Url> {
     use std::net::SocketAddr;
     let url = url.parse::<SocketAddr>().map_or_else(
-        |_| reqwest::Url::parse(url),
+        |_| url::Url::parse(url),
         |sa| {
             warn!("Url {url} has no scheme, assuming http");
-            reqwest::Url::parse(&format!("http://{sa}"))
+            url::Url::parse(&format!("http://{sa}"))
         },
     )?;
     if url.scheme() != "http" && url.scheme() != "https" {
@@ -227,11 +227,11 @@ fn parse_http_url(url: &str) -> Result<reqwest::Url> {
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 impl HTTPUrl {
     #[must_use = "the returned wrapper contains the supplied HTTP URL"]
-    pub const fn from_url(u: reqwest::Url) -> Self {
+    pub const fn from_url(u: url::Url) -> Self {
         Self(u)
     }
     #[must_use = "the HTTP URL is returned without modifying the wrapper"]
-    pub fn to_url(&self) -> reqwest::Url {
+    pub fn to_url(&self) -> url::Url {
         self.0.clone()
     }
 }
@@ -711,7 +711,7 @@ impl CacheConfigs {
         } else {
             // No levels specified - use single cache (backward compatible)
             let (cache_type, _) = self.into_fallback();
-            Ok(cache_type.map(|ct| vec![ct]).unwrap_or_default())
+            Ok(cache_type.map_or_default(|ct| vec![ct]))
         }
     }
 
@@ -941,6 +941,7 @@ impl NativeClientConfig {
 #[serde(deny_unknown_fields)]
 pub struct DistConfig {
     pub auth: DistAuth,
+    pub cluster: Option<sccache_peer_identity::PeerConfig>,
     #[cfg(any(feature = "dist-client", feature = "dist-server"))]
     pub scheduler_url: Option<HTTPUrl>,
     #[cfg(not(any(feature = "dist-client", feature = "dist-server")))]
@@ -958,6 +959,7 @@ impl Default for DistConfig {
     fn default() -> Self {
         Self {
             auth: DistAuth::default(),
+            cluster: None,
             scheduler_url: Option::default(),
             cache_dir: default_dist_cache_dir(),
             toolchains: Vec::default(),
@@ -2066,7 +2068,7 @@ pub mod scheduler {
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
 
-    use crate::errors::*;
+    use crate::errors::{Context, Result, bail};
 
     use serde::{Deserialize, Serialize};
 
@@ -2120,6 +2122,8 @@ pub mod scheduler {
     }
 
     impl JobSlackConfig {
+        /// # Errors
+        /// Rejects a negative or nonfinite proportional slack setting.
         pub fn validate(self) -> Result<()> {
             if !self.percent.is_finite() || self.percent < 0.0 {
                 bail!("scheduler job_slack.percent must be finite and non-negative");
@@ -2127,6 +2131,15 @@ pub mod scheduler {
             Ok(())
         }
 
+        #[must_use = "the computed admission capacity limits worker reservations"]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "validated nonnegative capacity is intentionally rounded to whole job slots using saturating float-to-integer casts"
+        )]
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "CPU capacity and proportional slack have been validated as nonnegative"
+        )]
         pub fn max_jobs(self, cpu_capacity: f64) -> usize {
             if !cpu_capacity.is_finite() || cpu_capacity < 0.0 {
                 return 0;
@@ -2143,7 +2156,7 @@ pub mod scheduler {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct PackageUpstream {
-        pub origin: reqwest::Url,
+        pub origin: url::Url,
         pub timeout_secs: u64,
     }
 
@@ -2152,6 +2165,7 @@ pub mod scheduler {
     #[serde(deny_unknown_fields)]
     pub struct NativeCacheConfig {
         pub public_addr: SocketAddr,
+        pub bind_address: Option<SocketAddr>,
         pub directory: PathBuf,
         pub space: crate::build_runtime::SpacePolicy,
         pub idle_timeout_secs: u64,
@@ -2217,7 +2231,18 @@ pub mod scheduler {
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
+    pub struct DashboardConfig {
+        pub bind_address: SocketAddr,
+        pub assets: PathBuf,
+        pub metrics_url: Option<String>,
+        pub metrics_ingress_host: Option<String>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct Config {
+        pub cluster_directory: PathBuf,
+        pub dashboard: Option<DashboardConfig>,
         pub public_addr: SocketAddr,
         pub client_auth: ClientAuth,
         pub server_auth: ServerAuth,
@@ -2227,11 +2252,31 @@ pub mod scheduler {
         pub native_cache: Option<NativeCacheConfig>,
     }
 
+    /// Load and validate scheduler configuration.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable, malformed or incompatible configuration.
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
         let config: Option<Config> = super::try_read_config_file(conf_path)
             .context("Failed to load scheduler config file")?;
         if let Some(config) = &config {
             config.job_slack.validate()?;
+            if let Some(dashboard) = &config.dashboard {
+                if !cfg!(feature = "scheduler-dashboard") {
+                    bail!("dashboard requires the scheduler-dashboard build feature");
+                }
+                if !dashboard.bind_address.ip().is_loopback() || !dashboard.assets.is_absolute() {
+                    bail!("dashboard requires a loopback bind address and absolute assets path");
+                }
+                if dashboard.bind_address == config.public_addr
+                    || config
+                        .native_cache
+                        .as_ref()
+                        .is_some_and(|native| native.public_addr == dashboard.bind_address)
+                {
+                    bail!("dashboard requires a separate listener address");
+                }
+            }
             if let Some(native) = &config.native_cache {
                 native.session_limits()?;
                 if native.public_addr == config.public_addr {
@@ -2252,6 +2297,7 @@ pub mod scheduler {
             let path = dir.path().join("scheduler.toml");
             let base = r#"
 public_addr = "127.0.0.1:10600"
+cluster_directory = "/tmp/test-cluster"
 [client_auth]
 type = "DANGEROUSLY_INSECURE"
 [server_auth]
@@ -2283,10 +2329,10 @@ pub mod server {
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
 
-    use crate::errors::*;
+    use crate::errors::{Context, Result};
 
     const TEN_GIGS: u64 = 10 * 1024 * 1024 * 1024;
-    fn default_toolchain_cache_size() -> u64 {
+    const fn default_toolchain_cache_size() -> u64 {
         TEN_GIGS
     }
 
@@ -2314,11 +2360,11 @@ pub mod server {
     fn default_pot_clone_args() -> Vec<String> {
         DEFAULT_POT_CLONE_ARGS
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect()
     }
 
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(tag = "type")]
     #[serde(deny_unknown_fields)]
     pub enum BuilderType {
@@ -2346,7 +2392,7 @@ pub mod server {
         },
     }
 
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(tag = "type")]
     #[serde(deny_unknown_fields)]
     pub enum SchedulerAuth {
@@ -2386,9 +2432,10 @@ pub mod server {
         pub package_transfer: crate::build_runtime::PackageTransferCost,
     }
 
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub struct Config {
+        pub cluster: sccache_peer_identity::PeerConfig,
         pub builder: BuilderType,
         pub cache_dir: Option<PathBuf>,
         pub public_addr: SocketAddr,
@@ -2403,6 +2450,10 @@ pub mod server {
         pub native_worker: Option<NativeWorkerConfig>,
     }
 
+    /// Load worker configuration.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable or malformed configuration.
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
         super::try_read_config_file(conf_path).context("Failed to load server config file")
     }
@@ -3763,6 +3814,7 @@ key_prefix = "cosprefix"
                 multilevel: None,
             },
             dist: DistConfig {
+                cluster: None,
                 auth: DistAuth::Token {
                     token: "secrettoken".to_owned()
                 },
@@ -3817,6 +3869,11 @@ fn server_toml_parse() {
     # The path to the bubblewrap version 0.3.0+ `bwrap` binary.
     bwrap_path = "/usr/bin/bwrap"
 
+    [cluster]
+    directory = "/tmp/worker-identity"
+    ca_certificate = "/tmp/ca.pem"
+    scheduler_id = "0101010101010101010101010101010101010101010101010101010101010101"
+
     [scheduler_auth]
     type = "jwt_token"
     # This will be generated by the `generate-jwt-hs256-server-token` command or
@@ -3828,6 +3885,11 @@ fn server_toml_parse() {
     assert_eq!(
         server_config,
         server::Config {
+            cluster: sccache_peer_identity::PeerConfig {
+                directory: "/tmp/worker-identity".into(),
+                ca_certificate: "/tmp/ca.pem".into(),
+                scheduler_id: sccache_peer_identity::PeerId::from_digest([1; 32]),
+            },
             builder: BuilderType::Overlay {
                 build_dir: PathBuf::from("/tmp/build"),
                 bwrap_path: PathBuf::from("/usr/bin/bwrap"),

@@ -72,7 +72,7 @@ impl ExpiringBlobs {
 /// evicted after the job releases its leases. They bridge the heartbeat
 /// inventory refresh interval, not the artifact-grace period.
 #[derive(Default)]
-pub(crate) struct RecentResidency {
+pub struct RecentResidency {
     retained: ExpiringBlobs,
     acquired: ExpiringBlobs,
 }

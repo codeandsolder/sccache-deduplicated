@@ -105,6 +105,26 @@ use std::time::Duration;
 use crate::errors::{Context, bail};
 use crate::errors::{Result, anyhow};
 
+/// Low-rate capacity and distribution observation for one cache tier.
+#[derive(Debug)]
+pub struct CacheTierObservation {
+    pub backend: &'static str,
+    pub current_bytes: Option<u64>,
+    pub maximum_bytes: Option<u64>,
+    pub report: Option<crate::build_runtime::analytics::TierCacheReport>,
+}
+
+impl CacheTierObservation {
+    pub async fn observe(storage: &(impl Storage + ?Sized)) -> Self {
+        Self {
+            backend: storage.cache_type_name(),
+            current_bytes: storage.current_size().await.ok().flatten(),
+            maximum_bytes: storage.max_size().await.ok().flatten(),
+            report: None,
+        }
+    }
+}
+
 /// An interface to cache storage.
 #[async_trait]
 pub trait Storage: Send + Sync {
@@ -205,6 +225,11 @@ pub trait Storage: Send + Sync {
 
     /// Get the maximum storage size, if applicable.
     async fn max_size(&self) -> Result<Option<u64>>;
+
+    /// Snapshot each tier independently; never initiate expensive scans on a compile path.
+    async fn tier_observations(&self, _allow_refresh: bool) -> Vec<CacheTierObservation> {
+        vec![CacheTierObservation::observe(self).await]
+    }
 
     /// Get multi-level cache statistics, if this is a multi-level storage.
     fn multilevel_stats(&self) -> Option<MultiLevelStats> {
@@ -455,6 +480,21 @@ impl Storage for RemoteStorage {
             return Ok(Some(manager.high_watermark()));
         }
         Ok(None)
+    }
+
+    #[cfg(feature = "s3")]
+    async fn tier_observations(&self, allow_refresh: bool) -> Vec<CacheTierObservation> {
+        let mut observation = CacheTierObservation::observe(self).await;
+        if let Some(manager) = &self.managed_capacity {
+            match manager
+                .analytics_report(allow_refresh && self.rw_mode == CacheMode::ReadWrite)
+                .await
+            {
+                Ok(report) => observation.report = report,
+                Err(error) => warn!("managed cache analytics unavailable: {error:#}"),
+            }
+        }
+        vec![observation]
     }
 
     fn basedirs(&self) -> &[Vec<u8>] {

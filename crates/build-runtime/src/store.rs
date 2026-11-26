@@ -1813,7 +1813,7 @@ impl<L> Seek for LeasedReader<'_, L> {
 mod history;
 mod space;
 use crate::SpacePolicy;
-pub use space::{SpaceReport, StageBudget};
+pub use space::{CacheAnalyticsSampler, SpaceReport, SpaceStatus, StageBudget};
 mod audit;
 pub use audit::{ComponentAudit, NativeIndexAudit, SchemaInventory};
 mod packages;
