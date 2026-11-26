@@ -535,7 +535,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
 }
 
 #[test]
-fn delegation_blocks_early_worker_verification_until_assignment_returns() -> Result<()> {
+fn delegation_is_nonblocking_and_retries_early_worker_verification() -> Result<()> {
     use std::{sync::mpsc, thread};
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
@@ -573,29 +573,48 @@ fn delegation_blocks_early_worker_verification_until_assignment_returns() -> Res
         };
         thread::scope(|scope| -> Result<()> {
             let (start, start_rx) = mpsc::channel();
-            let (attempt, attempt_rx) = mpsc::channel();
             let (done, done_rx) = mpsc::channel();
             let service = &service;
             let action = &action;
             let verifier = scope.spawn(move || -> Result<()> {
                 start_rx.recv_timeout(Duration::from_secs(5))?;
-                attempt.send(())?;
-                done.send(service.verify_execution(ticket, publisher, action))?;
+                assert_eq!(service.status(ticket)?, NativeStatus::Compiling);
+                service.renew(ticket, Publisher::Client)?;
+                assert!(
+                    service
+                        .verify_execution(ticket, publisher, action)
+                        .unwrap_err()
+                        .is::<NativeServiceBusy>()
+                );
+                assert!(
+                    service
+                        .schedule(ticket, action, test_peer(9), selection(), |_, _| bail!(
+                            "duplicate allocation"
+                        ))
+                        .unwrap_err()
+                        .is::<NativeServiceBusy>()
+                );
+                assert!(
+                    !service
+                        .schedule(ticket, action, test_peer(8), selection(), |_, _| bail!(
+                            "wrong requester"
+                        ))
+                        .unwrap_err()
+                        .is::<NativeServiceBusy>()
+                );
+                done.send(())?;
                 Ok(())
             });
             let reply = service.schedule(ticket, action, test_peer(9), selection(), |_, _| {
                 start.send(())?;
-                attempt_rx.recv_timeout(Duration::from_secs(5))?;
-                // The action mutex is still held while assignment returns.
-                assert!(matches!(
-                    done_rx.recv_timeout(Duration::from_millis(50)),
-                    Err(mpsc::RecvTimeoutError::Timeout)
-                ));
+                done_rx.recv_timeout(Duration::from_secs(5))?;
                 Ok(expected.clone())
             })?;
             assert_eq!(reply, expected);
-            let verified = done_rx.recv_timeout(Duration::from_secs(5))?;
-            assert_eq!(verified.is_ok(), accepted);
+            assert_eq!(
+                service.verify_execution(ticket, publisher, action).is_ok(),
+                accepted
+            );
             verifier
                 .join()
                 .map_err(|_| anyhow!("verification thread panicked"))??;
@@ -603,6 +622,107 @@ fn delegation_blocks_early_worker_verification_until_assignment_returns() -> Res
         })?;
         service.close(ticket, Publisher::Client)?;
     }
+    Ok(())
+}
+
+#[test]
+fn closing_during_assignment_cannot_resurrect_the_ticket() -> Result<()> {
+    use std::{sync::mpsc, thread};
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let action = request()?;
+    let NativeAdmission::Compile { ticket } = service.admit(
+        action.clone(),
+        Publisher::Client,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
+    else {
+        bail!("expected compilation");
+    };
+    let worker = WorkerAllocation {
+        peer: test_peer(1),
+        routes: sccache_peer_identity::RouteSet::new("127.0.0.1:10501".parse()?, []),
+        job: 42,
+        auth: "proof".into(),
+    };
+    let publisher = Publisher::Worker {
+        peer: worker.peer,
+        job: worker.job,
+    };
+    thread::scope(|scope| -> Result<()> {
+        let (start, started) = mpsc::channel();
+        let (done, closed) = mpsc::channel();
+        let service = &service;
+        let closer = scope.spawn(move || -> Result<()> {
+            started.recv_timeout(Duration::from_secs(5))?;
+            service.close(ticket, Publisher::Client)?;
+            done.send(())?;
+            Ok(())
+        });
+        let result = service.schedule(ticket, &action, test_peer(9), selection(), |_, _| {
+            start.send(())?;
+            closed.recv_timeout(Duration::from_secs(5))?;
+            Ok(ScheduleReply::Assigned(worker))
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled before acknowledgement")
+        );
+        closer.join().map_err(|_| anyhow!("closer panicked"))??;
+        Ok(())
+    })?;
+    assert!(
+        service
+            .verify_execution(ticket, publisher, &action)
+            .is_err()
+    );
+    assert!(service.status(ticket).is_err());
+    assert!(matches!(
+        service.admit(
+            action,
+            Publisher::Client,
+            ActionMode::Reuse,
+            BTreeMap::new()
+        )?,
+        NativeAdmission::Compile { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn failed_assignment_releases_intent_for_retry() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let action = request()?;
+    let NativeAdmission::Compile { ticket } = service.admit(
+        action.clone(),
+        Publisher::Client,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
+    else {
+        bail!("expected compilation");
+    };
+    assert!(
+        service
+            .schedule(ticket, &action, test_peer(9), selection(), |_, _| bail!(
+                "transport failed"
+            ))
+            .is_err()
+    );
+    let expected = ScheduleReply::Unavailable {
+        message: "no capacity".into(),
+    };
+    assert_eq!(
+        service.schedule(ticket, &action, test_peer(9), selection(), |_, _| Ok(
+            expected.clone()
+        ))?,
+        expected
+    );
+    service.renew(ticket, Publisher::Client)?;
     Ok(())
 }
 

@@ -429,8 +429,8 @@ impl NativeDispatcher {
             },
             assignment: Box::new(Assignment { spec, pins }),
         };
-        // No authorization RPC on this request thread: schedule still holds
-        // its session lock while awaiting our assignment acknowledgement.
+        // No authorization RPC on this request thread: the scheduler has not
+        // yet installed the delegated publisher while awaiting our acknowledgement.
         if let Err(error) = sender.try_send(task) {
             reservations.remove(&id);
             drop(reservations);

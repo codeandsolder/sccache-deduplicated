@@ -393,6 +393,25 @@ enum Kind {
     Tree,
 }
 
+struct AllocationIntent {
+    declaration: [u8; 32],
+    requester: crate::PeerId,
+    selection: DeliverySelection,
+}
+
+impl AllocationIntent {
+    fn matches(
+        &self,
+        declaration: [u8; 32],
+        requester: crate::PeerId,
+        selection: &DeliverySelection,
+    ) -> bool {
+        self.declaration == declaration
+            && self.requester == requester
+            && &self.selection == selection
+    }
+}
+
 struct DelegatedAllocation {
     declaration: [u8; 32],
     worker: WorkerAllocation,
@@ -416,6 +435,7 @@ pub struct DeliveryReceipt {
 }
 
 struct Session {
+    allocating: Option<Arc<AllocationIntent>>,
     allocation: Option<DelegatedAllocation>,
     expires: Instant,
     publisher: Publisher,
@@ -439,6 +459,26 @@ impl Session {
 }
 
 type SharedSession = Arc<Mutex<Session>>;
+
+// The allocation claim owns no mutex guard. Failure or unwinding releases
+// only its own intent, never a later retry.
+struct AllocationClaim {
+    session: SharedSession,
+    intent: Arc<AllocationIntent>,
+}
+
+impl Drop for AllocationClaim {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.session.lock()
+            && state
+                .allocating
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.intent))
+        {
+            state.allocating = None;
+        }
+    }
+}
 
 /// Owns short-lived compile, upload and download capabilities.
 ///
@@ -594,6 +634,7 @@ impl NativeSessions {
         sessions.insert(
             ticket,
             Arc::new(Mutex::new(Session {
+                allocating: None,
                 allocation: None,
                 expires: self.deadline(),
                 publisher,
@@ -606,12 +647,18 @@ impl NativeSessions {
     }
 
     fn touch(&self, session: &mut Session) -> Result<()> {
-        ensure!(session.expires > Instant::now(), "native ticket expired");
+        ensure!(
+            session.allocating.is_some() || session.expires > Instant::now(),
+            "native ticket expired"
+        );
         session.expires = self.deadline();
         Ok(())
     }
 
     fn authorize(&self, session: &mut Session, publisher: Publisher) -> Result<()> {
+        if session.allocating.is_some() {
+            return Err(NativeServiceBusy.into());
+        }
         ensure!(
             session.publisher == publisher,
             "native publisher does not own ticket"
@@ -641,7 +688,10 @@ impl NativeSessions {
             // Never wait on another session's I/O while holding the global map.
             map.retain(|_, shared| match shared.try_lock() {
                 Ok(mut state) => {
-                    if state.expires <= now && !matches!(state.phase, Phase::Publishing(_)) {
+                    if state.expires <= now
+                        && state.allocating.is_none()
+                        && !matches!(state.phase, Phase::Publishing(_))
+                    {
                         expired.push(std::mem::replace(&mut state.phase, Phase::Failed));
                         false
                     } else {
@@ -827,8 +877,10 @@ impl NativeSessions {
     }
 
     /// Allocate one scheduler job for a pending action, or replay the
-    /// original allocation after a lost response. The per-action lock
-    /// serializes allocation without blocking unrelated actions.
+    /// original allocation after a lost response. A short-lived intent
+    /// serializes assignment without holding the session lock across I/O.
+    /// Duplicate requests and early worker verification receive a retryable
+    /// busy result until the publisher has been installed.
     ///
     /// # Errors
     /// Returns an error if the declaration differs, the ticket is not pending,
@@ -862,11 +914,18 @@ impl NativeSessions {
             );
             return Ok(ScheduleReply::Assigned(allocation.worker.clone()));
         }
+        if let Some(intent) = &state.allocating {
+            ensure!(
+                intent.matches(declaration, requester, &selection),
+                "allocation declaration differs from admission"
+            );
+            return Err(NativeServiceBusy.into());
+        }
         let publisher = state.publisher;
-        let Phase::Pending(pending) = &mut state.phase else {
+        let Phase::Pending(pending) = &state.phase else {
             bail!("native ticket is no longer pending");
         };
-        let Pending::Action(action) = &mut **pending else {
+        let Pending::Action(action) = &**pending else {
             bail!("native ticket is not an action");
         };
         ensure!(
@@ -885,8 +944,31 @@ impl NativeSessions {
                     || request.optional_outputs.contains_key(name)),
             "undeclared selected output"
         );
+        let inputs = action.inputs.clone();
+        let trees = action
+            .request
+            .input_trees
+            .iter()
+            .map(|id| {
+                inputs
+                    .get(id)
+                    .map(|tree| &tree.blobs)
+                    .context("missing admitted input manifest")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let intent = Arc::new(AllocationIntent {
+            declaration,
+            requester,
+            selection,
+        });
+        state.allocating = Some(Arc::clone(&intent));
+        drop(state);
+        let claim = AllocationClaim {
+            session: Arc::clone(&session),
+            intent,
+        };
         let mut blobs = BTreeMap::new();
-        for tree in action.inputs.values() {
+        for tree in inputs.values() {
             for (&id, &size) in &tree.blobs {
                 ensure!(
                     blobs
@@ -896,26 +978,24 @@ impl NativeSessions {
                 );
             }
         }
-        let trees = action
-            .request
-            .input_trees
-            .iter()
-            .map(|id| {
-                action
-                    .inputs
-                    .get(id)
-                    .map(|tree| &tree.blobs)
-                    .context("missing admitted input manifest")
-            })
-            .collect::<Result<Vec<_>>>()?;
         let allocation_started = Instant::now();
         let reply = allocate(blobs, trees)?;
+        let mut state = Self::lock(&session)?;
+        ensure!(
+            state
+                .allocating
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &claim.intent))
+                && matches!(state.phase, Phase::Pending(_)),
+            "native allocation cancelled before acknowledgement"
+        );
+        state.allocating = None;
         if let ScheduleReply::Assigned(allocation) = &reply {
             state.allocation = Some(DelegatedAllocation {
                 declaration,
                 worker: allocation.clone(),
                 requester,
-                selection,
+                selection: claim.intent.selection.clone(),
                 allocation_started,
                 delivery_reported: false,
             });
@@ -963,7 +1043,9 @@ impl NativeSessions {
     pub fn renew(&self, ticket: Ticket, publisher: Publisher) -> Result<()> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
-        if publisher == Publisher::Client
+        if publisher == Publisher::Client && state.allocating.is_some() {
+            self.touch(&mut state)
+        } else if publisher == Publisher::Client
             && (matches!(state.phase, Phase::Ready(_)) || state.negotiated_result().is_some())
         {
             self.authorize_reader(&mut state, publisher)
@@ -1303,7 +1385,10 @@ impl NativeSessions {
         if matches!(state.phase, Phase::Ready(_) | Phase::Failed) {
             self.touch(&mut state)?;
         } else if !matches!(state.phase, Phase::Publishing(_)) {
-            ensure!(state.expires > Instant::now(), "native ticket expired");
+            ensure!(
+                state.allocating.is_some() || state.expires > Instant::now(),
+                "native ticket expired"
+            );
         }
         Ok(match &state.phase {
             Phase::Pending(_) | Phase::Publishing(_) if preview => state
@@ -2034,6 +2119,7 @@ impl NativeSessions {
                 "native publication in progress"
             );
             state.expires = Instant::now();
+            state.allocating = None;
             std::mem::replace(&mut state.phase, Phase::Failed)
         };
         let removed = self.sessions()?.remove(&ticket);
