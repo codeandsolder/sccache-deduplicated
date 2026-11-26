@@ -693,13 +693,13 @@ pub struct NativeStore {
 
 impl NativeStore {
     /// Canonical directory owned by this store.
-    #[must_use]
+    #[must_use = "the root identifies the store directory"]
     pub fn root(&self) -> &Path {
         &self.inner.root
     }
 
     /// The single admission and eviction policy for all clones.
-    #[must_use]
+    #[must_use = "the policy controls admission and eviction"]
     pub fn managed_space_policy(&self) -> Option<SpacePolicy> {
         self.inner.space_policy
     }
