@@ -277,7 +277,7 @@ impl IntermediateFs {
         let mut staged = tempfile::NamedTempFile::new_in(&self.scratch)?;
         self.content.fetch(reference, staged.as_file_mut())?;
         ensure!(
-            staged.metadata()?.len() == reference.blob.size,
+            staged.as_file().metadata()?.len() == reference.blob.size,
             "intermediate length mismatch"
         );
         staged.seek(SeekFrom::Start(0))?;

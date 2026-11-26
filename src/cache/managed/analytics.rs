@@ -71,20 +71,9 @@ impl ManagedRemoteCache {
         &self,
         path: &str,
     ) -> anyhow::Result<Option<(TierCacheReport, String)>> {
-        let reader = match self.operator.reader(path).await {
-            Ok(reader) => reader,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let Some((body, etag)) = self.read_versioned_object(path).await? else {
+            return Ok(None);
         };
-        let body = match reader.read(..).await {
-            Ok(body) => body.to_bytes(),
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let etag = reader
-            .metadata()
-            .and_then(|metadata| metadata.etag().map(str::to_owned))
-            .ok_or_else(|| anyhow::anyhow!("managed cache analytics report has no ETag"))?;
         let report = bincode::deserialize(&body)?;
         Ok(Some((report, etag)))
     }

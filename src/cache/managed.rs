@@ -436,11 +436,10 @@ impl ManagedRemoteCache {
         }
     }
 
-    async fn read_metadata_shard(
-        &self,
-        shard_path: &str,
-    ) -> anyhow::Result<Option<MetadataShardSnapshot>> {
-        let reader = match self.operator.reader(shard_path).await {
+    // Read the contents and their ETag from the same response. A separate
+    // stat could observe a newer object and invalidate optimistic concurrency.
+    async fn read_versioned_object(&self, path: &str) -> anyhow::Result<Option<(Bytes, String)>> {
+        let reader = match self.operator.reader(path).await {
             Ok(reader) => reader,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -450,11 +449,19 @@ impl ManagedRemoteCache {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let Some(metadata) = reader.metadata() else {
-            anyhow::bail!("managed cache metadata shard {shard_path} read returned no metadata");
-        };
-        let Some(etag) = metadata.etag().map(str::to_owned) else {
-            anyhow::bail!("managed cache metadata shard {shard_path} has no ETag");
+        let etag = reader
+            .metadata()
+            .and_then(|metadata| metadata.etag().map(str::to_owned))
+            .ok_or_else(|| anyhow::anyhow!("managed cache object {path} has no ETag"))?;
+        Ok(Some((body, etag)))
+    }
+
+    async fn read_metadata_shard(
+        &self,
+        shard_path: &str,
+    ) -> anyhow::Result<Option<MetadataShardSnapshot>> {
+        let Some((body, etag)) = self.read_versioned_object(shard_path).await? else {
+            return Ok(None);
         };
         let shard = deserialize_metadata_shard(&body)?;
         Ok(Some(MetadataShardSnapshot { etag, shard }))

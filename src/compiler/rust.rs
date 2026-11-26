@@ -42,7 +42,6 @@ use log::Level::Trace;
 #[cfg(feature = "dist-client")]
 use semver::Version;
 use serde::Serialize;
-#[cfg(feature = "dist-client")]
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env::consts::DLL_EXTENSION;
