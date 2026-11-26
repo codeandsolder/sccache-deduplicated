@@ -3837,7 +3837,7 @@ mod scheduler_tests {
         tokio::time::timeout(Duration::from_secs(5), requester.0.notified()).await?;
         assert_eq!(scheduler.handle_status()?.in_progress, 1);
         task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
         assert_no_assigned_jobs(&scheduler, &worker);
         assert_eq!(scheduler.handle_status()?.in_progress, 0);
         Ok(())
