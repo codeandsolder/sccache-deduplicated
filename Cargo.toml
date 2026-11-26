@@ -66,7 +66,7 @@ jsonwebtoken-btls = { git = "https://github.com/codeandsolder/btls-fast.git", re
 libc = "0.2.153"
 lru = "0.19"
 log = "0.4"
-lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "e58a7abdb5a0f47a969771fc0b6837c5103863ee", optional = true }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "db56ab80551cfdd3e658e157b36a017f91d7a264", optional = true }
 memchr = "2"
 mime = "0.3"
 object = { version = "0.41", default-features = false, features = ["read", "std"] }
