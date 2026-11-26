@@ -553,24 +553,9 @@ impl NativeCacheClient {
                 on_tree(&tree);
                 inputs.push(tree);
             }
-            let announced = Instant::now();
-            loop {
-                check()?;
-                match self
-                    .control_with_timeout_async::<_, ()>("inputs_staged", &ticket, self.timeout)
-                    .await
-                {
-                    Ok(()) => break,
-                    Err(error)
-                        if retryable_transport_error(&error)
-                            && announced.elapsed() < policy.timeout =>
-                    {
-                        warm = false;
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+            warm &= self
+                .announce_worker_inputs(ticket, policy.timeout, check)
+                .await?;
             Ok(PreparedExecution {
                 request,
                 _inputs: inputs,
@@ -588,6 +573,32 @@ impl NativeCacheClient {
             Err(error) => {
                 lease.fail().await;
                 Err(error)
+            }
+        }
+    }
+
+    async fn announce_worker_inputs(
+        &self,
+        ticket: Ticket,
+        timeout: Duration,
+        check: &LeaseCheck<'_>,
+    ) -> Result<bool> {
+        let mut warm = true;
+        let announced = Instant::now();
+        loop {
+            check()?;
+            match self
+                .control_with_timeout_async::<_, ()>("inputs_staged", &ticket, self.timeout)
+                .await
+            {
+                Ok(()) => return Ok(warm),
+                Err(error)
+                    if retryable_transport_error(&error) && announced.elapsed() < timeout =>
+                {
+                    warm = false;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error),
             }
         }
     }
