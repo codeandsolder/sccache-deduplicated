@@ -535,12 +535,14 @@ struct UploadGuard {
     session: SharedSession,
     publisher: Publisher,
     blob: BlobRef,
+    active: bool,
     _slot: UploadSlot,
 }
 
 impl Drop for UploadGuard {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.session.lock()
+        if self.active
+            && let Ok(mut state) = self.session.lock()
             && let Phase::Pending(pending) = &mut state.phase
             && let Some(transfer) = pending.transfer_mut()
         {
@@ -1407,6 +1409,7 @@ impl NativeSessions {
             session,
             publisher,
             blob,
+            active: true,
             _slot: slot,
         };
         let stager = self.store().prepare_physical(blob, encoding)?;
@@ -1426,7 +1429,7 @@ impl NativeSessions {
             stager,
             publication,
         } = upload;
-        let guard = match publication {
+        let mut guard = match publication {
             UploadPublication::Direct(guard) => guard,
             UploadPublication::Backfill {
                 manifest,
@@ -1457,7 +1460,8 @@ impl NativeSessions {
         let transfer = pending.transfer_mut().context("native upload cancelled")?;
         transfer.staged.insert(guard.blob.id, staged);
         transfer.active.remove(&guard.blob.id);
-        // The guard also clears the marker on error paths.
+        // Disarm under the same lock; a later transfer must not lose its marker.
+        guard.active = false;
         drop(state);
         drop(guard);
         Ok(())

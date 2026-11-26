@@ -31,7 +31,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{net::TcpStream, sync::Semaphore, time::timeout};
 use tokio_btls::SslStream;
 use tower::ServiceExt as _;
 
@@ -206,6 +206,7 @@ fn server_config(credentials: &TlsCredentials, allow_enrollment: bool) -> Result
 /// future handshakes; in-flight streams retain their authenticated identity.
 pub struct ClusterListener {
     config: RwLock<Arc<SslContext>>,
+    handshakes: Semaphore,
     id: PeerId,
     role: Role,
     ca_fingerprint: [u8; 32],
@@ -237,6 +238,12 @@ impl ClusterListener {
     fn with_enrollment(credentials: &TlsCredentials, allow_enrollment: bool) -> Result<Self> {
         Ok(Self {
             config: RwLock::new(Arc::new(server_config(credentials, allow_enrollment)?)),
+            handshakes: Semaphore::new(
+                std::thread::available_parallelism()
+                    .map_or(1, std::num::NonZeroUsize::get)
+                    .saturating_mul(8)
+                    .clamp(32, 256),
+            ),
             allow_enrollment,
             id: credentials.id()?,
             role: credentials.role,
@@ -354,6 +361,12 @@ impl ClusterListener {
                 && router.allow_enrollment == self.allow_enrollment,
             "cluster router belongs to a different listener"
         );
+        // Only unauthenticated TLS work is limited here, not established HTTP
+        // connections or requests. Stalled handshakes expire independently.
+        let handshake = self
+            .handshakes
+            .try_acquire()
+            .context("TLS handshake capacity exhausted")?;
         let address = match socket.peer_addr()? {
             SocketAddr::V6(address) if address.ip().to_ipv4_mapped().is_some() => SocketAddr::new(
                 std::net::IpAddr::V6(*address.ip()).to_canonical(),
@@ -378,6 +391,7 @@ impl ClusterListener {
                 AuthenticatedPeer::from_verified_leaf(&leaf.to_der()?, address, path)
             })
             .transpose()?;
+        drop(handshake);
         let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
             let mut request = request.map(Body::new);
             request

@@ -7,7 +7,7 @@ use std::{
     future::Future,
     io::{self, Read},
     net::{SocketAddr, TcpListener},
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
     time::{Duration, Instant},
 };
 
@@ -638,6 +638,40 @@ pub(super) fn bind_data_socket(
     }
 }
 
+// Connection budgets count idle sockets, not admitted application work.
+// Reserve half the process descriptor budget for outgoing RPCs, CAS files,
+// compilers, listeners, logs and other non-accepted descriptors.
+const LISTENER_CONNECTION_LIMIT: usize = 65_536;
+const PROCESS_FD_TARGET: u64 = 262_144;
+
+fn connection_capacity(soft_limit: u64) -> usize {
+    usize::try_from((soft_limit / 2).min(PROCESS_FD_TARGET / 2))
+        .expect("connection budget fits usize")
+}
+
+fn process_connections() -> Arc<Semaphore> {
+    static CONNECTIONS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(CONNECTIONS.get_or_init(|| {
+        use rustix::process::{Resource, getrlimit, setrlimit};
+        let mut limit = getrlimit(Resource::Nofile);
+        let target = limit.maximum.unwrap_or(PROCESS_FD_TARGET).min(PROCESS_FD_TARGET);
+        if limit.current.is_some_and(|current| current < target) {
+            let requested = rustix::process::Rlimit {
+                current: Some(target),
+                maximum: limit.maximum,
+            };
+            if let Err(error) = setrlimit(Resource::Nofile, requested) {
+                warn!("cannot raise distributed server FD limit: {error}");
+            }
+            limit = getrlimit(Resource::Nofile);
+        }
+        let soft = limit.current.unwrap_or(PROCESS_FD_TARGET);
+        let capacity = connection_capacity(soft);
+        info!("distributed socket admission: {capacity} process-wide, {LISTENER_CONNECTION_LIMIT} per listener (FD soft limit {soft})");
+        Arc::new(Semaphore::new(capacity))
+    }))
+}
+
 /// Bind the listener before starting any dependent background services.
 pub(super) struct Listener {
     socket: TcpListener,
@@ -682,7 +716,7 @@ impl Listener {
     #[cfg(test)]
     pub(super) fn run_until(self, stop: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(crate::util::num_cpus())
             .max_blocking_threads(
                 AdmissionPools::total_capacity(self.threads)
                     .saturating_mul(2)
@@ -700,7 +734,7 @@ impl Listener {
 
     pub(super) fn run(self) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(crate::util::num_cpus())
             .max_blocking_threads(
                 AdmissionPools::total_capacity(self.threads)
                     .saturating_mul(2)
@@ -720,9 +754,8 @@ impl Listener {
             router,
         } = self;
         let socket = tokio::net::TcpListener::from_std(socket)?;
-        let connections = Arc::new(Semaphore::new(
-            AdmissionPools::total_capacity(threads).saturating_mul(4),
-        ));
+        let connections = Arc::new(Semaphore::new(LISTENER_CONNECTION_LIMIT));
+        let process_connections = process_connections();
         let router = router.layer(Extension(Arc::new(AdmissionPools::new(threads))));
         let router = match role {
             ListenerRole::Scheduler(enrollment) => tls.scheduler_router(enrollment, router)?,
@@ -738,14 +771,36 @@ impl Listener {
             )?,
         };
         loop {
-            let (socket, _) = socket.accept().await?;
-            let Ok(connection) = Arc::clone(&connections).try_acquire_owned() else {
-                continue;
+            // Backpressure accept rather than accepting and immediately resetting
+            // an otherwise valid connection. The process-wide budget spans all listeners.
+            let connection = Arc::clone(&connections).acquire_owned().await?;
+            let process_connection = Arc::clone(&process_connections).acquire_owned().await?;
+            let socket = match socket.accept().await {
+                Ok((socket, _)) => socket,
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EMFILE) | Some(libc::ENFILE)
+                    ) =>
+                {
+                    warn!("distributed listener descriptor exhaustion: {error}");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
             };
             let tls = Arc::clone(&tls);
             let router = router.clone();
             tokio::spawn(async move {
-                let _connection = connection;
+                let _connection = (connection, process_connection);
                 let result = tls.serve(socket, router).await;
                 if let Err(error) = result {
                     debug!("distributed HTTPS connection ended: {error:#}");
@@ -907,6 +962,14 @@ mod streaming_tests {
                 let _ = stopped.send(());
             }
         }
+    }
+
+    #[test]
+    fn socket_budget_is_independent_of_request_capacity() {
+        assert_eq!(connection_capacity(2_048), 1_024);
+        assert_eq!(connection_capacity(262_144), 131_072);
+        assert_eq!(connection_capacity(u64::MAX), 131_072);
+        assert_eq!(LISTENER_CONNECTION_LIMIT, 65_536);
     }
 
     #[test]

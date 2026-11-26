@@ -273,7 +273,10 @@ mod tests {
                 BlobEncoding::ZstdChunks,
                 BlobEncoding::Raw,
             )?;
-            assert!(ingest.feed(&mut target, &corrupt).is_err());
+            let result = ingest
+                .feed(&mut target, &corrupt)
+                .and_then(|()| ingest.finish(&mut target));
+            assert!(result.is_err(), "corruption at offset {offset} accepted");
         }
         let mut target = tempfile::tempfile()?;
         let mut ingest = BlobIngest::new(
