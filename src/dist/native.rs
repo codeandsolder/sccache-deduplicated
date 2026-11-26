@@ -151,6 +151,15 @@ pub struct NativeCacheClient {
     timeout: Duration,
 }
 
+struct UploadObservation {
+    address: crate::dist::cluster_routes::Route,
+    length: u64,
+    header_length: usize,
+    started: Instant,
+    local: Option<std::net::IpAddr>,
+    evidence: Option<crate::dist::cluster_routes::interface::Evidence>,
+}
+
 impl NativeCacheClient {
     /// Create an authenticated native client with explicit request bounds.
     ///
@@ -637,6 +646,7 @@ impl NativeCacheClient {
         self.control("poll_input", &ticket)
     }
 
+    #[cfg(any(feature = "dist-client", test))]
     pub(super) fn inputs_staged(&self, ticket: Ticket) -> Result<()> {
         self.control("inputs_staged", &ticket)
     }
@@ -1228,12 +1238,14 @@ impl NativeCacheClient {
             let evidence = tracked.evidence();
             let attempt = upload::send(request, length, self.metadata_limit, tracked)?;
             match self.record_upload_attempt(
-                address,
-                length,
-                header.len(),
-                started,
-                local,
-                evidence,
+                UploadObservation {
+                    address,
+                    length,
+                    header_length: header.len(),
+                    started,
+                    local,
+                    evidence,
+                },
                 attempt,
             )? {
                 std::ops::ControlFlow::Break(bytes) => return Ok(bytes),
@@ -1245,14 +1257,17 @@ impl NativeCacheClient {
 
     fn record_upload_attempt(
         &self,
-        address: crate::dist::cluster_routes::Route,
-        length: u64,
-        header_length: usize,
-        started: Instant,
-        local: Option<std::net::IpAddr>,
-        evidence: Option<crate::dist::cluster_routes::interface::Evidence>,
+        observation: UploadObservation,
         attempt: upload::Attempt,
     ) -> Result<std::ops::ControlFlow<Vec<u8>, anyhow::Error>> {
+        let UploadObservation {
+            address,
+            length,
+            header_length,
+            started,
+            local,
+            evidence,
+        } = observation;
         let peer = self.peer.scheduler_id();
         let role = sccache_cluster_identity::Role::Scheduler;
         match attempt.result {
@@ -1361,12 +1376,14 @@ impl NativeCacheClient {
             )
             .await?;
             match self.record_upload_attempt(
-                address,
-                length,
-                header.len(),
-                started,
-                local,
-                evidence,
+                UploadObservation {
+                    address,
+                    length,
+                    header_length: header.len(),
+                    started,
+                    local,
+                    evidence,
+                },
                 attempt,
             )? {
                 std::ops::ControlFlow::Break(_) => return Ok(()),

@@ -10,7 +10,7 @@ use anyhow::{Context, Result, ensure};
 
 use crate::build_runtime::{
     ActionFingerprint, ActionMode, CapturedExecution, ContentId, NativeStore, ResultLease,
-    ResultManifest, StageBudget,
+    StageBudget,
 };
 
 type Contents = BTreeMap<ContentId, u64>;
@@ -286,7 +286,7 @@ impl Drop for GraceReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build_runtime::{Artifact, BlobRef, Eviction};
+    use crate::build_runtime::{Artifact, BlobRef, Eviction, ResultManifest};
 
     #[tokio::test]
     async fn shared_artifacts_charge_once_and_expiry_releases_eviction_pin() -> Result<()> {

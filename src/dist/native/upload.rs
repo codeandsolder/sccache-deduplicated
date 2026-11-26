@@ -206,6 +206,90 @@ mod tests {
     use super::*;
     use std::net::{Ipv4Addr, TcpListener};
 
+    #[cfg(all(unix, feature = "native-store"))]
+    #[tokio::test]
+    async fn refused_connection_does_not_read_immutable_file() -> Result<()> {
+        let socket = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let address = socket.local_addr()?;
+        drop(socket);
+        let request = wreq::Client::builder()
+            .no_proxy()
+            .build()?
+            .post(format!("http://{address}/upload"))
+            .timeout(std::time::Duration::from_secs(2));
+        // A declared but absent payload would return a local truncation
+        // error if the stream were read before a connection exists.
+        let file = std::sync::Arc::new(tempfile::tempfile()?);
+        let attempt = send_file(
+            request,
+            Bytes::from_static(b"metadata"),
+            file,
+            1 << 20,
+            1024,
+            None,
+        )
+        .await?;
+        assert!(attempt.result.is_err());
+        assert_eq!(attempt.consumed, 0);
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "native-store"))]
+    #[tokio::test]
+    async fn immutable_file_body_reads_exact_positional_range() -> Result<()> {
+        use std::{
+            io::{Seek, SeekFrom, Write},
+            sync::Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let bytes = (0..(3 * CHUNK + 17))
+            .map(|index| u8::try_from(index % 251).unwrap_or_default())
+            .collect::<Vec<_>>();
+        let mut file = tempfile::tempfile()?;
+        file.write_all(&bytes)?;
+        file.seek(SeekFrom::Start(123))?;
+        let file = Arc::new(file);
+        let expected = [b"metadata".as_slice(), &bytes].concat();
+        let size = bytes.len() as u64;
+        let length = expected.len();
+        let receiver = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(stream.read_u8().await?);
+                ensure!(headers.len() <= 16 * 1024, "oversized request headers");
+            }
+            let mut actual = vec![0; length];
+            stream.read_exact(&mut actual).await?;
+            assert_eq!(actual, expected);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let request = wreq::Client::builder()
+            .no_proxy()
+            .build()?
+            .post(format!("http://{address}/upload"))
+            .timeout(std::time::Duration::from_secs(5));
+        let attempt = send_file(
+            request,
+            Bytes::from_static(b"metadata"),
+            Arc::clone(&file),
+            size,
+            1024,
+            None,
+        )
+        .await?;
+        assert_eq!(attempt.result?.bytes, b"OK");
+        assert_eq!(attempt.consumed, length as u64);
+        receiver.await??;
+        assert_eq!((&*file).stream_position()?, 123);
+        Ok(())
+    }
+
     #[test]
     fn refused_connection_does_not_read_nonseekable_source() -> Result<()> {
         let socket = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
