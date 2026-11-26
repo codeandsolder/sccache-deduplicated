@@ -562,6 +562,11 @@ fn missing_content_is_not_returned_as_a_hit() -> Result<()> {
     )?;
     fs::remove_file(store.inner.blob_path(object.id))?;
     assert!(store.lookup(published.action)?.is_none());
+    {
+        let pins = store.inner.lock_pins()?;
+        assert!(!pins.actions.contains_key(&published.action));
+        assert!(!pins.blobs.contains_key(&object.id));
+    }
     assert_eq!(
         store.result_receipt(published.action)?,
         Some(result(object))
@@ -793,6 +798,88 @@ fn lookups_do_not_wait_on_publication_lock() -> Result<()> {
         assert!(observed??);
         Ok(())
     })?;
+    Ok(())
+}
+
+#[test]
+fn live_reservations_do_not_wait_for_publication_but_pending_content_is_protected() -> Result<()> {
+    use std::{sync::mpsc, time::Duration};
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let stage = store.stage(&b"live and pending"[..])?;
+    let blob = stage.reference();
+    let published = store.publish(
+        &action("live-reserve"),
+        &result(blob),
+        vec![stage],
+        ActionMode::Reuse,
+    )?;
+    let references = BTreeMap::from([(blob.id, blob.size)]);
+    let mutation = store.inner.lock_mutations()?;
+    let reservation = thread::scope(|scope| -> Result<_> {
+        let (send, receive) = mpsc::channel();
+        let store = &store;
+        let references = references.clone();
+        let worker = scope.spawn(move || send.send(store.reserve_blobs(references)));
+        let observed = receive.recv_timeout(Duration::from_secs(2));
+        drop(mutation);
+        worker
+            .join()
+            .map_err(|_| anyhow!("reservation worker panicked"))??;
+        observed?
+    })?;
+    assert!(reservation.missing().is_empty());
+    assert!(matches!(
+        store.evict(published.action)?,
+        Eviction::Removed { .. }
+    ));
+    let mutation = store.inner.lock_mutations()?;
+    let pending = thread::scope(|scope| -> Result<_> {
+        let (send, receive) = mpsc::channel();
+        let store = &store;
+        let worker = scope.spawn(move || send.send(store.reserve_blobs(references)));
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(mutation);
+        let pending = receive.recv_timeout(Duration::from_secs(2))??;
+        worker
+            .join()
+            .map_err(|_| anyhow!("reservation worker panicked"))??;
+        Ok(pending)
+    })?;
+    drop(reservation);
+    assert!(pending.missing().is_empty());
+    assert_eq!(store.collect_garbage(8)?.blobs, 0);
+    drop(pending);
+    assert_eq!(store.collect_garbage(8)?.blobs, 1);
+    Ok(())
+}
+
+#[test]
+fn publication_tracks_unsynced_shards_across_aborted_transactions() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let first = store.stage(&b"aborted staging"[..])?;
+    let blob = first.reference();
+    let mut directories = BTreeSet::new();
+    {
+        let _mutation = store.inner.lock_mutations()?;
+        let _reservation = store.inner.install_blob(first, &mut directories)?;
+        assert!(store.inner.dirty_blob_directory.load(Ordering::Relaxed));
+    }
+    assert!(store.inner.dirty_blob_directory.load(Ordering::Relaxed));
+    assert!(store.open_available_physical(blob)?.is_none());
+    let replacement = store.stage_expected(blob, &b"aborted staging"[..])?;
+    store.publish(
+        &action("recovered"),
+        &result(blob),
+        vec![replacement],
+        ActionMode::Reuse,
+    )?;
+    assert!(!store.inner.dirty_blob_directory.load(Ordering::Relaxed));
+    assert!(store.open_available_physical(blob)?.is_some());
     Ok(())
 }
 

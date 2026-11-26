@@ -712,6 +712,7 @@ fn indexed_tree_repairs_only_physically_missing_content() -> Result<()> {
     let before = store.stats()?;
     std::fs::remove_file(store.inner.blob_path(bad_ref.id))?;
     assert!(store.lookup_tree(id)?.is_none());
+    assert!(!store.inner.lock_pins()?.trees.contains_key(&id));
     let reserve = store.reserve_tree_upload(&manifest)?;
     assert_eq!(reserve.missing(), &[bad_ref]);
     let repaired = store.stage_expected(bad_ref, &b"lost file"[..])?;

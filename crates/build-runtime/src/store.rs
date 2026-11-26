@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -585,6 +585,9 @@ struct Inner {
     // Mutations serialize filesystem changes with durable metadata commits.
     // Readers only acquire the separate pin lock, not the publication lock.
     mutations: Mutex<()>,
+    // Under the mutation lock, remember newly created shard entries even
+    // if their publication aborts before synchronizing the parent.
+    dirty_blob_directory: AtomicBool,
     pins: Mutex<Pins>,
     package_imports: Mutex<BTreeSet<crate::PackageIdentity>>,
     tree_flights: trees::TreeFlights,
@@ -595,6 +598,25 @@ struct Inner {
     // inversion with transactional publication and eviction.
     space_released: AtomicU64,
     result_history_limit: AtomicU64,
+}
+
+/// Files and staging accounting remain owned by a transaction until its
+/// durable index commit. Multiple roots and original archives share this set.
+#[derive(Default)]
+struct Publication {
+    directories: BTreeSet<PathBuf>,
+    reservations: Vec<space::StagingReservation>,
+}
+
+impl Publication {
+    fn commit(self, inner: &Inner, write: WriteTransaction) -> Result<()> {
+        inner.sync_publication_directories(&self.directories)?;
+        write.commit()?;
+        inner.publications.send_modify(|()| {});
+        // Only release staging reservations after the live accounting commit.
+        drop(self);
+        Ok(())
+    }
 }
 
 impl Inner {
@@ -696,11 +718,10 @@ impl Inner {
         let parent = path.parent().context("invalid blob storage path")?;
         if directories.insert(parent.to_owned()) {
             match fs::create_dir(parent) {
-                Ok(()) => {}
+                Ok(()) => self.dirty_blob_directory.store(true, Ordering::Relaxed),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
             }
-            directories.insert(self.root.join("blobs"));
         }
         // An unindexed file can remain after a failed transaction; replace it
         // with verified bytes rather than trusting its name or its length.
@@ -714,6 +735,20 @@ impl Inner {
         // The caller keeps this reservation alive until the redb transaction
         // commits the blob's index entry and its resident-byte accounting.
         Ok(reservation)
+    }
+
+    fn sync_publication_directories(&self, directories: &BTreeSet<PathBuf>) -> Result<()> {
+        for directory in directories {
+            File::open(directory)?.sync_all()?;
+        }
+        // Every newly created shard name must be durable before its content
+        // is indexed. Existing shard entries were synchronized at open or
+        // during the publication that created them.
+        if self.dirty_blob_directory.load(Ordering::Relaxed) {
+            File::open(self.root.join("blobs"))?.sync_all()?;
+            self.dirty_blob_directory.store(false, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     fn remove_blob(&self, id: ContentId) -> Result<()> {
@@ -1025,6 +1060,7 @@ impl NativeStore {
             }
         }
         clean_orphan_mounts(&root.join("mounts"))?;
+        File::open(root.join("blobs"))?.sync_all()?;
         File::open(&root)?.sync_all()?;
         let write = db.begin_write()?;
         write.open_table(ACTIONS)?;
@@ -1070,6 +1106,7 @@ impl NativeStore {
             root,
             db,
             mutations: Mutex::new(()),
+            dirty_blob_directory: AtomicBool::new(false),
             pins: Mutex::new(pins),
             package_imports: Mutex::new(BTreeSet::new()),
             tree_flights: trees::TreeFlights::default(),
@@ -1504,7 +1541,7 @@ impl NativeStore {
         let blobs = manifest.blobs()?;
         let staged = self.prepare_staging(&blobs, staged)?;
         let write = self.inner.db.begin_write()?;
-        let mut staged_reservations = Vec::new();
+        let mut publication = Publication::default();
         let new_action;
         {
             let mut actions = write.open_table(ACTIONS)?;
@@ -1532,18 +1569,11 @@ impl NativeStore {
                     }
                     // A physically incomplete indexed result can be repaired
                     // in place without changing its references or accounting.
-                    self.attach_blobs(
-                        &write,
-                        &result.0,
-                        &blobs,
-                        staged,
-                        true,
-                        &mut staged_reservations,
-                    )?;
+                    self.attach_blobs(&write, &result.0, &blobs, staged, true, &mut publication)?;
                     drop(result_actions);
                     drop(results);
                     drop(actions);
-                    return self.commit_result(write, staged_reservations, published);
+                    return self.commit_result(write, publication, published);
                 }
                 // A fresh build may replace an unavailable result; ordinary
                 // reuse must still never overwrite a complete result.
@@ -1569,7 +1599,7 @@ impl NativeStore {
                 &blobs,
                 staged,
                 existing_result,
-                &mut staged_reservations,
+                &mut publication,
             )?;
             if !existing_result {
                 let bytes = encoding().serialize(manifest)?;
@@ -1594,7 +1624,7 @@ impl NativeStore {
         }
         self.commit_result(
             write,
-            staged_reservations,
+            publication,
             Published {
                 action,
                 result,
@@ -1617,16 +1647,13 @@ impl NativeStore {
     fn commit_result(
         &self,
         write: WriteTransaction,
-        staged_reservations: Vec<space::StagingReservation>,
+        publication: Publication,
         published: Published,
     ) -> Result<Published> {
         history::forget(&write, published.action)?;
         // Files and their directory entries are durable before the index
         // exposes them. Orphans from an interrupted write are harmless.
-        write.commit()?;
-        self.inner.publications.send_modify(|()| {});
-        // Keep the staging budget reserved until the resident count includes the new bytes.
-        drop(staged_reservations);
+        publication.commit(&self.inner, write)?;
         self.inner
             .lock_pins()?
             .touch(space::Root::Action(published.action));
@@ -1662,7 +1689,7 @@ impl NativeStore {
         blobs: &BTreeMap<ContentId, u64>,
         mut staged: BTreeMap<ContentId, StagedBlob>,
         existing_result: bool,
-        reservations: &mut Vec<space::StagingReservation>,
+        publication: &mut Publication,
     ) -> Result<()> {
         let mut blob_table = write.open_table(BLOBS)?;
         let mut layouts = write.open_table(BLOB_LAYOUTS)?;
@@ -1702,19 +1729,24 @@ impl NativeStore {
         }
         let mut added = 0_u64;
         let mut pending_removed = 0_u64;
-        let mut directories = BTreeSet::new();
         for (&id, &size) in blobs {
             if repair.contains(&id) {
                 let blob = staged.remove(&id).context("validated repair disappeared")?;
                 layouts.insert(&id.0, blob.encoding as u8)?;
-                reservations.push(self.inner.install_blob(blob, &mut directories)?);
+                publication.reservations.push(
+                    self.inner
+                        .install_blob(blob, &mut publication.directories)?,
+                );
             } else if blob_table.get(&id.0)?.is_none() {
                 if resurrected.binary_search(&id).is_err() {
                     let blob = staged
                         .remove(&id)
                         .context("validated staged content disappeared")?;
                     let encoding = blob.encoding;
-                    reservations.push(self.inner.install_blob(blob, &mut directories)?);
+                    publication.reservations.push(
+                        self.inner
+                            .install_blob(blob, &mut publication.directories)?,
+                    );
                     ensure!(
                         layouts.insert(&id.0, encoding as u8)?.is_none(),
                         "physical encoding already indexed for new CAS content"
@@ -1753,11 +1785,6 @@ impl NativeStore {
                     .checked_sub(pending_removed)
                     .context("pending GC size underflow")?,
             )?;
-        }
-        // Every staged inode was synced before admission. Sync each affected
-        // shard once, before the transaction exposes any of its content.
-        for directory in directories.iter().rev() {
-            File::open(directory)?.sync_all()?;
         }
         Ok(())
     }
