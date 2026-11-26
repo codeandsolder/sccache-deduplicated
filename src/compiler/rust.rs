@@ -3853,6 +3853,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             let mut remapped_disks = HashSet::new();
             for (local_path, dist_path) in get_path_mappings(path_transformer) {
                 if canonical_paths
+                    .as_ref()
                     .is_some_and(|paths| paths.is_canonical_mapping(&local_path, &dist_path))
                 {
                     continue;

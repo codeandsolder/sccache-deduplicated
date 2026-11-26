@@ -358,6 +358,7 @@ impl TransferSession {
         #[cfg(all(feature = "dist-client", target_os = "linux"))]
         {
             self.native_exchange = None;
+            self.intermediate_read = None;
         }
         #[cfg(feature = "dist-client")]
         {
@@ -817,6 +818,21 @@ mod tests {
         async fn max_size(&self) -> Result<Option<u64>> {
             Ok(Some(64 * 1024 * 1024))
         }
+    }
+
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    #[tokio::test]
+    async fn abort_releases_intermediate_read_descriptor() -> Result<()> {
+        let mut session = TransferSession::new(4096, Arc::new(ToolchainReservations::default()));
+        session.intermediate_read = Some((tokio::fs::File::from_std(tempfile::tempfile()?), 8));
+        assert!(matches!(
+            session
+                .handle(TransferRequest::Abort, &MemoryStorage::default())
+                .await?,
+            TransferReply::Ack
+        ));
+        assert!(session.intermediate_read.is_none());
+        Ok(())
     }
 
     #[test]

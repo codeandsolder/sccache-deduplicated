@@ -329,25 +329,16 @@ impl Filesystem for IntermediateFs {
             reply,
             (|| {
                 let node = self.node(ino)?;
-                // For ordinary inodes, /proc/self/fd follows the descriptor to
-                // the actual inode even after rename. Symlinks use AT_EMPTY_PATH.
-                if node.fd.metadata()?.file_type().is_symlink() {
-                    rfs::linkat(
-                        &node.fd,
-                        "",
-                        &self.node(parent)?.fd,
-                        name,
-                        AtFlags::EMPTY_PATH,
-                    )?;
-                } else {
-                    rfs::linkat(
-                        rfs::CWD,
-                        node.path(),
-                        &self.node(parent)?.fd,
-                        name,
-                        AtFlags::SYMLINK_FOLLOW,
-                    )?;
-                }
+                // Following the procfs descriptor magic link resolves the
+                // pinned inode itself, including a dangling symlink, without
+                // traversing its target or requiring AT_EMPTY_PATH privileges.
+                rfs::linkat(
+                    rfs::CWD,
+                    node.path(),
+                    &self.node(parent)?.fd,
+                    name,
+                    AtFlags::SYMLINK_FOLLOW,
+                )?;
                 self.lookup_attr(parent, name)
             })(),
         );

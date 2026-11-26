@@ -91,6 +91,17 @@ fn mounted_intermediates_preserve_inode_semantics_and_fetch_only_on_demand() -> 
     fs::rename(&a, &moved)?;
     let symlink = mount.join("symlink");
     std::os::unix::fs::symlink("subdir/moved", &symlink)?;
+    let dangling = mount.join("dangling");
+    let dangling_alias = mount.join("dangling-alias");
+    std::os::unix::fs::symlink("absent-target", &dangling)?;
+    fs::hard_link(&dangling, &dangling_alias)?;
+    assert_eq!(fs::read_link(&dangling_alias)?, Path::new("absent-target"));
+    assert_eq!(
+        fs::symlink_metadata(&dangling)?.ino(),
+        fs::symlink_metadata(&dangling_alias)?.ino()
+    );
+    assert_eq!(fs::symlink_metadata(&dangling_alias)?.nlink(), 2);
+
     fs::set_permissions(&moved, fs::Permissions::from_mode(0o640))?;
     let stamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1_234_567);
     File::open(&moved)?.set_times(fs::FileTimes::new().set_modified(stamp))?;

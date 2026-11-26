@@ -242,13 +242,22 @@ impl NativeCacheClient {
         let mut delay = Duration::from_millis(10);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            match self.status(ticket) {
+            anyhow::ensure!(!remaining.is_zero(), "native publication deadline exceeded");
+            match self.control_with_timeout(
+                "status",
+                &super::StatusRequest {
+                    ticket,
+                    preview: false,
+                },
+                remaining,
+            ) {
                 Ok(NativeStatus::Ready(manifest)) => return Ok(manifest),
                 Ok(NativeStatus::Failed) => anyhow::bail!("native result publication failed"),
                 Ok(NativeStatus::Compiling | NativeStatus::Negotiated(_)) => {}
                 Err(error) if super::retryable_transport_error(&error) => {}
                 Err(error) => return Err(error),
             }
+            let remaining = deadline.saturating_duration_since(Instant::now());
             anyhow::ensure!(!remaining.is_zero(), "native publication deadline exceeded");
             std::thread::sleep(delay.min(remaining));
             delay = (delay * 2).min(Duration::from_millis(100));

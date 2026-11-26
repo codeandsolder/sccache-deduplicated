@@ -367,9 +367,22 @@ impl NativeCacheClient {
     }
 
     fn control<T: Serialize, R: DeserializeOwned>(&self, operation: &str, value: &T) -> Result<R> {
+        self.control_with_timeout(operation, value, self.timeout)
+    }
+
+    fn control_with_timeout<T: Serialize, R: DeserializeOwned>(
+        &self,
+        operation: &str,
+        value: &T,
+        timeout: Duration,
+    ) -> Result<R> {
+        ensure!(
+            !timeout.is_zero(),
+            "native control request deadline expired"
+        );
         let data = codec().with_limit(self.metadata_limit).serialize(value)?;
         let response = self
-            .send_replayable(operation, data, self.timeout)?
+            .send_replayable(operation, data, timeout.min(self.timeout))?
             .error_for_status()?;
         decode_response(response, self.metadata_limit)
     }
@@ -1220,45 +1233,35 @@ impl NativeCacheClient {
     }
 
     /// Download retained content with the ordinary authenticated, measured
-    /// direct-peer transport and a verified scheduler fallback.
+    /// direct-peer transport and a verified scheduler fallback. Return the
+    /// verified staging descriptor at offset zero, without copying its bytes.
     /// # Errors
     /// Returns an error for an unavailable or corrupt retained blob.
     #[cfg(all(target_os = "linux", feature = "native-store"))]
-    pub fn download_retained(
-        &self,
-        group: Ticket,
-        blob: BlobRef,
-        mut destination: impl Write,
-    ) -> Result<()> {
+    pub fn download_retained(&self, group: Ticket, blob: BlobRef) -> Result<File> {
+        let stage = |reader, encoding| {
+            let mut file = tempfile::tempfile()?;
+            crate::build_runtime::transfer_native_blob(
+                reader,
+                io::sink(),
+                &mut file,
+                blob,
+                encoding,
+            )?;
+            file.rewind()?;
+            Ok(file)
+        };
         let plans = self.retained_source_plans(group, &[blob]);
         if let Some(plan) = plans.get(&blob.id)
-            && let Some(mut file) = self.try_peer_blob(plan, |reader, encoding| {
-                let mut file = tempfile::tempfile()?;
-                crate::build_runtime::transfer_native_blob(
-                    reader,
-                    io::sink(),
-                    &mut file,
-                    blob,
-                    encoding,
-                )?;
-                file.rewind()?;
-                Ok(file)
-            })
+            && let Some(file) = self.try_peer_blob(plan, stage)
         {
-            io::copy(&mut file, &mut destination)?;
-            return Ok(());
+            return Ok(file);
         }
         let request = codec().serialize(&RetainedDownloadRequest { group, blob })?;
         let (reader, encoding) = self
             .receive_blob("retain_download", request, blob, self.timeout)?
             .context("native retained content unavailable")?;
-        crate::build_runtime::transfer_native_blob(
-            reader,
-            io::sink(),
-            &mut destination,
-            blob,
-            encoding,
-        )
+        stage(reader, encoding)
     }
 
     /// Report a failed compilation without publishing any shared result.

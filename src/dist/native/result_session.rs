@@ -2,13 +2,7 @@
 use super::{NativeCacheClient, renewal::Renewals};
 use crate::build_runtime::{BlobRef, ContentId, ResultManifest, wire::Ticket};
 use anyhow::{Context, Result, ensure};
-use std::{
-    collections::BTreeMap,
-    fs::File,
-    io::{Seek, SeekFrom},
-    sync::Mutex,
-    time::Duration,
-};
+use std::{collections::BTreeMap, fs::File, sync::Mutex, time::Duration};
 
 pub struct NativeResultSession {
     client: NativeCacheClient,
@@ -74,10 +68,7 @@ impl NativeResultSession {
 
     pub fn read(&self, blob: BlobRef) -> Result<File> {
         self.authorize(blob)?;
-        let mut file = tempfile::tempfile()?;
-        self.client.download_retained(self.group, blob, &mut file)?;
-        file.seek(SeekFrom::Start(0))?;
-        Ok(file)
+        self.client.download_retained(self.group, blob)
     }
 }
 
