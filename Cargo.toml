@@ -309,3 +309,6 @@ unnecessary_semicolon = "warn"
 # One source identity for direct streams and all Flate2 consumers.
 [patch.crates-io]
 zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "98f76b3a242099f2229b048360eeb4707246a68f" }
+reqsign-core = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "792158bc847448dd4436504f647fec2a59f02be6" }
+reqsign-azure-storage = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "792158bc847448dd4436504f647fec2a59f02be6" }
+reqsign-google = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "792158bc847448dd4436504f647fec2a59f02be6" }
