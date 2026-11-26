@@ -2634,7 +2634,10 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         fs::read(private.join("rust-reference.rlib"))?
     );
     let stats = service.stats()?;
-    assert_eq!(stats.cache_hits.all(), 32 - namespace_compiles);
+    assert_eq!(
+        stats.cache_hits.all(),
+        32 - u64::try_from(namespace_compiles)?
+    );
     assert_eq!(
         stats.dist_compiles.values().sum::<usize>(),
         namespace_compiles
