@@ -55,6 +55,91 @@ fn sample_tree(blob: BlobRef) -> Result<TreeManifest> {
     })
 }
 
+/// Measure warm tree/result leases and reservation admission over the same
+/// immutable closure, including contention between independent consumers.
+#[test]
+#[ignore = "CAS metadata contention benchmark"]
+fn benchmark_cas_metadata_contention() -> Result<()> {
+    use std::{sync::Barrier, time::Instant};
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    let mut entries = BTreeMap::new();
+    let mut staged = Vec::new();
+    for index in 0..1024_u32 {
+        let data = index.to_le_bytes().repeat(256);
+        let blob = store.stage(data.as_slice())?;
+        entries.insert(
+            TreePath::new(format!("input-{index:04}").into_bytes())?,
+            TreeEntry::File {
+                blob: blob.reference(),
+                metadata: metadata(0o444),
+            },
+        );
+        staged.push(blob);
+    }
+    let tree = TreeManifest {
+        root: metadata(0o555),
+        entries,
+    };
+    let id = store.publish_tree(&tree, staged)?;
+    let result = ResultManifest {
+        outputs: BTreeMap::from([("tree".into(), Artifact::Tree(tree.clone()))]),
+        stdout: None,
+        stderr: None,
+    };
+    let fingerprint = ActionFingerprint {
+        schema: "metadata-benchmark".into(),
+        components: BTreeMap::new(),
+    };
+    let action = store
+        .publish(&fingerprint, &result, Vec::new(), crate::ActionMode::Reuse)?
+        .action;
+    let blobs = tree.blobs()?;
+    for width in [1, 8] {
+        let barrier = Barrier::new(width);
+        let elapsed = std::thread::scope(|scope| -> Result<_> {
+            let jobs = (0..width)
+                .map(|_| {
+                    scope.spawn(|| -> Result<_> {
+                        barrier.wait();
+                        let start = Instant::now();
+                        for _ in 0..16 {
+                            let tree = store.lookup_tree(id)?.context("benchmark tree missing")?;
+                            let result =
+                                store.lookup(action)?.context("benchmark result missing")?;
+                            let reserved = store.reserve_blobs(blobs.clone())?;
+                            anyhow::ensure!(
+                                reserved.missing().is_empty(),
+                                "benchmark input missing"
+                            );
+                            std::hint::black_box((&tree, &result, &reserved));
+                        }
+                        Ok(start.elapsed())
+                    })
+                })
+                .collect::<Vec<_>>();
+            jobs.into_iter()
+                .map(|job| {
+                    job.join()
+                        .map_err(|_| anyhow::anyhow!("benchmark worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let maximum = elapsed.iter().max().context("missing benchmark sample")?;
+        println!(
+            "CAS_METADATA threads={width} iterations=16 files=1024 wall_ms={:.3} mean_ms={:.3}",
+            maximum.as_secs_f64() * 1000.0,
+            elapsed
+                .iter()
+                .map(std::time::Duration::as_secs_f64)
+                .sum::<f64>()
+                * 1000.0
+                / f64::from(u32::try_from(width)?)
+        );
+    }
+    Ok(())
+}
+
 /// Copy representative real C/C++ headers into a deterministic CAS input.
 fn compiler_header_corpus(input: &std::path::Path) -> Result<(Vec<String>, u64)> {
     use std::{fs, path::PathBuf};
