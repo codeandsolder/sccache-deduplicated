@@ -588,6 +588,7 @@ struct Inner {
     pins: Mutex<Pins>,
     package_imports: Mutex<BTreeSet<crate::PackageIdentity>>,
     tree_flights: trees::TreeFlights,
+    publications: tokio::sync::watch::Sender<()>,
     space_policy: Option<SpacePolicy>,
     space: Mutex<space::SpaceState>,
     // Releases never acquire the space admission lock, avoiding lock-order
@@ -1044,6 +1045,7 @@ impl NativeStore {
             pins: Mutex::new(pins),
             package_imports: Mutex::new(BTreeSet::new()),
             tree_flights: trees::TreeFlights::default(),
+            publications: tokio::sync::watch::Sender::new(()),
             space_policy,
             space: Mutex::default(),
             space_released: AtomicU64::new(0),
@@ -1332,6 +1334,58 @@ impl NativeStore {
         })
     }
 
+    /// Wait for independently produced content, pinning each available subset.
+    /// A publication notification is registered before checking residency, so
+    /// a concurrent commit cannot be lost between the check and the wait.
+    /// This does not claim acquisition ownership or request any network I/O.
+    ///
+    /// # Errors
+    /// Returns an error for cancellation, timeout, invalid content or storage failure.
+    pub async fn await_blobs<Cancel>(
+        &self,
+        mut blobs: BTreeMap<ContentId, u64>,
+        deadline: Instant,
+        cancelled: Cancel,
+    ) -> Result<Vec<UploadReservation>>
+    where
+        Cancel: std::future::Future<Output = Result<()>> + Send,
+    {
+        let mut publications = self.inner.publications.subscribe();
+        let mut cancelled = std::pin::pin!(cancelled);
+        let mut pins = Vec::new();
+        while !blobs.is_empty() {
+            ensure!(
+                Instant::now() < deadline,
+                "native content publication deadline exceeded"
+            );
+            // Forget prior changes, then check the current durable index.
+            let _ = publications.borrow_and_update();
+            let count = blobs.len();
+            let store = self.clone();
+            let ready = tokio::task::spawn_blocking(move || store.reserve_blobs(blobs)).await??;
+            blobs = ready
+                .missing()
+                .iter()
+                .map(|blob| (blob.id, blob.size))
+                .collect();
+            if blobs.len() < count {
+                pins.push(ready);
+            }
+            if !blobs.is_empty() {
+                tokio::select! {
+                    result = tokio::time::timeout_at(deadline.into(), publications.changed()) => {
+                        result.context("native content publication deadline exceeded")??;
+                    }
+                    result = &mut cancelled => {
+                        result?;
+                        anyhow::bail!("native content publication cancelled");
+                    }
+                }
+            }
+        }
+        Ok(pins)
+    }
+
     /// Atomically publish a successful result. All newly referenced blobs must
     /// be staged; blobs already in the store can be referenced without upload.
     ///
@@ -1499,6 +1553,7 @@ impl NativeStore {
         // Files and their directory entries are durable before the index
         // exposes them. Orphans from an interrupted write are harmless.
         write.commit()?;
+        self.inner.publications.send_modify(|()| {});
         // Keep the staging budget reserved until the resident count includes the new bytes.
         drop(staged_reservations);
         self.inner

@@ -1061,33 +1061,17 @@ impl NativeCacheClient {
                 self.timeout,
             )
             .await?;
-            let start = Instant::now();
-            let mut pending = chunk.to_vec();
-            let mut delay = Duration::from_millis(10);
-            while !pending.is_empty() {
-                check()?;
-                ensure!(
-                    start.elapsed() < self.timeout,
-                    "shared native input backfill timed out"
-                );
-                let count = pending.len();
-                let blobs = pending
-                    .into_iter()
-                    .map(|blob| (blob.id, blob.size))
-                    .collect();
-                let owned = store.clone();
-                let ready =
-                    tokio::task::spawn_blocking(move || owned.reserve_blobs(blobs)).await??;
-                pending = ready.missing().to_vec();
-                if pending.len() < count {
-                    pins.push(ready);
-                    delay = Duration::from_millis(10);
+            let deadline = Instant::now()
+                .checked_add(self.timeout)
+                .context("shared native input deadline overflow")?;
+            let cancelled = async {
+                loop {
+                    check()?;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                if !pending.is_empty() {
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_millis(200));
-                }
-            }
+            };
+            let blobs = chunk.iter().map(|blob| (blob.id, blob.size)).collect();
+            pins.extend(store.await_blobs(blobs, deadline, cancelled).await?);
         }
         check()?;
         let owned = store.clone();

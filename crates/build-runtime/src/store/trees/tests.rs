@@ -361,6 +361,69 @@ fn materialization_preserves_modes_links_and_timestamps_without_mutating_cas() -
     Ok(())
 }
 
+#[tokio::test]
+async fn independently_published_blobs_wake_waiters_and_keep_content_pinned() -> Result<()> {
+    use std::{
+        collections::BTreeMap,
+        time::{Duration, Instant},
+    };
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let first = store.stage(&b"first shared input"[..])?;
+    let second = store.stage(&b"second shared input"[..])?;
+    let blobs = [first.reference(), second.reference()];
+    let required = blobs
+        .into_iter()
+        .map(|blob| (blob.id, blob.size))
+        .collect::<BTreeMap<_, _>>();
+    let waiter = {
+        let store = store.clone();
+        let required = required.clone();
+        tokio::spawn(async move {
+            store
+                .await_blobs(
+                    required,
+                    Instant::now() + Duration::from_secs(5),
+                    std::future::pending(),
+                )
+                .await
+        })
+    };
+    let first_tree = NativeStore::blob_retention_manifest(blobs[0])?;
+    let second_tree = NativeStore::blob_retention_manifest(blobs[1])?;
+    let first_id = store.publish_tree(&first_tree, vec![first])?;
+    tokio::task::yield_now().await;
+    let second_id = store.publish_tree(&second_tree, vec![second])?;
+    let pins = waiter.await??;
+    assert!(!pins.is_empty());
+    store.evict_tree(first_id)?;
+    store.evict_tree(second_id)?;
+    store.collect_garbage(100)?;
+    for blob in blobs {
+        assert!(store.open_available_physical(blob)?.is_some());
+    }
+    drop(pins);
+    store.collect_garbage(100)?;
+    for blob in blobs {
+        assert!(store.open_available_physical(blob)?.is_none());
+    }
+    let err = store
+        .await_blobs(
+            required.clone(),
+            Instant::now() + Duration::from_millis(20),
+            std::future::pending(),
+        )
+        .await;
+    assert!(err.is_err());
+    let err = store
+        .await_blobs(required, Instant::now() + Duration::from_secs(5), async {
+            anyhow::bail!("cancelled")
+        })
+        .await;
+    assert!(err.is_err());
+    Ok(())
+}
+
 #[test]
 fn concurrent_tree_acquisition_shares_one_transfer_and_keeps_consumer_pins() -> Result<()> {
     use std::sync::{

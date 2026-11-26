@@ -400,6 +400,7 @@ impl NativeStore {
             }
         }
         write.commit()?;
+        self.inner.publications.send_modify(|()| {});
         drop(staged_reservations);
         self.inner.lock_pins()?.touch(Root::Tree(id));
         Ok(id)
