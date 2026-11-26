@@ -240,7 +240,7 @@ pub(super) struct PublicationCallbacks<S, O> {
     reason = "native listener startup owns the shared session lifetime and starts its coordinated acquisition and maintenance workers"
 )]
 pub(super) fn spawn<Fut, PeerFut>(
-    config: &NativeCacheConfig,
+    cache: (&NativeCacheConfig, NativeStore),
     allocate: impl Fn(crate::dist::NativeAssignment, NetworkSnapshot, Arc<PackageCatalog>) -> Fut
     + Send
     + Sync
@@ -267,6 +267,7 @@ where
     Fut: Future<Output = Result<ScheduleReply>> + Send + 'static,
     PeerFut: Future<Output = Result<Option<StagedBlob>>> + Send + 'static,
 {
+    let (config, store) = cache;
     let PublicationCallbacks {
         source_plan,
         observe_result,
@@ -274,10 +275,7 @@ where
     let socket = super::cluster_http::bind_data_socket(config.public_addr, config.bind_address)?;
     let bound = socket.local_addr()?;
     let limits = config.session_limits()?;
-    let sessions = Arc::new(NativeSessions::new(
-        NativeStore::open_managed(&config.directory, config.space)?,
-        limits,
-    )?);
+    let sessions = Arc::new(NativeSessions::new(store, limits)?);
     let maintenance = Arc::downgrade(&sessions);
     let fetch_peer = Arc::new(fetch_peer);
     // Keep source acquisition bounded separately from compiler execution

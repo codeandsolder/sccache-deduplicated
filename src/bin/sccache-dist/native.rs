@@ -30,7 +30,7 @@ pub struct NativeWorker {
     renewal_interval: Duration,
     package_import: Option<PackageImportLimits>,
     package_transfer: PackageTransportTracker,
-    artifact_grace: sccache::dist::native::ArtifactGrace,
+    artifact_grace: Option<sccache::dist::native::ArtifactGrace>,
     placement: Mutex<PlacementCache>,
     pub(super) metadata_limit: usize,
     pub(super) max_inflight_jobs: Option<usize>,
@@ -40,11 +40,10 @@ impl NativeWorker {
     pub(super) fn new(
         config: NativeWorkerConfig,
         peer: std::sync::Arc<sccache_cluster_identity::PeerCredentials>,
+        shared_store: Option<NativeStore>,
     ) -> Result<Self> {
         ensure!(
-            config.directory.is_absolute()
-                && config.scratch.is_absolute()
-                && config.bubblewrap.is_absolute(),
+            config.scratch.is_absolute() && config.bubblewrap.is_absolute(),
             "native worker paths must be absolute"
         );
         ensure!(
@@ -55,19 +54,37 @@ impl NativeWorker {
             "invalid native worker configuration"
         );
 
+        let shared = shared_store.is_some();
+        let store = match (shared_store, config.directory, config.space) {
+            (Some(store), None, None) => store,
+            (None, Some(directory), Some(space)) if directory.is_absolute() => {
+                NativeStore::open_managed(&directory, space)?
+            }
+            _ => anyhow::bail!("invalid standalone or shared native store configuration"),
+        };
+        let space = store
+            .managed_space_policy()
+            .ok_or_else(|| anyhow::anyhow!("worker requires a managed store"))?;
         let grace_bytes = config.artifact_grace_bytes.unwrap_or_else(|| {
-            (config.space.max_resident_bytes / 4)
+            (space.max_resident_bytes / 4)
                 .max(config.max_result_bytes.saturating_mul(2))
-                .min(config.space.max_resident_bytes)
+                .min(space.max_resident_bytes)
         });
         ensure!(
-            (config.max_result_bytes..=config.space.max_resident_bytes).contains(&grace_bytes),
+            (config.max_result_bytes..=space.max_resident_bytes).contains(&grace_bytes),
             "artifact grace budget must fit one maximum result and the resident budget"
         );
-        let artifact_grace = sccache::dist::native::ArtifactGrace::new(
-            Duration::from_secs(config.artifact_grace_secs),
-            grace_bytes,
-        )?;
+        // A shared store must not publish a worker's grace result into the
+        // scheduler's action index before its authenticated commit. The
+        // scheduler already retains the committed output.
+        let artifact_grace = (!shared)
+            .then(|| {
+                sccache::dist::native::ArtifactGrace::new(
+                    Duration::from_secs(config.artifact_grace_secs),
+                    grace_bytes,
+                )
+            })
+            .transpose()?;
         if let Some(limits) = config.package_import {
             limits.validate()?;
             ensure!(
@@ -76,7 +93,6 @@ impl NativeWorker {
             );
         }
         std::fs::create_dir_all(&config.scratch)?;
-        let store = NativeStore::open_managed(&config.directory, config.space)?;
         let scope = ContentId::of(
             format!(
                 "{}\n{}",
@@ -86,11 +102,14 @@ impl NativeWorker {
             .as_bytes(),
         );
         let (mut placement, timing) = PlacementCache::open(
-            config.directory.join("worker-timing.json"),
+            store.root().join("worker-timing.json"),
             scope,
             config.package_transfer,
         );
-        placement.analytics = Some(store.analytics_sampler()?);
+        // The scheduler already reports this physical cache. Do not count it twice.
+        if !shared {
+            placement.analytics = Some(store.analytics_sampler()?);
+        }
         let package_transfer = PackageTransportTracker::new(timing)?;
         let _ = store.can_clone_into(&config.scratch)?;
         let client = NativeCacheClient::new(
@@ -148,7 +167,9 @@ impl NativeWorker {
     }
 
     pub(super) fn placement(&self, queue: sccache::dist::NativeQueueSnapshot) -> NativePlacement {
-        self.artifact_grace.reap();
+        if let Some(grace) = &self.artifact_grace {
+            grace.reap();
+        }
         let timing = self.package_transfer.snapshot();
         let mut cache = self
             .placement
@@ -183,7 +204,7 @@ impl NativeWorker {
             package_import: self.package_import,
             transport: &self.package_transfer,
             execution_queue: queue,
-            artifact_grace: &self.artifact_grace,
+            artifact_grace: self.artifact_grace.as_ref(),
         }
     }
 

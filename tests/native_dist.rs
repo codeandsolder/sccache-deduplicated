@@ -183,8 +183,8 @@ fn native_worker_config(
         toolchain_archive_sources: Vec::new(),
         native_worker: Some(server::NativeWorkerConfig {
             cache_url: HTTPUrl::from_url(cache_url),
-            directory: root.join("worker-store"),
-            space: space(),
+            directory: Some(root.join("worker-store")),
+            space: Some(space()),
             scratch: root.join("scratch"),
             bubblewrap: "/usr/bin/bwrap".into(),
             platform_contract: platform.into(),
@@ -203,7 +203,7 @@ fn native_worker_config(
 }
 
 struct Fleet {
-    worker: Process,
+    worker: Option<Process>,
     scheduler: Process,
     worker_directory: PathBuf,
     scheduler_directory: PathBuf,
@@ -243,11 +243,24 @@ impl Fleet {
         package_upstreams: BTreeMap<String, scheduler::PackageUpstream>,
         transfer: sccache::build_runtime::PackageTransferCost,
     ) -> Result<Self> {
+        Self::start_with_mode(root, package_upstreams, transfer, false)
+    }
+
+    fn start_with_mode(
+        root: &Path,
+        package_upstreams: BTreeMap<String, scheduler::PackageUpstream>,
+        transfer: sccache::build_runtime::PackageTransferCost,
+        colocated: bool,
+    ) -> Result<Self> {
         let [scheduler_address, cache_address, worker_address] = addresses()?;
         let scheduler_url = url::Url::parse(&format!("https://{scheduler_address}/"))?;
         let cache_url = url::Url::parse(&format!("https://{cache_address}/"))?;
         let scheduler_directory = root.join("scheduler-store");
-        let worker_directory = root.join("worker-store");
+        let worker_directory = if colocated {
+            scheduler_directory.clone()
+        } else {
+            root.join("worker-store")
+        };
         let cluster_directory = root.join("cluster");
         fs::create_dir_all(&cluster_directory)?;
         drop(sccache_cluster_identity::scheduler_registry(
@@ -268,11 +281,32 @@ impl Fleet {
             ..cluster.clone()
         };
         let worker_id = sccache_cluster_identity::open_identity(&worker_cluster)?.id()?;
+        let mut worker_config = native_worker_config(
+            root,
+            worker_cluster.clone(),
+            worker_address,
+            scheduler_url.clone(),
+            cache_url.clone(),
+            PLATFORM,
+            transfer,
+        );
+        let (local_worker, standalone_worker) = if colocated {
+            let native = worker_config
+                .native_worker
+                .as_mut()
+                .context("native config missing")?;
+            native.directory = None;
+            native.space = None;
+            (Some(Box::new(worker_config)), None)
+        } else {
+            (None, Some(worker_config))
+        };
         let mut scheduler_process = Process::start(
             root,
             "scheduler",
             &scheduler::Config {
                 cluster_directory,
+                local_worker,
                 public_addr: scheduler_address,
                 client_auth: scheduler::ClientAuth::Token {
                     token: CLIENT_TOKEN.into(),
@@ -324,22 +358,15 @@ impl Fleet {
         )?;
         let (http, status_base) = (transport.client(), transport.base().clone());
         let status = || fetch_status(&http, &status_base);
-        let mut worker_process = Process::start(
-            root,
-            "server",
-            &native_worker_config(
-                root,
-                worker_cluster.clone(),
-                worker_address,
-                scheduler_url.clone(),
-                cache_url.clone(),
-                PLATFORM,
-                transfer,
-            ),
-        )?;
+        let mut worker_process = standalone_worker
+            .as_ref()
+            .map(|config| Process::start(root, "server", config))
+            .transpose()?;
         wait_for(|| {
             scheduler_process.check()?;
-            worker_process.check()?;
+            if let Some(worker) = &mut worker_process {
+                worker.check()?;
+            }
             Ok(status()
                 .ok()
                 .filter(|status| status.num_servers == 1 && status.available_jobs > 0))
@@ -405,10 +432,13 @@ impl Fleet {
         } = self;
         drop(worker);
         drop(scheduler);
-        Ok((
-            NativeStore::open(&scheduler_directory)?.stats()?,
-            NativeStore::open(&worker_directory)?.stats()?,
-        ))
+        let scheduler_stats = NativeStore::open(&scheduler_directory)?.stats()?;
+        let worker_stats = if worker_directory == scheduler_directory {
+            scheduler_stats
+        } else {
+            NativeStore::open(&worker_directory)?.stats()?
+        };
+        Ok((scheduler_stats, worker_stats))
     }
 }
 
@@ -2453,6 +2483,49 @@ fn audit_index(index: &Path, component: &str) -> Result<ComponentAudit> {
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     Ok(serde_json::from_value(report["comparison"].clone())?)
+}
+
+#[test]
+#[ignore = "requires Linux Bubblewrap, GCC and ldd"]
+fn colocated_native_worker_shares_one_store_and_commits_results() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let fleet = Fleet::start_with_mode(root, BTreeMap::new(), Default::default(), true)?;
+    let mut service = LocalService::start(root, &fleet, None)?;
+    let source = root.join("compile");
+    fs::create_dir(&source)?;
+    fs::write(
+        source.join("probe.c"),
+        b"int colocated_probe(void) { return 42; }",
+    )?;
+    let compile = || -> Result<Vec<u8>> {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .args(["/usr/bin/gcc", "-c", "probe.c", "-o", "probe.o"])
+            .current_dir(&source)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "colocated compilation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(fs::read(source.join("probe.o"))?)
+    };
+    let first = compile()?;
+    fs::remove_file(source.join("probe.o"))?;
+    assert_eq!(compile()?, first);
+    let stats = service.stats()?;
+    assert_eq!(stats.cache_hits.all(), 1);
+    assert_eq!(stats.cache_misses.all(), 1);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 1);
+    assert_eq!(stats.dist_errors, 0);
+    service.stop()?;
+    let (scheduler, worker) = fleet.finish()?;
+    assert_eq!(scheduler, worker);
+    assert_eq!(scheduler.actions, 1);
+    assert!(!root.join("worker-store").exists());
+    assert!(root.join("scheduler-store/index.redb").is_file());
+    Ok(())
 }
 
 #[test]

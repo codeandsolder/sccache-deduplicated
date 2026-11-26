@@ -383,7 +383,7 @@ fn run(command: Command) -> Result<i32> {
 
         Command::Auth(auth) => run_auth(auth),
         Command::Scheduler(config) => start_scheduler(*config),
-        Command::Server(config) => start_worker(*config),
+        Command::Server(config) => start_worker(*config, None),
     }
 }
 
@@ -637,6 +637,7 @@ fn start_scheduler(config: scheduler_config::Config) -> Result<i32> {
         maintenance_drain_file,
         job_slack,
         native_cache,
+        local_worker,
     } = config;
 
     let check_client_auth: Box<dyn dist::http::ClientAuthCheck> = match client_auth {
@@ -716,7 +717,26 @@ fn start_scheduler(config: scheduler_config::Config) -> Result<i32> {
         dashboard,
     );
     // A running server never exits successfully (Result<Infallible>).
-    match http_scheduler.start()? {}
+    let local_worker = local_worker.map(colocated_worker_start);
+    match http_scheduler.start(local_worker)? {}
+}
+
+fn colocated_worker_start(config: Box<server_config::Config>) -> dist::http::LocalWorkerStart {
+    Box::new(move |store| {
+        std::thread::Builder::new()
+            .name("colocated-native-worker".into())
+            .spawn(move || match start_worker(*config, Some(store)) {
+                Ok(code) => {
+                    error!("colocated worker unexpectedly returned {code}");
+                    std::process::exit(1);
+                }
+                Err(error) => {
+                    error!("colocated worker failed: {error:#}");
+                    std::process::exit(1);
+                }
+            })?;
+        Ok(())
+    })
 }
 
 fn worker_bootstrap_token(
@@ -742,7 +762,10 @@ fn worker_bootstrap_token(
     })
 }
 
-fn start_worker(config: server_config::Config) -> Result<i32> {
+fn start_worker(
+    config: server_config::Config,
+    shared_store: Option<sccache::build_runtime::NativeStore>,
+) -> Result<i32> {
     let server_config::Config {
         cluster,
         builder,
@@ -816,10 +839,10 @@ fn start_worker(config: server_config::Config) -> Result<i32> {
     )?;
     #[cfg(target_os = "linux")]
     let native_worker = native_worker
-        .map(|config| NativeWorker::new(config, std::sync::Arc::clone(&peer)))
+        .map(|config| NativeWorker::new(config, std::sync::Arc::clone(&peer), shared_store))
         .transpose()?;
     #[cfg(not(target_os = "linux"))]
-    if native_worker.is_some() {
+    if native_worker.is_some() || shared_store.is_some() {
         bail!("native worker requires Linux");
     }
     let server = Server::new(archive);

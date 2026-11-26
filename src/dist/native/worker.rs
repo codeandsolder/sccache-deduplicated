@@ -203,7 +203,7 @@ pub struct WorkerDelivery<'a> {
     pub package_import: Option<PackageImportLimits>,
     pub transport: &'a PackageTransportTracker,
     pub execution_queue: &'a crate::dist::execution_queue::ExecutionQueue,
-    pub artifact_grace: &'a super::ArtifactGrace,
+    pub artifact_grace: Option<&'a super::ArtifactGrace>,
 }
 
 #[cfg(feature = "dist-client")]
@@ -563,7 +563,7 @@ impl NativeCacheClient {
             Ok(PreparedExecution {
                 request,
                 _inputs: inputs,
-                output: Some(output),
+                output,
                 warm_staging: warm.then(|| started.elapsed()),
             })
         }
@@ -815,7 +815,7 @@ impl NativeCacheClient {
 }
 
 struct WorkerStorage {
-    output: (super::grace::GraceReservation, StageBudget),
+    output: Option<(super::grace::GraceReservation, StageBudget)>,
     cached: Vec<(TreeId, Option<TreeLease>)>,
     warm: bool,
 }
@@ -825,7 +825,7 @@ struct WorkerStorage {
 async fn prepare_worker_storage(
     store: &NativeStore,
     policy: &ExecutionPolicy,
-    grace: &super::ArtifactGrace,
+    grace: Option<&super::ArtifactGrace>,
     request: &ActionRequest,
     estimated_result_bytes: Option<u64>,
     check: &LeaseCheck<'_>,
@@ -833,42 +833,51 @@ async fn prepare_worker_storage(
     let predicted = estimated_result_bytes
         .unwrap_or(policy.max_result_bytes)
         .clamp(1, policy.max_result_bytes);
-    let mut reservation = {
+    let mut warm = true;
+    let reservation = if let Some(grace) = grace {
+        let mut reservation = {
+            let store = store.clone();
+            let grace = grace.clone();
+            tokio::task::spawn_blocking(move || {
+                grace.reap();
+                maintain_executor_space(&store)?;
+                grace.reserve(predicted)
+            })
+            .await??
+        };
+        let started = Instant::now();
+        warm = reservation.is_some();
+        while reservation.is_none() {
+            check()?;
+            ensure!(
+                started.elapsed() < policy.timeout,
+                "native artifact grace admission timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            check()?;
+            let grace = grace.clone();
+            reservation = tokio::task::spawn_blocking(move || grace.reserve(predicted)).await??;
+        }
+        reservation
+    } else {
         let store = store.clone();
-        let grace = grace.clone();
-        tokio::task::spawn_blocking(move || {
-            grace.reap();
-            maintain_executor_space(&store)?;
-            grace.reserve(predicted)
-        })
-        .await??
+        tokio::task::spawn_blocking(move || maintain_executor_space(&store)).await??;
+        None
     };
-    let started = Instant::now();
-    let warm = reservation.is_some();
-    while reservation.is_none() {
-        check()?;
-        ensure!(
-            started.elapsed() < policy.timeout,
-            "native artifact grace admission timed out"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        check()?;
-        let grace = grace.clone();
-        reservation = tokio::task::spawn_blocking(move || grace.reserve(predicted)).await??;
-    }
-    let reservation = reservation.context("missing worker grace reservation")?;
     check()?;
     let store = store.clone();
     let limit = policy.max_result_bytes;
     let trees = request.input_trees.clone();
     tokio::task::spawn_blocking(move || {
-        let budget = store.reserve_staging(limit)?;
+        let output = reservation
+            .map(|reservation| Ok::<_, anyhow::Error>((reservation, store.reserve_staging(limit)?)))
+            .transpose()?;
         let cached = trees
             .into_iter()
             .map(|id| Ok((id, store.lookup_tree(id)?)))
             .collect::<Result<Vec<_>>>()?;
         Ok(WorkerStorage {
-            output: (reservation, budget),
+            output,
             cached,
             warm,
         })

@@ -419,7 +419,7 @@ impl NativeDispatcher {
         let threads = {
             let shared = Arc::clone(&shared);
             spawn_pool("native-compile", width, ready_rx, move |task| {
-                shared.compile(task, &publishing)
+                shared.compile(task, &publishing);
             })?
         };
         let publication_task = {
