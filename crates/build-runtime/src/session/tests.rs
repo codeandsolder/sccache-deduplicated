@@ -276,6 +276,29 @@ fn result_contract_and_limits_control_publication() -> Result<()> {
     Ok(())
 }
 
+impl NativeSessions {
+    fn schedule(
+        &self,
+        ticket: Ticket,
+        request: &ActionRequest,
+        requester: crate::PeerId,
+        selection: DeliverySelection,
+        allocate: impl FnOnce(
+            BTreeMap<ContentId, u64>,
+            Vec<&BTreeMap<ContentId, u64>>,
+        ) -> Result<ScheduleReply>,
+    ) -> Result<ScheduleReply> {
+        match self.prepare_schedule(ticket, request, requester, selection)? {
+            SchedulePreparation::Replay(reply) => Ok(reply),
+            SchedulePreparation::Dispatch(mut reservation) => {
+                let (blobs, trees) = reservation.placement_inputs();
+                let reply = allocate(blobs, trees)?;
+                reservation.finish(reply)
+            }
+        }
+    }
+}
+
 #[test]
 fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     let dir = tempfile::tempdir()?;

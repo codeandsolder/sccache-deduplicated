@@ -4,6 +4,7 @@
 use std::{
     collections::BTreeMap,
     fs::File,
+    future::Future,
     io::{Read, Seek},
     sync::Arc,
     thread,
@@ -11,7 +12,7 @@ use std::{
 };
 
 use super::cluster_http::{
-    AdmissionClass, Listener, ListenerRole, Request, binary, path_route, routes,
+    AdmissionClass, Listener, ListenerRole, Request, async_route, binary, path_route, routes,
 };
 use anyhow::{Context, Result, ensure};
 use axum::{
@@ -29,8 +30,9 @@ use crate::{
     build_runtime::{
         ActionMode, ArchiveLength, BlobEncoding, BlobRef, Direction, ExecutionSpec,
         NativeContentPending, NativeInputRejected, NativeServiceBusy, NativeSessions, NativeStore,
-        NetworkMeter, PackageIdentity, PackageImportLimits, PackageSource, Peer, StagedBlob,
-        TreeId, TreeManifest, VerifiedPackage,
+        NetworkMeter, NetworkSnapshot, PackageCatalog, PackageIdentity, PackageImportLimits,
+        PackageSource, Peer, SchedulePreparation, ScheduleReservation, StagedBlob, TreeId,
+        TreeManifest, VerifiedPackage,
         wire::{BlobRecipient, BlobSource, BlobSourcePlan, Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
@@ -43,14 +45,6 @@ use crate::{
 };
 
 mod network;
-
-pub(super) type Allocator = dyn Fn(
-        crate::dist::NativeAssignment,
-        &crate::build_runtime::NetworkSnapshot,
-        std::sync::Arc<crate::build_runtime::PackageCatalog>,
-    ) -> Result<ScheduleReply>
-    + Send
-    + Sync;
 
 pub(super) type SourcePlanner<'a> = dyn Fn(BlobRef, BlobRecipient, Option<crate::dist::ServerId>) -> Result<Vec<BlobSource>>
     + Send
@@ -144,13 +138,9 @@ pub(super) struct PublicationCallbacks<S, O> {
     clippy::too_many_lines,
     reason = "native listener startup owns the shared session lifetime and starts its coordinated acquisition and maintenance workers"
 )]
-pub(super) fn spawn(
+pub(super) fn spawn<Fut>(
     config: &NativeCacheConfig,
-    allocate: impl Fn(
-        crate::dist::NativeAssignment,
-        &crate::build_runtime::NetworkSnapshot,
-        std::sync::Arc<crate::build_runtime::PackageCatalog>,
-    ) -> Result<ScheduleReply>
+    allocate: impl Fn(crate::dist::NativeAssignment, NetworkSnapshot, Arc<PackageCatalog>) -> Fut
     + Send
     + Sync
     + 'static,
@@ -176,7 +166,10 @@ pub(super) fn spawn(
     tls: Arc<ClusterListener>,
     enrollment: Arc<SchedulerEnrollment>,
     network: Arc<NetworkMeter>,
-) -> Result<(std::net::SocketAddr, Arc<NativeSessions>)> {
+) -> Result<(std::net::SocketAddr, Arc<NativeSessions>)>
+where
+    Fut: Future<Output = Result<ScheduleReply>> + Send + 'static,
+{
     let PublicationCallbacks {
         source_plan,
         observe_result,
@@ -250,27 +243,40 @@ pub(super) fn spawn(
         config.public_addr,
     )?;
     let retained_sessions = Arc::clone(&sessions);
+    let schedule_sessions = Arc::clone(&sessions);
+    let schedule_network = Arc::clone(&network);
+    let allocate = Arc::new(allocate);
     let server = Listener::from_socket(
         socket,
         tls,
         ListenerRole::Scheduler(enrollment),
         config.http_threads,
-        native_router(move |request, role, operation| {
-            respond(
-                request,
-                role,
-                operation,
-                NativeServices {
-                    sessions: &sessions,
-                    packages: packages.as_ref(),
-                    network: &network,
-                    source_plan: &source_plan,
-                    observe_result: &observe_result,
-                },
-                &allocate,
-                metadata_limit,
-            )
-        }),
+        native_router(
+            move |request, role, operation| {
+                respond(
+                    request,
+                    role,
+                    operation,
+                    NativeServices {
+                        sessions: &sessions,
+                        packages: packages.as_ref(),
+                        network: &network,
+                        source_plan: &source_plan,
+                        observe_result: &observe_result,
+                    },
+                    metadata_limit,
+                )
+            },
+            move |request| {
+                schedule_response(
+                    request,
+                    Arc::clone(&schedule_sessions),
+                    Arc::clone(&schedule_network),
+                    Arc::clone(&allocate),
+                    metadata_limit,
+                )
+            },
+        ),
     )?;
     info!("Native cache listening on {bound}");
     thread::Builder::new()
@@ -309,7 +315,6 @@ fn native_admission_class((_, operation): &(String, String)) -> AdmissionClass {
     match operation.as_str() {
         "renew" | "fail" | "retain_renew" | "retain_close" | "close" | "inputs_staged"
         | "input_unavailable" => AdmissionClass::Control,
-        "schedule" => AdmissionClass::Dispatch,
         "admit" | "status" | "poll_input" | "verify" | "input_prefetch" | "retain_open"
         | "retain_add" | "blob_sources" | "retain_sources" | "tree_offer" | "tree_commit"
         | "tree_open" | "package_plan" | "begin" | "commit" => AdmissionClass::Metadata,
@@ -317,21 +322,32 @@ fn native_admission_class((_, operation): &(String, String)) -> AdmissionClass {
     }
 }
 
-fn native_router<F>(handler: F) -> Router
+fn native_router<F, A, Fut>(handler: F, schedule: A) -> Router
 where
     F: Fn(&Request, &str, &str) -> Response + Send + Sync + 'static,
+    A: Fn(Request) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Response> + Send + 'static,
 {
     routes(
-        Router::new().route(
-            "/api/v5/native/{role}/{operation}",
-            path_route(
-                MethodFilter::POST,
-                native_admission_class,
-                |handler: &F, request, (role, operation): (String, String)| {
-                    handler(request, &role, &operation)
-                },
+        Router::new()
+            .route(
+                "/api/v5/native/client/schedule",
+                async_route(
+                    MethodFilter::POST,
+                    AdmissionClass::Dispatch,
+                    move |_: Arc<F>, request| schedule(request),
+                ),
+            )
+            .route(
+                "/api/v5/native/{role}/{operation}",
+                path_route(
+                    MethodFilter::POST,
+                    native_admission_class,
+                    |handler: &F, request, (role, operation): (String, String)| {
+                        handler(request, &role, &operation)
+                    },
+                ),
             ),
-        ),
         handler,
     )
 }
@@ -474,7 +490,6 @@ fn respond(
     role: &str,
     operation: &str,
     services: NativeServices<'_>,
-    allocate: &Allocator,
     limit: usize,
 ) -> Response {
     if request.header("Content-Type") != Some("application/octet-stream") {
@@ -502,7 +517,117 @@ fn respond(
         }
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    match dispatch(request, services, allocate, publisher, operation, limit) {
+    native_response(
+        operation,
+        dispatch(request, services, publisher, operation, limit),
+    )
+}
+
+// Prepare immutable placement inputs on the blocking pool; the worker RPC
+// itself is a future and holds neither a session lock nor a blocking thread.
+async fn schedule_response<A, Fut>(
+    mut request: Request,
+    sessions: Arc<NativeSessions>,
+    network: Arc<NetworkMeter>,
+    allocate: Arc<A>,
+    limit: usize,
+) -> Response
+where
+    A: Fn(crate::dist::NativeAssignment, NetworkSnapshot, Arc<PackageCatalog>) -> Fut
+        + Send
+        + Sync
+        + 'static,
+    Fut: Future<Output = Result<ScheduleReply>> + Send,
+{
+    if request.header("Content-Type") != Some("application/octet-stream") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Some(response) = role_error(&request, Role::Client) {
+        return response;
+    }
+    let requester = request.id();
+    let result = async {
+        let bytes = request
+            .read_bounded(limit)
+            .await
+            .map_err(|error| anyhow::anyhow!("native schedule body: {error:?}"))?;
+        let prepared = tokio::task::spawn_blocking(move || {
+            let schedule: ScheduleRequest = codec().with_limit(limit as u64).deserialize(&bytes)?;
+            prepare_schedule(&sessions, &network, requester, schedule)
+        })
+        .await??;
+        let reply = match prepared {
+            Ok((reservation, assignment, snapshot, packages)) => {
+                let reply = allocate(assignment, snapshot, packages).await?;
+                reservation.finish(reply)?
+            }
+            Err(replay) => replay,
+        };
+        encode(&reply, limit)
+    }
+    .await;
+    native_response("schedule", result)
+}
+
+type PreparedSchedule = (
+    ScheduleReservation,
+    crate::dist::NativeAssignment,
+    NetworkSnapshot,
+    Arc<PackageCatalog>,
+);
+
+fn prepare_schedule(
+    sessions: &NativeSessions,
+    network: &NetworkMeter,
+    requester: crate::dist::ServerId,
+    schedule: ScheduleRequest,
+) -> Result<std::result::Result<PreparedSchedule, ScheduleReply>> {
+    let ScheduleRequest {
+        ticket,
+        spec,
+        receiver,
+        selected,
+    } = schedule;
+    ensure!(receiver.valid(), "invalid client delivery telemetry");
+    let request = spec.action_request()?;
+    let selection = crate::build_runtime::wire::DeliverySelection::new(&spec, selected)?;
+    let profile = selection.profile;
+    let mut reservation = match sessions.prepare_schedule(ticket, &request, requester, selection)? {
+        SchedulePreparation::Replay(reply) => return Ok(Err(reply)),
+        SchedulePreparation::Dispatch(reservation) => reservation,
+    };
+    let (inputs, trees) = reservation.placement_inputs();
+    let blobs = inputs
+        .iter()
+        .map(|(&id, &size)| BlobRef { id, size })
+        .collect::<Vec<_>>();
+    let mut packages = sessions
+        .store()
+        .package_catalog(&blobs)
+        .unwrap_or_else(|error| {
+            warn!("Native package placement catalog unavailable: {error:#}");
+            PackageCatalog::default()
+        });
+    packages.restrict_to_trees(trees);
+    let mut snapshot = network.snapshot();
+    snapshot.interfaces = crate::dist::cluster::interface_report();
+    Ok(Ok((
+        reservation,
+        crate::dist::NativeAssignment {
+            ticket,
+            spec,
+            input_blobs: inputs,
+            estimated_result_bytes: None,
+            receiver: Some((requester, receiver)),
+            delivery_profile: Some(profile),
+        },
+        snapshot,
+        Arc::new(packages),
+    )))
+}
+
+fn native_response(operation: &str, result: Result<Response>) -> Response {
+    match result {
         Ok(response) => response,
         Err(error) if error.is::<NativeContentPending>() => {
             (StatusCode::ACCEPTED, "native input pending").into_response()
@@ -531,7 +656,6 @@ fn respond(
 fn dispatch(
     request: &Request,
     services: NativeServices<'_>,
-    allocate: &Allocator,
     publisher: Publisher,
     operation: &str,
     limit: usize,
@@ -680,59 +804,6 @@ fn dispatch(
             let reader = network.meter(Direction::Receive, peer, body, header.blob.size, None);
             sessions.backfill_input(header.ticket, header.blob, reader)?;
             encode(&(), limit)
-        }
-        "schedule" if publisher == Publisher::Client => {
-            let ScheduleRequest {
-                ticket,
-                spec,
-                receiver,
-                selected,
-            } = metadata(request, limit)?;
-            ensure!(receiver.valid(), "invalid client delivery telemetry");
-            let requester_id = request.id();
-            let request = spec.action_request()?;
-            let selection = crate::build_runtime::wire::DeliverySelection::new(&spec, selected)?;
-            let profile = selection.profile;
-            encode(
-                &sessions.schedule(
-                    ticket,
-                    &request,
-                    requester_id,
-                    selection,
-                    |inputs, trees| {
-                        let blobs = inputs
-                            .iter()
-                            .map(|(&id, &size)| BlobRef { id, size })
-                            .collect::<Vec<_>>();
-                        let mut packages =
-                            sessions
-                                .store()
-                                .package_catalog(&blobs)
-                                .unwrap_or_else(|error| {
-                                    warn!(
-                                        "Native package placement catalog unavailable: {error:#}"
-                                    );
-                                    crate::build_runtime::PackageCatalog::default()
-                                });
-                        packages.restrict_to_trees(trees);
-                        let mut snapshot = network.snapshot();
-                        snapshot.interfaces = crate::dist::cluster::interface_report();
-                        allocate(
-                            crate::dist::NativeAssignment {
-                                ticket,
-                                spec,
-                                input_blobs: inputs,
-                                estimated_result_bytes: None,
-                                receiver: Some((requester_id, receiver)),
-                                delivery_profile: Some(profile),
-                            },
-                            &snapshot,
-                            std::sync::Arc::new(packages),
-                        )
-                    },
-                )?,
-                limit,
-            )
         }
         "status" if publisher == Publisher::Client => {
             let StatusRequest { ticket, preview } = metadata(request, limit)?;

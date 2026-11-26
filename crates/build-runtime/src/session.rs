@@ -480,6 +480,70 @@ impl Drop for AllocationClaim {
     }
 }
 
+/// A replayed allocation or the exclusive right to dispatch a new action.
+pub enum SchedulePreparation {
+    Replay(ScheduleReply),
+    Dispatch(ScheduleReservation),
+}
+
+/// Owns a scheduling intent across asynchronous remote assignment.
+/// Dropping the reservation releases the intent without changing publisher.
+pub struct ScheduleReservation {
+    claim: AllocationClaim,
+    blobs: BTreeMap<ContentId, u64>,
+    trees: Vec<Arc<InputManifest>>,
+    allocation_started: Instant,
+    idle_timeout: Duration,
+}
+
+impl ScheduleReservation {
+    /// Move the deduplicated input closure into placement, and borrow the
+    /// immutable per-tree closures for the package catalog.
+    #[must_use = "placement must use the admitted input closure"]
+    pub fn placement_inputs(
+        &mut self,
+    ) -> (BTreeMap<ContentId, u64>, Vec<&BTreeMap<ContentId, u64>>) {
+        (
+            std::mem::take(&mut self.blobs),
+            self.trees.iter().map(|tree| &tree.blobs).collect(),
+        )
+    }
+
+    /// Install the delegated publisher after the worker acknowledges.
+    ///
+    /// # Errors
+    /// Returns an error if the client cancelled the allocation or state is poisoned.
+    pub fn finish(self, reply: ScheduleReply) -> Result<ScheduleReply> {
+        let mut state = NativeSessions::lock(&self.claim.session)?;
+        ensure!(
+            state
+                .allocating
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.claim.intent))
+                && matches!(state.phase, Phase::Pending(_)),
+            "native allocation cancelled before acknowledgement"
+        );
+        state.allocating = None;
+        if let ScheduleReply::Assigned(allocation) = &reply {
+            state.allocation = Some(DelegatedAllocation {
+                declaration: self.claim.intent.declaration,
+                worker: allocation.clone(),
+                requester: self.claim.intent.requester,
+                selection: self.claim.intent.selection.clone(),
+                allocation_started: self.allocation_started,
+                delivery_reported: false,
+            });
+            state.publisher = Publisher::Worker {
+                peer: allocation.peer,
+                job: allocation.job,
+            };
+        }
+        state.expires = Instant::now() + self.idle_timeout;
+        drop(state);
+        Ok(reply)
+    }
+}
+
 /// Owns short-lived compile, upload and download capabilities.
 ///
 /// Filesystem and database operations happen outside the session map lock.
@@ -885,24 +949,20 @@ impl NativeSessions {
     /// # Errors
     /// Returns an error if the declaration differs, the ticket is not pending,
     /// or allocation fails.
-    pub fn schedule(
+    pub fn prepare_schedule(
         &self,
         ticket: Ticket,
         request: &ActionRequest,
         requester: crate::PeerId,
         selection: DeliverySelection,
-        allocate: impl FnOnce(
-            BTreeMap<ContentId, u64>,
-            Vec<&BTreeMap<ContentId, u64>>,
-        ) -> Result<ScheduleReply>,
-    ) -> Result<ScheduleReply> {
+    ) -> Result<SchedulePreparation> {
+        let declaration =
+            crate::identity::typed_digest(b"sccache-native-allocation-declaration-v1\0", request)?;
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         if !matches!(state.phase, Phase::Publishing(_)) {
             self.touch(&mut state)?;
         }
-        let declaration =
-            crate::identity::typed_digest(b"sccache-native-allocation-declaration-v1\0", request)?;
         // Assignment starts independently of the response reaching the
         // origin. Replay survives execution, publication and failure.
         if let Some(allocation) = &state.allocation {
@@ -912,7 +972,9 @@ impl NativeSessions {
                     && allocation.selection == selection,
                 "allocation declaration differs from admission"
             );
-            return Ok(ScheduleReply::Assigned(allocation.worker.clone()));
+            return Ok(SchedulePreparation::Replay(ScheduleReply::Assigned(
+                allocation.worker.clone(),
+            )));
         }
         if let Some(intent) = &state.allocating {
             ensure!(
@@ -952,7 +1014,7 @@ impl NativeSessions {
             .map(|id| {
                 inputs
                     .get(id)
-                    .map(|tree| &tree.blobs)
+                    .cloned()
                     .context("missing admitted input manifest")
             })
             .collect::<Result<Vec<_>>>()?;
@@ -978,35 +1040,13 @@ impl NativeSessions {
                 );
             }
         }
-        let allocation_started = Instant::now();
-        let reply = allocate(blobs, trees)?;
-        let mut state = Self::lock(&session)?;
-        ensure!(
-            state
-                .allocating
-                .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, &claim.intent))
-                && matches!(state.phase, Phase::Pending(_)),
-            "native allocation cancelled before acknowledgement"
-        );
-        state.allocating = None;
-        if let ScheduleReply::Assigned(allocation) = &reply {
-            state.allocation = Some(DelegatedAllocation {
-                declaration,
-                worker: allocation.clone(),
-                requester,
-                selection: claim.intent.selection.clone(),
-                allocation_started,
-                delivery_reported: false,
-            });
-            state.publisher = Publisher::Worker {
-                peer: allocation.peer,
-                job: allocation.job,
-            };
-        }
-        state.expires = self.deadline();
-        drop(state);
-        Ok(reply)
+        Ok(SchedulePreparation::Dispatch(ScheduleReservation {
+            claim,
+            blobs,
+            trees,
+            allocation_started: Instant::now(),
+            idle_timeout: self.limits.idle_timeout,
+        }))
     }
 
     /// Verify that the executing worker received the admitted declaration.

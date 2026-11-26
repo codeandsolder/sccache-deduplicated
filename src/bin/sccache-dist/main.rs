@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque, btree_map};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 #[cfg_attr(target_os = "freebsd", path = "build_freebsd.rs")]
@@ -1232,6 +1232,28 @@ struct Reservation {
     estimated_result_bytes: Option<u64>,
 }
 
+// An assignment owns capacity from reservation until publication. Dropping an
+// unfinished RPC (including a cancelled spawn_blocking result) releases it.
+struct AssignmentGuard {
+    scheduler: Arc<Scheduler>,
+    server_id: ServerId,
+    job_id: JobId,
+}
+
+impl Drop for AssignmentGuard {
+    fn drop(&mut self) {
+        if let Ok(mut servers) = self.scheduler.servers.lock()
+            && let Some(entry) = servers.get_mut(&self.server_id)
+            && entry.jobs_assigning.remove(&self.job_id).is_some()
+        {
+            entry.jobs_assigned.remove(&self.job_id);
+            entry.last_error = Some(Instant::now());
+        }
+        #[cfg(feature = "scheduler-dashboard")]
+        self.scheduler.dashboard_changed();
+    }
+}
+
 struct NoCapacity(usize);
 
 struct CandidateSet {
@@ -1467,34 +1489,49 @@ impl Scheduler {
 }
 
 impl Scheduler {
-    fn allocate_job(
-        &self,
+    async fn allocate_job(
+        self: Arc<Self>,
         requester: &dyn SchedulerOutgoing,
         mut assignment: JobAssignment,
         network: &NetworkSnapshot,
-        packages: &std::sync::Arc<sccache::build_runtime::PackageCatalog>,
+        packages: &Arc<sccache::build_runtime::PackageCatalog>,
     ) -> Result<AllocJobResult> {
-        #[cfg(feature = "scheduler-dashboard")]
-        let _dashboard_change = DashboardChange(self);
-        if self.is_draining() {
-            return Ok(AllocJobResult::Fail {
-                msg: "scheduler is draining for maintenance".to_owned(),
-            });
-        }
-        let assigned_at = Instant::now();
-        let reservation = match self.reserve_job(&assignment, network, packages, assigned_at)? {
-            Ok(reservation) => reservation,
-            Err(NoCapacity(count)) => {
-                return Ok(AllocJobResult::Fail {
-                    msg: format!("Insufficient capacity across {count} available servers"),
-                });
+        let scheduler = Arc::clone(&self);
+        let network = network.clone();
+        let packages = Arc::clone(packages);
+        let prepared = tokio::task::spawn_blocking(move || -> Result<_> {
+            if scheduler.is_draining() {
+                return Ok(Err(AllocJobResult::Fail {
+                    msg: "scheduler is draining for maintenance".to_owned(),
+                }));
             }
+            let assigned_at = Instant::now();
+            let reservation =
+                match scheduler.reserve_job(&assignment, &network, &packages, assigned_at)? {
+                    Ok(reservation) => reservation,
+                    Err(NoCapacity(count)) => {
+                        return Ok(Err(AllocJobResult::Fail {
+                            msg: format!("Insufficient capacity across {count} available servers"),
+                        }));
+                    }
+                };
+            let guard = AssignmentGuard {
+                scheduler: Arc::clone(&scheduler),
+                server_id: reservation.server_id,
+                job_id: reservation.job_id,
+            };
+            #[cfg(feature = "scheduler-dashboard")]
+            scheduler.dashboard_changed();
+            if let JobAssignment::Native(native) = &mut assignment {
+                native.estimated_result_bytes = reservation.estimated_result_bytes;
+            }
+            Ok(Ok((assignment, reservation, guard, assigned_at)))
+        })
+        .await??;
+        let (assignment, reservation, _guard, assigned_at) = match prepared {
+            Ok(prepared) => prepared,
+            Err(response) => return Ok(response),
         };
-        #[cfg(feature = "scheduler-dashboard")]
-        self.dashboard_changed();
-        if let JobAssignment::Native(native) = &mut assignment {
-            native.estimated_result_bytes = reservation.estimated_result_bytes;
-        }
         let result = requester
             .do_assign_job(
                 reservation.server_id,
@@ -1502,23 +1539,8 @@ impl Scheduler {
                 assignment,
                 reservation.auth.clone(),
             )
-            .with_context(|| {
-                // LOCKS
-                let Ok(mut servers) = self.servers.lock() else {
-                    return "assign job failed and server state mutex is poisoned";
-                };
-                if let Some(entry) = servers.get_mut(&reservation.server_id) {
-                    entry.last_error = Some(Instant::now());
-                    entry.jobs_assigning.remove(&reservation.job_id);
-                    if entry.jobs_assigned.remove(&reservation.job_id).is_none() {
-                        "assign job failed and job not known to the server"
-                    } else {
-                        "assign job failed, job un-assigned from the server"
-                    }
-                } else {
-                    "assign job failed and server not known"
-                }
-            })?;
+            .await
+            .context("assign job failed")?;
         self.complete_reservation(reservation, &result, assigned_at)
     }
 
@@ -1792,9 +1814,10 @@ fn validate_heartbeat(
     Ok(())
 }
 
+#[async_trait::async_trait]
 impl SchedulerIncoming for Scheduler {
-    fn handle_alloc_job(
-        &self,
+    async fn handle_alloc_job(
+        self: Arc<Self>,
         requester: &dyn SchedulerOutgoing,
         tc: Toolchain,
     ) -> Result<AllocJobResult> {
@@ -1804,10 +1827,11 @@ impl SchedulerIncoming for Scheduler {
             &NetworkSnapshot::default(),
             &std::sync::Arc::default(),
         )
+        .await
     }
 
-    fn handle_alloc_native_job(
-        &self,
+    async fn handle_alloc_native_job(
+        self: Arc<Self>,
         requester: &dyn SchedulerOutgoing,
         assignment: NativeAssignment,
         network: &NetworkSnapshot,
@@ -1835,6 +1859,7 @@ impl SchedulerIncoming for Scheduler {
             network,
             &packages,
         )
+        .await
     }
 
     fn observe_native_lifecycle(
@@ -2889,8 +2914,9 @@ mod scheduler_tests {
 
     struct AcceptAssign;
 
+    #[async_trait::async_trait]
     impl SchedulerOutgoing for AcceptAssign {
-        fn do_assign_job(
+        async fn do_assign_job(
             &self,
             _server_id: ServerId,
             _job_id: JobId,
@@ -3103,10 +3129,10 @@ mod scheduler_tests {
         })
     }
 
-    #[test]
-    fn native_staged_closure_survives_stale_heartbeat_and_failed_compilation() -> Result<()> {
+    #[tokio::test]
+    async fn native_staged_closure_survives_stale_heartbeat_and_failed_compilation() -> Result<()> {
         use sccache::build_runtime::{BlobRef, ContentId, wire::NativeJobPhase};
-        let scheduler = Scheduler::new();
+        let scheduler = Arc::new(Scheduler::new());
         let worker: ServerId = ServerId::from_digest([1; 32]);
         let peer: ServerId = ServerId::from_digest([2; 32]);
         let platform = ContentId::of(b"native-staging-test");
@@ -3131,12 +3157,14 @@ mod scheduler_tests {
             id: ContentId::of(b"input"),
             size: 512 << 20,
         };
-        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
-            &AcceptAssign,
-            native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
-            &NetworkSnapshot::default(),
-            Default::default(),
-        )?
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
+            .handle_alloc_native_job(
+                &AcceptAssign,
+                native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
+                &NetworkSnapshot::default(),
+                Default::default(),
+            )
+            .await?
         else {
             bail!("worker unavailable");
         };
@@ -3253,13 +3281,13 @@ mod scheduler_tests {
         Ok(())
     }
 
-    #[test]
-    fn native_completed_timing_supersedes_heartbeat_until_worker_restart() -> Result<()> {
+    #[tokio::test]
+    async fn native_completed_timing_supersedes_heartbeat_until_worker_restart() -> Result<()> {
         use sccache::build_runtime::{
             ContentId, ResultManifest,
             wire::{ActionObservation, WorkerTiming},
         };
-        let scheduler = Scheduler::new();
+        let scheduler = Arc::new(Scheduler::new());
         let worker: ServerId = ServerId::from_digest([1; 32]);
         let platform = ContentId::of(b"timing-platform");
         let nonce = ServerNonce::new();
@@ -3279,12 +3307,14 @@ mod scheduler_tests {
             )
         };
         heartbeat(nonce.clone(), capabilities.clone(), &[])?;
-        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
-            &AcceptAssign,
-            native_test_assignment(platform, BTreeMap::new())?,
-            &NetworkSnapshot::default(),
-            Default::default(),
-        )?
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
+            .handle_alloc_native_job(
+                &AcceptAssign,
+                native_test_assignment(platform, BTreeMap::new())?,
+                &NetworkSnapshot::default(),
+                Default::default(),
+            )
+            .await?
         else {
             bail!("worker unavailable");
         };
@@ -3347,10 +3377,10 @@ mod scheduler_tests {
         Ok(())
     }
 
-    #[test]
-    fn native_producer_receipt_places_consumer_before_next_heartbeat() -> Result<()> {
+    #[tokio::test]
+    async fn native_producer_receipt_places_consumer_before_next_heartbeat() -> Result<()> {
         use sccache::build_runtime::{Artifact, BlobRef, ContentId, ResultManifest};
-        let scheduler = Scheduler::new();
+        let scheduler = Arc::new(Scheduler::new());
         let producer: ServerId = ServerId::from_digest([1; 32]);
         let other: ServerId = ServerId::from_digest([2; 32]);
         let platform = ContentId::of(b"test");
@@ -3376,12 +3406,14 @@ mod scheduler_tests {
         };
         register(producer, 2_000_000_000)?;
         let network = NetworkSnapshot::default();
-        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
-            &AcceptAssign,
-            native_test_assignment(platform, BTreeMap::new())?,
-            &network,
-            Default::default(),
-        )?
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
+            .handle_alloc_native_job(
+                &AcceptAssign,
+                native_test_assignment(platform, BTreeMap::new())?,
+                &network,
+                Default::default(),
+            )
+            .await?
         else {
             bail!("producer not allocated")
         };
@@ -3438,12 +3470,14 @@ mod scheduler_tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].server, producer);
         scheduler.handle_update_job_state(job, producer, JobState::Complete)?;
-        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
-            &AcceptAssign,
-            native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
-            &network,
-            Default::default(),
-        )?
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
+            .handle_alloc_native_job(
+                &AcceptAssign,
+                native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
+                &network,
+                Default::default(),
+            )
+            .await?
         else {
             bail!("consumer not allocated")
         };
@@ -3464,12 +3498,14 @@ mod scheduler_tests {
                 )?
                 .is_empty()
         );
-        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
-            &AcceptAssign,
-            native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
-            &network,
-            Default::default(),
-        )?
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
+            .handle_alloc_native_job(
+                &AcceptAssign,
+                native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
+                &network,
+                Default::default(),
+            )
+            .await?
         else {
             bail!("consumer not allocated after restart")
         };
@@ -3477,13 +3513,13 @@ mod scheduler_tests {
         Ok(())
     }
 
-    #[test]
-    fn native_jobs_select_compatible_workers_using_shared_capacity() -> Result<()> {
+    #[tokio::test]
+    async fn native_jobs_select_compatible_workers_using_shared_capacity() -> Result<()> {
         use sccache::build_runtime::ContentId;
-        let scheduler = Scheduler::new_with_job_slack(JobSlackConfig {
+        let scheduler = Arc::new(Scheduler::new_with_job_slack(JobSlackConfig {
             static_jobs: 0,
             percent: 0.0,
-        });
+        }));
         let a: ServerId = ServerId::from_digest([1; 32]);
         let b: ServerId = ServerId::from_digest([2; 32]);
         let nonce_a = ServerNonce::new();
@@ -3515,12 +3551,14 @@ mod scheduler_tests {
         )?;
         let assignment =
             native_test_assignment(platform, BTreeMap::from([(ContentId([1; 32]), 10)]))?;
-        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
-            &AcceptAssign,
-            assignment.clone(),
-            &NetworkSnapshot::default(),
-            Default::default(),
-        )?
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
+            .handle_alloc_native_job(
+                &AcceptAssign,
+                assignment.clone(),
+                &NetworkSnapshot::default(),
+                Default::default(),
+            )
+            .await?
         else {
             bail!("compatible worker unavailable");
         };
@@ -3532,16 +3570,19 @@ mod scheduler_tests {
             Some(&BTreeMap::from([(ContentId([1; 32]), 10)]))
         );
         assert!(matches!(
-            scheduler.handle_alloc_native_job(
-                &AcceptAssign,
-                assignment,
-                &NetworkSnapshot::default(),
-                Default::default(),
-            )?,
+            Arc::clone(&scheduler)
+                .handle_alloc_native_job(
+                    &AcceptAssign,
+                    assignment,
+                    &NetworkSnapshot::default(),
+                    Default::default(),
+                )
+                .await?,
             AllocJobResult::Fail { .. }
         ));
-        let AllocJobResult::Success { job_alloc, .. } =
-            scheduler.handle_alloc_job(&AcceptAssign, test_toolchain('a'))?
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
+            .handle_alloc_job(&AcceptAssign, test_toolchain('a'))
+            .await?
         else {
             bail!("archive worker unavailable");
         };
@@ -3549,12 +3590,12 @@ mod scheduler_tests {
         Ok(())
     }
 
-    #[test]
-    fn scheduler_status_tracks_per_worker_admission_and_capacity_changes() {
-        let scheduler = Scheduler::new_with_job_slack(JobSlackConfig {
+    #[tokio::test]
+    async fn scheduler_status_tracks_per_worker_admission_and_capacity_changes() {
+        let scheduler = Arc::new(Scheduler::new_with_job_slack(JobSlackConfig {
             static_jobs: 0,
             percent: 200.0,
-        });
+        }));
         let ids: [ServerId; 3] = [
             ServerId::from_digest([1; 32]),
             ServerId::from_digest([2; 32]),
@@ -3589,15 +3630,17 @@ mod scheduler_tests {
         }
         for _ in 0..13 {
             assert!(matches!(
-                scheduler
+                Arc::clone(&scheduler)
                     .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+                    .await
                     .unwrap(),
                 AllocJobResult::Success { .. }
             ));
         }
         assert!(matches!(
-            scheduler
+            Arc::clone(&scheduler)
                 .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+                .await
                 .unwrap(),
             AllocJobResult::Fail { .. }
         ));
@@ -3637,8 +3680,9 @@ mod scheduler_tests {
 
     struct StatusDuringAssign<'a>(&'a Scheduler);
 
+    #[async_trait::async_trait]
     impl SchedulerOutgoing for StatusDuringAssign<'_> {
-        fn do_assign_job(
+        async fn do_assign_job(
             &self,
             _server_id: ServerId,
             job_id: JobId,
@@ -3671,8 +3715,9 @@ mod scheduler_tests {
         nonce: ServerNonce,
     }
 
+    #[async_trait::async_trait]
     impl SchedulerOutgoing for SnapshotDuringAssign<'_> {
-        fn do_assign_job(
+        async fn do_assign_job(
             &self,
             server_id: ServerId,
             job_id: JobId,
@@ -3695,19 +3740,21 @@ mod scheduler_tests {
         }
     }
 
-    #[test]
-    fn heartbeat_reports_inflight_and_accepted_assignments() -> Result<()> {
-        let scheduler = Scheduler::new();
+    #[tokio::test]
+    async fn heartbeat_reports_inflight_and_accepted_assignments() -> Result<()> {
+        let scheduler = Arc::new(Scheduler::new());
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
-        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_job(
-            &SnapshotDuringAssign {
-                scheduler: &scheduler,
-                nonce: nonce.clone(),
-            },
-            test_toolchain('c'),
-        )?
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
+            .handle_alloc_job(
+                &SnapshotDuringAssign {
+                    scheduler: &scheduler,
+                    nonce: nonce.clone(),
+                },
+                test_toolchain('c'),
+            )
+            .await?
         else {
             panic!("expected job allocation");
         };
@@ -3735,13 +3782,14 @@ mod scheduler_tests {
         Ok(())
     }
 
-    #[test]
-    fn status_counts_assignment_rpc_reservations() {
-        let scheduler = Scheduler::new();
+    #[tokio::test]
+    async fn status_counts_assignment_rpc_reservations() {
+        let scheduler = Arc::new(Scheduler::new());
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         register_test_server(&scheduler, server_id, ServerNonce::new());
-        let AllocJobResult::Success { job_alloc, .. } = scheduler
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
             .handle_alloc_job(&StatusDuringAssign(&scheduler), test_toolchain('c'))
+            .await
             .unwrap()
         else {
             panic!("worker should accept job");
@@ -3755,9 +3803,49 @@ mod scheduler_tests {
         assert_eq!(scheduler.handle_status().unwrap().in_progress, 0);
     }
 
-    #[test]
-    fn idle_workers_receive_jobs_proportional_to_cpu_capacity() {
-        let scheduler = Scheduler::new();
+    struct StalledAssign(tokio::sync::Notify);
+
+    #[async_trait::async_trait]
+    impl SchedulerOutgoing for StalledAssign {
+        async fn do_assign_job(
+            &self,
+            _server_id: ServerId,
+            _job_id: JobId,
+            _assignment: JobAssignment,
+            _auth: String,
+        ) -> Result<AssignJobResult> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_assignment_releases_reserved_capacity() -> Result<()> {
+        let scheduler = Arc::new(Scheduler::new());
+        let worker = ServerId::from_digest([1; 32]);
+        register_test_server(&scheduler, worker, ServerNonce::new());
+        let requester = Arc::new(StalledAssign(tokio::sync::Notify::new()));
+        let task = tokio::spawn({
+            let scheduler = Arc::clone(&scheduler);
+            let requester = Arc::clone(&requester);
+            async move {
+                scheduler
+                    .handle_alloc_job(requester.as_ref(), test_toolchain('x'))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), requester.0.notified()).await?;
+        assert_eq!(scheduler.handle_status()?.in_progress, 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_no_assigned_jobs(&scheduler, &worker);
+        assert_eq!(scheduler.handle_status()?.in_progress, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idle_workers_receive_jobs_proportional_to_cpu_capacity() {
+        let scheduler = Arc::new(Scheduler::new());
         let ids: Vec<ServerId> = [1, 2, 3]
             .into_iter()
             .map(|i| ServerId::from_digest([i; 32]))
@@ -3778,8 +3866,9 @@ mod scheduler_tests {
 
         let mut observed = Vec::new();
         for _ in 0..1024 {
-            let result = scheduler
+            let result = Arc::clone(&scheduler)
                 .handle_alloc_job(&AcceptAssign, test_toolchain('b'))
+                .await
                 .unwrap();
             let AllocJobResult::Success { job_alloc, .. } = result else {
                 panic!("eligible idle workers must accept a job");
@@ -3810,28 +3899,32 @@ mod scheduler_tests {
         );
     }
 
-    #[test]
-    fn maintenance_drain_refuses_new_allocations_without_creating_job_state() {
+    #[tokio::test]
+    async fn maintenance_drain_refuses_new_allocations_without_creating_job_state() {
         let dir = tempfile::tempdir().unwrap();
         let drain = dir.path().join("scheduler-drain");
-        let scheduler =
-            Scheduler::new_with_job_slack_and_drain(JobSlackConfig::default(), Some(drain.clone()));
+        let scheduler = Arc::new(Scheduler::new_with_job_slack_and_drain(
+            JobSlackConfig::default(),
+            Some(drain.clone()),
+        ));
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         register_test_server(&scheduler, server_id, ServerNonce::new());
 
         std::fs::write(&drain, b"drain").unwrap();
         assert!(scheduler.handle_is_draining());
         assert_eq!(scheduler.handle_status().unwrap().available_jobs, 0);
-        let allocation = scheduler
+        let allocation = Arc::clone(&scheduler)
             .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+            .await
             .unwrap();
         assert!(matches!(allocation, AllocJobResult::Fail { .. }));
         assert_no_assigned_jobs(&scheduler, &server_id);
 
         std::fs::remove_file(&drain).unwrap();
         assert!(!scheduler.handle_is_draining());
-        let allocation = scheduler
+        let allocation = Arc::clone(&scheduler)
             .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+            .await
             .unwrap();
         assert!(matches!(allocation, AllocJobResult::Success { .. }));
     }
@@ -3855,8 +3948,9 @@ mod scheduler_tests {
         server_nonce: ServerNonce,
     }
 
+    #[async_trait::async_trait]
     impl SchedulerOutgoing for ReapDuringAssign<'_> {
-        fn do_assign_job(
+        async fn do_assign_job(
             &self,
             server_id: ServerId,
             job_id: JobId,
@@ -3890,15 +3984,16 @@ mod scheduler_tests {
         }
     }
 
-    #[test]
-    fn ready_transition_starts_its_own_unclaimed_timeout() {
-        let scheduler = Scheduler::new();
+    #[tokio::test]
+    async fn ready_transition_starts_its_own_unclaimed_timeout() {
+        let scheduler = Arc::new(Scheduler::new());
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
 
-        let AllocJobResult::Success { job_alloc, .. } = scheduler
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
             .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+            .await
             .unwrap()
         else {
             panic!("worker should accept job");
@@ -3947,14 +4042,15 @@ mod scheduler_tests {
         assert_no_assigned_jobs(&scheduler, &server_id);
     }
 
-    #[test]
-    fn progressing_pending_upload_renews_lease_but_inactive_upload_expires() -> Result<()> {
-        let scheduler = Scheduler::new();
+    #[tokio::test]
+    async fn progressing_pending_upload_renews_lease_but_inactive_upload_expires() -> Result<()> {
+        let scheduler = Arc::new(Scheduler::new());
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
-        let AllocJobResult::Success { job_alloc, .. } =
-            scheduler.handle_alloc_job(&AcceptAssign, test_toolchain('c'))?
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
+            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+            .await?
         else {
             bail!("worker should accept job");
         };
@@ -4002,15 +4098,16 @@ mod scheduler_tests {
         Ok(())
     }
 
-    #[test]
-    fn pending_jobs_expire_but_started_jobs_remain_owned_by_execution() {
-        let scheduler = Scheduler::new();
+    #[tokio::test]
+    async fn pending_jobs_expire_but_started_jobs_remain_owned_by_execution() {
+        let scheduler = Arc::new(Scheduler::new());
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
 
-        let AllocJobResult::Success { job_alloc, .. } = scheduler
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
             .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+            .await
             .unwrap()
         else {
             panic!("worker should accept job");
@@ -4033,8 +4130,9 @@ mod scheduler_tests {
             .unwrap();
         assert_no_assigned_jobs(&scheduler, &server_id);
 
-        let AllocJobResult::Success { job_alloc, .. } = scheduler
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
             .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+            .await
             .unwrap()
         else {
             panic!("worker should accept another job");
@@ -4105,9 +4203,9 @@ mod scheduler_tests {
         }
     }
 
-    #[test]
-    fn failed_token_generation_never_reserves_capacity() {
-        let scheduler = Scheduler::new();
+    #[tokio::test]
+    async fn failed_token_generation_never_reserves_capacity() {
+        let scheduler = Arc::new(Scheduler::new());
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         scheduler
             .handle_heartbeat_server(
@@ -4120,20 +4218,22 @@ mod scheduler_tests {
             )
             .unwrap();
         assert!(
-            scheduler
+            Arc::clone(&scheduler)
                 .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+                .await
                 .is_err()
         );
         assert_no_assigned_jobs(&scheduler, &server_id);
     }
 
-    #[test]
-    fn completion_without_assignment_does_not_discard_job() {
-        let scheduler = Scheduler::new();
+    #[tokio::test]
+    async fn completion_without_assignment_does_not_discard_job() {
+        let scheduler = Arc::new(Scheduler::new());
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         register_test_server(&scheduler, server_id, ServerNonce::new());
-        let AllocJobResult::Success { job_alloc, .. } = scheduler
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
             .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+            .await
             .unwrap()
         else {
             panic!("worker should accept job");
@@ -4180,14 +4280,15 @@ mod scheduler_tests {
         assert_no_assigned_jobs(&scheduler, &server_id);
     }
 
-    #[test]
-    fn started_jobs_reconcile_against_worker_running_inventory() {
-        let scheduler = Scheduler::new();
+    #[tokio::test]
+    async fn started_jobs_reconcile_against_worker_running_inventory() {
+        let scheduler = Arc::new(Scheduler::new());
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
-        let AllocJobResult::Success { job_alloc, .. } = scheduler
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
             .handle_alloc_job(&AcceptAssign, test_toolchain('d'))
+            .await
             .unwrap()
         else {
             panic!("expected scheduler job allocation");
@@ -4257,14 +4358,15 @@ mod scheduler_tests {
         );
     }
 
-    #[test]
-    fn only_the_completing_worker_can_retry_a_known_completion() -> Result<()> {
-        let scheduler = Scheduler::new();
+    #[tokio::test]
+    async fn only_the_completing_worker_can_retry_a_known_completion() -> Result<()> {
+        let scheduler = Arc::new(Scheduler::new());
         let owner: ServerId = ServerId::from_digest([1; 32]);
         let other: ServerId = ServerId::from_digest([2; 32]);
         register_test_server(&scheduler, owner, ServerNonce::new());
-        let AllocJobResult::Success { job_alloc, .. } =
-            scheduler.handle_alloc_job(&AcceptAssign, test_toolchain('f'))?
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
+            .handle_alloc_job(&AcceptAssign, test_toolchain('f'))
+            .await?
         else {
             panic!("expected job");
         };
@@ -4316,14 +4418,15 @@ mod scheduler_tests {
         Ok(())
     }
 
-    #[test]
-    fn returned_running_job_resets_missing_heartbeat_grace() {
-        let scheduler = Scheduler::new();
+    #[tokio::test]
+    async fn returned_running_job_resets_missing_heartbeat_grace() {
+        let scheduler = Arc::new(Scheduler::new());
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
-        let AllocJobResult::Success { job_alloc, .. } = scheduler
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
             .handle_alloc_job(&AcceptAssign, test_toolchain('d'))
+            .await
             .unwrap()
         else {
             panic!("expected scheduler job allocation");
@@ -4391,13 +4494,14 @@ mod scheduler_tests {
         assert_no_assigned_jobs(&scheduler, &server_id);
     }
 
-    #[test]
-    fn state_acknowledgments_are_idempotent() {
-        let scheduler = Scheduler::new();
+    #[tokio::test]
+    async fn state_acknowledgments_are_idempotent() {
+        let scheduler = Arc::new(Scheduler::new());
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         register_test_server(&scheduler, server_id, ServerNonce::new());
-        let AllocJobResult::Success { job_alloc, .. } = scheduler
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
             .handle_alloc_job(&AcceptAssign, test_toolchain('d'))
+            .await
             .unwrap()
         else {
             panic!("expected scheduler job allocation");
@@ -4518,9 +4622,9 @@ mod scheduler_tests {
         assert!(error.to_string().contains("changed name"));
     }
 
-    #[test]
-    fn allocation_fails_if_assignment_is_cleaned_up() {
-        let scheduler = Scheduler::new();
+    #[tokio::test]
+    async fn allocation_fails_if_assignment_is_cleaned_up() {
+        let scheduler = Arc::new(Scheduler::new());
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         let server_nonce = ServerNonce::new();
 
@@ -4531,8 +4635,9 @@ mod scheduler_tests {
             server_id,
             server_nonce,
         };
-        let allocation = scheduler
+        let allocation = Arc::clone(&scheduler)
             .handle_alloc_job(&requester, test_toolchain('c'))
+            .await
             .unwrap();
 
         assert!(matches!(allocation, AllocJobResult::Fail { .. }));

@@ -179,55 +179,70 @@ fn with_native_service(
             let network = Arc::clone(&network);
             let observations = Arc::clone(&observations);
             let sources = Arc::clone(&sources);
-            native_router(move |request, role, operation| {
-                respond(
-                    request,
-                    role,
-                    operation,
-                    NativeServices {
-                        sessions: &sessions,
-                        packages: None,
-                        network: &network,
-                        source_plan: &|blob, _, _| {
-                            Ok(sources
-                                .lock()
-                                .unwrap()
-                                .get(&blob.id)
-                                .cloned()
-                                .unwrap_or_default())
+            let schedule_sessions = Arc::clone(&sessions);
+            let schedule_network = Arc::clone(&network);
+            native_router(
+                move |request, role, operation| {
+                    respond(
+                        request,
+                        role,
+                        operation,
+                        NativeServices {
+                            sessions: &sessions,
+                            packages: None,
+                            network: &network,
+                            source_plan: &|blob, _, _| {
+                                Ok(sources
+                                    .lock()
+                                    .unwrap()
+                                    .get(&blob.id)
+                                    .cloned()
+                                    .unwrap_or_default())
+                            },
+                            observe_result: &|server, job, event| {
+                                let result = match event {
+                                    crate::dist::NativeLifecycleEvent::Delivered(_) => return,
+                                    crate::dist::NativeLifecycleEvent::InputsStaged => {
+                                        Observation::Staged
+                                    }
+                                    crate::dist::NativeLifecycleEvent::Negotiated => {
+                                        Observation::Negotiated
+                                    }
+                                    crate::dist::NativeLifecycleEvent::Committed {
+                                        manifest,
+                                        retained_after_begin,
+                                        ..
+                                    } => Observation::Committed(
+                                        manifest.clone(),
+                                        retained_after_begin,
+                                    ),
+                                };
+                                observations.lock().unwrap().push((server, job, result));
+                            },
                         },
-                        observe_result: &|server, job, event| {
-                            let result = match event {
-                                crate::dist::NativeLifecycleEvent::Delivered(_) => return,
-                                crate::dist::NativeLifecycleEvent::InputsStaged => {
-                                    Observation::Staged
-                                }
-                                crate::dist::NativeLifecycleEvent::Negotiated => {
-                                    Observation::Negotiated
-                                }
-                                crate::dist::NativeLifecycleEvent::Committed {
-                                    manifest,
-                                    retained_after_begin,
-                                    ..
-                                } => Observation::Committed(manifest.clone(), retained_after_begin),
-                            };
-                            observations.lock().unwrap().push((server, job, result));
-                        },
-                    },
-                    &move |_, _, _| {
-                        Ok(ScheduleReply::Assigned(WorkerAllocation {
-                            peer: worker,
-                            routes: sccache_peer_identity::RouteSet::new(
-                                "127.0.0.1:10501".parse().unwrap(),
-                                [],
-                            ),
-                            job: 42,
-                            auth: "allocation-proof".into(),
-                        }))
-                    },
-                    1024 * 1024,
-                )
-            })
+                        1024 * 1024,
+                    )
+                },
+                move |request| {
+                    schedule_response(
+                        request,
+                        Arc::clone(&schedule_sessions),
+                        Arc::clone(&schedule_network),
+                        Arc::new(move |_, _, _| async move {
+                            Ok(ScheduleReply::Assigned(WorkerAllocation {
+                                peer: worker,
+                                routes: sccache_peer_identity::RouteSet::new(
+                                    "127.0.0.1:10501".parse().unwrap(),
+                                    [],
+                                ),
+                                job: 42,
+                                auth: "allocation-proof".into(),
+                            }))
+                        }),
+                        1024 * 1024,
+                    )
+                },
+            )
         },
     )?;
     let url = url::Url::parse(&format!("https://{}/", server.local_addr()?))?;

@@ -72,6 +72,7 @@ pub(super) fn decode_bincode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> bi
 #[cfg(feature = "dist-server")]
 #[derive(Debug)]
 pub(super) enum BoundedReadError {
+    AlreadyExtracted,
     Io(std::io::Error),
     TooLarge,
 }
