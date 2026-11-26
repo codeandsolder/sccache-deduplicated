@@ -10,7 +10,7 @@ use std::time::Duration;
 
 fn validate_purpose(ca: &X509Ref, leaf: &X509Ref, purpose: X509Purpose) -> Result<()> {
     let mut store = X509StoreBuilder::new()?;
-    store.add_cert(ca.to_owned())?;
+    store.add_cert(ca)?;
     store.verify_param_mut().set_purpose(purpose)?;
     let store = store.build();
     let chain = Stack::new()?;

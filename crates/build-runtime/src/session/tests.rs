@@ -1651,6 +1651,7 @@ fn retention_group_survives_action_close_refresh_and_exceeds_action_slots() -> R
     let owner = test_peer(1);
     let other = test_peer(2);
     let group = service.open_retention(owner)?;
+    let expiring = service.open_retention(owner)?;
     let mut retained = Vec::new();
     let key = request()?.action_fingerprint()?.key()?;
     // More results than the entire action ticket capacity. Repeated refresh
@@ -1683,6 +1684,9 @@ fn retention_group_survives_action_close_refresh_and_exceeds_action_slots() -> R
         );
         service.retain_result(group, ticket, result.id()?, owner)?;
         service.retain_result(group, ticket, result.id()?, owner)?;
+        if value == 23 {
+            service.retain_result(expiring, ticket, result.id()?, owner)?;
+        }
         service.close(ticket, Publisher::Client)?;
         retained.push((blob, bytes));
     }
@@ -1698,6 +1702,15 @@ fn retention_group_survives_action_close_refresh_and_exceeds_action_slots() -> R
     assert!(service.renew_retention(group, other).is_err());
     assert!(service.close_retention(group, other).is_err());
     service.close_retention(group, owner)?;
+    assert_eq!(service.store().evict(key)?, Eviction::Pinned);
+    // Reaping the remaining group releases its pin without an explicit close.
+    assert_eq!(
+        service
+            .retained
+            .reap(Instant::now() + Duration::from_secs(11))?,
+        1
+    );
+    assert!(service.renew_retention(expiring, owner).is_err());
     assert!(!matches!(service.store().evict(key)?, Eviction::Pinned));
     Ok(())
 }

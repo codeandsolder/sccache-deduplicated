@@ -85,7 +85,7 @@ impl ClusterHttpClient {
             .tls_min_version(TlsVersion::TLS_1_3)
             .tls_max_version(TlsVersion::TLS_1_3)
             .http1_only()
-            .resolve(name.clone(), address)
+            .resolve(name, address)
             .no_proxy()
             .pool_max_idle_per_host(2)
             .pool_idle_timeout(std::time::Duration::from_secs(20))

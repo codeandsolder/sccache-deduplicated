@@ -134,6 +134,7 @@ struct ConnectionInfo {
 }
 
 /// A routing tree bound to one TLS listener identity and enrollment policy.
+///
 /// Only the listener can construct it, so an application cannot bypass
 /// transport-derived peer authorization by serving a bare Axum router.
 #[derive(Clone)]
@@ -330,7 +331,7 @@ impl ClusterListener {
         )))
     }
 
-    fn bind_router(&self, router: Router) -> ClusterRouter {
+    const fn bind_router(&self, router: Router) -> ClusterRouter {
         ClusterRouter {
             router,
             id: self.id,

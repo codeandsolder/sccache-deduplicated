@@ -250,7 +250,7 @@ fn Distribution(report: CacheDistribution) -> impl IntoView {
         </table></div>
         <Histogram title="Object size distribution" buckets=report.size total=total.clone() format=bytes/>
         <Histogram title="Time since last root touch" buckets=report.age_seconds total=total.clone() format=age_label/>
-        <Histogram title="Root touch frequency" buckets=report.frequency total=total.clone() format=|bound|bound.to_string()/>
+        <Histogram title="Root touch frequency" buckets=report.frequency total=total format=|bound|bound.to_string()/>
         <h3>"Eviction cost distribution"</h3>
         <p class=styles::muted>"Actual native eviction utility per independently reclaimable byte, lower scores first. Shared blobs are not counted as reclaimable by one root. Active pins and physical allocation are observed best-effort; zero-content roots are omitted."</p>
         <div class=styles::stats>

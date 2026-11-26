@@ -142,3 +142,34 @@ pub fn set_user_agent() -> Result<HttpTransporter> {
         .build()?;
     Ok(HttpTransporter::new(WreqTransport { client }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context as _;
+    use http_body::Body as _;
+
+    #[tokio::test]
+    async fn segmented_buffer_preserves_order_and_exact_remaining_length() -> Result<()> {
+        let mut body = BufferBody(Buffer::from(vec![
+            bytes::Bytes::from_static(b"alpha"),
+            bytes::Bytes::from_static(b"beta"),
+        ]));
+        assert_eq!(body.size_hint().exact(), Some(9));
+        for (expected, remaining) in [(&b"alpha"[..], 4), (&b"beta"[..], 0)] {
+            let frame = body
+                .frame()
+                .await
+                .transpose()?
+                .context("missing data frame")?;
+            let data = frame
+                .into_data()
+                .map_err(|_| anyhow::anyhow!("non-data frame"))?;
+            assert_eq!(data.as_ref(), expected);
+            assert_eq!(body.size_hint().exact(), Some(remaining));
+        }
+        assert!(body.is_end_stream());
+        assert!(body.frame().await.is_none());
+        Ok(())
+    }
+}
