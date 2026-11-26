@@ -17,10 +17,10 @@ if [[ "$role" == asus ]]; then
 fi
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 case "$role" in
-  acer) user=jan; source=/etc/sccache/client.conf; worker_gib=32; worker_target=24; minimum=16; target=24 ;;
+  acer) user=jan; source=/etc/sccache/client.conf; worker_gib=6; worker_target=5; minimum=16; target=24 ;;
   asus) user=jan; source=/etc/sccache/client.conf; worker_gib=48; worker_target=36; minimum=32; target=48 ;;
   cold-storage) user=sentinelx; source=/etc/sccache/client.conf; worker_gib=0 ;;
-  wsl) user=jan; source=/etc/sccache/config; worker_gib=48; worker_target=36; minimum=32; target=48 ;;
+  wsl) user=jan; source=/etc/sccache/config; worker_gib=6; worker_target=5; minimum=32; target=48 ;;
   *) exit 2 ;;
 esac
 [[ "$(systemctl show sccache-local.service -p User --value)" == "$user" ]]
@@ -46,6 +46,14 @@ assert_absent '^\s*\[(shared_daemon|dist\.native|dist\.cluster|compiler_aliases)
 cp -- "$source" "$stage/client-shared.toml"
 [[ $(rg -c '^\s*scheduler_url\s*=' "$stage/client-shared.toml") == 1 ]]
 sed -i -E "s|^\s*scheduler_url\s*=.*$|scheduler_url = \"$scheduler_url\"|" "$stage/client-shared.toml"
+# Acer and WSL share a 12 GiB retained local budget across native CAS,
+# archive/extracted toolchains and the relevant client-side stores.
+case "$role" in
+  acer|wsl) sed -i -E "s|^toolchain_cache_size\s*=.*$|toolchain_cache_size = $gib|" "$stage/client-shared.toml" ;;
+esac
+if [[ "$role" == wsl ]]; then
+  sed -i -E "s|^size\s*=.*$|size = $gib|" "$stage/client-shared.toml"
+fi
 cat >> "$stage/client-shared.toml" <<EOF
 
 [dist.cluster]
@@ -201,6 +209,14 @@ if (( worker_gib > 0 )); then
   cp -- "$worker" "$stage/server.conf"
   [[ $(rg -c '^\s*scheduler_url\s*=' "$stage/server.conf") == 1 ]]
   sed -i -E "s|^\s*scheduler_url\s*=.*$|scheduler_url = \"$scheduler_url\"|; /^\s*bind_address\s*=/d" "$stage/server.conf"
+  if [[ "$role" == acer || "$role" == wsl ]]; then
+    sed -i -E "s|^toolchain_cache_size\s*=.*$|toolchain_cache_size = $((2*gib))|" "$stage/server.conf"
+    if rg -q '^extracted_toolchain_cache_size\s*=' "$stage/server.conf"; then
+      sed -i -E "s|^extracted_toolchain_cache_size\s*=.*$|extracted_toolchain_cache_size = $((2*gib))|" "$stage/server.conf"
+    else
+      sed -i "/^\[builder\]/a extracted_toolchain_cache_size = $((2*gib))" "$stage/server.conf"
+    fi
+  fi
   cat >> "$stage/server.conf" <<EOF
 
 [cluster]

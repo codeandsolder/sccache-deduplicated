@@ -64,6 +64,12 @@ output="$(SCCACHE_SERVER_PORT=12345 route compiler 1000 gcc -c 'foo bar.c')"
 rg -Fxq 'uds= port=12345 canonical= start=0 no_auto=1' <<<"$output"
 output="$(SCCACHE_SERVER_UDS='\x00explicit' route compiler 0 gcc -c a.c)"
 rg -Fxq 'uds=\x00explicit port= canonical= start=0 no_auto=1' <<<"$output"
+# Rustc's nested linker must not contact the daemon even in an isolated
+# namespace. An unrelated compiler caller must still route normally.
+output="$(readlink() { printf '/rust/bin/rustc\n'; }; route compiler 1000 /usr/bin/printf '%s' 'nested-link')"
+[[ "$output" == nested-link ]]
+output="$(readlink() { printf '/usr/bin/bash\n'; }; route compiler 1000 gcc -c a.c)"
+rg -Fxq 'arg=<gcc>' <<<"$output"
 printf 'user_endpoint=unix:%s/unavailable.sock\n' "$root" >"$root/wrapper.conf"
 if route compiler 1000 rustc --version >"$root/failed.log" 2>&1; then
     printf 'missing endpoint unexpectedly succeeded\n' >&2; exit 1

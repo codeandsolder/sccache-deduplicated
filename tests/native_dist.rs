@@ -2466,6 +2466,16 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     let root = temp.path().canonicalize()?;
     let fleet = Fleet::start(&root, BTreeMap::new())?;
     let mut service = LocalService::start(&root, &fleet, None)?;
+    let status = service
+        .command(env!("CARGO_BIN_EXE_sccache"))
+        .arg("--dist-status")
+        .output()?;
+    ensure!(status.status.success(), "native status command failed");
+    let status: sccache::server::DistInfo = serde_json::from_slice(&status.stdout)?;
+    let sccache::server::DistInfo::SchedulerStatus(_, status) = status else {
+        anyhow::bail!("native scheduler status did not authenticate: {status:?}");
+    };
+    assert_eq!(status.num_servers, 1);
     let rustc = Command::new("rustc")
         .args(["--print", "sysroot"])
         .output()?;

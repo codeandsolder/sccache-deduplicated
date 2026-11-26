@@ -188,6 +188,22 @@ impl NativeCacheClient {
         }
     }
 
+    /// Query scheduler status using the same pinned cluster identity as builds.
+    #[cfg(all(target_os = "linux", feature = "dist-client"))]
+    pub(crate) async fn scheduler_status(&self) -> Result<super::SchedulerStatusResult> {
+        let (client, base) = self.routes.endpoint(
+            self.peer.scheduler_id(),
+            sccache_cluster_identity::Role::Scheduler,
+            crate::dist::cluster_routes::Route::unbound(self.peer.scheduler_address()),
+        )?;
+        let url = super::http::urls::scheduler_status(&base)?;
+        super::http::transport::send_async(
+            client.get(url.as_str()),
+            super::http::transport::RequestClass::Control,
+        )
+        .await
+    }
+
     fn cache_routes(&self) -> sccache_peer_identity::RouteSet {
         use sccache_peer_identity::{Role, RouteSet};
         #[derive(serde::Deserialize)]
