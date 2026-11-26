@@ -252,34 +252,12 @@ impl NativeStore {
         })
     }
 
-    /// Resolve or import an original archive under the store's shared
-    /// per-package admission limit. The input factory is invoked only
-    /// after admission and a second verified-cache lookup.
-    /// # Errors
-    /// Returns an error for busy service, invalid input or storage failure.
-    pub fn acquire_package<R: Read>(
-        &self,
-        identity: PackageIdentity,
-        length: ArchiveLength,
-        limits: PackageImportLimits,
-        executable: &std::path::Path,
-        acquire: impl FnOnce() -> Result<R>,
-    ) -> Result<(VerifiedPackage, bool)> {
-        match self.prepare_package(identity, length, limits, || Ok(()))? {
-            PackagePreparation::Cached(package) => Ok((package, true)),
-            PackagePreparation::Import(mut import, ()) => {
-                import.archive.read_from(acquire()?)?;
-                Ok((import.finish(executable)?, false))
-            }
-        }
-    }
-
     /// Claim a cold package before opening the input stream, or return its
     /// existing verified tree. The owned claim survives asynchronous I/O.
     ///
     /// # Errors
     /// Returns an error for a busy identity, invalid limits or storage failure.
-    pub(crate) fn prepare_package<T>(
+    pub fn prepare_package<T>(
         &self,
         identity: PackageIdentity,
         length: ArchiveLength,
@@ -309,15 +287,13 @@ impl NativeStore {
             "original package exceeds archive size limit"
         );
         let admitted = admit_cold()?;
-        Ok(PackagePreparation::Import(
-            Box::new(PackageImport {
-                archive: ArchiveStager::new(self, identity, length)?,
-                limits,
-                policy,
-                _slot: slot.context("missing package reservation")?,
-            }),
-            admitted,
-        ))
+        Ok(PackagePreparation::Import(Box::new(PackageImport {
+            archive: ArchiveStager::new(self, identity, length)?,
+            limits,
+            policy,
+            _slot: slot.context("missing package reservation")?,
+            _admitted: admitted,
+        })))
     }
 
     /// Resolve a previously imported exact package without transferring or
@@ -409,24 +385,25 @@ impl NativeStore {
 /// Admission to an original archive acquisition.
 pub enum PackagePreparation<T> {
     Cached(VerifiedPackage),
-    Import(Box<PackageImport>, T),
+    Import(Box<PackageImport<T>>),
 }
 
 /// An exclusive cold import with one private staging file. Both synchronous
 /// and asynchronous ingestion share the digest, length and publication rules.
-pub struct PackageImport {
+pub struct PackageImport<T> {
     archive: ArchiveStager,
     limits: PackageImportLimits,
     policy: PackagePolicy,
     _slot: PackageSlot,
+    _admitted: T,
 }
 
-impl PackageImport {
+impl<T: Send + 'static> PackageImport<T> {
     /// Finish the already verified archive with the isolated decoder.
     ///
     /// # Errors
     /// Returns an error for invalid content, decoder failure or storage failure.
-    pub(crate) fn finish(self, executable: &std::path::Path) -> Result<VerifiedPackage> {
+    pub fn finish(self: Box<Self>, executable: &std::path::Path) -> Result<VerifiedPackage> {
         let store = self.archive.store.clone();
         let (source, archive) = self.archive.finish()?;
         store.decode_verified_package(
@@ -441,30 +418,35 @@ impl PackageImport {
         )
     }
 
+    /// Hash a bounded batch and submit it to the completion driver. Both the
+    /// package claim and any additional admission guard remain owned by it.
+    ///
+    /// # Errors
+    /// Returns an error for oversized content or disk failure.
     #[cfg(feature = "async-io")]
-    pub(crate) fn record(&mut self, bytes: &[u8]) -> Result<u64> {
-        self.archive.record(bytes)
+    pub async fn append(mut self: Box<Self>, buffer: Vec<u8>) -> Result<(Box<Self>, Vec<u8>)> {
+        let offset = self.archive.record(&buffer)?;
+        crate::disk::run(move || async move {
+            let buffer =
+                crate::disk::write_all(Arc::clone(&self.archive.file), offset, buffer).await?;
+            Ok((self, buffer))
+        })
+        .await
     }
 
+    /// Verify and synchronize the complete archive before decoding.
+    ///
+    /// # Errors
+    /// Returns an error for incorrect content or disk failure.
     #[cfg(feature = "async-io")]
-    #[expect(
-        clippy::future_not_send,
-        reason = "runs only on the thread-local Compio completion driver"
-    )]
-    pub(crate) async fn write_batch(&self, offset: u64, buffer: Vec<u8>) -> Result<Vec<u8>> {
-        Ok(crate::disk::write_all(Arc::clone(&self.archive.file), offset, buffer).await?)
-    }
-
-    #[cfg(feature = "async-io")]
-    #[expect(
-        clippy::future_not_send,
-        reason = "runs only on the thread-local Compio completion driver"
-    )]
-    pub(crate) async fn seal(&mut self) -> Result<()> {
-        self.archive.verify()?;
-        crate::disk::seal_file(Arc::clone(&self.archive.file)).await?;
-        self.archive.synced = true;
-        Ok(())
+    pub async fn seal(mut self: Box<Self>) -> Result<Box<Self>> {
+        crate::disk::run(move || async move {
+            self.archive.verify()?;
+            crate::disk::seal_file(Arc::clone(&self.archive.file)).await?;
+            self.archive.synced = true;
+            Ok(self)
+        })
+        .await
     }
 }
 

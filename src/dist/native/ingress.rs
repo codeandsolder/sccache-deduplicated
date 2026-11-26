@@ -1,9 +1,10 @@
 //! Shared asynchronous CAS ingestion and CPU codec executor.
 
 use crate::build_runtime::{
-    BlobEncoding, BlobRef, NativeStore, NativeUpload, PhysicalStager, StagedBlob, TransferMeter,
+    ArchiveLength, BlobEncoding, BlobRef, NativeStore, NativeUpload, PackageImport, PhysicalStager,
+    StagedBlob, TransferMeter, VerifiedPackage,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use std::{future::Future, sync::OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -215,4 +216,57 @@ mod tests {
         assert_eq!(completed.load(Ordering::Relaxed), 1);
         Ok(())
     }
+}
+
+/// Receive and verify an original archive, then decode it outside the reactor.
+pub(in crate::dist) async fn receive_package<T: Send + 'static>(
+    mut upload: Box<PackageImport<T>>,
+    input: &mut (impl AsyncRead + Unpin + Send),
+    mut meter: Option<TransferMeter>,
+    length: ArchiveLength,
+) -> Result<(VerifiedPackage, std::time::Instant)> {
+    const CHUNK: usize = 256 * 1024;
+    let mut buffer = vec![0; CHUNK];
+    let mut remaining = length.maximum();
+    loop {
+        // Read at most one byte beyond the limit. An oversized stream cannot
+        // prolong the reservation by withholding the remainder of a batch.
+        let target = usize::try_from(remaining.saturating_add(1).min(CHUNK as u64))?;
+        let mut count = 0;
+        while count < target {
+            let read = input.read(&mut buffer[count..target]).await?;
+            if read == 0 {
+                break;
+            }
+            count += read;
+            if let Some(meter) = &mut meter {
+                meter.observe(read as u64);
+            }
+            ensure!(
+                count as u64 <= remaining,
+                "incorrect original package length or archive size limit exceeded"
+            );
+        }
+        if count == 0 {
+            if let Some(meter) = &mut meter {
+                meter.eof();
+            }
+            break;
+        }
+        remaining -= count as u64;
+        buffer.truncate(count);
+        (upload, buffer) = upload.append(buffer).await?;
+        buffer.resize(CHUNK, 0);
+        if count < target {
+            if let Some(meter) = &mut meter {
+                meter.eof();
+            }
+            break;
+        }
+    }
+    let downloaded = std::time::Instant::now();
+    let upload = upload.seal().await?;
+    let package =
+        tokio::task::spawn_blocking(move || upload.finish(&std::env::current_exe()?)).await??;
+    Ok((package, downloaded))
 }

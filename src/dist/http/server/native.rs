@@ -24,18 +24,17 @@ use futures::TryStreamExt;
 use http::StatusCode;
 use sccache_cluster_identity::{ClusterListener, Role, SchedulerEnrollment};
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncReadExt;
 use tokio_util::io::StreamReader;
 
 use super::{SchedulerRequester, role_error};
 use crate::{
     build_runtime::{
         ActionMode, ArchiveLength, BlobEncoding, BlobRef, Direction, ExecutionSpec,
-        NativeContentPending, NativeInputRejected, NativePackagePreparation, NativePackageUpload,
-        NativeServiceBusy, NativeSessions, NativeStore, NetworkMeter, NetworkSnapshot,
-        PackageCatalog, PackageIdentity, PackageImportLimits, PackageSource, Peer,
-        SchedulePreparation, ScheduleReservation, StagedBlob, TransferMeter, TreeId, TreeManifest,
-        VerifiedPackage,
+        NativeContentPending, NativeInputRejected, NativeServiceBusy, NativeSessions, NativeStore,
+        NetworkMeter, NetworkSnapshot, PackageCatalog, PackageIdentity, PackageImportLimits,
+        PackagePreparation, PackageSource, Peer, SchedulePreparation, ScheduleReservation,
+        StagedBlob, TreeId, TreeManifest, VerifiedPackage,
         wire::{BlobRecipient, BlobSource, BlobSourcePlan, Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
@@ -44,7 +43,7 @@ use crate::{
         InputPrefetchRequest, ManifestRequest, OpenTreeRequest, PackageAcquisition, PackageLocator,
         PackagePlanRequest, RetainRequest, RetainedDownloadRequest, ScheduleRequest, StatusRequest,
         codec,
-        ingress::{receive_blob, stage_blob},
+        ingress::{receive_blob, receive_package, stage_blob},
     },
 };
 
@@ -110,8 +109,8 @@ impl PackageService {
             tokio::task::spawn_blocking(move || sessions.prepare_package(identity, length, limits))
                 .await??;
         let upload = match prepared {
-            NativePackagePreparation::Cached(package) => return Ok((package, true)),
-            NativePackagePreparation::Import(upload) => upload,
+            PackagePreparation::Cached(package) => return Ok((package, true)),
+            PackagePreparation::Import(upload) => upload,
         };
         let response = client.get(url.as_str()).send().await?.error_for_status()?;
         ensure!(
@@ -127,7 +126,9 @@ impl PackageService {
             response.bytes_stream().map_err(std::io::Error::other),
         ));
         Ok((
-            receive_package(upload, &mut input, meter, length).await?,
+            receive_package(upload, &mut input, Some(meter), length)
+                .await?
+                .0,
             false,
         ))
     }
@@ -138,49 +139,6 @@ struct PackageRoutes {
     service: Arc<PackageService>,
     sessions: Arc<NativeSessions>,
     network: Arc<NetworkMeter>,
-}
-
-async fn receive_package(
-    mut upload: NativePackageUpload,
-    input: &mut (impl AsyncRead + Unpin),
-    mut meter: TransferMeter,
-    length: ArchiveLength,
-) -> Result<VerifiedPackage> {
-    const CHUNK: usize = 256 * 1024;
-    let mut buffer = vec![0; CHUNK];
-    let mut remaining = length.maximum();
-    loop {
-        // Read at most one byte beyond the limit. An oversized stream cannot
-        // prolong the reservation by withholding the remainder of a batch.
-        let target = usize::try_from(remaining.saturating_add(1).min(CHUNK as u64))?;
-        let mut count = 0;
-        while count < target {
-            let read = input.read(&mut buffer[count..target]).await?;
-            if read == 0 {
-                break;
-            }
-            count += read;
-            meter.observe(read as u64);
-            ensure!(
-                count as u64 <= remaining,
-                "incorrect original package length or archive size limit exceeded"
-            );
-        }
-        if count == 0 {
-            meter.eof();
-            break;
-        }
-        remaining -= count as u64;
-        buffer.truncate(count);
-        (upload, buffer) = upload.append(buffer).await?;
-        buffer.resize(CHUNK, 0);
-        if count < target {
-            meter.eof();
-            break;
-        }
-    }
-    let upload = upload.seal().await?;
-    tokio::task::spawn_blocking(move || upload.finish(&std::env::current_exe()?)).await?
 }
 
 async fn package_response(
@@ -224,8 +182,8 @@ async fn package_response(
             })
             .await??
             {
-                NativePackagePreparation::Cached(package) => (package, true),
-                NativePackagePreparation::Import(upload) => {
+                PackagePreparation::Cached(package) => (package, true),
+                PackagePreparation::Import(upload) => {
                     let meter = routes.network.transfer(
                         Direction::Receive,
                         peer,
@@ -233,7 +191,9 @@ async fn package_response(
                         Some(source.size),
                     );
                     (
-                        receive_package(upload, &mut input, meter, length).await?,
+                        receive_package(upload, &mut input, Some(meter), length)
+                            .await?
+                            .0,
                         false,
                     )
                 }

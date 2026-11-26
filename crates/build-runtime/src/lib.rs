@@ -58,9 +58,8 @@ mod session;
 #[cfg(all(unix, feature = "store"))]
 pub use session::{
     DeliveryReceipt, ManifestStatus, NativeContentPending, NativeDownload, NativeInputRejected,
-    NativePackagePreparation, NativePackageUpload, NativeServiceBusy, NativeSessions, NativeUpload,
-    PeerInputClaim, RecoveryStatus, SchedulePreparation, ScheduleReservation, SessionLimits,
-    SessionStatus, TicketStatus,
+    NativeServiceBusy, NativeSessions, NativeUpload, PeerInputClaim, RecoveryStatus,
+    SchedulePreparation, ScheduleReservation, SessionLimits, SessionStatus, TicketStatus,
 };
 #[cfg(all(unix, feature = "store"))]
 mod store;
@@ -69,10 +68,10 @@ pub use coordinator::{Admission, BuildCoordinator, CompilePermit};
 #[cfg(all(unix, feature = "store"))]
 pub use store::{
     CacheAnalyticsSampler, CacheStats, ComponentAudit, Eviction, GarbageCollected,
-    NativeIndexAudit, NativeStore, PackageArchiveLease, PackageDecoder, PackageImportLimits,
-    PackagePolicy, PackageSlot, PhysicalStager, Published, ResultLease, SchemaInventory,
-    SpaceReport, SpaceStatus, StageBudget, StagedBlob, TreeLease, UploadReservation,
-    VerifiedPackage, decode_package_process,
+    NativeIndexAudit, NativeStore, PackageArchiveLease, PackageDecoder, PackageImport,
+    PackageImportLimits, PackagePolicy, PackagePreparation, PackageSlot, PhysicalStager, Published,
+    ResultLease, SchemaInventory, SpaceReport, SpaceStatus, StageBudget, StagedBlob, TreeLease,
+    UploadReservation, VerifiedPackage, decode_package_process,
 };
 
 #[cfg(all(target_os = "linux", feature = "store"))]

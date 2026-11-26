@@ -1115,10 +1115,10 @@ async fn package_upload_reservations_release_on_drop_and_invalid_input() -> Resu
         compression: PackageCompression::Tar,
     };
     let length = ArchiveLength::Exact(bytes.len() as u64);
-    let prepare = |identity| -> Result<NativePackageUpload> {
+    let prepare = |identity| -> Result<_> {
         match service.prepare_package(identity, length, limits)? {
-            NativePackagePreparation::Import(upload) => Ok(upload),
-            NativePackagePreparation::Cached(_) => bail!("unexpected cached package"),
+            PackagePreparation::Import(upload) => Ok(upload),
+            PackagePreparation::Cached(_) => bail!("unexpected cached package"),
         }
     };
     let mut uploads = Vec::new();

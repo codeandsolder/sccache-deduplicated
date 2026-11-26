@@ -3,8 +3,6 @@
 //! scheduler. There is no legacy archive creation or client-side reupload.
 
 use std::{
-    cell::Cell,
-    io::{self, Read},
     num::NonZeroUsize,
     sync::{
         Arc, Mutex, PoisonError,
@@ -16,12 +14,12 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 use super::{
-    LeaseCheck, NativeCacheClient, PackagePlanRequest, map_packages, retryable_transport_error,
+    LeaseCheck, NativeCacheClient, PackagePlanRequest, ingress, retryable_transport_error,
 };
 use crate::build_runtime::{
     ArchiveLength, BlobRef, CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeServiceBusy,
-    NativeStore, PackageArchive, PackageImportLimits, PackageTransferCost, StageBudget, TreeId,
-    TreeLease, VerifiedPackage, execute,
+    NativeStore, PackageArchive, PackageImportLimits, PackagePreparation, PackageTransferCost,
+    StageBudget, TreeId, TreeLease, VerifiedPackage, execute,
     wire::{ActionObservation, ActionRequest, Ticket, WorkerTiming},
 };
 
@@ -336,23 +334,6 @@ mod transport_tests {
     }
 }
 
-// Measure the actual archive transfer independently of its subsequent decoder.
-struct TimedDownload<'a, R> {
-    reader: R,
-    start: Instant,
-    elapsed: &'a Cell<Option<Duration>>,
-}
-
-impl<R: Read> Read for TimedDownload<'_, R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let count = self.reader.read(buffer)?;
-        if count == 0 && !buffer.is_empty() && self.elapsed.get().is_none() {
-            self.elapsed.set(Some(self.start.elapsed()));
-        }
-        Ok(count)
-    }
-}
-
 impl NativeCacheClient {
     pub(super) fn reconstruct_packages(
         &self,
@@ -363,41 +344,50 @@ impl NativeCacheClient {
         transport: &PackageTransportTracker,
         check: &LeaseCheck<'_>,
     ) -> Result<Vec<VerifiedPackage>> {
-        let plan = self.control(
-            "package_plan",
-            &PackagePlanRequest {
-                ticket,
-                missing: missing.to_vec(),
-                max_archive_bytes: limits.max_archive_bytes,
-                cost: transport.estimate(),
-            },
-        );
-        let offers: Vec<PackageArchive> = match plan {
-            Ok(offers) => offers,
-            Err(error) => {
-                warn!("native original package plan unavailable: {error:#}");
-                return Ok(Vec::new());
-            }
-        };
-        let jobs = NonZeroUsize::new(limits.max_concurrent_imports)
-            .context("zero package acquisition concurrency")?;
-        let packages = map_packages(&offers, jobs, |offer| {
-            check()?;
-            match self.reconstruct_package(ticket, *offer, store, limits, transport, check) {
-                Ok(package) => Ok(Some(package)),
+        crate::http_client::io_runtime()?.block_on(async {
+            let plan = self
+                .control_with_timeout_async(
+                    "package_plan",
+                    &PackagePlanRequest {
+                        ticket,
+                        missing: missing.to_vec(),
+                        max_archive_bytes: limits.max_archive_bytes,
+                        cost: transport.estimate(),
+                    },
+                    self.timeout,
+                )
+                .await;
+            let offers: Vec<PackageArchive> = match plan {
+                Ok(offers) => offers,
                 Err(error) => {
-                    check()?;
-                    // Package transport is optional. Verify all remaining
-                    // input bytes by retrieving the missing blobs directly.
-                    warn!("native package reconstruction unavailable: {error:#}");
-                    Ok(None)
+                    warn!("native original package plan unavailable: {error:#}");
+                    return Ok(Vec::new());
                 }
-            }
-        })?;
-        Ok(packages.into_iter().flatten().collect())
+            };
+            let jobs = NonZeroUsize::new(limits.max_concurrent_imports)
+                .context("zero package acquisition concurrency")?;
+            let packages = ingress::map_bounded(offers, jobs, |offer| async move {
+                check()?;
+                match self
+                    .reconstruct_package(ticket, offer, store, limits, transport, check)
+                    .await
+                {
+                    Ok(package) => Ok(Some(package)),
+                    Err(error) => {
+                        check()?;
+                        // Package transport is optional. Verify all remaining
+                        // input bytes by retrieving the missing blobs directly.
+                        warn!("native package reconstruction unavailable: {error:#}");
+                        Ok(None)
+                    }
+                }
+            })
+            .await?;
+            Ok(packages.into_iter().flatten().collect())
+        })
     }
 
-    fn reconstruct_package(
+    async fn reconstruct_package(
         &self,
         ticket: Ticket,
         offer: PackageArchive,
@@ -413,40 +403,48 @@ impl NativeCacheClient {
             "invalid native original archive offer"
         );
         let start = Instant::now();
-        let executable = std::env::current_exe()?;
         loop {
             check()?;
             let attempted = Instant::now();
-            let downloaded = Cell::new(None);
-            let (package, reused) = match store.acquire_package(
-                offer.source.identity,
-                ArchiveLength::Exact(offer.source.size),
-                limits,
-                &executable,
-                || {
-                    let start = Instant::now();
-                    Ok(TimedDownload {
-                        reader: {
-                            let (response, encoding) =
-                                self.download_response(ticket, offer.blob)?;
-                            ensure!(
-                                encoding == crate::build_runtime::BlobEncoding::Raw,
-                                "package must be original bytes"
-                            );
-                            response
-                        },
-                        start,
-                        elapsed: &downloaded,
-                    })
-                },
-            ) {
-                Ok(package) => package,
+            let prepared = {
+                let store = store.clone();
+                tokio::task::spawn_blocking(move || {
+                    store.prepare_package(
+                        offer.source.identity,
+                        ArchiveLength::Exact(offer.source.size),
+                        limits,
+                        || Ok(()),
+                    )
+                })
+                .await?
+            };
+            let (package, downloaded) = match prepared {
+                Ok(PackagePreparation::Cached(package)) => (package, None),
+                Ok(PackagePreparation::Import(upload)) => {
+                    let transfer = Instant::now();
+                    let (mut response, encoding) = self
+                        .try_download_response_async(ticket, offer.blob, self.timeout)
+                        .await?
+                        .context("native original package unavailable")?;
+                    ensure!(
+                        encoding == crate::build_runtime::BlobEncoding::Raw,
+                        "package must be original bytes"
+                    );
+                    let (package, finished) = ingress::receive_package(
+                        upload,
+                        &mut response,
+                        None,
+                        ArchiveLength::Exact(offer.source.size),
+                    )
+                    .await?;
+                    (package, Some(finished.duration_since(transfer)))
+                }
                 Err(error) if error.is::<NativeServiceBusy>() => {
                     ensure!(
                         start.elapsed() < self.timeout,
                         "native worker package reservation deadline exceeded"
                     );
-                    std::thread::sleep(Duration::from_millis(100));
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -455,10 +453,8 @@ impl NativeCacheClient {
                 package.source() == offer.source && package.tree().id() == offer.tree,
                 "reconstructed original package identity mismatch"
             );
-            if !reused {
-                if let Some(download) = downloaded.get() {
-                    transport.observe_archive(offer, attempted.elapsed(), download);
-                }
+            if let Some(download) = downloaded {
+                transport.observe_archive(offer, attempted.elapsed(), download);
                 debug!(
                     "native package transfer estimate after import: {:?}",
                     transport.estimate()

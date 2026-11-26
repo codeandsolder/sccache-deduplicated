@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::store::{PackageImport, PackagePreparation};
+use crate::store::PackagePreparation;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use bincode::Options;
 
@@ -489,56 +489,6 @@ pub struct NativeUpload {
     publication: UploadPublication,
 }
 
-/// A warm package or an exclusive cold upload.
-pub enum NativePackagePreparation {
-    Cached(VerifiedPackage),
-    Import(NativePackageUpload),
-}
-
-/// Original archive upload holding both package and service reservations.
-pub struct NativePackageUpload {
-    import: Box<PackageImport>,
-    _slot: UploadSlot,
-}
-
-impl NativePackageUpload {
-    /// Hash a bounded batch, then submit it to the completion driver.
-    ///
-    /// # Errors
-    /// Returns an error for oversized content or disk failure.
-    #[cfg(feature = "async-io")]
-    pub async fn append(mut self, buffer: Vec<u8>) -> Result<(Self, Vec<u8>)> {
-        let offset = self.import.record(&buffer)?;
-        crate::disk::run(move || async move {
-            let buffer = self.import.write_batch(offset, buffer).await?;
-            Ok((self, buffer))
-        })
-        .await
-    }
-
-    /// Verify the complete archive and synchronize it before decoding.
-    ///
-    /// # Errors
-    /// Returns an error for incorrect content or disk failure.
-    #[cfg(feature = "async-io")]
-    pub async fn seal(self) -> Result<Self> {
-        crate::disk::run(move || async move {
-            let mut upload = self;
-            upload.import.seal().await?;
-            Ok(upload)
-        })
-        .await
-    }
-
-    /// Decode and publish the verified original using the isolated decoder.
-    ///
-    /// # Errors
-    /// Returns an error for invalid archive, decoder failure or storage failure.
-    pub fn finish(self, executable: &std::path::Path) -> Result<VerifiedPackage> {
-        self.import.finish(executable)
-    }
-}
-
 enum UploadPublication {
     Direct(UploadGuard),
     Backfill {
@@ -831,18 +781,10 @@ impl NativeSessions {
         identity: PackageIdentity,
         length: ArchiveLength,
         limits: PackageImportLimits,
-    ) -> Result<NativePackagePreparation> {
-        match self.store().prepare_package(identity, length, limits, || {
+    ) -> Result<PackagePreparation<impl Send + 'static>> {
+        self.store().prepare_package(identity, length, limits, || {
             self.upload_slot(UploadSource::Direct)
-        })? {
-            PackagePreparation::Cached(package) => Ok(NativePackagePreparation::Cached(package)),
-            PackagePreparation::Import(import, slot) => {
-                Ok(NativePackagePreparation::Import(NativePackageUpload {
-                    import,
-                    _slot: slot,
-                }))
-            }
-        }
+        })
     }
 
     fn sessions(&self) -> Result<MutexGuard<'_, HashMap<Ticket, SharedSession>>> {
