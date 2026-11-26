@@ -342,13 +342,7 @@ impl PhysicalStager {
     pub(crate) async fn finalize_io(&mut self) -> Result<()> {
         ensure!(self.ingest.is_none(), "native staging codec not finalized");
         self.flush_pending_io().await?;
-        let file = Arc::clone(&self.file);
-        compio_runtime::spawn_blocking(move || {
-            file.set_permissions(fs::Permissions::from_mode(0o400))
-        })
-        .await
-        .map_err(|error| anyhow!("staging permission task failed: {error:?}"))??;
-        crate::disk::sync_all(Arc::clone(&self.file)).await?;
+        crate::disk::seal_file(Arc::clone(&self.file)).await?;
         self.synced = true;
         Ok(())
     }
@@ -2014,6 +2008,7 @@ pub use packages::{
     PackageArchiveLease, PackageDecoder, PackageImportLimits, PackagePolicy, PackageSlot,
     VerifiedPackage, decode_package_process,
 };
+pub(crate) use packages::{PackageImport, PackagePreparation};
 mod trees;
 #[cfg(target_os = "linux")]
 pub use trees::MountedTree;

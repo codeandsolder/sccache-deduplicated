@@ -1091,6 +1091,74 @@ fn original_package_slots_deduplicate_identities_and_bound_parallel_imports() ->
     Ok(())
 }
 
+#[cfg(feature = "async-io")]
+#[tokio::test]
+async fn package_upload_reservations_release_on_drop_and_invalid_input() -> Result<()> {
+    use crate::PackageCompression;
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let limits = PackageImportLimits {
+        retain_original: false,
+        max_concurrent_imports: 8,
+        max_archive_bytes: 1024,
+        max_entries: 8,
+        max_expanded_bytes: 1024,
+        max_tar_bytes: 4096,
+        max_metadata_bytes: 4096,
+        decoder_memory_bytes: 1 << 20,
+        decoder_timeout_secs: 5,
+    };
+    let bytes = b"original archive bytes";
+    let identity = PackageIdentity {
+        sha256: Sha256::digest(bytes).into(),
+        compression: PackageCompression::Tar,
+    };
+    let length = ArchiveLength::Exact(bytes.len() as u64);
+    let prepare = |identity| -> Result<NativePackageUpload> {
+        match service.prepare_package(identity, length, limits)? {
+            NativePackagePreparation::Import(upload) => Ok(upload),
+            NativePackagePreparation::Cached(_) => bail!("unexpected cached package"),
+        }
+    };
+    let mut uploads = Vec::new();
+    for byte in 0..4 {
+        uploads.push(prepare(PackageIdentity {
+            sha256: [byte; 32],
+            ..identity
+        })?);
+    }
+    assert!(
+        prepare(identity)
+            .err()
+            .context("shared upload capacity exceeded")?
+            .is::<NativeServiceBusy>()
+    );
+    drop(uploads);
+    let upload = prepare(identity)?;
+    assert!(
+        prepare(identity)
+            .err()
+            .context("duplicate package admitted")?
+            .is::<NativeServiceBusy>()
+    );
+    let (upload, _) = upload.append(bytes[..5].to_vec()).await?;
+    assert!(upload.seal().await.is_err());
+    let upload = prepare(identity)?;
+    assert!(upload.append(vec![0; bytes.len() + 1]).await.is_err());
+    let upload = prepare(identity)?;
+    let (upload, _) = upload.append(vec![0; bytes.len()]).await?;
+    assert!(upload.seal().await.is_err());
+    let upload = prepare(identity)?;
+    let (upload, _) = upload.append(bytes.to_vec()).await?;
+    let upload = upload.seal().await?;
+    drop(upload);
+    assert_eq!(std::fs::read_dir(dir.path().join("staging"))?.count(), 0);
+    assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
+    assert!(service.lookup_package(identity, limits)?.is_none());
+    Ok(())
+}
+
 #[test]
 fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result<()> {
     let dir = tempfile::tempdir()?;

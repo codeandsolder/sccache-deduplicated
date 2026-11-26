@@ -179,6 +179,19 @@ pub(crate) async fn sync_all(file: Arc<File>) -> io::Result<()> {
     Ok(())
 }
 
+/// Seal an immutable staging file before it enters the durable index.
+pub(crate) async fn seal_file(file: Arc<File>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata_file = Arc::clone(&file);
+    compio_runtime::spawn_blocking(move || {
+        metadata_file.set_permissions(std::fs::Permissions::from_mode(0o400))
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("staging permission task failed: {error:?}"))??;
+    sync_all(file).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

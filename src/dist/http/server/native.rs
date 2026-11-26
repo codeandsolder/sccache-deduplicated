@@ -22,20 +22,22 @@ use axum::{
     routing::MethodFilter,
 };
 use bincode::Options;
+use futures::TryStreamExt;
 use http::StatusCode;
 use sccache_cluster_identity::{ClusterListener, Role, SchedulerEnrollment};
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 
 use super::{SchedulerRequester, role_error};
 use crate::{
     build_runtime::{
         ActionMode, ArchiveLength, BlobEncoding, BlobRef, Direction, ExecutionSpec,
-        NativeContentPending, NativeInputRejected, NativeServiceBusy, NativeSessions, NativeStore,
-        NetworkMeter, NetworkSnapshot, PackageCatalog, PackageIdentity, PackageImportLimits,
-        PackageSource, Peer, SchedulePreparation, ScheduleReservation, StagedBlob, TreeId,
-        TreeManifest, VerifiedPackage,
+        NativeContentPending, NativeInputRejected, NativePackagePreparation, NativePackageUpload,
+        NativeServiceBusy, NativeSessions, NativeStore, NetworkMeter, NetworkSnapshot,
+        PackageCatalog, PackageIdentity, PackageImportLimits, PackageSource, Peer,
+        SchedulePreparation, ScheduleReservation, StagedBlob, TransferMeter, TreeId, TreeManifest,
+        VerifiedPackage,
         wire::{BlobRecipient, BlobSource, BlobSourcePlan, Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
@@ -83,10 +85,10 @@ impl PackageService {
         Ok(Some(Self { limits, upstreams }))
     }
 
-    fn acquire(
+    async fn acquire(
         &self,
-        sessions: &NativeSessions,
-        locator: &PackageLocator,
+        sessions: Arc<NativeSessions>,
+        locator: PackageLocator,
         network: &NetworkMeter,
     ) -> Result<(VerifiedPackage, bool)> {
         locator.validate()?;
@@ -103,33 +105,170 @@ impl PackageService {
             length.maximum() <= self.limits.max_archive_bytes,
             "upstream package exceeds archive size limit"
         );
-        sessions.provision_package(
-            locator.identity,
-            length,
-            self.limits,
-            &std::env::current_exe()?,
-            || {
-                let response = crate::http_client::io_runtime()?
-                    .block_on(client.get(url.as_str()).send())?
-                    .error_for_status()?;
-                ensure!(
-                    response
-                        .content_length()
-                        .is_none_or(|size| length.accepts(size)),
-                    "upstream package length violates expectation"
-                );
-                let size = response.content_length().or(locator.expected_size);
-                let peer = observed_response_peer(&response, Peer::Upstream);
-                Ok(network.meter(
-                    Direction::Receive,
-                    peer,
-                    crate::http_client::ResponseReader::new(response)?,
-                    size.unwrap_or(0),
-                    size,
-                ))
-            },
-        )
+        let limits = self.limits;
+        let identity = locator.identity;
+        let prepared =
+            tokio::task::spawn_blocking(move || sessions.prepare_package(identity, length, limits))
+                .await??;
+        let upload = match prepared {
+            NativePackagePreparation::Cached(package) => return Ok((package, true)),
+            NativePackagePreparation::Import(upload) => upload,
+        };
+        let response = client.get(url.as_str()).send().await?.error_for_status()?;
+        ensure!(
+            response
+                .content_length()
+                .is_none_or(|size| length.accepts(size)),
+            "upstream package length violates expectation"
+        );
+        let size = response.content_length().or(locator.expected_size);
+        let peer = observed_response_peer(&response, Peer::Upstream);
+        let meter = network.transfer(Direction::Receive, peer, size.unwrap_or(0), size);
+        let mut input = StreamReader::new(Box::pin(
+            response.bytes_stream().map_err(std::io::Error::other),
+        ));
+        Ok((
+            receive_package(upload, &mut input, meter, length).await?,
+            false,
+        ))
     }
+}
+
+#[derive(Clone)]
+struct PackageRoutes {
+    service: Arc<PackageService>,
+    sessions: Arc<NativeSessions>,
+    network: Arc<NetworkMeter>,
+}
+
+async fn receive_package(
+    mut upload: NativePackageUpload,
+    input: &mut (impl AsyncRead + Unpin),
+    mut meter: TransferMeter,
+    length: ArchiveLength,
+) -> Result<VerifiedPackage> {
+    const CHUNK: usize = 256 * 1024;
+    let mut buffer = vec![0; CHUNK];
+    let mut remaining = length.maximum();
+    loop {
+        // Read at most one byte beyond the limit. An oversized stream cannot
+        // prolong the reservation by withholding the remainder of a batch.
+        let target = usize::try_from(remaining.saturating_add(1).min(CHUNK as u64))?;
+        let mut count = 0;
+        while count < target {
+            let read = input.read(&mut buffer[count..target]).await?;
+            if read == 0 {
+                break;
+            }
+            count += read;
+            meter.observe(read as u64);
+            ensure!(
+                count as u64 <= remaining,
+                "incorrect original package length or archive size limit exceeded"
+            );
+        }
+        if count == 0 {
+            meter.eof();
+            break;
+        }
+        remaining -= count as u64;
+        buffer.truncate(count);
+        (upload, buffer) = upload.append(buffer).await?;
+        buffer.resize(CHUNK, 0);
+        if count < target {
+            meter.eof();
+            break;
+        }
+    }
+    let upload = upload.seal().await?;
+    tokio::task::spawn_blocking(move || upload.finish(&std::env::current_exe()?)).await?
+}
+
+async fn package_response(
+    mut request: Request,
+    operation: &'static str,
+    routes: PackageRoutes,
+    limit: usize,
+) -> Response {
+    if let Err(response) = request_publisher(&request, "client") {
+        return response;
+    }
+    let result = async {
+        let rust = operation.starts_with("rust_");
+        let acquire = operation.ends_with("_acquire");
+        let (package, reused) = if acquire {
+            let bytes = request
+                .read_bounded(limit)
+                .await
+                .map_err(|error| anyhow::anyhow!("package locator body: {error:?}"))?;
+            let locator = codec()
+                .with_limit(u64::try_from(limit)?)
+                .deserialize(&bytes)?;
+            routes
+                .service
+                .acquire(Arc::clone(&routes.sessions), locator, &routes.network)
+                .await?
+        } else {
+            let peer = Peer::Client(request.id()).on_path(request.path());
+            let stream = request
+                .body_stream()
+                .context("missing original package body")?;
+            let mut input = StreamReader::new(Box::pin(stream));
+            let mut header = [0; 44];
+            input.read_exact(&mut header).await?;
+            let source: PackageSource = codec().with_limit(44).deserialize(&header)?;
+            let length = ArchiveLength::Exact(source.size);
+            let sessions = Arc::clone(&routes.sessions);
+            let limits = routes.service.limits;
+            match tokio::task::spawn_blocking(move || {
+                sessions.prepare_package(source.identity, length, limits)
+            })
+            .await??
+            {
+                NativePackagePreparation::Cached(package) => (package, true),
+                NativePackagePreparation::Import(upload) => {
+                    let meter = routes.network.transfer(
+                        Direction::Receive,
+                        peer,
+                        source.size,
+                        Some(source.size),
+                    );
+                    (
+                        receive_package(upload, &mut input, meter, length).await?,
+                        false,
+                    )
+                }
+            }
+        };
+        // Installer recipe publication reads the verified tree and updates the
+        // index; only that local work runs on the blocking pool.
+        if rust {
+            tokio::task::spawn_blocking(move || {
+                let package = routes
+                    .sessions
+                    .store()
+                    .publish_rust_installer(&package, routes.service.limits.policy()?.directory)?;
+                if acquire {
+                    encode(&PackageAcquisition { package, reused }, limit)
+                } else {
+                    encode(&package, limit)
+                }
+            })
+            .await?
+        } else if acquire {
+            encode(
+                &PackageAcquisition {
+                    package: package.receipt(),
+                    reused,
+                },
+                limit,
+            )
+        } else {
+            encode(&package.receipt(), limit)
+        }
+    }
+    .await;
+    native_response(operation, result)
 }
 
 pub(super) struct PublicationCallbacks<S, O> {
@@ -239,7 +378,12 @@ where
             })?;
     }
     let metadata_limit = config.max_metadata_bytes;
-    let packages = PackageService::new(config)?;
+    let packages = PackageService::new(config)?.map(Arc::new);
+    let package_routes = packages.as_ref().map(|service| PackageRoutes {
+        service: Arc::clone(service),
+        sessions: Arc::clone(&sessions),
+        network: Arc::clone(&network),
+    });
     network::start(
         &network,
         config.directory.join("network-path-timing.json"),
@@ -264,7 +408,7 @@ where
                     operation,
                     NativeServices {
                         sessions: &sessions,
-                        packages: packages.as_ref(),
+                        packages: packages.as_deref(),
                         network: &network,
                         source_plan: &source_plan,
                         observe_result: &observe_result,
@@ -291,6 +435,7 @@ where
                     metadata_limit,
                 )
             },
+            package_routes,
             metadata_limit,
         ),
     )?;
@@ -331,9 +476,23 @@ fn native_admission_class((_, operation): &(String, String)) -> AdmissionClass {
     match operation.as_str() {
         "renew" | "fail" | "retain_renew" | "retain_close" | "close" | "inputs_staged"
         | "input_unavailable" => AdmissionClass::Control,
-        "admit" | "status" | "poll_input" | "verify" | "input_prefetch" | "retain_open"
-        | "retain_add" | "blob_sources" | "retain_sources" | "tree_offer" | "tree_commit"
-        | "tree_open" | "package_plan" | "begin" | "commit" => AdmissionClass::Metadata,
+        "admit"
+        | "status"
+        | "poll_input"
+        | "verify"
+        | "input_prefetch"
+        | "retain_open"
+        | "retain_add"
+        | "blob_sources"
+        | "retain_sources"
+        | "tree_offer"
+        | "tree_commit"
+        | "tree_open"
+        | "package_plan"
+        | "package_lookup"
+        | "rust_package_lookup"
+        | "begin"
+        | "commit" => AdmissionClass::Metadata,
         _ => AdmissionClass::Bulk,
     }
 }
@@ -342,6 +501,7 @@ fn native_router<F, A, Fut, U, UFut>(
     handler: F,
     schedule: A,
     upload: U,
+    packages: Option<PackageRoutes>,
     metadata_limit: usize,
 ) -> Router
 where
@@ -354,56 +514,77 @@ where
     let upload = Arc::new(upload);
     let client_upload = Arc::clone(&upload);
     let client_backfill = Arc::clone(&upload);
-    routes(
-        Router::new()
-            .route(
-                "/api/v5/native/client/schedule",
-                async_route(
-                    MethodFilter::POST,
-                    AdmissionClass::Dispatch,
-                    move |_: Arc<F>, request| schedule(request),
-                ),
-            )
-            .route(
-                "/api/v5/native/client/upload",
-                async_route(
-                    MethodFilter::POST,
-                    AdmissionClass::Bulk,
-                    move |_: Arc<F>, request| client_upload(request, "client", "upload"),
-                ),
-            )
-            .route(
-                "/api/v5/native/worker/upload",
-                async_route(
-                    MethodFilter::POST,
-                    AdmissionClass::Bulk,
-                    move |_: Arc<F>, request| upload(request, "worker", "upload"),
-                ),
-            )
-            .route(
-                "/api/v5/native/client/backfill_input",
-                async_route(
-                    MethodFilter::POST,
-                    AdmissionClass::Bulk,
-                    move |_: Arc<F>, request| client_backfill(request, "client", "backfill_input"),
-                ),
-            )
-            .route(
-                "/api/v5/native/{role}/{operation}",
-                path_route(
-                    MethodFilter::POST,
-                    native_admission_class,
-                    move |_, (_, operation): &(String, String)| match operation.as_str() {
-                        "package_import" | "rust_package_import" => None,
-                        _ => Some(metadata_limit),
-                    },
-                    |handler: &F, request, (role, operation): (String, String)| {
-                        handler(request, &role, &operation)
-                    },
-                ),
+    let mut router = Router::new()
+        .route(
+            "/api/v5/native/client/schedule",
+            async_route(
+                MethodFilter::POST,
+                AdmissionClass::Dispatch,
+                move |_: Arc<F>, request| schedule(request),
             ),
-        handler,
-    )
+        )
+        .route(
+            "/api/v5/native/client/upload",
+            async_route(
+                MethodFilter::POST,
+                AdmissionClass::Bulk,
+                move |_: Arc<F>, request| client_upload(request, "client", "upload"),
+            ),
+        )
+        .route(
+            "/api/v5/native/worker/upload",
+            async_route(
+                MethodFilter::POST,
+                AdmissionClass::Bulk,
+                move |_: Arc<F>, request| upload(request, "worker", "upload"),
+            ),
+        )
+        .route(
+            "/api/v5/native/client/backfill_input",
+            async_route(
+                MethodFilter::POST,
+                AdmissionClass::Bulk,
+                move |_: Arc<F>, request| client_backfill(request, "client", "backfill_input"),
+            ),
+        )
+        .route(
+            "/api/v5/native/{role}/{operation}",
+            path_route(
+                MethodFilter::POST,
+                native_admission_class,
+                move |_, _: &(String, String)| Some(metadata_limit),
+                |handler: &F, request, (role, operation): (String, String)| {
+                    handler(request, &role, &operation)
+                },
+            ),
+        );
+    if let Some(packages) = packages {
+        for (path, operation) in [
+            ("/api/v5/native/client/package_import", "package_import"),
+            (
+                "/api/v5/native/client/rust_package_import",
+                "rust_package_import",
+            ),
+            ("/api/v5/native/client/package_acquire", "package_acquire"),
+            (
+                "/api/v5/native/client/rust_package_acquire",
+                "rust_package_acquire",
+            ),
+        ] {
+            let packages = packages.clone();
+            router = router.route(
+                path,
+                async_route(
+                    MethodFilter::POST,
+                    AdmissionClass::Bulk,
+                    move |_: Arc<F>, request| {
+                        package_response(request, operation, packages.clone(), metadata_limit)
+                    },
+                ),
+            );
+        }
+    }
+    routes(router, handler)
 }
 
 /// The single peer-content endpoint serves scheduler recovery, worker inputs,
@@ -855,67 +1036,6 @@ fn dispatch(
                         .map(crate::build_runtime::VerifiedPackage::receipt),
                     limit,
                 )
-            }
-        }
-        "package_acquire" | "rust_package_acquire"
-            if publisher == Publisher::Client && packages.is_some() =>
-        {
-            let locator: PackageLocator = metadata(request, limit)?;
-            let service = packages.context("native original-package provisioning disabled")?;
-            let (package, reused) = service.acquire(sessions, &locator, network)?;
-            if operation == "rust_package_acquire" {
-                let manifest = sessions
-                    .store()
-                    .publish_rust_installer(&package, service.limits.policy()?.directory)?;
-                encode(
-                    &PackageAcquisition {
-                        package: manifest,
-                        reused,
-                    },
-                    limit,
-                )
-            } else {
-                encode(
-                    &PackageAcquisition {
-                        package: package.receipt(),
-                        reused,
-                    },
-                    limit,
-                )
-            }
-        }
-        "package_import" | "rust_package_import"
-            if publisher == Publisher::Client && packages.is_some() =>
-        {
-            let service = packages.context("native original-package provisioning disabled")?;
-            let mut body = request.data().context("missing original package body")?;
-            // Fixed width: SHA-256, u32 codec, u64 length. The remaining
-            // bytes stream directly into verified archive staging.
-            let source: PackageSource = codec().with_limit(44).deserialize_from(&mut body)?;
-            let (package, _) = sessions.provision_package(
-                source.identity,
-                ArchiveLength::Exact(source.size),
-                service.limits,
-                &std::env::current_exe()?,
-                || {
-                    Ok(network.meter(
-                        Direction::Receive,
-                        peer,
-                        body,
-                        source.size,
-                        Some(source.size),
-                    ))
-                },
-            )?;
-            if operation == "rust_package_import" {
-                encode(
-                    &sessions
-                        .store()
-                        .publish_rust_installer(&package, service.limits.policy()?.directory)?,
-                    limit,
-                )
-            } else {
-                encode(&package.receipt(), limit)
             }
         }
         "admit" if publisher == Publisher::Client => {

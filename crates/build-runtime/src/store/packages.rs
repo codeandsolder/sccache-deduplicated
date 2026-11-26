@@ -5,7 +5,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{self, Read, Seek},
-    sync::Mutex,
+    os::unix::fs::{FileExt, PermissionsExt},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -14,7 +15,7 @@ use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{NativeStore, PACKAGES, StagedBlob, TreeLease, encoding};
+use super::{Inner, NativeStore, PACKAGES, StageBudget, StagedBlob, TreeLease, encoding};
 use crate::{
     ArchiveLength, BlobRef, ContentId, NativeServiceBusy, PackageArchive, PackageIdentity,
     PackageReceipt, PackageSource, TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath,
@@ -214,14 +215,14 @@ fn package_key(identity: PackageIdentity, policy: PackagePolicy) -> Result<Conte
 }
 
 /// Exclusive reservation for one original package import.
-pub struct PackageSlot<'a> {
-    active: &'a Mutex<BTreeSet<PackageIdentity>>,
+pub struct PackageSlot {
+    owner: Arc<Inner>,
     identity: PackageIdentity,
 }
 
-impl Drop for PackageSlot<'_> {
+impl Drop for PackageSlot {
     fn drop(&mut self) {
-        match self.active.lock() {
+        match self.owner.package_imports.lock() {
             Ok(mut active) => {
                 active.remove(&self.identity);
             }
@@ -235,11 +236,7 @@ impl NativeStore {
     /// may proceed concurrently within the owner-configured limit.
     /// # Errors
     /// Returns a busy error if the identity or capacity is reserved.
-    pub fn package_slot(
-        &self,
-        identity: PackageIdentity,
-        maximum: usize,
-    ) -> Result<PackageSlot<'_>> {
+    pub fn package_slot(&self, identity: PackageIdentity, maximum: usize) -> Result<PackageSlot> {
         let mut active = self
             .inner
             .package_imports
@@ -250,7 +247,7 @@ impl NativeStore {
         }
         drop(active);
         Ok(PackageSlot {
-            active: &self.inner.package_imports,
+            owner: Arc::clone(&self.inner),
             identity,
         })
     }
@@ -268,45 +265,59 @@ impl NativeStore {
         executable: &std::path::Path,
         acquire: impl FnOnce() -> Result<R>,
     ) -> Result<(VerifiedPackage, bool)> {
+        match self.prepare_package(identity, length, limits, || Ok(()))? {
+            PackagePreparation::Cached(package) => Ok((package, true)),
+            PackagePreparation::Import(mut import, ()) => {
+                import.archive.read_from(acquire()?)?;
+                Ok((import.finish(executable)?, false))
+            }
+        }
+    }
+
+    /// Claim a cold package before opening the input stream, or return its
+    /// existing verified tree. The owned claim survives asynchronous I/O.
+    ///
+    /// # Errors
+    /// Returns an error for a busy identity, invalid limits or storage failure.
+    pub(crate) fn prepare_package<T>(
+        &self,
+        identity: PackageIdentity,
+        length: ArchiveLength,
+        limits: PackageImportLimits,
+        admit_cold: impl FnOnce() -> Result<T>,
+    ) -> Result<PackagePreparation<T>> {
         let policy = limits.policy()?;
         let mut package = self.lookup_package(identity, policy)?;
-        let reservation = if package.is_none() {
-            let reservation = self.package_slot(identity, limits.max_concurrent_imports)?;
+        let slot = if package.is_none() {
+            let slot = self.package_slot(identity, limits.max_concurrent_imports)?;
             package = self.lookup_package(identity, policy)?;
-            Some(reservation)
+            Some(slot)
         } else {
             None
         };
-        let result = if let Some(package) = package {
+        if let Some(package) = package {
             if let ArchiveLength::Exact(size) = length {
                 ensure!(
                     package.source().size == size,
                     "original package length differs from verified source"
                 );
             }
-            (package, true)
-        } else {
-            ensure!(
-                length.maximum() <= limits.max_archive_bytes,
-                "original package exceeds archive size limit"
-            );
-            (
-                self.import_package(
-                    identity,
-                    length,
-                    policy,
-                    acquire()?,
-                    PackageDecoder::Isolated {
-                        executable,
-                        memory_bytes: limits.decoder_memory_bytes,
-                        timeout: std::time::Duration::from_secs(limits.decoder_timeout_secs),
-                    },
-                )?,
-                false,
-            )
-        };
-        drop(reservation);
-        Ok(result)
+            return Ok(PackagePreparation::Cached(package));
+        }
+        ensure!(
+            length.maximum() <= limits.max_archive_bytes,
+            "original package exceeds archive size limit"
+        );
+        let admitted = admit_cold()?;
+        Ok(PackagePreparation::Import(
+            Box::new(PackageImport {
+                archive: ArchiveStager::new(self, identity, length)?,
+                limits,
+                policy,
+                _slot: slot.context("missing package reservation")?,
+            }),
+            admitted,
+        ))
     }
 
     /// Resolve a previously imported exact package without transferring or
@@ -363,35 +374,19 @@ impl NativeStore {
             policy.max_entries > 0 && policy.max_tar_bytes > 0 && policy.max_metadata_bytes > 0,
             "invalid package limits"
         );
-        // Verify *before* decompression. A private staged compressed file
-        // prevents verification/decode races and is never published as a
-        // second permanent representation of the package.
-        let limit = length
-            .maximum()
-            .checked_add(1)
-            .context("package size overflow")?;
-        let mut hashed = ShaReader {
-            reader: input.take(limit),
-            hash: Sha256::new(),
-        };
-        let archive = self.stage_inner(
-            &mut hashed,
-            Some(limit),
-            super::space::StageBudget::new(self),
-        )?;
-        ensure!(
-            length.accepts(archive.reference().size),
-            "incorrect original package length or archive size limit exceeded"
-        );
-        let source = PackageSource {
-            identity,
-            size: archive.reference().size,
-        };
-        let digest: [u8; 32] = hashed.hash.finalize().into();
-        ensure!(
-            digest == source.identity.sha256,
-            "incorrect original package SHA-256"
-        );
+        let mut archive = ArchiveStager::new(self, identity, length)?;
+        archive.read_from(input)?;
+        let (source, archive) = archive.finish()?;
+        self.decode_verified_package(source, archive, policy, decoder)
+    }
+
+    fn decode_verified_package(
+        &self,
+        source: PackageSource,
+        archive: StagedBlob,
+        policy: PackagePolicy,
+        decoder: PackageDecoder<'_>,
+    ) -> Result<VerifiedPackage> {
         let reader = archive.open_file()?;
         let mut imported = ImportedTree::new(policy);
         decoder.decode(
@@ -411,16 +406,166 @@ impl NativeStore {
     }
 }
 
-struct ShaReader<R> {
-    reader: R,
-    hash: Sha256,
+/// Admission to an original archive acquisition.
+pub(crate) enum PackagePreparation<T> {
+    Cached(VerifiedPackage),
+    Import(Box<PackageImport>, T),
 }
 
-impl<R: Read> Read for ShaReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let count = self.reader.read(buffer)?;
-        self.hash.update(&buffer[..count]);
-        Ok(count)
+/// An exclusive cold import with one private staging file. Both synchronous
+/// and asynchronous ingestion share the digest, length and publication rules.
+pub(crate) struct PackageImport {
+    archive: ArchiveStager,
+    limits: PackageImportLimits,
+    policy: PackagePolicy,
+    _slot: PackageSlot,
+}
+
+impl PackageImport {
+    /// Finish the already verified archive with the isolated decoder.
+    ///
+    /// # Errors
+    /// Returns an error for invalid content, decoder failure or storage failure.
+    pub(crate) fn finish(self, executable: &std::path::Path) -> Result<VerifiedPackage> {
+        let store = self.archive.store.clone();
+        let (source, archive) = self.archive.finish()?;
+        store.decode_verified_package(
+            source,
+            archive,
+            self.policy,
+            PackageDecoder::Isolated {
+                executable,
+                memory_bytes: self.limits.decoder_memory_bytes,
+                timeout: std::time::Duration::from_secs(self.limits.decoder_timeout_secs),
+            },
+        )
+    }
+
+    #[cfg(feature = "async-io")]
+    pub(crate) fn record(&mut self, bytes: &[u8]) -> Result<u64> {
+        self.archive.record(bytes)
+    }
+
+    #[cfg(feature = "async-io")]
+    pub(crate) async fn write_batch(&self, offset: u64, buffer: Vec<u8>) -> Result<Vec<u8>> {
+        Ok(crate::disk::write_all(Arc::clone(&self.archive.file), offset, buffer).await?)
+    }
+
+    #[cfg(feature = "async-io")]
+    pub(crate) async fn seal(&mut self) -> Result<()> {
+        self.archive.verify()?;
+        crate::disk::seal_file(Arc::clone(&self.archive.file)).await?;
+        self.archive.synced = true;
+        Ok(())
+    }
+}
+
+struct ArchiveStager {
+    store: NativeStore,
+    file: Arc<File>,
+    path: tempfile::TempPath,
+    budget: StageBudget,
+    identity: PackageIdentity,
+    length: ArchiveLength,
+    size: u64,
+    sha: Sha256,
+    blake: blake3::Hasher,
+    synced: bool,
+}
+
+impl ArchiveStager {
+    fn new(store: &NativeStore, identity: PackageIdentity, length: ArchiveLength) -> Result<Self> {
+        let mut budget = StageBudget::new(store);
+        // Reserve exactly the permitted compressed input, not a second archive.
+        budget.grow_to(length.maximum())?;
+        let (file, path) =
+            tempfile::NamedTempFile::new_in(store.inner.root.join("staging"))?.into_parts();
+        Ok(Self {
+            store: store.clone(),
+            file: Arc::new(file),
+            path,
+            budget,
+            identity,
+            length,
+            size: 0,
+            sha: Sha256::new(),
+            blake: blake3::Hasher::new(),
+            synced: false,
+        })
+    }
+
+    fn record(&mut self, bytes: &[u8]) -> Result<u64> {
+        let offset = self.size;
+        let size = offset
+            .checked_add(u64::try_from(bytes.len())?)
+            .context("package size overflow")?;
+        ensure!(
+            size <= self.length.maximum(),
+            "incorrect original package length or archive size limit exceeded"
+        );
+        self.sha.update(bytes);
+        self.blake.update(bytes);
+        self.size = size;
+        Ok(offset)
+    }
+
+    fn read_from(&mut self, mut input: impl Read) -> Result<()> {
+        let mut buffer = vec![0; 256 * 1024];
+        loop {
+            let remaining = self.length.maximum() - self.size;
+            let count = usize::try_from(remaining.saturating_add(1).min(buffer.len() as u64))?;
+            match input.read(&mut buffer[..count]) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let bytes = &buffer[..count];
+                    let offset = self.record(bytes)?;
+                    self.file.write_all_at(bytes, offset)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn verify(&self) -> Result<()> {
+        ensure!(
+            self.length.accepts(self.size),
+            "incorrect original package length or archive size limit exceeded"
+        );
+        let digest: [u8; 32] = self.sha.clone().finalize().into();
+        ensure!(
+            digest == self.identity.sha256,
+            "incorrect original package SHA-256"
+        );
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(PackageSource, StagedBlob)> {
+        self.verify()?;
+        if !self.synced {
+            self.file
+                .set_permissions(std::fs::Permissions::from_mode(0o400))?;
+            self.file.sync_all()?;
+        }
+        let metadata = self.file.metadata()?;
+        Ok((
+            PackageSource {
+                identity: self.identity,
+                size: self.size,
+            },
+            StagedBlob {
+                path: self.path,
+                metadata,
+                reference: BlobRef {
+                    id: ContentId(*self.blake.finalize().as_bytes()),
+                    size: self.size,
+                },
+                encoding: crate::BlobEncoding::Raw,
+                owner: Arc::clone(&self.store.inner),
+                _reservation: self.budget.finish(self.size)?,
+            },
+        ))
     }
 }
 
@@ -700,6 +845,53 @@ mod tests {
         header.set_cksum();
         builder.append_link(&mut header, "component/bin/alias", "component/bin/compiler")?;
         Ok(builder.into_inner()?)
+    }
+
+    #[cfg(feature = "async-io")]
+    #[tokio::test]
+    async fn archive_batches_produce_the_same_verified_tree_and_original() -> Result<()> {
+        let bytes = example_tar()?;
+        let source = source(&bytes, PackageCompression::Tar);
+        let directory = tempfile::tempdir()?;
+        let store = NativeStore::open(directory.path())?;
+        let policy = PackagePolicy {
+            retain_original: true,
+            ..policy()
+        };
+        let mut archive =
+            ArchiveStager::new(&store, source.identity, ArchiveLength::Exact(source.size))?;
+        for chunk in bytes.chunks(137) {
+            let buffer = chunk.to_vec();
+            let offset = archive.record(&buffer)?;
+            archive = crate::disk::run(move || async move {
+                crate::disk::write_all(Arc::clone(&archive.file), offset, buffer).await?;
+                Ok(archive)
+            })
+            .await?;
+        }
+        let (actual, staged) = archive.finish()?;
+        assert_eq!(actual, source);
+        assert_eq!(
+            staged.reference(),
+            BlobRef {
+                id: ContentId::of(&bytes),
+                size: source.size
+            }
+        );
+        let package =
+            store.decode_verified_package(source, staged, policy, PackageDecoder::InProcess)?;
+        let other_directory = tempfile::tempdir()?;
+        let other = NativeStore::open(other_directory.path())?;
+        let expected = other.import_package(
+            source.identity,
+            ArchiveLength::AtMost(source.size),
+            policy,
+            &bytes[..],
+            PackageDecoder::InProcess,
+        )?;
+        assert_eq!(package.receipt(), expected.receipt());
+        assert_eq!(store.stats()?.logical_bytes, other.stats()?.logical_bytes);
+        Ok(())
     }
 
     #[test]

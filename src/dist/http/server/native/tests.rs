@@ -258,6 +258,7 @@ fn with_native_service(
                         1024 * 1024,
                     )
                 },
+                None,
                 1024 * 1024,
             )
         },
