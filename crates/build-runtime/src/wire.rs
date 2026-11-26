@@ -28,10 +28,13 @@ pub enum Publisher {
     Worker { peer: crate::PeerId, job: u64 },
 }
 
-/// A client request for a complete *native* action, not a legacy cache key.
-/// The output contract is an additional mandatory fingerprint component.
+/// A client request for a complete native execution declaration.
+/// A compiler front end may additionally supply a semantic result fingerprint;
+/// the exact declaration is still compared when assigning and verifying work.
+/// The output contract is a mandatory component of either result identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionRequest {
+    pub(crate) result_fingerprint: Option<ActionFingerprint>,
     pub(crate) fingerprint: ActionFingerprint,
     pub(crate) root: ExecutionRoot,
     pub input_trees: BTreeSet<TreeId>,
@@ -59,7 +62,11 @@ impl ActionRequest {
                 .all(|name| !name.is_empty() && !name.contains('\0')),
             "invalid output name"
         );
-        let mut fingerprint = self.fingerprint.clone();
+        let mut fingerprint = self
+            .result_fingerprint
+            .as_ref()
+            .unwrap_or(&self.fingerprint)
+            .clone();
         let digest = ContentId(typed_digest(
             b"sccache-output-contract-v2\0",
             &(&self.required_outputs, &self.optional_outputs),
@@ -80,13 +87,15 @@ impl ActionRequest {
                 .all(|layer| self.input_trees.contains(&layer.tree)),
             "native root recipe references an undeclared input"
         );
-        ensure!(
-            fingerprint
-                .components
-                .insert("root/tree".into(), ContentId(self.root.id.0))
-                .is_none(),
-            "reserved root component"
-        );
+        if self.result_fingerprint.is_none() {
+            ensure!(
+                fingerprint
+                    .components
+                    .insert("root/tree".into(), ContentId(self.root.id.0))
+                    .is_none(),
+                "reserved root component"
+            );
+        }
         Ok(fingerprint)
     }
 

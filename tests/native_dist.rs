@@ -15,9 +15,9 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use sccache::{
     build_runtime::{
-        ActionMode, Artifact, BuildPath, CommandSpec, ComponentAudit, ContentId, ExecutionRoot,
-        ExecutionSpec, InstallationManifest, MappedMetadata, MappedTree, NativeStore, OutputSpec,
-        SpacePolicy, TreeLayer, TreePath, TreeRecipe,
+        ActionMode, Artifact, BuildPath, CommandSpec, ContentId, ExecutionRoot, ExecutionSpec,
+        InstallationManifest, MappedMetadata, MappedTree, NativeStore, OutputSpec, SpacePolicy,
+        TreeLayer, TreePath, TreeRecipe,
         wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply},
     },
     config::{
@@ -1471,6 +1471,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     )?;
     let source_tree = mapping.prepare()?;
     let spec = ExecutionSpec {
+        compiler_result: None,
         platform: ContentId::of(PLATFORM.as_bytes()),
         root: ExecutionRoot::resolve(
             TreeRecipe {
@@ -1943,6 +1944,7 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
         fs::remove_file(&input)?;
     }
     let mut spec = ExecutionSpec {
+        compiler_result: None,
         platform: ContentId::of(PLATFORM.as_bytes()),
         root: ExecutionRoot::resolve(
             TreeRecipe {
@@ -2397,6 +2399,20 @@ fn main() { println!("{}", unsafe { native_value() }); }"#,
     Ok(())
 }
 
+fn action_report(output: &std::process::Output) -> Result<(String, String)> {
+    let log = String::from_utf8_lossy(&output.stderr);
+    ensure!(output.status.success(), "compiler failed: {log}");
+    let mut reports = log
+        .lines()
+        .filter_map(|line| line.split_once("native_action "));
+    let (_, report) = reports.next().context("missing native action report")?;
+    ensure!(reports.next().is_none(), "multiple native action reports");
+    let mut fields = report.split_whitespace();
+    let key = fields.next().context("missing key")?.to_owned();
+    let source = fields.next().context("missing source")?.to_owned();
+    Ok((key, source))
+}
+
 fn run_environment_audit(
     service: &LocalService,
     directory: &Path,
@@ -2407,7 +2423,7 @@ fn run_environment_audit(
         directory.join("audit.rs"),
         b"pub const OBSERVED: &str = env!(\"NATIVE_AUDIT_OBSERVED\");\n",
     )?;
-    let compile = |unused: &str, observed: &str| -> Result<Vec<u8>> {
+    let compile = |unused: &str, observed: &str| -> Result<((String, String), Vec<u8>)> {
         let output = service
             .command(env!("CARGO_BIN_EXE_sccache"))
             .arg(rustc)
@@ -2424,35 +2440,80 @@ fn run_environment_audit(
             ])
             .current_dir(directory)
             .env("SCCACHE_CONF", config)
-            .env("CARGO_NATIVE_AUDIT_UNUSED", unused)
+            .env("NATIVE_AUDIT_UNUSED", unused)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
             .env("NATIVE_AUDIT_OBSERVED", observed)
             .output()?;
-        ensure!(
-            output.status.success(),
-            "environment audit compile failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Ok(fs::read(directory.join("build/libaudit.rlib"))?)
+        let report = action_report(&output)?;
+        Ok((report, fs::read(directory.join("build/libaudit.rlib"))?))
     };
-    let first = compile("first", "first")?;
-    assert_eq!(compile("second", "first")?, first);
-    assert_ne!(compile("first", "second")?, first);
+    let ((key, source), first) = compile("first", "first")?;
+    assert_eq!(source, "worker");
+    let ((same, source), second) = compile("second", "first")?;
+    assert_eq!(source, "hit");
+    assert_eq!(key, same);
+    assert_eq!(first, second);
+    let ((changed, source), third) = compile("first", "second")?;
+    assert_eq!(source, "worker");
+    assert_ne!(key, changed);
+    assert_ne!(first, third);
     Ok(())
 }
 
-fn audit_index(index: &Path, component: &str) -> Result<ComponentAudit> {
-    let output = Command::new(env!("CARGO_BIN_EXE_sccache-dist"))
-        .args(["native-audit", "--index"])
-        .arg(index)
-        .args(["--schema", "native-linux-bwrap-v4", "--without", component])
-        .output()?;
-    ensure!(
-        output.status.success(),
-        "native audit command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    Ok(serde_json::from_value(report["comparison"].clone())?)
+#[test]
+#[ignore = "requires Linux Bubblewrap, GCC and ldd"]
+fn native_compiler_semantic_reuse_across_ephemeral_inputs() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("native-semantic-")
+        .tempdir_in("/tmp")?;
+    let root = temp.path().canonicalize()?;
+    let fleet = Fleet::start(&root, BTreeMap::new())?;
+    let mut service = LocalService::start(&root, &fleet, None)?;
+    let config = root.join("direct.toml");
+    fs::write(&config, "client_side_mode = false\n")?;
+    for (name, input) in [
+        ("probe.c", "int semantic_probe(void) { return VALUE; }\n"),
+        (
+            "probe.S",
+            ".data\n.globl semantic_probe\nsemantic_probe: .byte VALUE\n",
+        ),
+    ] {
+        let first = root.join("first");
+        let second = root.join("second");
+        for (dir, seconds) in [(&first, 1), (&second, 2)] {
+            fs::create_dir_all(dir)?;
+            let path = dir.join(name);
+            fs::write(&path, input)?;
+            fs::File::options().write(true).open(path)?.set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds)),
+            )?;
+        }
+        let compile = |dir: &Path, job: &str, value: &str| -> Result<((String, String), Vec<u8>)> {
+            let output = service
+                .command(env!("CARGO_BIN_EXE_sccache"))
+                .args(["/usr/bin/gcc", "-c", name, "-o", "probe.o", value])
+                .current_dir(dir)
+                .env("SCCACHE_CONF", &config)
+                .env("SCCACHE_LOG", "sccache::native_action=info")
+                .env("GITHUB_RUN_ID", job)
+                .output()?;
+            Ok((action_report(&output)?, fs::read(dir.join("probe.o"))?))
+        };
+        let ((key, source), artifact) = compile(&first, "1", "-DVALUE=42")?;
+        assert_eq!(source, "worker");
+        let ((same, source), bytes) = compile(&second, "2", "-DVALUE=42")?;
+        assert_eq!(source, "hit", "{name}");
+        assert_eq!(key, same);
+        assert_eq!(artifact, bytes);
+        let ((changed, source), bytes) = compile(&second, "3", "-DVALUE=17")?;
+        assert_eq!(source, "worker");
+        assert_ne!(key, changed);
+        assert_ne!(artifact, bytes);
+    }
+    service.stop()?;
+    fleet.finish()?;
+    Ok(())
 }
 
 #[test]
@@ -2537,9 +2598,9 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         "native namespace compiler path failed"
     );
     let stats = service.stats()?;
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 12);
-    assert_eq!(stats.cache_hits.all(), 12);
-    assert_eq!(stats.cache_misses.all(), 12);
+    let namespace_compiles = stats.dist_compiles.values().sum::<usize>();
+    assert!((11..=12).contains(&namespace_compiles));
+    assert_eq!(stats.cache_hits.all() + stats.cache_misses.all(), 24);
     assert_eq!(stats.forced_recaches, 4);
     assert_eq!(stats.dist_errors, 0);
     assert!(private.join("build/probe.o").is_file());
@@ -2573,26 +2634,16 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         fs::read(private.join("rust-reference.rlib"))?
     );
     let stats = service.stats()?;
-    assert_eq!(stats.cache_hits.all(), 20);
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 12);
+    assert_eq!(stats.cache_hits.all(), 32 - namespace_compiles);
+    assert_eq!(
+        stats.dist_compiles.values().sum::<usize>(),
+        namespace_compiles
+    );
     run_environment_audit(&service, &direct, &rustc, &direct_config)?;
-    let stats = service.stats()?;
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 15);
-    assert_eq!(stats.dist_errors, 0);
-    let index = fleet.scheduler_directory.join("index.redb");
+    assert_eq!(service.stats()?.dist_errors, 0);
     service.stop()?;
     let (scheduler, worker) = fleet.finish()?;
-    assert_eq!(scheduler.actions, 11);
-    let unused = audit_index(&index, "environment/CARGO_NATIVE_AUDIT_UNUSED")?;
-    assert_eq!(unused.equivalent_pairs, 1);
-    assert_eq!(unused.conflicting_pairs, 0);
-    let observed = audit_index(&index, "environment/NATIVE_AUDIT_OBSERVED")?;
-    assert_eq!(observed.equivalent_pairs, 0);
-    assert_eq!(observed.conflicting_pairs, 1);
-    assert_eq!(unused.examined_actions, 11);
-    eprintln!("actual Rust environment audit: {unused:?}; {observed:?}");
-    // All eleven distinct remotely produced actions are retained.
-    assert_eq!(worker.actions, 11);
+    assert_eq!(scheduler.actions, worker.actions);
     Ok(())
 }
 

@@ -154,6 +154,19 @@ impl ExecutionRoot {
     }
 }
 
+/// Compiler-front-end identity of a reusable result. The authenticated client
+/// supplies the compiler's semantic input digest; the exact execution plan
+/// remains independently verified. The packaged toolchain is also an input
+/// because an identical driver may load different auxiliary programs/libraries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompilerResultIdentity {
+    pub semantic: ContentId,
+    pub toolchain: TreeId,
+    /// Additional compiler-visible inputs not covered by the front-end digest.
+    pub input_closure: Option<TreeId>,
+    pub environment: ContentId,
+}
+
 /// All declared inputs to a Linux native build.
 ///
 /// Platform is a versioned execution-contract digest supplied by deployment
@@ -163,6 +176,7 @@ impl ExecutionRoot {
 /// actual files, and scratch, output and namespace policy are schema-fixed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionSpec {
+    pub compiler_result: Option<CompilerResultIdentity>,
     pub platform: ContentId,
     pub root: ExecutionRoot,
     pub mounts: BTreeMap<BuildPath, TreeId>,
@@ -227,7 +241,7 @@ impl ExecutionSpec {
         Ok(())
     }
 
-    /// Derive the cache request from the exact declaration that will execute.
+    /// Derive both exact execution and reusable result identity from the declaration.
     ///
     /// # Errors
     /// Returns an error for an invalid or unencodable specification.
@@ -262,7 +276,52 @@ impl ExecutionSpec {
                 optional_outputs.insert(name.clone(), output.kind);
             }
         }
+        let result_fingerprint = self.compiler_result.map(|identity| {
+            let mut components = BTreeMap::from([
+                ("compiler/semantic".into(), identity.semantic),
+                ("compiler/toolchain".into(), ContentId(identity.toolchain.0)),
+                ("compiler/environment".into(), identity.environment),
+                ("platform".into(), self.platform),
+                (
+                    "command/umask".into(),
+                    ContentId::of(&self.command.umask.to_le_bytes()),
+                ),
+            ]);
+            if let Some(tree) = identity.input_closure {
+                components.insert("compiler/input-closure".into(), ContentId(tree.0));
+            }
+            // Generated trees may contain embedded paths (e.g. Rust rlink).
+            // Preserve their logical output root even when file output names
+            // are relocatable according to the compiler frontend.
+            for (name, output) in &self.outputs {
+                if output.kind == OutputKind::GeneratedTree {
+                    components.insert(
+                        format!("output/path/{name}"),
+                        ContentId::of(output.path.as_bytes()),
+                    );
+                }
+            }
+            ActionFingerprint {
+                schema: "native-compiler-result-v1".into(),
+                components,
+            }
+        });
+        if let Some(identity) = self.compiler_result {
+            ensure!(
+                self.mounts.is_empty(),
+                "compiler identity does not describe additional mounts"
+            );
+            ensure!(
+                self.root
+                    .recipe
+                    .layers
+                    .iter()
+                    .any(|layer| layer.tree == identity.toolchain),
+                "compiler result identity references an undeclared toolchain"
+            );
+        }
         Ok(ActionRequest {
+            result_fingerprint,
             fingerprint: ActionFingerprint {
                 schema: "native-linux-bwrap-v4".into(),
                 components,
@@ -283,6 +342,7 @@ mod tests {
 
     fn spec() -> Result<ExecutionSpec> {
         Ok(ExecutionSpec {
+            compiler_result: None,
             platform: ContentId::of(b"platform"),
             root: ExecutionRoot {
                 id: TreeId([1; 32]),
@@ -369,6 +429,69 @@ mod tests {
             .mounts
             .insert(BuildPath::new(b"/other".to_vec())?, TreeId([2; 32]));
         assert_ne!(first, key(&changed)?);
+        Ok(())
+    }
+
+    #[test]
+    fn compiler_result_identity_is_independent_of_exact_execution() -> Result<()> {
+        let mut original = spec()?;
+        original.mounts.clear();
+        let toolchain = original.root.recipe.layers[0].tree;
+        let identity = CompilerResultIdentity {
+            semantic: ContentId::of(b"compiler semantic inputs"),
+            toolchain,
+            input_closure: Some(TreeId([8; 32])),
+            environment: ContentId::of(b"compiler environment"),
+        };
+        original.compiler_result = Some(identity);
+        let request = original.action_request()?;
+        let key = request.action_fingerprint()?.key()?;
+        let mut changed = original.clone();
+        changed
+            .command
+            .environment
+            .insert(b"CI_RUN_ID".to_vec(), b"new".to_vec());
+        changed.command.cwd = BuildPath::new(b"/different-checkout".to_vec())?;
+        changed.root.id = TreeId([9; 32]);
+        let changed_request = changed.action_request()?;
+        assert_ne!(request, changed_request);
+        assert_eq!(key, changed_request.action_fingerprint()?.key()?);
+
+        for different in [
+            CompilerResultIdentity {
+                semantic: ContentId::of(b"changed input"),
+                ..identity
+            },
+            CompilerResultIdentity {
+                input_closure: Some(TreeId([10; 32])),
+                ..identity
+            },
+            CompilerResultIdentity {
+                environment: ContentId::of(b"changed compiler environment"),
+                ..identity
+            },
+        ] {
+            changed.compiler_result = Some(different);
+            assert_ne!(key, changed.action_request()?.action_fingerprint()?.key()?);
+        }
+        changed.compiler_result = Some(identity);
+        changed.command.umask = 0o077;
+        assert_ne!(key, changed.action_request()?.action_fingerprint()?.key()?);
+        changed.command.umask = original.command.umask;
+        changed.platform = ContentId::of(b"changed platform");
+        assert_ne!(key, changed.action_request()?.action_fingerprint()?.key()?);
+        changed.platform = original.platform;
+        changed
+            .outputs
+            .get_mut("object")
+            .context("test output")?
+            .required = false;
+        assert_ne!(key, changed.action_request()?.action_fingerprint()?.key()?);
+        changed.compiler_result = Some(CompilerResultIdentity {
+            toolchain: TreeId([12; 32]),
+            ..identity
+        });
+        assert!(changed.action_request().is_err());
         Ok(())
     }
 

@@ -16,9 +16,10 @@ use anyhow::{Context, Result, ensure};
 
 use crate::{
     build_runtime::{
-        ActionKey, ActionMode, BuildPath, CommandSpec, ContentId, DescriptorDigestProvider,
-        ExecutionRoot, ExecutionSpec, OutputKind, OutputSpec, PreparedTree, SourceDigestCache,
-        TreeRecipe,
+        ActionKey, ActionMode, BuildPath, CommandSpec, CompilerResultIdentity, ContentId,
+        DescriptorDigestProvider, ExecutionRoot, ExecutionSpec, OutputKind, OutputSpec,
+        PreparedTree, SourceDigestCache, TreeEntry, TreeId, TreeManifest, TreeRecipe,
+        TreeTimestamp,
     },
     cache::FileObjectSource,
     client::{SharedConnection, connection_task},
@@ -458,6 +459,144 @@ impl NativeOutput {
     }
 }
 
+/// The compiler frontend declares which semantic identity it can establish.
+/// Opaque extensions keep exact execution identity: their code can observe
+/// arbitrary environment values and input metadata outside compiler dep-info.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ResultIdentityPolicy {
+    Exact,
+    PreprocessedC,
+    Rust,
+}
+
+impl ResultIdentityPolicy {
+    fn identity(
+        self,
+        key: &str,
+        command: &CommandSpec,
+        toolchain: TreeId,
+        inputs: &TreeManifest,
+    ) -> Result<Option<CompilerResultIdentity>> {
+        if self == Self::Exact || opaque_compiler_extension(command, inputs) {
+            return Ok(None);
+        }
+        let environment = compiler_environment(command, self);
+        let input_closure = if self == Self::Rust {
+            // Rust's dep-info includes sources and direct externs, but the
+            // packaged search closure also includes transitive dependencies.
+            // Rustc reads these by content; do not make delivery mtimes inputs.
+            let mut manifest = inputs.clone();
+            let stamp = TreeTimestamp {
+                seconds: 0,
+                nanoseconds: 0,
+            };
+            manifest.root.modified = stamp;
+            for entry in manifest.entries.values_mut() {
+                match entry {
+                    TreeEntry::Directory(metadata) | TreeEntry::File { metadata, .. } => {
+                        metadata.modified = stamp
+                    }
+                    TreeEntry::Symlink { modified, .. } => *modified = stamp,
+                    TreeEntry::Hardlink(_) => {}
+                }
+            }
+            Some(manifest.id()?)
+        } else {
+            None
+        };
+        Ok(Some(CompilerResultIdentity {
+            semantic: ContentId::of(key.as_bytes()),
+            toolchain,
+            input_closure,
+            environment,
+        }))
+    }
+}
+
+/// Compiler extensions execute arbitrary native code, outside the semantic
+/// dependency model of ordinary frontends. Retain the exact declaration key.
+fn opaque_compiler_extension(command: &CommandSpec, inputs: &TreeManifest) -> bool {
+    command.arguments.iter().any(|arg| {
+        [
+            b"-fplugin".as_slice(),
+            b"-fpass-plugin",
+            b"-load",
+            b"-add-plugin",
+            b"-plugin",
+            b"-wrapper",
+            b"-specs",
+            b"--specs",
+            b"-Zcodegen-backend",
+            b"codegen-backend=",
+        ]
+        .iter()
+        .any(|prefix| arg.starts_with(prefix))
+    }) || inputs
+        .entries
+        .keys()
+        .any(|path| path.as_bytes().ends_with(b".so"))
+}
+
+/// Extra driver/runtime dependencies not necessarily present in preprocessor
+/// output or Rust's dep-info. Hash the observed command environment, not job,
+/// shell or scheduler bookkeeping. Rust source-observed values and Cargo
+/// semantic environment are already included in the frontend digest.
+fn compiler_environment(command: &CommandSpec, policy: ResultIdentityPolicy) -> ContentId {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"sccache-native-compiler-environment-v1\0");
+    for (name, value) in &command.environment {
+        let name = name.as_slice();
+        let relevant = [
+            b"LANG".as_slice(),
+            b"LANGUAGE",
+            b"TZ",
+            b"TERM",
+            b"SOURCE_DATE_EPOCH",
+            b"PATH",
+        ]
+        .contains(&name)
+            || [b"LC_".as_slice(), b"LD_"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            || match policy {
+                ResultIdentityPolicy::PreprocessedC => {
+                    [b"GCC_".as_slice(), b"CLANG_", b"CCC_"]
+                        .iter()
+                        .any(|prefix| name.starts_with(prefix))
+                        || [
+                            b"COMPILER_PATH".as_slice(),
+                            b"LIBRARY_PATH",
+                            b"CPATH",
+                            b"C_INCLUDE_PATH",
+                            b"CPLUS_INCLUDE_PATH",
+                            b"OBJC_INCLUDE_PATH",
+                            b"DEPENDENCIES_OUTPUT",
+                            b"SUNPRO_DEPENDENCIES",
+                        ]
+                        .contains(&name)
+                }
+                ResultIdentityPolicy::Rust => {
+                    name.starts_with(b"RUSTC_")
+                        || [
+                            b"RUST_MIN_STACK".as_slice(),
+                            b"RUST_BACKTRACE",
+                            b"RUST_LIB_BACKTRACE",
+                            b"RUSTFLAGS",
+                        ]
+                        .contains(&name)
+                }
+                ResultIdentityPolicy::Exact => false,
+            };
+        if relevant {
+            for field in [name, value.as_slice()] {
+                digest.update(&(field.len() as u128).to_le_bytes());
+                digest.update(field);
+            }
+        }
+    }
+    ContentId(*digest.finalize().as_bytes())
+}
+
 struct CompilerPlan {
     spec: ExecutionSpec,
     inputs: Vec<PreparedTree>,
@@ -471,10 +610,11 @@ impl CompilerPlan {
         outputs: Vec<NativeOutput>,
         transformer: dist::PathTransformer,
         packagers: DistPackagers,
-        platform: ContentId,
+        identity: (ContentId, ResultIdentityPolicy, &str),
         preparation: (&SourceDigestCache, Option<&NativeCompilerClient>),
     ) -> Result<Self> {
         let (toolchain_digests, native) = preparation;
+        let (platform, result_policy, key) = identity;
         let mut layout = pkg::CompilerInputs::new(transformer);
         layout.directory(cwd)?;
         let mut paths = BTreeMap::new();
@@ -528,27 +668,31 @@ impl CompilerPlan {
                 .map(|tree| (tree.id(), tree.manifest()))
                 .collect(),
         )?;
+        let command = CommandSpec {
+            umask: command
+                .umask
+                .context("native execution requires a known process umask")?,
+            executable: BuildPath::new(command.executable.into_bytes())?,
+            arguments: command
+                .arguments
+                .into_iter()
+                .map(String::into_bytes)
+                .collect(),
+            cwd: BuildPath::new(command.cwd.into_bytes())?,
+            environment: command
+                .env_vars
+                .into_iter()
+                .map(|(name, value)| (name.into_bytes(), value.into_bytes()))
+                .collect(),
+        };
+        let compiler_result =
+            result_policy.identity(key, &command, inputs[0].id(), inputs[1].manifest())?;
         let spec = ExecutionSpec {
+            compiler_result,
             platform,
             root,
             mounts: BTreeMap::new(),
-            command: CommandSpec {
-                umask: command
-                    .umask
-                    .context("native execution requires a known process umask")?,
-                executable: BuildPath::new(command.executable.into_bytes())?,
-                arguments: command
-                    .arguments
-                    .into_iter()
-                    .map(String::into_bytes)
-                    .collect(),
-                cwd: BuildPath::new(command.cwd.into_bytes())?,
-                environment: command
-                    .env_vars
-                    .into_iter()
-                    .map(|(name, value)| (name.into_bytes(), value.into_bytes()))
-                    .collect(),
-            },
+            command,
             outputs: paths,
         };
         spec.validate()?;
@@ -769,10 +913,13 @@ pub(super) async fn compile<T: CommandCreatorSync>(
     creator: T,
     cwd: PathBuf,
     compilation: Box<dyn Compilation<T>>,
-    control: CacheControl,
+    identity: (CacheControl, &str),
     pool: &tokio::runtime::Handle,
 ) -> Result<(CompileResult, process::Output)> {
     let start = Instant::now();
+    let result_policy = compilation.native_result_policy();
+    let (control, key) = identity;
+    let key = key.to_owned();
     crate::server::activity::phase(crate::server::activity::Phase::PlanCompile);
     let mut transformer = dist::PathTransformer::new();
     let (local, remote, cacheable) =
@@ -811,7 +958,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                     outputs,
                     layout,
                     packagers,
-                    preparation_client.policy.platform,
+                    (preparation_client.policy.platform, result_policy, &key),
                     (
                         &preparation_client.toolchain_digests,
                         Some(&preparation_client),
@@ -956,6 +1103,7 @@ mod tests {
         }))?;
         assert_eq!(hashed.cache_control, CacheControl::Default);
         let compilation = hashed.compilation;
+        let result_policy = compilation.native_result_policy();
         let mut transformer = dist::PathTransformer::new();
         let (_, remote, cacheable) =
             compilation.generate_compile_commands(&mut transformer, CompileTransport::Native)?;
@@ -1005,7 +1153,7 @@ mod tests {
             outputs,
             layout,
             compilation.into_dist_packagers(transformer)?,
-            platform,
+            (platform, result_policy, &hashed.key),
             (&SourceDigestCache::default(), None),
         )?;
         let store = NativeStore::open(&cwd.join("native-store"))?;

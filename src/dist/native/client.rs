@@ -1194,6 +1194,7 @@ mod result_tests {
         }
         let intermediate = intermediate.prepare()?;
         let spec = ExecutionSpec {
+            compiler_result: None,
             platform: ContentId::of(b"platform"),
             root: ExecutionRoot::resolve(
                 TreeRecipe::union(metadata(0o755), [input.id()]),
