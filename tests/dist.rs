@@ -25,6 +25,12 @@ use std::process::Output;
 use sccache::errors::*;
 
 pub mod harness;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[path = "dist/transport_stall.rs"]
+mod transport_stall;
 
 /// One worker per compatible group, with independent client-result caches.
 /// Keeping the worker alive also retains verified extracted toolchains. The
