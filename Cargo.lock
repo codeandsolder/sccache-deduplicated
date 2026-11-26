@@ -4001,6 +4001,7 @@ dependencies = [
  "percent-encoding",
  "predicates",
  "rand 0.10.4",
+ "rayon-core",
  "regex",
  "rustix",
  "sccache-build",

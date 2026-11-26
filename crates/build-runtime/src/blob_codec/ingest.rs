@@ -2,9 +2,9 @@
 //! state machine never waits for input and buffers at most one codec frame.
 
 use super::{
-    BlobEncoding, BlobRef, CHUNK, ChunkWidths, ContentId, File, MAGIC, Result, Write,
+    BlobEncoding, BlobRef, CHUNK, ChunkWidths, ContentId, MAGIC, Result, Write,
     decode_transport_chunk, validate_transport_header, validate_transport_widths,
-    write_encoded_chunk, write_encoded_header,
+    write_encoded_chunk,
 };
 use crate::store::BlobIntegrityError;
 use anyhow::{Context, ensure};
@@ -25,19 +25,22 @@ pub(crate) struct BlobIngest {
     pending: Vec<u8>,
     digest: blake3::Hasher,
     decoded: u64,
-    written_chunks: u32,
 }
 
 impl BlobIngest {
     pub(crate) fn new(
-        file: &mut File,
+        file: &mut impl Write,
         expected: BlobRef,
         source: BlobEncoding,
         target: BlobEncoding,
     ) -> Result<Self> {
         if source == BlobEncoding::Raw && target == BlobEncoding::ZstdChunks {
             file.write_all(&MAGIC)?;
-            file.write_all(&[0_u8; 16])?;
+            // The expected logical size is already negotiated. Emit the final
+            // header now rather than seeking back during finalization.
+            file.write_all(&expected.size.to_le_bytes())?;
+            file.write_all(&u32::try_from(CHUNK)?.to_le_bytes())?;
+            file.write_all(&u32::try_from(expected.size.div_ceil(CHUNK as u64))?.to_le_bytes())?;
         }
         Ok(Self {
             expected,
@@ -49,11 +52,14 @@ impl BlobIngest {
             pending: Vec::new(),
             digest: blake3::Hasher::new(),
             decoded: 0,
-            written_chunks: 0,
         })
     }
 
-    pub(crate) fn feed(&mut self, file: &mut File, mut input: &[u8]) -> Result<()> {
+    pub(crate) fn requires_codec_pool(&self) -> bool {
+        !matches!(self.state, InputState::Raw) || self.target == BlobEncoding::ZstdChunks
+    }
+
+    pub(crate) fn feed(&mut self, file: &mut impl Write, mut input: &[u8]) -> Result<()> {
         if matches!(self.state, InputState::Raw) {
             return self.feed_raw(file, input);
         }
@@ -76,7 +82,7 @@ impl BlobIngest {
         Ok(())
     }
 
-    fn feed_raw(&mut self, file: &mut File, mut bytes: &[u8]) -> Result<()> {
+    fn feed_raw(&mut self, file: &mut impl Write, mut bytes: &[u8]) -> Result<()> {
         self.decoded = self
             .decoded
             .checked_add(u64::try_from(bytes.len())?)
@@ -96,10 +102,6 @@ impl BlobIngest {
         while !bytes.is_empty() {
             if self.pending.is_empty() && bytes.len() >= CHUNK {
                 write_encoded_chunk(file, &bytes[..CHUNK])?;
-                self.written_chunks = self
-                    .written_chunks
-                    .checked_add(1)
-                    .context("too many CAS chunks")?;
                 bytes = &bytes[CHUNK..];
             } else {
                 let count = bytes.len().min(CHUNK - self.pending.len());
@@ -113,19 +115,15 @@ impl BlobIngest {
         Ok(())
     }
 
-    fn flush_raw_chunk(&mut self, file: &mut File) -> Result<()> {
+    fn flush_raw_chunk(&mut self, file: &mut impl Write) -> Result<()> {
         if !self.pending.is_empty() {
             write_encoded_chunk(file, &self.pending)?;
-            self.written_chunks = self
-                .written_chunks
-                .checked_add(1)
-                .context("too many CAS chunks")?;
             self.pending.clear();
         }
         Ok(())
     }
 
-    fn finish_part(&mut self, file: &mut File) -> Result<()> {
+    fn finish_part(&mut self, file: &mut impl Write) -> Result<()> {
         self.state = match self.state {
             InputState::Header => {
                 let count =
@@ -174,7 +172,7 @@ impl BlobIngest {
         Ok(())
     }
 
-    pub(crate) fn finish(mut self, file: &mut File) -> Result<()> {
+    pub(crate) fn finish(mut self, file: &mut impl Write) -> Result<()> {
         ensure!(
             matches!(self.state, InputState::Raw | InputState::Complete),
             "truncated native CAS content"
@@ -192,7 +190,6 @@ impl BlobIngest {
         );
         if matches!(self.state, InputState::Raw) && self.target == BlobEncoding::ZstdChunks {
             self.flush_raw_chunk(file)?;
-            write_encoded_header(file, self.decoded, self.written_chunks)?;
         }
         Ok(())
     }
@@ -201,7 +198,10 @@ impl BlobIngest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Seek, SeekFrom};
+    use std::{
+        fs::File,
+        io::{Read, Seek, SeekFrom},
+    };
 
     fn contents(file: &mut File) -> Result<Vec<u8>> {
         file.seek(SeekFrom::Start(0))?;

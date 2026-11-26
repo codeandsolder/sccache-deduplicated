@@ -12,7 +12,8 @@ use std::{
 };
 
 use super::cluster_http::{
-    AdmissionClass, Listener, ListenerRole, Request, async_route, binary, path_route, routes,
+    AdmissionClass, Listener, ListenerRole, Request, async_route, binary, compute, path_route,
+    routes,
 };
 use anyhow::{Context, Result, ensure};
 use axum::{
@@ -626,26 +627,57 @@ async fn upload_response(
             .await??
         };
         let mut meter = network.transfer(Direction::Receive, peer, header.blob.size, None);
-        let mut buffer = vec![0; 128 * 1024];
+        // Batch at the CAS frame size, rather than dispatching work for
+        // every TLS record. A raw-to-raw batch only needs a bounded hash/copy.
+        let mut buffer = vec![0; 256 * 1024];
+        let codec_pool = upload.requires_codec_pool();
         loop {
-            let count = input.read(&mut buffer).await.map_err(|error| {
-                let error = anyhow::Error::from(error);
-                if backfill {
-                    error.context(NativeServiceBusy)
-                } else {
-                    error
+            let mut count = 0;
+            while count < buffer.len() {
+                let read = input.read(&mut buffer[count..]).await.map_err(|error| {
+                    let error = anyhow::Error::from(error);
+                    if backfill {
+                        error.context(NativeServiceBusy)
+                    } else {
+                        error
+                    }
+                })?;
+                if read == 0 {
+                    meter.eof();
+                    break;
                 }
-            })?;
+                count += read;
+                meter.observe(read as u64);
+            }
             if count == 0 {
-                meter.eof();
                 break;
             }
-            meter.observe(count as u64);
-            (upload, buffer) = tokio::task::spawn_blocking(move || {
-                upload.feed(&buffer[..count])?;
-                Ok::<_, anyhow::Error>((upload, buffer))
+            if codec_pool {
+                (upload, buffer) = compute(move || {
+                    upload.encode_pending(&buffer[..count])?;
+                    Ok((upload, buffer))
+                })
+                .await?;
+            } else {
+                upload.encode_pending(&buffer[..count])?;
+            }
+            upload = tokio::task::spawn_blocking(move || {
+                upload.flush_pending()?;
+                Ok::<_, anyhow::Error>(upload)
             })
             .await??;
+            if count < buffer.len() {
+                break;
+            }
+        }
+        if codec_pool {
+            upload = compute(move || {
+                upload.finish_encoding()?;
+                Ok(upload)
+            })
+            .await?;
+        } else {
+            upload.finish_encoding()?;
         }
         tokio::task::spawn_blocking(move || sessions.finish_upload(upload)).await??;
         encode(&(), limit)

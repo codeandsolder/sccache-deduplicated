@@ -523,6 +523,39 @@ impl NativeUpload {
         self.classify(result)
     }
 
+    /// Whether incremental encoding may require compression or decompression.
+    #[must_use]
+    pub fn requires_codec_pool(&self) -> bool {
+        self.stager.requires_codec_pool()
+    }
+
+    /// Verify and encode a bounded batch without filesystem I/O.
+    ///
+    /// # Errors
+    /// Returns an error for malformed input or an unflushed previous batch.
+    pub fn encode_pending(&mut self, bytes: &[u8]) -> Result<()> {
+        let result = self.stager.encode_pending(bytes);
+        self.classify(result)
+    }
+
+    /// Write the verified physical batch, without codec work.
+    ///
+    /// # Errors
+    /// Returns an error for storage failure or a failed codec.
+    pub fn flush_pending(&mut self) -> Result<()> {
+        let result = self.stager.flush_pending();
+        self.classify(result)
+    }
+
+    /// Complete codec validation and produce any final physical bytes.
+    ///
+    /// # Errors
+    /// Returns an error for invalid or incomplete content.
+    pub fn finish_encoding(&mut self) -> Result<()> {
+        let result = self.stager.finish_encoding();
+        self.classify(result)
+    }
+
     fn classify<T>(&self, result: Result<T>) -> Result<T> {
         match &self.publication {
             UploadPublication::Direct(_) => result,

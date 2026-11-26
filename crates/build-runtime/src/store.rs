@@ -235,7 +235,8 @@ pub(crate) struct PhysicalStager {
     store: NativeStore,
     file: NamedTempFile,
     budget: StageBudget,
-    ingest: blob_codec::BlobIngest,
+    ingest: Option<blob_codec::BlobIngest>,
+    encoded: Vec<u8>,
     expected: BlobRef,
     failed: bool,
 }
@@ -243,7 +244,62 @@ pub(crate) struct PhysicalStager {
 impl PhysicalStager {
     pub(crate) fn feed(&mut self, bytes: &[u8]) -> Result<()> {
         ensure!(!self.failed, "native staging already failed");
-        let result = self.ingest.feed(self.file.as_file_mut(), bytes);
+        ensure!(
+            self.encoded.is_empty(),
+            "encoded native staging bytes not flushed"
+        );
+        let result = self
+            .ingest
+            .as_mut()
+            .context("native staging codec finalized")?
+            .feed(self.file.as_file_mut(), bytes);
+        self.failed = result.is_err();
+        result
+    }
+
+    pub(crate) fn requires_codec_pool(&self) -> bool {
+        self.ingest
+            .as_ref()
+            .is_some_and(blob_codec::BlobIngest::requires_codec_pool)
+    }
+
+    // The codec and the filesystem write are separate operations. Keep the
+    // output private so callers cannot substitute unverified physical bytes.
+    pub(crate) fn encode_pending(&mut self, bytes: &[u8]) -> Result<()> {
+        ensure!(!self.failed, "native staging already failed");
+        ensure!(
+            self.encoded.is_empty(),
+            "encoded native staging bytes not flushed"
+        );
+        let result = self
+            .ingest
+            .as_mut()
+            .context("native staging codec finalized")?
+            .feed(&mut self.encoded, bytes);
+        self.failed = result.is_err();
+        result
+    }
+
+    pub(crate) fn flush_pending(&mut self) -> Result<()> {
+        ensure!(!self.failed, "native staging already failed");
+        let result = self.file.as_file_mut().write_all(&self.encoded);
+        self.failed = result.is_err();
+        self.encoded.clear();
+        result?;
+        Ok(())
+    }
+
+    pub(crate) fn finish_encoding(&mut self) -> Result<()> {
+        ensure!(!self.failed, "native staging already failed");
+        ensure!(
+            self.encoded.is_empty(),
+            "encoded native staging bytes not flushed"
+        );
+        let result = self
+            .ingest
+            .take()
+            .context("native staging codec finalized")?
+            .finish(&mut self.encoded);
         self.failed = result.is_err();
         result
     }
@@ -262,7 +318,10 @@ impl PhysicalStager {
 
     pub(crate) fn finish(mut self) -> Result<StagedBlob> {
         ensure!(!self.failed, "native staging already failed");
-        self.ingest.finish(self.file.as_file_mut())?;
+        self.flush_pending()?;
+        if let Some(ingest) = self.ingest.take() {
+            ingest.finish(self.file.as_file_mut())?;
+        }
         self.file
             .as_file()
             .set_permissions(fs::Permissions::from_mode(0o400))?;
@@ -1078,7 +1137,8 @@ impl NativeStore {
             store: self.clone(),
             file,
             budget,
-            ingest,
+            ingest: Some(ingest),
+            encoded: Vec::new(),
             expected,
             failed: false,
         })
