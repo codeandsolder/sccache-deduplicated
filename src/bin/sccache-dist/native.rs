@@ -139,7 +139,7 @@ impl NativeWorker {
     }
 
     /// Only the standalone store needs its own periodic maintenance.
-    pub(super) fn maintains_local_store(&self) -> bool {
+    pub(super) const fn maintains_local_store(&self) -> bool {
         self.artifact_grace.is_some()
     }
 
