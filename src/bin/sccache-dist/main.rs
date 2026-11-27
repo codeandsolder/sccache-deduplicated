@@ -3716,6 +3716,26 @@ mod scheduler_tests {
         Ok(())
     }
 
+    #[cfg(feature = "scheduler-dashboard")]
+    #[test]
+    fn scheduler_status_does_not_wait_for_busy_scheduling_locks() -> Result<()> {
+        let scheduler = Scheduler::new_with_job_slack(JobSlackConfig {
+            static_jobs: 0,
+            percent: 200.0,
+        });
+        {
+            let _servers = scheduler.servers.lock().unwrap();
+            assert!(scheduler.handle_dashboard_snapshot().is_err());
+            assert!(scheduler.jobs.try_lock().is_ok());
+        }
+        {
+            let _jobs = scheduler.jobs.lock().unwrap();
+            assert!(scheduler.handle_dashboard_snapshot().is_err());
+        }
+        assert!(scheduler.handle_dashboard_snapshot().is_ok());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn scheduler_status_tracks_per_worker_admission_and_capacity_changes() {
         let scheduler = Arc::new(Scheduler::new_with_job_slack(JobSlackConfig {

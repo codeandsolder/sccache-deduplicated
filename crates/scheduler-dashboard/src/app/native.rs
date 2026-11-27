@@ -45,11 +45,12 @@ pub(super) fn NativeStatus(data: DashboardSource, tab: RwSignal<Tab>) -> impl In
     });
     view! {
         <div class=styles::subhead>
-            {move || totals.with(|totals| totals.as_ref().map(|totals| view! {
-                <span class=if totals.draining || totals.workers == 0 {styles::warning} else {styles::healthy}>
-                    {if totals.draining {"DRAINING"} else if totals.workers == 0 {"NO WORKERS"} else {"ACCEPTING WORK"}}
-                </span>
-            }))}
+            <span class=move || if error.with(Option::is_some) || totals.with(|totals| totals.as_ref().is_none_or(|totals| totals.draining || totals.workers == 0)) {styles::warning} else {styles::healthy}>
+                {move || {
+                    let status = totals.with(|totals| totals.as_ref().map_or("UNKNOWN", |totals| if totals.draining {"DRAINING"} else if totals.workers == 0 {"NO WORKERS"} else {"ACCEPTING WORK"}));
+                    if error.with(Option::is_some) {format!("Last known: {status}")} else {status.into()}
+                }}
+            </span>
             <span class=styles::muted>{move || timestamp(sampled_at.get())}</span>
         </div>
         {move || error.get().map(|error| view!{<p class=styles::warning>{error}</p>})}
@@ -111,9 +112,9 @@ fn Overview(totals: Memo<Option<Totals>>, history: Memo<Vec<Sample>>) -> impl In
                         .map(|sample| {
                             (
                                 display_count(sample.unix_secs),
-                                Some(display_count(
-                                    u64::try_from(field(&sample.totals)).unwrap_or(u64::MAX),
-                                )),
+                                sample.totals.as_ref().map(|totals| {
+                                    display_count(u64::try_from(field(totals)).unwrap_or(u64::MAX))
+                                }),
                             )
                         })
                         .collect(),
@@ -248,7 +249,7 @@ mod admission_tests {
         };
         let history = [Sample {
             unix_secs: 99,
-            totals: Totals::default(),
+            totals: Some(Totals::default()),
             admission: Some(AdmissionCounts {
                 hits: 4,
                 ..Default::default()
@@ -269,7 +270,7 @@ mod admission_tests {
     fn history_uses_deltas_and_keeps_idle_gaps() {
         let sample = |unix_secs, hits, misses| Sample {
             unix_secs,
-            totals: Totals::default(),
+            totals: Some(Totals::default()),
             admission: Some(AdmissionCounts {
                 hits,
                 misses,
@@ -310,9 +311,13 @@ mod admission_tests {
 fn CasPanel(telemetry: Memo<Option<NativeTelemetry>>) -> impl IntoView {
     let cache = Memo::new(move |_| {
         telemetry.with(|telemetry| {
-            telemetry
-                .as_ref()
-                .map(|telemetry| (telemetry.cache.clone(), telemetry.cache_error.clone()))
+            telemetry.as_ref().map(|telemetry| {
+                (
+                    telemetry.cache.clone(),
+                    telemetry.cache_error.clone(),
+                    telemetry.cache_sampled_at,
+                )
+            })
         })
     });
     let service = Memo::new(move |_| {
@@ -332,7 +337,8 @@ fn CasPanel(telemetry: Memo<Option<NativeTelemetry>>) -> impl IntoView {
     view! {
         <section id="cas"><h2>"Scheduler CAS"</h2>
             <p class=styles::muted>{move || telemetry.with(|value| value.as_ref().map_or_else(|| "No native telemetry yet".into(), |value| timestamp(Some(value.sampled_at))))}</p>
-            {move || cache.get().map(|(cache,error)| view! {
+            {move || cache.get().map(|(cache,error,cache_sampled_at)| view! {
+                <p class=styles::muted>{format!("CAS counters: {}",timestamp(cache_sampled_at))}</p>
                 {error.map(|error| view!{<p class=styles::warning>{error}</p>})}
                 {cache.map_or_else(|| view!{<p class=styles::muted>"No CAS snapshot available."</p>}.into_any(), |cache| view!{
                     <div class=styles::stats>
@@ -344,7 +350,7 @@ fn CasPanel(telemetry: Memo<Option<NativeTelemetry>>) -> impl IntoView {
             {move || space.get().map(|(space,error)|view!{
                 {error.map(|error|view!{<p class=styles::warning>{error}</p>})}
                 {space.map(|space| {
-                    let live = cache.with(|value| value.as_ref().and_then(|(cache,error)| error.is_none().then_some(cache.as_ref()).flatten().map(|cache|cache.logical_bytes.saturating_add(cache.pending_gc_bytes))));
+                    let live = cache.with(|value| value.as_ref().and_then(|(cache,error,_)| error.is_none().then_some(cache.as_ref()).flatten().map(|cache|cache.logical_bytes.saturating_add(cache.pending_gc_bytes))));
                     view!{<SpaceStatus space=space live=live/>}
                 })}
             })}

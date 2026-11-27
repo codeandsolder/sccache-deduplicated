@@ -698,10 +698,15 @@ invalid metrics URLs. Builds without the feature reject dashboard configuration.
 The initial typed SSR snapshot hydrates once. `GET /api/events` then streams
 a full reset followed by ordered deltas. Worker and job rows are keyed by
 identity; unchanged rows are not retransmitted just to update their age.
-Scheduler mutations wake the sampler, coalesced to at most ten projections
-per second. The periodic two-second sample covers time-based state changes
-and CAS/network observations and appends one history point (900 retained).
-History resets with the scheduler. Reconnection and broadcast lag both
+Scheduler mutations wake the sampler while a native SSE client is connected,
+coalesced to at most ten projections per second. Without viewers only the
+two-second periodic sample runs. The dashboard never waits for the scheduler's
+jobs, servers or recent-client locks; a contended intermediate observation is
+skipped. A failed periodic scheduler observation leaves a gap in its activity
+series but does not discard independently sampled CAS/admission telemetry.
+History retains up to 900 samples and resets on scheduler restart or a
+backward wall-clock step. Stale CAS counters retain their own last-successful
+timestamp. Reconnection and broadcast lag both
 produce a fresh reset; revision gaps cannot be silently ignored.
 
 The UI includes worker heartbeat age, capacity, errors, reservations and

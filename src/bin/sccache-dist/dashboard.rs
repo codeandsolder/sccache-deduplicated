@@ -312,12 +312,12 @@ pub fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
     let draining = scheduler.is_draining();
     let jobs = scheduler
         .jobs
-        .lock()
-        .map_err(|_| anyhow!("jobs mutex poisoned"))?;
+        .try_lock()
+        .map_err(|error| anyhow!("dashboard jobs lock unavailable: {error}"))?;
     let servers = scheduler
         .servers
-        .lock()
-        .map_err(|_| anyhow!("servers mutex poisoned"))?;
+        .try_lock()
+        .map_err(|error| anyhow!("dashboard servers lock unavailable: {error}"))?;
     let now = Instant::now();
     let mut snapshot = Snapshot::default();
     snapshot.totals.draining = draining;
@@ -355,8 +355,8 @@ pub fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
     drop(jobs);
     let clients = scheduler
         .dashboard_clients
-        .lock()
-        .map_err(|_| anyhow!("dashboard client registry poisoned"))?;
+        .try_lock()
+        .map_err(|error| anyhow!("dashboard client registry unavailable: {error}"))?;
     for (&id, (seen, rates)) in clients.iter() {
         if now.saturating_duration_since(*seen) > dist::http::HEARTBEAT_TIMEOUT {
             continue;

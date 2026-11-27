@@ -75,6 +75,17 @@ pub fn apply_event(state: &mut DashboardData, event: NativeEvent) -> bool {
     state.revision = patch.revision;
     state.error = patch.error;
     if let Some(sample) = patch.sample {
+        // The wall clock may step backwards. Do not retain an unsorted
+        // time axis or calculate counter deltas across a clock discontinuity.
+        if let Some(last) = state.history.last() {
+            match sample.unix_secs.cmp(&last.unix_secs) {
+                std::cmp::Ordering::Less => state.history.clear(),
+                std::cmp::Ordering::Equal => {
+                    state.history.pop();
+                }
+                std::cmp::Ordering::Greater => {}
+            }
+        }
         if state.history.len() >= HISTORY_CAPACITY {
             state.history.remove(0);
         }
@@ -182,7 +193,7 @@ mod tests {
         let sample = Sample {
             admission: None,
             unix_secs: 1,
-            totals: Totals::default(),
+            totals: Some(Totals::default()),
         };
         let patch = make_patch(
             &state,
@@ -268,6 +279,43 @@ mod tests {
     }
 
     #[test]
+    fn history_replaces_duplicate_timestamps_and_clears_on_clock_reversal() {
+        let mut state = DashboardData::default();
+        for (time, hits) in [(10, 1), (12, 2), (12, 3), (9, 4), (11, 5)] {
+            let patch = make_patch(
+                &state,
+                None,
+                None,
+                Some(Sample {
+                    admission: Some(crate::AdmissionCounts {
+                        hits,
+                        ..Default::default()
+                    }),
+                    unix_secs: time,
+                    totals: None,
+                }),
+                None,
+            );
+            assert!(apply_event(&mut state, NativeEvent::Patch(Box::new(patch))));
+            if time == 12 {
+                assert_eq!(state.history.len(), 2);
+                assert_eq!(
+                    state.history[1].admission.map(|counts| counts.hits),
+                    Some(hits)
+                );
+            }
+        }
+        assert_eq!(
+            state
+                .history
+                .iter()
+                .map(|sample| sample.unix_secs)
+                .collect::<Vec<_>>(),
+            [9, 11]
+        );
+    }
+
+    #[test]
     fn unchanged_sample_carries_no_rows_or_history() {
         let snapshot = Snapshot::default();
         let state = DashboardData {
@@ -281,7 +329,7 @@ mod tests {
             Some(Sample {
                 admission: None,
                 unix_secs: 1,
-                totals: Totals::default(),
+                totals: Some(Totals::default()),
             }),
             None,
         );

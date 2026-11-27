@@ -271,6 +271,7 @@ impl AdmissionCounts {
 /// Independent, periodically collected CAS and network observations.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NativeTelemetry {
+    pub cache_sampled_at: Option<u64>,
     pub admission: Option<AdmissionCounts>,
     pub analytics: Option<AnalyticsObservation>,
     pub sampled_at: u64,
@@ -289,7 +290,7 @@ pub struct NativeTelemetry {
 pub struct Sample {
     pub admission: Option<AdmissionCounts>,
     pub unix_secs: u64,
-    pub totals: Totals,
+    pub totals: Option<Totals>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]

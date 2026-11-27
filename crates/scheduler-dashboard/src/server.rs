@@ -51,8 +51,14 @@ impl DashboardState {
         result: Result<Snapshot>,
         history: bool,
         telemetry: Option<NativeTelemetry>,
+        timestamp: u64,
     ) -> Result<()> {
         self.feed.publish(|state| {
+            let sample = history.then(|| Sample {
+                admission: telemetry.as_ref().and_then(|value| value.admission),
+                unix_secs: timestamp,
+                totals: result.as_ref().ok().map(|snapshot| snapshot.totals.clone()),
+            });
             let mut patch = match result {
                 Ok(snapshot) => {
                     if !history
@@ -62,30 +68,30 @@ impl DashboardState {
                     {
                         return Ok(None);
                     }
-                    let timestamp = now();
-                    let sample = history.then(|| Sample {
-                        admission: telemetry.as_ref().and_then(|value| value.admission),
-                        unix_secs: timestamp,
-                        totals: snapshot.totals.clone(),
-                    });
                     make_patch(state, Some(&snapshot), Some(timestamp), sample, None)
                 }
                 Err(error) => {
-                    let message = "Scheduler snapshot unavailable; showing last successful sample";
-                    if state.error.as_deref() == Some(message) && telemetry.is_none() {
+                    // A change wake-up is an optional low-latency projection.
+                    // Avoid flickering a warning on momentary lock contention.
+                    if !history && telemetry.is_none() {
                         return Ok(None);
                     }
-                    log::warn!("dashboard sample failed: {error:#}");
-                    make_patch(state, None, None, None, Some(message.into()))
+                    let message = "Scheduler snapshot unavailable; showing last successful sample";
+                    if state.error.as_deref() != Some(message) {
+                        log::warn!("dashboard sample failed: {error:#}");
+                    }
+                    make_patch(state, None, None, sample, Some(message.into()))
                 }
             };
             if let Some(mut telemetry) = telemetry {
-                telemetry.sampled_at = now();
-                if telemetry.cache_error.is_some() && telemetry.cache.is_none() {
-                    telemetry.cache = state
-                        .telemetry
-                        .as_ref()
-                        .and_then(|previous| previous.cache.clone());
+                telemetry.sampled_at = timestamp;
+                if telemetry.cache.is_some() {
+                    telemetry.cache_sampled_at = Some(timestamp);
+                } else if telemetry.cache_error.is_some()
+                    && let Some(previous) = &state.telemetry
+                {
+                    telemetry.cache.clone_from(&previous.cache);
+                    telemetry.cache_sampled_at = previous.cache_sampled_at;
                 }
                 patch.telemetry = Some(telemetry);
             }
@@ -183,23 +189,34 @@ fn sample_loop(
     const MIN_CHANGE_INTERVAL: Duration = Duration::from_millis(100);
     let mut next_history = Instant::now();
     loop {
-        let now = Instant::now();
-        let history = now >= next_history;
+        let instant = Instant::now();
+        let history = instant >= next_history;
         if history {
-            next_history = now + HISTORY_INTERVAL;
+            next_history = instant + HISTORY_INTERVAL;
         }
+        let timestamp = now();
         if let Err(error) = state.publish(
             snapshot(),
             history,
             if history { telemetry() } else { None },
+            timestamp,
         ) {
             log::error!("dashboard publish failed: {error:#}");
         }
         let next_change = Instant::now() + MIN_CHANGE_INTERVAL;
         match wake.recv_timeout(next_history.saturating_duration_since(Instant::now())) {
             Ok(()) => {
-                std::thread::sleep(next_change.saturating_duration_since(Instant::now()));
-                let _ = wake.try_recv();
+                // Keep periodic history even while nobody is watching, but
+                // avoid taking scheduler locks for every mutation in that case.
+                let deadline = if state.feed.has_subscribers() {
+                    next_change.min(next_history)
+                } else {
+                    next_history
+                };
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                if wake.try_recv() == Err(std::sync::mpsc::TryRecvError::Disconnected) {
+                    return;
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
@@ -273,14 +290,30 @@ mod tests {
     #[test]
     fn failed_samples_preserve_last_good_data_and_history_is_bounded() -> Result<()> {
         let state = DashboardState::default();
-        for _ in 0..=HISTORY_CAPACITY {
-            state.publish(Ok(Snapshot::default()), true, None)?;
+        for index in 0..=HISTORY_CAPACITY {
+            state.publish(
+                Ok(Snapshot::default()),
+                true,
+                None,
+                u64::try_from(index)? * 2,
+            )?;
         }
-        state.publish(Err(anyhow::anyhow!("failure")), true, None)?;
+        state.publish(
+            Err(anyhow::anyhow!("failure")),
+            true,
+            None,
+            u64::try_from(HISTORY_CAPACITY)? * 2 + 2,
+        )?;
         let status = state.snapshot();
         assert_eq!(status.history.len(), HISTORY_CAPACITY);
         assert!(status.snapshot.is_some());
         assert!(status.error.is_some());
+        assert!(
+            status
+                .history
+                .last()
+                .is_some_and(|sample| sample.totals.is_none())
+        );
         Ok(())
     }
 
@@ -303,40 +336,51 @@ mod tests {
                 cache: Some(cache.clone()),
                 ..Default::default()
             }),
+            10,
         )?;
         let previous = state.snapshot();
-        state.publish(Ok(Snapshot::default()), false, None)?;
+        state.publish(Ok(Snapshot::default()), false, None, 11)?;
         assert_eq!(state.snapshot(), previous);
         state.publish(
             Err(anyhow::anyhow!("scheduler failed")),
             true,
             Some(NativeTelemetry {
                 cache_error: Some("CAS unavailable; showing last successful sample".into()),
+                admission: Some(crate::AdmissionCounts {
+                    hits: 17,
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
+            12,
         )?;
         let snapshot = state.snapshot();
         assert!(snapshot.error.is_some());
-        assert_eq!(snapshot.history.len(), 1);
+        assert_eq!(snapshot.history.len(), 2);
+        let sample = snapshot.history.last().context("missing sample")?;
+        assert!(sample.totals.is_none());
+        assert_eq!(sample.admission.map(|counts| counts.hits), Some(17));
         let telemetry = snapshot.telemetry.context("telemetry missing")?;
         assert_eq!(telemetry.cache, Some(cache));
         assert!(telemetry.cache_error.is_some());
+        assert_eq!(telemetry.cache_sampled_at, Some(10));
+        assert_eq!(telemetry.sampled_at, 12);
         Ok(())
     }
 
     #[tokio::test]
     async fn subscription_reset_has_no_gap_and_lag_is_resynchronizable() -> Result<()> {
         let state = DashboardState::default();
-        state.publish(Ok(Snapshot::default()), true, None)?;
+        state.publish(Ok(Snapshot::default()), true, None, 1)?;
         let (reset, mut rx) = state.feed.subscribe()?;
         let mut client = DashboardData::default();
         assert!(apply_event(&mut client, serde_json::from_str(&reset)?));
-        state.publish(Ok(Snapshot::default()), true, None)?;
+        state.publish(Ok(Snapshot::default()), true, None, 2)?;
         let event = rx.recv().await?;
         assert!(apply_event(&mut client, serde_json::from_str(&event)?));
         assert_eq!(client, state.snapshot());
-        for _ in 0..40 {
-            state.publish(Ok(Snapshot::default()), true, None)?;
+        for timestamp in 3..43 {
+            state.publish(Ok(Snapshot::default()), true, None, timestamp)?;
         }
         assert!(matches!(
             rx.recv().await,
@@ -351,13 +395,13 @@ mod tests {
     #[tokio::test]
     async fn change_notification_does_not_grow_history() -> Result<()> {
         let state = DashboardState::default();
-        state.publish(Ok(Snapshot::default()), true, None)?;
+        state.publish(Ok(Snapshot::default()), true, None, 1)?;
         let (reset, mut rx) = state.feed.subscribe()?;
         let mut client = DashboardData::default();
         assert!(apply_event(&mut client, serde_json::from_str(&reset)?));
         let mut snapshot = Snapshot::default();
         snapshot.totals.workers = 2;
-        state.publish(Ok(snapshot), false, None)?;
+        state.publish(Ok(snapshot), false, None, 2)?;
         let event = rx.recv().await?;
         assert!(apply_event(&mut client, serde_json::from_str(&event)?));
         assert_eq!(client.history.len(), 1);
@@ -396,7 +440,7 @@ mod tests {
     #[tokio::test]
     async fn http_stream_reconnects_with_current_snapshot() -> Result<()> {
         let state = DashboardState::default();
-        state.publish(Ok(Snapshot::default()), true, None)?;
+        state.publish(Ok(Snapshot::default()), true, None, 1)?;
         let metrics = metrics::MetricsService::new(None, None)?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
@@ -420,7 +464,7 @@ mod tests {
         assert_eq!(snapshot, state.snapshot());
         let mut changed = Snapshot::default();
         changed.totals.workers = 7;
-        state.publish(Ok(changed), false, None)?;
+        state.publish(Ok(changed), false, None, 2)?;
         let response = client
             .get(format!("{base}/api/events"))
             .send()
