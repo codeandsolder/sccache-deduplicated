@@ -13,7 +13,6 @@ use sccache_rust_build::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -184,6 +183,7 @@ impl<'a> Planner<'a> {
             &target_spec.crate_types,
             &self.graph.units[unit].features,
             host,
+            format!("{:?}", self.graph.units[unit].domain),
             test,
             metadata,
             &profile.options,
@@ -309,7 +309,8 @@ impl<'a> Planner<'a> {
                 if !selected {
                     continue;
                 }
-                let test = self.options.mode == Mode::Test && target.test;
+                let test = (self.options.mode == Mode::Test && target.test)
+                    || matches!(target.kind, TargetKind::Test | TargetKind::Bench);
                 if self.options.mode == Mode::Test && !test {
                     continue;
                 }
@@ -325,15 +326,21 @@ impl<'a> Planner<'a> {
             !roots.is_empty(),
             "no selected targets have their required features"
         );
+        ensure!(
+            self.options.mode != Mode::Run || roots.len() == 1,
+            "run requires exactly one binary"
+        );
         for (unit, target, compiled, test) in roots {
             let spec = self.target(unit, target).clone();
-            let Action::Compile { tag, metadata, .. } = &self.nodes[compiled].action else {
+            let Action::Compile { tag, metadata, .. } = self.nodes[compiled].action.clone() else {
                 bail!("invalid root action")
             };
-            if *metadata {
+            if metadata {
                 continue;
             }
-            if self.options.mode == Mode::Test && test && !self.options.no_run {
+            if self.options.mode == Mode::Run
+                || (self.options.mode == Mode::Test && test && !self.options.no_run)
+            {
                 self.nodes.push(Node {
                     action: Action::Run {
                         unit,
@@ -341,9 +348,11 @@ impl<'a> Planner<'a> {
                     },
                     deps: BTreeSet::from([compiled]),
                     outputs: vec![],
-                    label: format!("run tests {}", spec.name),
+                    label: format!("run {}", spec.name),
                 });
-                continue;
+                if self.options.mode != Mode::Run {
+                    continue;
+                }
             }
             let directory = if test {
                 self.final_root.join("tests")
@@ -890,6 +899,7 @@ impl<'a> Planner<'a> {
             command: command(executable, &manifest.root, vec![], env)?,
             stdout: Some(path(stdout)?),
             stderr: Some(path(stderr)?),
+            inherit_stdin: false,
         })
     }
 
@@ -941,6 +951,7 @@ impl<'a> Planner<'a> {
                     )?,
                     stdout: None,
                     stderr: None,
+                    inherit_stdin: self.options.mode == Mode::Run,
                 }
             }
         };

@@ -68,7 +68,7 @@ impl Profile {
             ),
         ]);
         if let Some(profiles) = profiles {
-            for name in chain.into_iter().rev() {
+            for &name in chain.iter().rev() {
                 let Some(profile) = table(profiles.get(name), "profile")? else {
                     continue;
                 };
@@ -81,7 +81,7 @@ impl Profile {
                 options.insert("codegen-units".into(), "256".into());
                 options.remove("lto");
                 options.remove("panic");
-                for name in ["dev", "release", name] {
+                for &name in chain.iter().rev() {
                     if let Some(overrides) = profiles
                         .get(name)
                         .and_then(Value::as_table)

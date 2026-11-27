@@ -33,8 +33,6 @@ use crate::protocol::{
 use crate::util;
 use anyhow::Context as _;
 use bytes::{Bytes, BytesMut, buf::BufMut};
-use fs::metadata;
-use fs_err as fs;
 use futures::channel::mpsc;
 use futures::future::FutureExt;
 use futures::{Sink, SinkExt, Stream, StreamExt, TryFutureExt, future};
@@ -59,9 +57,9 @@ use std::pin::Pin;
 use std::process::{ExitStatus, Output};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 #[cfg(feature = "dist-client")]
 use std::time::Instant;
-use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::{
@@ -1056,29 +1054,29 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
     }
 }
 
-/// Maps a compiler proxy path to a compiler proxy and it's last modification time
-type CompilerProxyMap<C> = HashMap<PathBuf, (Arc<dyn CompilerProxy<C>>, SystemTime)>;
+/// Maps a compiler proxy path to a resolver and its executable content digest
+type CompilerProxyMap<C> = HashMap<PathBuf, (Arc<dyn CompilerProxy<C>>, String)>;
 type CompilerMap<C> = HashMap<PathBuf, Option<CompilerCacheEntry<C>>>;
 
 /// entry of the compiler cache
 struct CompilerCacheEntry<C> {
     /// compiler argument trait obj
     pub compiler: Box<dyn Compiler<C>>,
-    /// modification time of the compilers executable file
-    pub mtime: SystemTime,
+    /// Content digest of the resolved compiler executable
+    pub digest: String,
     /// distributed compilation extra info
-    pub dist_info: Option<(PathBuf, SystemTime)>,
+    pub dist_info: Option<(PathBuf, String)>,
 }
 
 impl<C> CompilerCacheEntry<C> {
     fn new(
         compiler: Box<dyn Compiler<C>>,
-        mtime: SystemTime,
-        dist_info: Option<(PathBuf, SystemTime)>,
+        digest: String,
+        dist_info: Option<(PathBuf, String)>,
     ) -> Self {
         Self {
             compiler,
-            mtime,
+            digest,
             dist_info,
         }
     }
@@ -1115,8 +1113,7 @@ where
     /// map the cwd with compiler proxy path to a proxy resolver, which
     /// will dynamically resolve the input compiler for the current context
     /// (usually file or current working directory)
-    /// the associated `SystemTime` is the modification time of
-    /// the compiler proxy, in order to track updates of the proxy itself
+    /// The associated digest identifies the proxy executable bytes.
     compiler_proxies: Arc<RwLock<CompilerProxyMap<C>>>,
 
     /// Task pool for blocking (used mostly for disk I/O-bound tasks) and
@@ -1802,9 +1799,10 @@ where
         cwd: &Path,
         args: &[OsString],
         env: &[(OsString, OsString)],
-        resolved: (PathBuf, SystemTime, Option<(PathBuf, SystemTime)>),
+        resolved: (PathBuf, String, Option<(PathBuf, String)>),
+        proxy_digest: String,
     ) -> Result<Box<dyn Compiler<C>>> {
-        let (resolved_compiler_path, mtime, dist_info) = resolved;
+        let (resolved_compiler_path, digest, dist_info) = resolved;
         let info = get_compiler_info::<C>(
             self.creator.clone(),
             &path,
@@ -1844,10 +1842,10 @@ where
             self.compiler_proxies
                 .write()
                 .await
-                .insert(path, (Arc::from(proxy), mtime));
+                .insert(path, (Arc::from(proxy), proxy_digest));
         }
 
-        let map_info = CompilerCacheEntry::new(compiler.clone(), mtime, dist_info);
+        let map_info = CompilerCacheEntry::new(compiler.clone(), digest, dist_info);
         trace!(
             "Inserting POSSIBLY PROXIED cache map info for {}",
             util::debug_display(&resolved_compiler_path)
@@ -1876,10 +1874,12 @@ where
         trace!("compiler_info");
         let path = self.compiler_aliases.resolve(path)?;
 
+        let proxy_digest = util::Digest::file(&path, &self.rt).await?;
         let compiler_proxy = {
             let compiler_proxies = self.compiler_proxies.read().await;
             compiler_proxies
                 .get(&path)
+                .filter(|(_, digest)| digest == &proxy_digest)
                 .map(|(compiler_proxy, _)| Arc::clone(compiler_proxy))
         };
         let resolved_with_proxy = match compiler_proxy {
@@ -1890,22 +1890,7 @@ where
             None => None,
         };
 
-        let (resolved_compiler_path, mtime) = if let Some(resolved) = resolved_with_proxy {
-            resolved
-        } else {
-            let attr = metadata(&path).with_context(|| {
-                format!("failed to read compiler metadata at {}", path.display())
-            })?;
-            (
-                path.clone(),
-                attr.modified().with_context(|| {
-                    format!(
-                        "failed to read compiler modification time at {}",
-                        path.display()
-                    )
-                })?,
-            )
-        };
+        let resolved_compiler_path = resolved_with_proxy.unwrap_or_else(|| path.clone());
 
         // Follow symlinks without breaking clang-style multicall names.
         let resolved_compiler_path = match resolved_compiler_path.canonicalize() {
@@ -1915,25 +1900,31 @@ where
             _ => resolved_compiler_path,
         };
 
-        let dist_info = match self.dist_client.get_client().await {
-            Ok(Some(ref client)) => client
-                .get_custom_toolchain(&resolved_compiler_path)
-                .and_then(|archive| {
-                    metadata(&archive)
-                        .and_then(|attr| attr.modified())
-                        .ok()
-                        .map(|mtime| (archive, mtime))
-                }),
+        let digest = if resolved_compiler_path == path {
+            proxy_digest.clone()
+        } else {
+            util::Digest::file(&resolved_compiler_path, &self.rt).await?
+        };
+        let archive = match self.dist_client.get_client().await {
+            Ok(Some(ref client)) => client.get_custom_toolchain(&resolved_compiler_path),
             _ => None,
+        };
+        let dist_info = if let Some(archive) = archive {
+            let digest = util::Digest::file(&archive, &self.rt).await?;
+            Some((archive, digest))
+        } else {
+            None
         };
 
         let cached = match self.compilers.read().await.get(&resolved_compiler_path) {
-            Some(Some(entry)) if entry.mtime == mtime && entry.dist_info == dist_info => {
+            Some(Some(entry)) if entry.digest == digest && entry.dist_info == dist_info => {
                 Some(entry.compiler.box_clone())
             }
             _ => None,
         };
-        if let Some(compiler) = cached {
+        if let Some(compiler) = cached
+            && compiler.validate_discovery(&self.rt).await?
+        {
             trace!("compiler_info cache hit");
             return Ok(compiler);
         }
@@ -1944,7 +1935,8 @@ where
             &cwd,
             args,
             env,
-            (resolved_compiler_path, mtime, dist_info),
+            (resolved_compiler_path, digest, dist_info),
+            proxy_digest,
         )
         .await
     }

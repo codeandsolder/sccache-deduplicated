@@ -63,7 +63,7 @@ use std::pin::Pin;
 use std::process::{self, Stdio};
 use std::str;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 #[cfg(feature = "dist-client")]
@@ -485,8 +485,7 @@ pub type GenerateCompileCommandsResult<T> = Result<(
     Cacheable,
 )>;
 
-pub type CompilerProxyFuture =
-    Pin<Box<dyn Future<Output = Result<(PathBuf, SystemTime)>> + Send + 'static>>;
+pub type CompilerProxyFuture = Pin<Box<dyn Future<Output = Result<PathBuf>> + Send + 'static>>;
 
 #[cfg(feature = "dist-client")]
 pub type DistPackagers = (
@@ -542,6 +541,13 @@ where
         env_vars: &[(OsString, OsString)],
         policy: CompilerCachePolicy,
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>>;
+    /// Verify the content identity of compiler-specific supporting files.
+    fn validate_discovery<'a>(
+        &'a self,
+        _pool: &'a tokio::runtime::Handle,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async { Ok(true) })
+    }
     fn box_clone(&self) -> Box<dyn Compiler<T>>;
 }
 
@@ -557,8 +563,7 @@ where
 {
     /// Maps the executable to be used in `cwd` to the true, proxied compiler.
     ///
-    /// Returns the absolute path to the true compiler and the timestamp of
-    /// timestamp of the true compiler. Iff the resolution fails,
+    /// Returns the absolute path to the true compiler. If resolution fails,
     /// the returned future resolves to an error with more information.
     fn resolve_proxied_executable(
         &self,
@@ -1895,7 +1900,7 @@ where
                         trace!("Found rustup proxy executable");
                         // take the pathbuf for rustc as resolved by the proxy
                         match proxy.resolve_proxied_executable(creator1, cwd, env).await {
-                            Ok((resolved_path, _time)) => {
+                            Ok(resolved_path) => {
                                 trace!(
                                     "Resolved path with rustup proxy {}",
                                     crate::util::debug_display(&resolved_path)

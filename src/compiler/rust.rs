@@ -68,7 +68,7 @@ use std::sync::LazyLock;
 #[cfg(feature = "dist-client")]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{self, SystemTime};
+use std::time;
 use walkdir::WalkDir;
 
 use crate::errors::{Context, Result, anyhow, bail};
@@ -1407,6 +1407,15 @@ async fn discover_rust_sysroot<T: CommandCreatorSync>(
     let output = run_input_output(cmd, None).await?;
     let outstr = String::from_utf8(output.stdout).context("Error parsing sysroot")?;
     let sysroot = PathBuf::from(outstr.trim_end());
+    let libs = rust_discovery_files(&sysroot, executable, dist_archive)?;
+    Ok((sysroot, libs))
+}
+
+fn rust_discovery_files(
+    sysroot: &Path,
+    executable: &Path,
+    dist_archive: Option<PathBuf>,
+) -> Result<Vec<PathBuf>> {
     let libs_path = sysroot.join(LIBS_DIR);
     let mut libs = fs::read_dir(&libs_path)
         .with_context(|| {
@@ -1430,6 +1439,7 @@ async fn discover_rust_sysroot<T: CommandCreatorSync>(
             })
         })
         .collect::<Vec<_>>();
+    libs.push(executable.to_owned());
     if let Some(path) = dist_archive {
         trace!(
             "Hashing {} along with rustc libs.",
@@ -1438,7 +1448,7 @@ async fn discover_rust_sysroot<T: CommandCreatorSync>(
         libs.push(path);
     }
     libs.sort();
-    Ok((sysroot, libs))
+    Ok(libs)
 }
 
 impl Rust {
@@ -1483,7 +1493,9 @@ impl Rust {
                 None
             }
         };
-        let digests = discovery.hash_toolchain_files(&libs, &pool).await?;
+        let digests =
+            futures::future::try_join_all(libs.iter().map(|path| Digest::file(path, &pool)))
+                .await?;
         Ok(Self {
             executable,
             host,
@@ -1560,6 +1572,20 @@ where
         }
     }
 
+    fn validate_discovery<'a>(
+        &'a self,
+        pool: &'a tokio::runtime::Handle,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            let files =
+                rust_discovery_files(&self.sysroot, &self.executable, self.dist_archive.clone())?;
+            let digests =
+                futures::future::try_join_all(files.iter().map(|path| Digest::file(path, pool)))
+                    .await?;
+            Ok(digests == self.compiler_shlibs_digests)
+        })
+    }
+
     fn box_clone(&self) -> Box<dyn Compiler<T>> {
         Box::new((*self).clone())
     }
@@ -1574,7 +1600,7 @@ where
         mut creator: T,
         cwd: PathBuf,
         env: &[(OsString, OsString)],
-    ) -> Pin<Box<dyn Future<Output = Result<(PathBuf, SystemTime)>> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PathBuf>> + Send>> {
         let mut child = creator.new_command_sync(&self.proxy_executable);
         child
             .current_dir(&cwd)
@@ -1595,19 +1621,11 @@ where
                 "proxy: rustup which rustc produced: {}",
                 crate::util::debug_display(&proxied_compiler)
             );
-            // TODO: Delegate FS access to a thread pool if possible
-            let attr = fs::metadata(proxied_compiler.as_path())
-                .context("Failed to obtain metadata of the resolved, true rustc")?;
-
-            if attr.is_file() {
-                attr.modified()
-                    .context("Failed to read the resolved rustc modification time")
-            } else {
-                Err(anyhow!(
-                    "proxy: rustup resolved compiler is not of type file"
-                ))
-            }
-            .map(move |mtime| (proxied_compiler, mtime))
+            anyhow::ensure!(
+                proxied_compiler.is_file(),
+                "rustup resolved compiler is not a file"
+            );
+            Ok(proxied_compiler)
         })
     }
 
@@ -5069,7 +5087,7 @@ impl pkg::DiscoverToolchain for RustToolchainPackager {
 #[derive(Debug)]
 struct RlibDepsDetail {
     deps: Vec<String>,
-    mtime: time::SystemTime,
+    digest: String,
 }
 
 #[cfg(feature = "dist-client")]
@@ -5080,8 +5098,10 @@ impl Meter<PathBuf, RlibDepsDetail> for DepsSize {
         use std::mem::size_of;
         let key_size = size_of::<PathBuf>() + key.capacity();
         let names_size = value.deps.iter().map(String::capacity).sum::<usize>();
-        let value_size =
-            size_of::<RlibDepsDetail>() + value.deps.capacity() * size_of::<String>() + names_size;
+        let value_size = size_of::<RlibDepsDetail>()
+            + value.digest.capacity()
+            + value.deps.capacity() * size_of::<String>()
+            + names_size;
         u64::try_from(key_size + value_size).unwrap_or(u64::MAX)
     }
 }
@@ -5132,9 +5152,7 @@ impl RlibDepReader {
         env_vars: &[(OsString, OsString)],
         rlib: &Path,
     ) -> Result<Vec<String>> {
-        let rlib_mtime = fs::metadata(rlib)
-            .and_then(|m| m.modified())
-            .context("Unable to get rlib modified time")?;
+        let digest = Digest::reader_sync(fs::File::open(rlib)?)?;
 
         {
             let mut cache = self
@@ -5142,7 +5160,7 @@ impl RlibDepReader {
                 .lock()
                 .map_err(|_| anyhow!("rlib dependency cache mutex poisoned"))?;
             if let Some(deps_detail) = cache.get(rlib)
-                && rlib_mtime == deps_detail.mtime
+                && digest == deps_detail.digest
             {
                 return Ok(deps_detail.deps.clone());
             }
@@ -5188,8 +5206,10 @@ impl RlibDepReader {
         })?;
 
         {
-            // This will behave poorly if the rlib is changing under our feet, but in that case rustc
-            // will also do the wrong thing, so the user has bigger issues to deal with.
+            anyhow::ensure!(
+                digest == Digest::reader_sync(fs::File::open(rlib)?)?,
+                "rlib content changed during dependency discovery"
+            );
             let mut cache = self
                 .cache
                 .lock()
@@ -5198,7 +5218,7 @@ impl RlibDepReader {
                 rlib.to_owned(),
                 RlibDepsDetail {
                     deps: deps.clone(),
-                    mtime: rlib_mtime,
+                    digest,
                 },
             );
         }

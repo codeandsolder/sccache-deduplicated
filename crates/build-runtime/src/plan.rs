@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BuildGraph, BuildPath};
 
-pub const BUILD_PLAN_VERSION: u32 = 1;
+pub const BUILD_PLAN_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,9 +35,6 @@ pub struct PlanNode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlanAction {
-    /// Resolve this action through the live frontend after prerequisites
-    /// finish. An offline plan must not contain deferred actions.
-    Deferred,
     /// A logical dependency with no process (for example an overridden
     /// build script whose outputs are already supplied by configuration).
     Noop,
@@ -49,6 +46,7 @@ pub enum PlanAction {
         command: PlanCommand,
         stdout: Option<BuildPath>,
         stderr: Option<BuildPath>,
+        inherit_stdin: bool,
     },
     /// Materialize a final output from a completed predecessor.
     Publish {
@@ -158,19 +156,19 @@ impl BuildPlan {
 }
 
 impl PlanNode {
-    /// Validate a resolved action before execution. Deferred commands are
-    /// deliberately checked again after the frontend supplies them.
+    /// Validate a materialized action before execution.
     ///
     /// # Errors
     /// Returns an error for an invalid command or undeclared output.
     pub fn validate_action(&self, action: &PlanAction) -> Result<()> {
         match action {
-            PlanAction::Deferred | PlanAction::Noop => {}
+            PlanAction::Noop => {}
             PlanAction::Compile { command } => command.validate()?,
             PlanAction::Process {
                 command,
                 stdout,
                 stderr,
+                ..
             } => {
                 command.validate()?;
                 for path in stdout.iter().chain(stderr) {

@@ -6,20 +6,17 @@ use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fs,
-    io::{self, BufReader, IsTerminal, Write},
+    io::{self, IsTerminal, Write},
     num::NonZeroUsize,
     os::unix::ffi::OsStrExt as _,
     path::Path,
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::{Mutex, mpsc},
+    process::{Command, Stdio},
+    sync::mpsc,
     thread,
 };
 
 use anyhow::{Context, Result, ensure};
-use sccache_build::{
-    BuildGraph, BuildPlan, PlanAction, PlanCommand, PlanConnection, PlanNode, PlannerReply,
-    PlannerRequest,
-};
+use sccache_build::{BuildGraph, BuildPlan, PlanAction, PlanCommand, PlanNode};
 
 use crate::{
     commands::{CompileInvocation, CompileSession},
@@ -116,7 +113,6 @@ pub(crate) fn execute_node(
         fs::create_dir_all(BuildPlan::path(directory))?;
     }
     match action {
-        PlanAction::Deferred => anyhow::bail!("unresolved build action"),
         PlanAction::Noop => {}
         PlanAction::Compile { command } => {
             let mut invocation = invocation(command);
@@ -149,6 +145,7 @@ pub(crate) fn execute_node(
             command,
             stdout,
             stderr,
+            inherit_stdin,
         } => {
             let invocation = invocation(command);
             let mut process = Command::new(invocation.exe);
@@ -157,7 +154,11 @@ pub(crate) fn execute_node(
                 .current_dir(invocation.cwd)
                 .env_clear()
                 .envs(invocation.env_vars)
-                .stdin(Stdio::null());
+                .stdin(if *inherit_stdin {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                });
             if let Some(output) = stdout {
                 process.stdout(fs::File::create(BuildPlan::path(output))?);
             }
@@ -249,163 +250,12 @@ pub(crate) fn execute(path: &Path, max_in_flight: NonZeroUsize, config: &Config)
         fs::File::open(path).with_context(|| format!("open build plan {}", path.display()))?;
     let plan: BuildPlan = serde_json::from_reader(io::BufReader::new(file))?;
     let graph = plan.graph()?;
-    ensure!(
-        plan.nodes
-            .iter()
-            .all(|node| !matches!(node.action, PlanAction::Deferred)),
-        "offline build plan contains deferred actions"
-    );
     let session = CompileSession::new(config, true)?;
     dispatch(graph, max_in_flight, |index| {
         let node = &plan.nodes[index];
         execute_node(&session, node, &node.action)
             .with_context(|| format!("build node {index}: {}", node.label))
     })
-}
-
-/// A live planner is a command materializer, not a second job scheduler.
-/// Requests are serialized because Cargo's workspace model is single-threaded;
-/// execution and dependency admission remain concurrent.
-struct PlannerClient {
-    connection: PlanConnection<BufReader<ChildStdout>, ChildStdin>,
-    child: Child,
-}
-
-impl PlannerClient {
-    fn start(command: &mut Command) -> Result<(Self, BuildPlan)> {
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .context("start build planner")?;
-        let stdin = child.stdin.take().context("missing planner stdin")?;
-        let stdout = child.stdout.take().context("missing planner stdout")?;
-        let mut client = Self {
-            connection: PlanConnection::new(BufReader::new(stdout), stdin),
-            child,
-        };
-        let PlannerReply::Plan { plan } = client.reply()? else {
-            anyhow::bail!("planner did not send a build graph");
-        };
-        Ok((client, plan))
-    }
-
-    fn reply(&mut self) -> Result<PlannerReply> {
-        match self.connection.receive()? {
-            PlannerReply::Error { message } => anyhow::bail!("planner: {message}"),
-            reply => Ok(reply),
-        }
-    }
-
-    fn request(&mut self, request: &PlannerRequest) -> Result<PlannerReply> {
-        self.connection.send(request)?;
-        self.reply()
-    }
-
-    fn prepare(&mut self, index: usize) -> Result<PlanAction> {
-        let PlannerReply::Action {
-            index: returned,
-            action,
-        } = self.request(&PlannerRequest::Prepare { index })?
-        else {
-            anyhow::bail!("expected prepared action");
-        };
-        ensure!(returned == index, "planner returned the wrong node");
-        ensure!(
-            !matches!(action, PlanAction::Deferred),
-            "planner returned an unresolved action"
-        );
-        Ok(action)
-    }
-
-    fn complete(&mut self, index: usize) -> Result<()> {
-        let PlannerReply::Completed { index: returned } =
-            self.request(&PlannerRequest::Complete { index })?
-        else {
-            anyhow::bail!("expected completed action");
-        };
-        ensure!(returned == index, "planner completed the wrong node");
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        ensure!(
-            matches!(
-                self.request(&PlannerRequest::Finish)?,
-                PlannerReply::Finished
-            ),
-            "planner did not finish"
-        );
-        ensure!(
-            self.child.wait()?.success(),
-            "planner exited unsuccessfully"
-        );
-        Ok(())
-    }
-}
-
-impl Drop for PlannerClient {
-    fn drop(&mut self) {
-        // Dispatch has drained all accepted actions before this runs. Reap
-        // the planner so it cannot retain source-cache or layout locks.
-        if !matches!(self.child.try_wait(), Ok(Some(_))) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
-pub(crate) fn execute_planner(
-    executable: &Path,
-    args: &[OsString],
-    max_in_flight: NonZeroUsize,
-    leased_intermediates: bool,
-    config: &Config,
-) -> Result<()> {
-    let mut command = Command::new(executable);
-    command.args(args);
-    if leased_intermediates {
-        #[cfg(all(target_os = "linux", feature = "dist-client"))]
-        return crate::cargo_launcher::with_intermediates(&mut command, |command| {
-            execute_planner_command(command, max_in_flight, config)
-        });
-        #[cfg(not(all(target_os = "linux", feature = "dist-client")))]
-        anyhow::bail!("leased intermediates require Linux native distributed compilation");
-    }
-    execute_planner_command(&mut command, max_in_flight, config)
-}
-
-fn execute_planner_command(
-    command: &mut Command,
-    max_in_flight: NonZeroUsize,
-    config: &Config,
-) -> Result<()> {
-    let (client, plan) = PlannerClient::start(command)?;
-    let graph = plan.graph()?;
-    let client = Mutex::new(client);
-    let session = CompileSession::new(config, true)?;
-    let planner = || {
-        client
-            .lock()
-            .map_err(|_| anyhow::anyhow!("planner lock poisoned"))
-    };
-    dispatch(graph, max_in_flight, |index| {
-        let node = &plan.nodes[index];
-        (|| -> Result<()> {
-            let action = if matches!(node.action, PlanAction::Deferred) {
-                Some(planner()?.prepare(index)?)
-            } else {
-                None
-            };
-            execute_node(&session, node, action.as_ref().unwrap_or(&node.action))?;
-            if action.is_some() {
-                planner()?.complete(index)?;
-            }
-            Ok(())
-        })()
-        .with_context(|| format!("build node {index}: {}", node.label))
-    })?;
-    planner()?.finish()
 }
 
 #[cfg(test)]
