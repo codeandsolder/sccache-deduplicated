@@ -225,6 +225,8 @@ impl Drop for PackageSlot {
         match self.owner.package_imports.lock() {
             Ok(mut active) => {
                 active.remove(&self.identity);
+                drop(active);
+                self.owner.package_changes.send_modify(|()| {});
             }
             Err(error) => log::error!("could not release native package reservation: {error:#}"),
         }
@@ -294,6 +296,49 @@ impl NativeStore {
             _slot: slot.context("missing package reservation")?,
             _admitted: admitted,
         })))
+    }
+
+    /// Wait for local package admission without repeatedly looking up an
+    /// already-active identity. Recheck the verified index after each slot
+    /// release, since the preceding owner may have completed the import.
+    /// Remote callers still use immediate admission and explicit busy replies.
+    ///
+    /// # Errors
+    /// Returns an error for cancellation, timeout, invalid limits or storage failure.
+    pub async fn await_package<Cancel>(
+        &self,
+        identity: PackageIdentity,
+        length: ArchiveLength,
+        limits: PackageImportLimits,
+        deadline: std::time::Instant,
+        cancelled: Cancel,
+    ) -> Result<PackagePreparation<()>>
+    where
+        Cancel: std::future::Future<Output = Result<()>> + Send,
+    {
+        let mut changed = self.inner.package_changes.subscribe();
+        let acquire = async {
+            loop {
+                let store = self.clone();
+                let prepared = tokio::task::spawn_blocking(move || {
+                    store.prepare_package(identity, length, limits, || Ok(()))
+                })
+                .await?;
+                match prepared {
+                    Err(error) if error.is::<NativeServiceBusy>() => changed.changed().await?,
+                    result => return result,
+                }
+            }
+        };
+        tokio::select! {
+            result = tokio::time::timeout_at(deadline.into(), acquire) => {
+                result.context("native package reservation deadline exceeded")?
+            }
+            result = cancelled => {
+                result?;
+                bail!("native package reservation cancelled");
+            }
+        }
     }
 
     /// Resolve a previously imported exact package without transferring or
@@ -835,6 +880,93 @@ mod tests {
         header.set_cksum();
         builder.append_link(&mut header, "component/bin/alias", "component/bin/compiler")?;
         Ok(builder.into_inner()?)
+    }
+
+    #[tokio::test]
+    async fn package_waiters_reuse_completed_import_and_release_cancelled_claims() -> Result<()> {
+        use std::{
+            future::pending,
+            time::{Duration, Instant},
+        };
+        let bytes = example_tar()?;
+        let source = source(&bytes, PackageCompression::Tar);
+        let directory = tempfile::tempdir()?;
+        let store = NativeStore::open(directory.path())?;
+        let limits = PackageImportLimits {
+            retain_original: false,
+            max_concurrent_imports: 1,
+            max_archive_bytes: 100_000,
+            max_entries: 100,
+            max_expanded_bytes: 10_000,
+            max_tar_bytes: 100_000,
+            max_metadata_bytes: 100_000,
+            decoder_memory_bytes: 1 << 20,
+            decoder_timeout_secs: 5,
+        };
+        let held = store.package_slot(source.identity, 1)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let waiting = store.await_package(
+            source.identity,
+            ArchiveLength::Exact(source.size),
+            limits,
+            deadline,
+            pending(),
+        );
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut waiting)
+                .await
+                .is_err()
+        );
+        let verified = store.import_package(
+            source.identity,
+            ArchiveLength::Exact(source.size),
+            limits.policy()?,
+            &bytes[..],
+            PackageDecoder::InProcess,
+        )?;
+        drop(held);
+        let PackagePreparation::Cached(reused) = waiting.await? else {
+            bail!("waiter did not reuse the completed import");
+        };
+        assert_eq!(verified.receipt(), reused.receipt());
+        let other = PackageIdentity {
+            sha256: [77; 32],
+            ..source.identity
+        };
+        let held = store.package_slot(other, 1)?;
+        let cancelled = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            bail!("test cancellation")
+        };
+        let error = store
+            .await_package(
+                other,
+                ArchiveLength::Exact(source.size),
+                limits,
+                deadline,
+                cancelled,
+            )
+            .await
+            .err()
+            .context("cancelled import was admitted")?;
+        assert!(error.to_string().contains("test cancellation"));
+        drop(held);
+        let PackagePreparation::Import(acquired) = store
+            .await_package(
+                other,
+                ArchiveLength::Exact(source.size),
+                limits,
+                deadline,
+                pending(),
+            )
+            .await?
+        else {
+            bail!("cold package not admitted after cancellation");
+        };
+        drop(acquired);
+        assert!(store.package_slot(other, 1).is_ok());
+        Ok(())
     }
 
     #[cfg(feature = "async-io")]
