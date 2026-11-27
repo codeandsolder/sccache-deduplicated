@@ -63,6 +63,8 @@ pub struct Planner<'a> {
     nodes: Vec<Node>,
     libraries: Vec<Option<usize>>,
     scripts: Vec<Option<usize>>,
+    binaries: Vec<BTreeMap<String, (usize, PathBuf)>>,
+    binary_publications: Vec<Vec<usize>>,
     file_names: BTreeMap<(bool, bool, Vec<String>), Vec<String>>,
 }
 
@@ -121,6 +123,8 @@ impl<'a> Planner<'a> {
             nodes: Vec::new(),
             libraries: vec![None; graph.units.len()],
             scripts: vec![None; graph.units.len()],
+            binaries: vec![BTreeMap::new(); graph.units.len()],
+            binary_publications: vec![Vec::new(); graph.units.len()],
             file_names: BTreeMap::new(),
         };
         planner.allocate()?;
@@ -219,9 +223,11 @@ impl<'a> Planner<'a> {
         let outputs = if metadata {
             vec![output_dir.join(format!("lib{name}-{tag}.rmeta"))]
         } else {
-            let cache_key = (host, test, types.clone());
+            let cache_key = (host, test && target_spec.harness, types.clone());
             if !self.file_names.contains_key(&cache_key) {
-                let names = self.toolchain.filenames(&types, host, test)?;
+                let names = self
+                    .toolchain
+                    .filenames(&types, host, test && target_spec.harness)?;
                 self.file_names.insert(cache_key.clone(), names);
             }
             self.file_names[&cache_key]
@@ -295,31 +301,78 @@ impl<'a> Planner<'a> {
         }
         let mut roots = Vec::new();
         for &unit in &self.graph.roots {
-            let manifest = self.unit_manifest(unit);
-            let targets = manifest.targets.clone();
+            let targets = self.unit_manifest(unit).targets.clone();
+            let features = self.graph.units[unit].features.clone();
+            let available = |target: &Target| target.required_features.is_subset(&features);
+            let needs_integration_binaries = targets.iter().any(|target| {
+                target.kind == TargetKind::Test && self.options.selects(target) && available(target)
+            });
+            // Build actual binaries for integration tests, not the unit-test
+            // harnesses. The executable paths must remain usable at test time.
+            for (index, target) in targets.iter().enumerate() {
+                if target.kind != TargetKind::Binary || !available(target) {
+                    continue;
+                }
+                let selected = self.options.selects(target);
+                if (selected && self.options.mode != Mode::Test) || needs_integration_binaries {
+                    let compiled = self.compile(unit, index, false, false)?;
+                    let Action::Compile { tag, metadata, .. } = &self.nodes[compiled].action else {
+                        bail!("invalid binary compile action")
+                    };
+                    let destination = if *metadata {
+                        self.final_root.join(&target.name)
+                    } else {
+                        let source = self.nodes[compiled]
+                            .outputs
+                            .first()
+                            .context("missing binary output")?;
+                        self.final_root.join(
+                            source
+                                .file_name()
+                                .and_then(OsStr::to_str)
+                                .context("invalid binary filename")?
+                                .replace(&format!("-{tag}"), ""),
+                        )
+                    };
+                    self.binaries[unit].insert(target.name.clone(), (compiled, destination));
+                    if needs_integration_binaries
+                        && !(selected && self.options.mode != Mode::Test)
+                        && !*metadata
+                    {
+                        roots.push((unit, index, compiled, false));
+                    }
+                }
+            }
             for (index, target) in targets.iter().enumerate() {
                 if target.kind == TargetKind::BuildScript
                     || !target
                         .required_features
                         .is_subset(&self.graph.units[unit].features)
+                    || !self.options.selects(target)
                 {
                     continue;
                 }
-                let selected = self.options.selects(target);
-                if !selected {
-                    continue;
+                let harness_target = matches!(target.kind, TargetKind::Test | TargetKind::Bench);
+                let test_mode = self.options.mode == Mode::Test || harness_target;
+                if self.options.mode != Mode::Test || target.test || harness_target {
+                    let compiled = if target.kind == TargetKind::Library && !test_mode {
+                        self.libraries[unit].context("missing library node")?
+                    } else if target.kind == TargetKind::Binary && !test_mode {
+                        self.binaries[unit][&target.name].0
+                    } else {
+                        self.compile(unit, index, test_mode, false)?
+                    };
+                    roots.push((unit, index, compiled, test_mode));
                 }
-                let test = (self.options.mode == Mode::Test && target.test)
-                    || matches!(target.kind, TargetKind::Test | TargetKind::Bench);
-                if self.options.mode == Mode::Test && !test {
-                    continue;
+                if self.options.all_targets
+                    && self.options.mode != Mode::Test
+                    && target.test
+                    && !harness_target
+                    && matches!(target.kind, TargetKind::Library | TargetKind::Binary)
+                {
+                    let compiled = self.compile(unit, index, true, false)?;
+                    roots.push((unit, index, compiled, true));
                 }
-                let compiled = if target.kind == TargetKind::Library && !test {
-                    self.libraries[unit].context("missing library node")?
-                } else {
-                    self.compile(unit, index, test, false)?
-                };
-                roots.push((unit, index, compiled, test));
             }
         }
         ensure!(
@@ -338,9 +391,7 @@ impl<'a> Planner<'a> {
             if metadata {
                 continue;
             }
-            if self.options.mode == Mode::Run
-                || (self.options.mode == Mode::Test && test && !self.options.no_run)
-            {
+            if self.options.mode == Mode::Test && test && !self.options.no_run {
                 self.nodes.push(Node {
                     action: Action::Run {
                         unit,
@@ -350,12 +401,12 @@ impl<'a> Planner<'a> {
                     outputs: vec![],
                     label: format!("run {}", spec.name),
                 });
-                if self.options.mode != Mode::Run {
-                    continue;
-                }
+                continue;
             }
             let directory = if test {
                 self.final_root.join("tests")
+            } else if spec.kind == TargetKind::Example {
+                self.final_root.join("examples")
             } else {
                 self.final_root.clone()
             };
@@ -371,6 +422,7 @@ impl<'a> Planner<'a> {
                     filename.replace(&format!("-{tag}"), "")
                 };
                 let destination = directory.join(final_name);
+                let publication = self.nodes.len();
                 self.nodes.push(Node {
                     action: Action::Publish {
                         source,
@@ -380,6 +432,20 @@ impl<'a> Planner<'a> {
                     outputs: vec![destination],
                     label: format!("publish {}", spec.name),
                 });
+                if spec.kind == TargetKind::Binary && !test {
+                    self.binary_publications[unit].push(publication);
+                }
+                if self.options.mode == Mode::Run {
+                    self.nodes.push(Node {
+                        action: Action::Run {
+                            unit,
+                            compiler: compiled,
+                        },
+                        deps: BTreeSet::from([publication]),
+                        outputs: vec![],
+                        label: format!("run {}", spec.name),
+                    });
+                }
             }
         }
         Ok(())
@@ -417,6 +483,9 @@ impl<'a> Planner<'a> {
                         }
                     }
                     if !script {
+                        if self.target(unit, target).kind == TargetKind::Test {
+                            deps.extend(self.binary_publications[unit].iter().copied());
+                        }
                         if let Some(script) = self.scripts[unit] {
                             deps.insert(script);
                         }
@@ -499,6 +568,31 @@ impl<'a> Planner<'a> {
     fn env(&self, unit: usize, target: &Target) -> BTreeMap<OsString, OsString> {
         let manifest = self.unit_manifest(unit);
         let mut env = self.settings.environment.clone();
+        env.retain(|name, _| {
+            let name = name.as_encoded_bytes();
+            ![
+                b"CARGO_PKG_".as_slice(),
+                b"CARGO_CFG_",
+                b"CARGO_FEATURE_",
+                b"CARGO_BIN_EXE_",
+                b"DEP_",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+                && ![
+                    b"CARGO_PRIMARY_PACKAGE".as_slice(),
+                    b"CARGO_BIN_NAME",
+                    b"CARGO_CRATE_NAME",
+                    b"OUT_DIR",
+                    b"HOST",
+                    b"TARGET",
+                    b"PROFILE",
+                    b"OPT_LEVEL",
+                    b"DEBUG",
+                    b"NUM_JOBS",
+                ]
+                .contains(&name)
+        });
         let package = &manifest.package;
         let mut set = |key: &str, value: OsString| {
             env.insert(key.into(), value);
@@ -659,8 +753,16 @@ impl<'a> Planner<'a> {
                 target.crate_types.join(",").into()
             },
         ];
-        if test {
+        if test && target.harness {
             args.push("--test".into());
+        }
+        if target.kind == TargetKind::Test {
+            for (name, (_, executable)) in &self.binaries[unit] {
+                env.insert(
+                    format!("CARGO_BIN_EXE_{name}").into(),
+                    executable.as_os_str().to_owned(),
+                );
+            }
         }
         args.extend([
             "--emit".into(),
@@ -811,6 +913,7 @@ impl<'a> Planner<'a> {
             .find(|t| t.kind == TargetKind::BuildScript)
             .context("missing script target")?;
         let mut env = self.env(unit, target);
+        env.remove(OsStr::new("RUSTFLAGS"));
         let platform = if self.graph.units[unit].domain == BuildDomain::Host {
             &self.toolchain.host
         } else {
@@ -938,6 +1041,12 @@ impl<'a> Planner<'a> {
                     bail!("invalid test compiler")
                 };
                 let target = self.target(*unit, target);
+                let executable =
+                    if self.options.mode == Mode::Run && target.kind == TargetKind::Binary {
+                        &self.binaries[*unit][&target.name].1
+                    } else {
+                        executable
+                    };
                 let mut env = self.env(*unit, target);
                 if let Some(output) = self.read_script(*unit)? {
                     env.extend(output.env.into_iter().map(|(k, v)| (k.into(), v.into())));

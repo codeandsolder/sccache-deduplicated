@@ -62,6 +62,18 @@ pub struct RustBuildArgs {
     #[arg(long)]
     all_targets: bool,
     #[arg(long)]
+    example: Vec<String>,
+    #[arg(long)]
+    examples: bool,
+    #[arg(long = "test")]
+    test_targets: Vec<String>,
+    #[arg(long)]
+    tests: bool,
+    #[arg(long)]
+    bench: Vec<String>,
+    #[arg(long)]
+    benches: bool,
+    #[arg(long)]
     pub no_run: bool,
     #[arg(long)]
     target: Option<OsString>,
@@ -93,10 +105,24 @@ impl RustBuildArgs {
     }
 
     pub fn selects(&self, target: &Target) -> bool {
-        if self.lib || self.bins || !self.bin.is_empty() {
-            return (self.lib && target.kind == TargetKind::Library)
-                || (target.kind == TargetKind::Binary
-                    && (self.bins || self.bin.contains(&target.name)));
+        if self.lib
+            || self.bins
+            || !self.bin.is_empty()
+            || self.examples
+            || !self.example.is_empty()
+            || self.tests
+            || !self.test_targets.is_empty()
+            || self.benches
+            || !self.bench.is_empty()
+        {
+            return match target.kind {
+                TargetKind::Library => self.lib,
+                TargetKind::Binary => self.bins || self.bin.contains(&target.name),
+                TargetKind::Example => self.examples || self.example.contains(&target.name),
+                TargetKind::Test => self.tests || self.test_targets.contains(&target.name),
+                TargetKind::Bench => self.benches || self.bench.contains(&target.name),
+                TargetKind::BuildScript => false,
+            };
         }
         if self.mode == Mode::Run {
             return target.kind == TargetKind::Binary;
@@ -105,12 +131,48 @@ impl RustBuildArgs {
             return target.kind != TargetKind::BuildScript;
         }
         if self.mode == Mode::Test {
-            return matches!(
-                target.kind,
-                TargetKind::Library | TargetKind::Binary | TargetKind::Test
-            );
+            return target.test
+                && matches!(
+                    target.kind,
+                    TargetKind::Library
+                        | TargetKind::Binary
+                        | TargetKind::Test
+                        | TargetKind::Example
+                );
         }
         matches!(target.kind, TargetKind::Library | TargetKind::Binary)
+    }
+
+    fn dev_dependencies(&self) -> bool {
+        self.mode == Mode::Test
+            || self.all_targets
+            || self.examples
+            || !self.example.is_empty()
+            || self.tests
+            || !self.test_targets.is_empty()
+            || self.benches
+            || !self.bench.is_empty()
+    }
+
+    pub fn validate_targets(&self, graph: &Graph) -> Result<()> {
+        for (kind, names) in [
+            (TargetKind::Binary, &self.bin),
+            (TargetKind::Example, &self.example),
+            (TargetKind::Test, &self.test_targets),
+            (TargetKind::Bench, &self.bench),
+        ] {
+            for name in names {
+                ensure!(
+                    graph.roots.iter().any(|unit| graph
+                        .manifest(*unit)
+                        .targets
+                        .iter()
+                        .any(|target| target.kind == kind && &target.name == name)),
+                    "unknown selected target {name:?}"
+                );
+            }
+        }
+        Ok(())
     }
 
     fn selected(&self, workspace: &Workspace) -> Result<Vec<PathBuf>> {
@@ -191,6 +253,13 @@ fn execute(args: RustBuildArgs) -> Result<i32> {
             .unwrap_or(&workspace.root.join("target")),
         &cwd,
     )?;
+    let marker = target_root.join("CACHEDIR.TAG");
+    if !marker.exists() {
+        fs::write(
+            &marker,
+            b"Signature: 8a477f597d28d172789f06886806bc55\n# Managed Rust build outputs.\n",
+        )?;
+    }
     let mut final_root = target_root;
     if target.is_some() {
         final_root.push(&toolchain.target.triple);
@@ -223,7 +292,7 @@ fn execute(args: RustBuildArgs) -> Result<i32> {
                 .collect(),
             default_features: !args.no_default_features,
             all_features: args.all_features,
-            dev_dependencies: args.mode == Mode::Test || args.all_targets,
+            dev_dependencies: args.dev_dependencies(),
             host: toolchain.host.clone(),
             target: toolchain.target.clone(),
         };
@@ -248,6 +317,7 @@ fn execute(args: RustBuildArgs) -> Result<i32> {
         if changed {
             sources.lock.write(&workspace.root.join("Cargo.lock"))?;
         }
+        args.validate_targets(&graph)?;
         let planner = Planner::new(
             &graph,
             &workspace,

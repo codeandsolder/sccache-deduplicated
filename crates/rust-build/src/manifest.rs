@@ -48,6 +48,9 @@ pub struct Target {
     pub crate_types: Vec<String>,
     pub required_features: BTreeSet<String>,
     pub test: bool,
+    pub harness: bool,
+    pub doctest: bool,
+    pub doc: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -402,7 +405,18 @@ fn target(
         required_features: strings(spec.get("required-features"))?
             .into_iter()
             .collect(),
-        test: boolean(spec, "test", true)?,
+        test: boolean(
+            spec,
+            "test",
+            kind != TargetKind::Example && kind != TargetKind::Bench,
+        )?,
+        harness: boolean(spec, "harness", true)?,
+        doctest: boolean(spec, "doctest", kind == TargetKind::Library)?,
+        doc: boolean(
+            spec,
+            "doc",
+            matches!(kind, TargetKind::Library | TargetKind::Binary),
+        )?,
     })
 }
 

@@ -802,6 +802,12 @@ fn cargo_manifest_tree_inputs(manifest: &Path, output_dir: &Path) -> Result<Vec<
             {
                 return false;
             }
+            if entry.file_type().is_dir()
+                && path != manifest_dir
+                && path.join("CACHEDIR.TAG").is_file()
+            {
+                return false;
+            }
             !matches!(
                 entry.file_name().to_str(),
                 Some(".git" | ".hg" | ".svn" | ".jj")
