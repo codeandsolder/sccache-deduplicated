@@ -369,8 +369,17 @@ impl Resolver<'_, '_> {
                                 break;
                             }
                             let dependency = &request.parent.dependencies[request.key.1];
-                            let result = sources
-                                .dependency(&request.parent, request.source.as_deref(), dependency)
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    sources.dependency(
+                                        &request.parent,
+                                        request.source.as_deref(),
+                                        dependency,
+                                    )
+                                }))
+                                .unwrap_or_else(|_| {
+                                    Err(anyhow::anyhow!("source acquisition panicked"))
+                                })
                                 .with_context(|| {
                                     format!(
                                         "resolve {} dependency {}",

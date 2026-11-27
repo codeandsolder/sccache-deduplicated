@@ -324,7 +324,7 @@ impl IntermediateFs {
             let mut offset = 0;
             let mut bytes = vec![0; 128 * 1024];
             while offset < reference.blob.size {
-                let n = source.read_at(&mut bytes, offset)?;
+                let n = crate::retry_io::retry_interrupted(|| source.read_at(&mut bytes, offset))?;
                 ensure!(n != 0, "truncated intermediate spool");
                 destination.write_all_at(&bytes[..n], offset)?;
                 offset += n as u64;

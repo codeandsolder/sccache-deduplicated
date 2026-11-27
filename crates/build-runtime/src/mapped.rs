@@ -410,13 +410,14 @@ fn hash_open_source(file: &File, stat: &Stat) -> Result<BlobRef> {
     let mut hash = blake3::Hasher::new();
     while offset < size {
         let count = usize::try_from((size - offset).min(buffer.len() as u64))?;
-        let read = file.read_at(&mut buffer[..count], offset)?;
+        let read =
+            crate::retry_io::retry_interrupted(|| file.read_at(&mut buffer[..count], offset))?;
         ensure!(read != 0, "file truncated during capture");
         hash.update(&buffer[..read]);
         offset += read as u64;
     }
     ensure!(
-        file.read_at(&mut buffer[..1], size)? == 0,
+        crate::retry_io::retry_interrupted(|| file.read_at(&mut buffer[..1], size))? == 0,
         "file extended during capture"
     );
     unchanged(stat, &fstat(file)?)?;

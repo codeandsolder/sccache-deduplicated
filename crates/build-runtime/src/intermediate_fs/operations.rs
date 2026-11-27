@@ -89,7 +89,7 @@ impl IntermediateFs {
             None => self.file(fh)?,
         };
         let mut bytes = vec![0; size as usize];
-        let n = file.read_at(&mut bytes, offset)?;
+        let n = crate::retry_io::retry_interrupted(|| file.read_at(&mut bytes, offset))?;
         bytes.truncate(n);
         drop(guard);
         Ok(bytes)
@@ -99,7 +99,9 @@ impl IntermediateFs {
         let _guard = lock(&node.mutation)?;
         self.detach(&node, false)?;
         let file = self.file(fh)?;
-        Ok(u32::try_from(file.write_at(bytes, offset)?)?)
+        Ok(u32::try_from(crate::retry_io::retry_interrupted(|| {
+            file.write_at(bytes, offset)
+        })?)?)
     }
     fn read_xattr(&self, ino: INodeNo, name: &OsStr) -> Result<Vec<u8>> {
         let node = self.node(ino)?;

@@ -103,6 +103,8 @@ pub use tree_fs::{MaterializationStats, MaterializedTree, materialize_tree};
 #[cfg(all(target_os = "linux", feature = "mapping"))]
 mod mapped;
 #[cfg(all(target_os = "linux", feature = "mapping"))]
+mod retry_io;
+#[cfg(all(target_os = "linux", feature = "mapping"))]
 mod source;
 #[cfg(all(target_os = "linux", feature = "mapping"))]
 pub use mapped::{
