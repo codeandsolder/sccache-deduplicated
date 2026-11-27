@@ -107,6 +107,12 @@ impl ActionRequest {
     /// Returns an error for missing required outputs, unexpected artifacts, invalid metadata,
     /// or conflicting content lengths anywhere in the result.
     pub fn validate_result(&self, result: &ResultManifest) -> Result<()> {
+        self.validate_output_contract(result)?;
+        result.blobs()?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_output_contract(&self, result: &ResultManifest) -> Result<()> {
         ensure!(
             self.required_outputs
                 .keys()
@@ -123,7 +129,6 @@ impl ActionRequest {
                 "unexpected output name or kind"
             );
         }
-        result.blobs()?;
         Ok(())
     }
 }

@@ -488,6 +488,38 @@ struct Session {
 }
 
 impl Session {
+    fn result_negotiation(&mut self, manifest: &ResultManifest) -> Result<ResultNegotiation<'_>> {
+        match &mut self.phase {
+            Phase::Pending(pending) => {
+                let Pending::Action(action) = &mut **pending else {
+                    bail!("ticket does not accept a result");
+                };
+                if let Some((previous, transfer)) = &action.upload {
+                    ensure!(
+                        previous == manifest,
+                        "result manifest changed after negotiation"
+                    );
+                    Ok(ResultNegotiation::Existing(BeginResult {
+                        missing: transfer.missing(),
+                    }))
+                } else {
+                    action.request.validate_output_contract(manifest)?;
+                    Ok(ResultNegotiation::Unnegotiated(action))
+                }
+            }
+            Phase::Ready(Ready::Result(lease)) => {
+                ensure!(
+                    lease.manifest() == manifest,
+                    "result already committed with different manifest"
+                );
+                Ok(ResultNegotiation::Existing(BeginResult {
+                    missing: Vec::new(),
+                }))
+            }
+            _ => bail!("native session is not accepting a result"),
+        }
+    }
+
     fn negotiated_result(&self) -> Option<&ResultManifest> {
         // Local execution and trees keep their existing publication semantics.
         self.allocation.as_ref()?;
@@ -500,6 +532,11 @@ impl Session {
             _ => None,
         }
     }
+}
+
+enum ResultNegotiation<'a> {
+    Existing(BeginResult),
+    Unnegotiated(&'a mut PendingAction),
 }
 
 type SharedSession = Arc<Mutex<Session>>;
@@ -1322,45 +1359,37 @@ impl NativeSessions {
         manifest: ResultManifest,
     ) -> Result<BeginResult> {
         let session = self.get(ticket)?;
-        let mut state = Self::lock(&session)?;
-        self.authorize(&mut state, publisher)?;
-        self.limits.check_blobs(Kind::Action, &manifest.blobs()?)?;
+        {
+            let mut state = Self::lock(&session)?;
+            self.authorize(&mut state, publisher)?;
+            if let ResultNegotiation::Existing(reply) = state.result_negotiation(&manifest)? {
+                return Ok(reply);
+            }
+            drop(state);
+        }
+        // Validate and reserve the closure outside the session lock. A
+        // collector or filesystem lookup must never block ticket renewal.
+        let blobs = manifest.blobs()?;
+        self.limits.check_blobs(Kind::Action, &blobs)?;
         ensure!(
             manifest.logical_bytes()? <= self.limits.max_result_bytes,
             "native result logical byte limit exceeded"
         );
-        match &mut state.phase {
-            Phase::Pending(pending) => {
-                let Pending::Action(action) = &mut **pending else {
-                    bail!("ticket does not accept a result");
-                };
-                action.request.validate_result(&manifest)?;
-                if let Some((previous, transfer)) = &action.upload {
-                    ensure!(
-                        previous == &manifest,
-                        "result manifest changed after negotiation"
-                    );
-                    return Ok(BeginResult {
-                        missing: transfer.missing(),
-                    });
-                }
-                let transfer = Transfer::new(self.store().reserve_upload(&manifest)?);
+        let transfer = Transfer::new(self.store().reserve_blobs(&blobs)?);
+        let mut state = Self::lock(&session)?;
+        self.authorize(&mut state, publisher)?;
+        // Another identical begin may already have won, or the ticket may
+        // have closed while its content was being pinned.
+        let reply = match state.result_negotiation(&manifest)? {
+            ResultNegotiation::Existing(reply) => reply,
+            ResultNegotiation::Unnegotiated(action) => {
                 let missing = transfer.missing();
                 action.upload = Some((manifest, transfer));
-                drop(state);
-                Ok(BeginResult { missing })
+                BeginResult { missing }
             }
-            Phase::Ready(Ready::Result(lease)) => {
-                ensure!(
-                    lease.manifest() == &manifest,
-                    "result already committed with different manifest"
-                );
-                Ok(BeginResult {
-                    missing: Vec::new(),
-                })
-            }
-            _ => bail!("native session is not accepting a result"),
-        }
+        };
+        drop(state);
+        Ok(reply)
     }
 
     /// Negotiate a tree upload. A previously committed tree needs no data.
