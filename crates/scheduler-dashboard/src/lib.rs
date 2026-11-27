@@ -291,6 +291,7 @@ pub struct NativeTelemetry {
     pub live_traces: Option<sccache_build::wire::LiveTraceSnapshot>,
     pub cache_sampled_at: Option<u64>,
     pub admission: Option<AdmissionCounts>,
+    pub duplicate_misses: Option<sccache_build::analytics::DuplicateMisses>,
     pub analytics: Option<AnalyticsObservation>,
     pub sampled_at: u64,
     pub cache: Option<Cache>,

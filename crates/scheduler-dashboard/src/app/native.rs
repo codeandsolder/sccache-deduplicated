@@ -203,6 +203,9 @@ fn AdmissionPanel(
             Some((value.sampled_at, value.admission?))
         })
     });
+    let duplicates = Memo::new(move |_| {
+        telemetry.with(|value| value.as_ref().and_then(|sample| sample.duplicate_misses))
+    });
     let series = Memo::new(move |_| history.with(|history| admission_history(history)));
     let unit = Memo::new(|_| "percent".into());
     let step = Signal::derive(|| 2_u64);
@@ -232,6 +235,13 @@ fn AdmissionPanel(
                     }).collect_view()
                 }}
             </tbody></table></div>
+            <h3>"Identical-output cache misses"</h3>
+            <p class=styles::muted>"Successful new-key results that match another known action’s artifacts. Exact results also match stdout and stderr. Counters survive restart; existing results and retained eviction receipts are comparison data, not retroactively counted misses. Forced refreshes and known same-key restorations are excluded."</p>
+            <div class=styles::stats id="duplicate-misses">
+                <div class=styles::stat><small>"Identical-output misses"</small><strong>{move || duplicates.get().map_or_else(|| "—".into(), |value| value.identical_outputs.to_string())}</strong></div>
+                <div class=styles::stat><small>"Identical complete results"</small><strong>{move || duplicates.get().map_or_else(|| "—".into(), |value| value.identical_results.to_string())}</strong></div>
+                <div class=styles::stat><small>"New-key results"</small><strong>{move || duplicates.get().map_or_else(|| "—".into(), |value| value.new_keys.to_string())}</strong></div>
+            </div>
             <h3>"Rolling native admission hit rate"</h3>
             <HistoryChart series=series unit=unit step=step window=Signal::derive(|| None)/>
         </section>

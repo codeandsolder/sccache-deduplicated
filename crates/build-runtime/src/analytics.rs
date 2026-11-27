@@ -1,6 +1,15 @@
 //! Bounded cache-distribution summaries shared by producers and the dashboard.
 use serde::{Deserialize, Serialize};
 
+/// Durable count of successful new-key publications whose artifacts were
+/// already known under a different action. Complete results include diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateMisses {
+    pub new_keys: u64,
+    pub identical_outputs: u64,
+    pub identical_results: u64,
+}
+
 /// All byte counts refer to distinct content, not references to it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheWeight {

@@ -523,6 +523,24 @@ rlib. The archive emitter still supports per-file trimming and streams
 ordinary files instead of collecting them into a buffer. The native
 input and toolchain trees use the same explicit directory normalization.
 
+For ordinary preprocessed C and C++ actions, the package owns its executable
+search path. The client resolves helpers using the requested driver and its
+arguments, captures the selected ELF dependency closures, and verifies a
+reconstructed library search contract without the host's loader cache.
+Changing Cargo output directories or irrelevant PATH/LD_LIBRARY_PATH entries
+does not change that contract. Actual changes in selected helpers or shared
+libraries remain inputs. Opaque compiler extensions retain exact execution
+identity; arbitrary loader injection is not automatically distributed.
+
+The dashboard's Cache hits tab includes durable counters of successful new-key
+reuse-mode publications whose artifacts match another known action, and the
+subset whose complete results (including diagnostics) match. Existing live
+manifests and retained eviction receipts are comparison data, not retroactively
+counted misses. Same-key retries, recovery, and explicit refreshes do not count.
+The comparison index follows retention and does not pin payloads. Identical
+outputs alone are evidence of redundant work, not permission to alias
+semantically different compiler requests.
+
 ## Validation
 
 The runtime crate has focused tests for identity, import, tree capture,

@@ -45,6 +45,21 @@ pub(crate) fn native_directory_metadata() -> Result<crate::build_runtime::TreeMe
 pub enum ToolchainScope {
     Default,
     RustCompiler,
+    PreprocessedC,
+}
+
+/// Native package and the execution search environment selected by its
+/// discovery. No caller path list is used as the compiler's runtime contract.
+#[cfg(target_os = "linux")]
+pub struct NativeToolchain {
+    pub mapping: crate::build_runtime::MappedTree,
+    pub search: Option<NativeSearchEnvironment>,
+}
+
+#[cfg(target_os = "linux")]
+pub struct NativeSearchEnvironment {
+    pub path: Vec<u8>,
+    pub libraries: Option<Vec<u8>>,
 }
 
 pub trait ToolchainPackager: Send {
@@ -82,10 +97,7 @@ pub trait ToolchainPackager: Send {
     /// # Errors
     /// Returns an error if discovery fails or this packager has no native mapping.
     #[cfg(target_os = "linux")]
-    fn native_mapping(
-        self: Box<Self>,
-        _scope: ToolchainScope,
-    ) -> Result<crate::build_runtime::MappedTree> {
+    fn native_mapping(self: Box<Self>, _scope: ToolchainScope) -> Result<NativeToolchain> {
         bail!("native mapping not supported by this toolchain packager")
     }
 }
@@ -122,11 +134,13 @@ impl<T: DiscoverToolchain> ToolchainPackager for T {
             .write_compressed_tar(f)
     }
 
-    fn native_mapping(
-        self: Box<Self>,
-        scope: ToolchainScope,
-    ) -> Result<crate::build_runtime::MappedTree> {
-        self.package_builder(scope)?.into_native_mapping()
+    fn native_mapping(self: Box<Self>, scope: ToolchainScope) -> Result<NativeToolchain> {
+        let mut builder = self.package_builder(scope)?;
+        let search = builder.take_native_search();
+        Ok(NativeToolchain {
+            mapping: builder.into_native_mapping()?,
+            search,
+        })
     }
 }
 
@@ -188,6 +202,7 @@ mod toolchain_imp {
         // `tar_safe_path`).
         symlinks: BTreeMap<PathBuf, PathBuf>,
         root_mappings: Vec<(PathBuf, PathBuf)>,
+        native_search: Option<super::NativeSearchEnvironment>,
     }
 
     impl ToolchainPackageBuilder {
@@ -198,6 +213,7 @@ mod toolchain_imp {
                 file_set: BTreeMap::new(),
                 symlinks: BTreeMap::new(),
                 root_mappings: Vec::new(),
+                native_search: None,
             }
         }
 
@@ -261,6 +277,54 @@ mod toolchain_imp {
                 self.file_set.insert(tar_path, obj_path);
             }
             Ok(())
+        }
+
+        /// Record an already-resolved ELF closure without probing individual
+        /// libraries a second time (which would lose the executable RUNPATH).
+        pub fn add_resolved_executable(
+            &mut self,
+            executable: &Path,
+            libraries: &[PathBuf],
+        ) -> Result<()> {
+            self.add_file(executable.to_owned())?;
+            for library in libraries {
+                self.add_file(library.clone())?;
+            }
+            Ok(())
+        }
+
+        /// Publish the exact selected helper name in a private executable
+        /// search directory. Names may be used by drivers as fallback
+        /// searches, independently of their compiled-in absolute paths.
+        pub fn add_native_helper(
+            &mut self,
+            name: &std::ffi::OsStr,
+            executable: &Path,
+        ) -> Result<()> {
+            let alias = Path::new("/__sccache/toolchain/bin").join(name);
+            anyhow::ensure!(
+                name == alias.file_name().unwrap_or_default(),
+                "invalid native helper name"
+            );
+            let executable = executable.canonicalize()?;
+            if let Some(previous) = self.symlinks.insert(alias, executable.clone()) {
+                anyhow::ensure!(
+                    previous == executable,
+                    "conflicting selected native helpers"
+                );
+            }
+            Ok(())
+        }
+
+        pub fn set_native_search(&mut self, libraries: Option<Vec<u8>>) {
+            self.native_search = Some(super::NativeSearchEnvironment {
+                path: b"/__sccache/toolchain/bin".to_vec(),
+                libraries,
+            });
+        }
+
+        pub fn take_native_search(&mut self) -> Option<super::NativeSearchEnvironment> {
+            self.native_search.take()
         }
 
         /// Add a directory entry to the package.

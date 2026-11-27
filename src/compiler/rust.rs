@@ -5131,6 +5131,7 @@ fn test_native_rust_toolchain_ignores_only_installation_ledger() -> Result<()> {
             dlltool_files: Vec::new(),
         })
         .native_mapping(scope)?
+        .mapping
         .prepare()?
         .id())
     };

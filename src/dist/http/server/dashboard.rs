@@ -59,6 +59,11 @@ pub(super) fn snapshot(sessions: &NativeSessions, network: &NetworkMeter) -> Nat
             errors: admissions.errors,
         }),
         live_traces: sessions.live_traces().ok(),
+        duplicate_misses: sessions
+            .store()
+            .duplicate_misses()
+            .map_err(|error| warn!("dashboard duplicate miss counter unavailable: {error:#}"))
+            .ok(),
         ..Default::default()
     };
     match sessions.store().stats() {

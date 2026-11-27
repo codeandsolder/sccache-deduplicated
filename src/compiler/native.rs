@@ -605,6 +605,56 @@ fn compiler_environment(command: &CommandSpec, policy: ResultIdentityPolicy) -> 
     ContentId(*digest.finalize().as_bytes())
 }
 
+fn prepare_toolchain(
+    packager: Box<dyn pkg::ToolchainPackager>,
+    digests: &SourceDigestCache,
+    policy: ResultIdentityPolicy,
+    command: &mut CommandSpec,
+    inputs: &TreeManifest,
+) -> Result<PreparedTree> {
+    let scope = match (policy, opaque_compiler_extension(command, inputs)) {
+        (ResultIdentityPolicy::Rust, false) => pkg::ToolchainScope::RustCompiler,
+        (ResultIdentityPolicy::PreprocessedC, false) => pkg::ToolchainScope::PreprocessedC,
+        _ => pkg::ToolchainScope::Default,
+    };
+    let before = digests.catalog_hits();
+    let start = Instant::now();
+    let package = packager.native_mapping(scope)?;
+    if scope == pkg::ToolchainScope::PreprocessedC {
+        let search = package
+            .search
+            .context("C toolchain did not establish its execution environment")?;
+        command.environment.insert(b"PATH".to_vec(), search.path);
+        command.environment.remove(b"LD_LIBRARY_PATH".as_slice());
+        if let Some(libraries) = search.libraries {
+            command
+                .environment
+                .insert(b"LD_LIBRARY_PATH".to_vec(), libraries);
+        }
+        // The native worker receives fully preprocessed input. Include
+        // search already ran locally; these variables are not runtime inputs.
+        for name in [
+            b"CPATH".as_slice(),
+            b"C_INCLUDE_PATH",
+            b"CPLUS_INCLUDE_PATH",
+            b"OBJC_INCLUDE_PATH",
+        ] {
+            command.environment.remove(name);
+        }
+    }
+    let prepared = package.mapping.prepare_with_cache(digests)?;
+    let after = digests.catalog_hits();
+    debug!(
+        "native toolchain preparation took {:.3}s; verified installation memo: {} files, {} bytes (process totals: {} files, {} bytes)",
+        start.elapsed().as_secs_f64(),
+        after.0.saturating_sub(before.0),
+        after.1.saturating_sub(before.1),
+        after.0,
+        after.1
+    );
+    Ok(prepared)
+}
+
 struct CompilerPlan {
     spec: ExecutionSpec,
     inputs: Vec<PreparedTree>,
@@ -668,39 +718,16 @@ impl CompilerPlan {
         } else {
             mapped.prepare()?
         };
-        let scope = if result_policy == ResultIdentityPolicy::Rust
-            && !opaque_compiler_extension(&command, inputs.manifest())
-        {
-            pkg::ToolchainScope::RustCompiler
-        } else {
-            pkg::ToolchainScope::Default
-        };
-        let before = toolchain_digests.catalog_hits();
-        let start = Instant::now();
-        let toolchain = toolchain
-            .native_mapping(scope)?
-            .prepare_with_cache(toolchain_digests)?;
-        let after = toolchain_digests.catalog_hits();
-        debug!(
-            "native toolchain preparation took {:.3}s; verified installation memo: {} files, {} bytes (process totals: {} files, {} bytes)",
-            start.elapsed().as_secs_f64(),
-            after.0.saturating_sub(before.0),
-            after.1.saturating_sub(before.1),
-            after.0,
-            after.1
-        );
+        let toolchain = prepare_toolchain(
+            toolchain,
+            toolchain_digests,
+            result_policy,
+            &mut command,
+            inputs.manifest(),
+        )?;
         let layout = layout.into_native_mapping(|_| false)?.prepare()?;
         let directories = pkg::native_directory_metadata()?;
         let inputs = vec![toolchain, inputs, layout];
-        if result_policy == ResultIdentityPolicy::PreprocessedC
-            && !opaque_compiler_extension(&command, inputs[1].manifest())
-        {
-            let manifests = inputs
-                .iter()
-                .map(PreparedTree::manifest)
-                .collect::<Vec<_>>();
-            command.normalize_search_environment(&manifests, &paths);
-        }
         let recipe = TreeRecipe::union(directories, inputs.iter().map(PreparedTree::id));
         let root = ExecutionRoot::resolve(
             recipe,
@@ -1294,6 +1321,234 @@ mod tests {
         }
         assert!(!config.fallback_cache.dir.exists());
         assert!(!config.dist.cache_dir.exists());
+        Ok(())
+    }
+
+    fn cxx_cargo_plan(
+        rt: &tokio::runtime::Runtime,
+        root: &Path,
+        compiler_path: &Path,
+        digests: &SourceDigestCache,
+        alternate: bool,
+    ) -> Result<CompilerPlan> {
+        let target = root.join("target");
+        let profile = target.join("debug");
+        let out = profile.join("build/boringssl-0123456789abcdef/out");
+        let cwd = out.join("native-cxx/build");
+        for directory in [&cwd, &profile.join("deps"), &profile.join("bin")] {
+            std::fs::create_dir_all(directory)?;
+        }
+        let source = out.join("input.cc");
+        std::fs::write(
+            &source,
+            "#include <vector>\nextern \"C\" int size() { std::vector<int> a{1,2,3}; return a.size(); }\nextern \"C\" const char* file() { return __FILE__; }\n",
+        )?;
+        let environment = vec![
+            (
+                "PATH".into(),
+                format!(
+                    "{}:/usr/bin:/bin:{}",
+                    if alternate { "/bin" } else { "/usr/bin" },
+                    profile.join("bin").display()
+                )
+                .into(),
+            ),
+            (
+                "LD_LIBRARY_PATH".into(),
+                format!(
+                    "{}:{}:{}",
+                    profile.join("deps").display(),
+                    profile.display(),
+                    root.join("missing").display()
+                )
+                .into(),
+            ),
+            ("OUT_DIR".into(), out.as_os_str().into()),
+            (
+                "SCCACHE_CANONICAL_TARGET_ROOT".into(),
+                target.as_os_str().into(),
+            ),
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            ("LANG".into(), "C".into()),
+        ];
+        let args = vec![
+            "-g".into(),
+            "-O2".into(),
+            "-MMD".into(),
+            "-MF".into(),
+            cwd.join("input.d").into_os_string(),
+            "-c".into(),
+            source.into_os_string(),
+            "-o".into(),
+            cwd.join("input.o").into_os_string(),
+        ];
+        let pool = rt.handle();
+        let mut config = config()?;
+        config.fallback_cache.dir = root.join("unexpected-archive-cache");
+        config.dist.cache_dir = root.join("unexpected-toolchain-cache");
+        let storage = storage_from_config(&config, pool)?;
+        let creator = ProcessCommandCreator::new(&Client::new_num(1));
+        let (compiler, _) = rt.block_on(get_compiler_info(
+            creator.clone(),
+            compiler_path,
+            &cwd,
+            &args,
+            &environment,
+            pool,
+            crate::compiler::CompilerDiscovery::default(),
+        ))?;
+        let CompilerArguments::Ok(mut hasher) = compiler.parse_arguments(
+            &args,
+            &cwd,
+            &environment,
+            super::super::CompilerCachePolicy::Native,
+        ) else {
+            anyhow::bail!("real C++ invocation was not cacheable");
+        };
+        let hash = rt.block_on(hasher.generate_hash_key(GenerateHashKeyContext {
+            native: None,
+            creator: &creator,
+            cwd: cwd.clone(),
+            env_vars: environment,
+            may_dist: true,
+            pool,
+            rewrite_includes_only: false,
+            storage,
+            cache_control: CacheControl::Default,
+        }))?;
+        let compilation = hash.compilation;
+        let policy = compilation.native_result_policy();
+        let mut transformer = dist::PathTransformer::new();
+        let (_, remote, cacheable) =
+            compilation.generate_compile_commands(&mut transformer, CompileTransport::Native)?;
+        assert_eq!(cacheable, Cacheable::Yes);
+        let remote = remote.context("missing real C++ native command")?;
+        let outputs = compilation
+            .outputs()
+            .filter(|output| output.key != "d")
+            .map(|output| NativeOutput::file(&cwd, output))
+            .collect();
+        let mut layout = dist::PathTransformer::new();
+        for (local, remote) in transformer.path_mappings() {
+            layout.add_root_mapping(local, &remote);
+        }
+        CompilerPlan::prepare(
+            remote,
+            &cwd,
+            outputs,
+            layout,
+            compilation.into_dist_packagers(transformer)?,
+            (ContentId::of(b"test"), policy, &hash.key),
+            (digests, None),
+        )
+    }
+
+    fn execute_cxx_cargo_plan(
+        plan: &CompilerPlan,
+        store: &NativeStore,
+        scratch: &Path,
+    ) -> Result<crate::build_runtime::ResultManifest> {
+        let leases = plan
+            .inputs
+            .iter()
+            .map(|tree| tree.import(store).map(Arc::new))
+            .collect::<Result<Vec<_>>>()?;
+        let result = execute(
+            &plan.spec,
+            store,
+            &ExecutionPolicy {
+                platform: ContentId::of(b"test"),
+                bubblewrap: "/usr/bin/bwrap".into(),
+                scratch: scratch.to_owned(),
+                timeout: Duration::from_secs(60),
+                max_result_bytes: 64 * 1024 * 1024,
+            },
+            &leases,
+            None,
+            || Ok(()),
+            |_| {},
+        )?;
+        if !result.status().success() {
+            let mut stderr = Vec::new();
+            if let Some(blob) = result.diagnostics().1 {
+                result.open_blob(blob.id)?.read_to_end(&mut stderr)?;
+            }
+            anyhow::bail!(
+                "isolated C++ compile failed: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        let manifest = result
+            .successful_result()
+            .context("missing C++ result")?
+            .clone();
+        let staged = manifest
+            .blobs()?
+            .into_iter()
+            .map(|(id, size)| {
+                store.stage_expected(
+                    crate::build_runtime::BlobRef { id, size },
+                    result.open_blob(id)?,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        store.publish(
+            &plan.spec.action_request()?.action_fingerprint()?,
+            &manifest,
+            staged,
+            ActionMode::Reuse,
+        )?;
+        Ok(manifest)
+    }
+
+    #[test]
+    #[ignore = "requires real g++ and Linux Bubblewrap"]
+    fn native_cxx_cargo_search_environment_is_independent_of_build_root() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let rt = tokio::runtime::Runtime::new()?;
+        let compiler = which::which("g++")?;
+        let digests = SourceDigestCache::default();
+        let first = cxx_cargo_plan(&rt, &temp.path().join("first"), &compiler, &digests, false)?;
+        let second = cxx_cargo_plan(&rt, &temp.path().join("second"), &compiler, &digests, true)?;
+        assert_eq!(
+            first.spec.command.environment[b"PATH".as_slice()],
+            b"/__sccache/toolchain/bin"
+        );
+        assert!(
+            !first
+                .spec
+                .command
+                .environment
+                .contains_key(b"LD_LIBRARY_PATH".as_slice())
+        );
+        assert!(
+            !second
+                .spec
+                .command
+                .environment
+                .contains_key(b"LD_LIBRARY_PATH".as_slice())
+        );
+        let fingerprint = first.spec.action_request()?.action_fingerprint()?;
+        let other = second.spec.action_request()?.action_fingerprint()?;
+        assert_eq!(
+            fingerprint,
+            other,
+            "different components: {:?}",
+            fingerprint.differing_components(&other)
+        );
+        let store = NativeStore::open(&temp.path().join("cas"))?;
+        let first_result = execute_cxx_cargo_plan(&first, &store, temp.path())?;
+        let hit = store
+            .lookup(other.key()?)?
+            .context("second root missed the first result")?;
+        assert_eq!(hit.manifest(), &first_result);
+        drop(hit);
+        let second_result = execute_cxx_cargo_plan(&second, &store, temp.path())?;
+        assert_eq!(
+            first_result, second_result,
+            "independent sandbox executions differed"
+        );
+        assert_eq!(store.duplicate_misses()?.identical_outputs, 0);
         Ok(())
     }
 

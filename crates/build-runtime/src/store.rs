@@ -1229,6 +1229,7 @@ impl NativeStore {
         write.open_table(BLOB_LAYOUTS)?;
         write.open_multimap_table(RESULT_ACTIONS)?;
         write.open_multimap_table(BLOB_ROOTS)?;
+        duplicate_results::initialize(&write)?;
         write.open_table(PENDING_DELETIONS)?;
         {
             let mut accounting = write.open_table(ACCOUNTING)?;
@@ -2031,6 +2032,8 @@ impl NativeStore {
                     .context("missing indexed result")?;
                 let manifest: ResultManifest = encoding().deserialize(manifest.value())?;
                 history::remember(&write, action, manifest, limit)?;
+            } else {
+                duplicate_results::forget(&write, action)?;
             }
             unreferenced_logical_bytes = Self::release_result_reference(
                 &write,
@@ -2450,6 +2453,7 @@ impl<L> Seek for LeasedReader<'_, L> {
     }
 }
 
+mod duplicate_results;
 mod history;
 mod space;
 use crate::SpacePolicy;

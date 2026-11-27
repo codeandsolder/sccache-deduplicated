@@ -620,6 +620,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
             kind: self.compiler.kind(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             env_vars: Vec::new(),
+            driver_args: Vec::new(),
         })
     }
     fn parse_arguments(
@@ -2191,6 +2192,11 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
     fn automatic_dist_toolchain_is_ready(&self) -> bool {
         use std::io::Read as _;
 
+        if self.env_vars.iter().any(|(name, value)| {
+            matches!(name.to_str(), Some("LD_PRELOAD" | "LD_AUDIT")) && !value.is_empty()
+        }) {
+            return false;
+        }
         // A script's transitive execution environment is not automatically
         // discoverable by ELF dependency analysis. A custom archive may
         // still explicitly provide the wrapper and its dependencies.
@@ -2227,11 +2233,17 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
             extra_dist_files: parsed_args.extra_dist_files,
             extra_hash_files: parsed_args.extra_hash_files,
         });
+        let driver_args = parsed_args
+            .common_args
+            .into_iter()
+            .chain(parsed_args.arch_args)
+            .collect();
         let toolchain_packager = Box::new(CToolchainPackager {
             executable,
             kind: compiler.kind(),
             cwd,
             env_vars,
+            driver_args,
         });
         Ok((inputs_packager, toolchain_packager))
     }
@@ -2307,6 +2319,7 @@ struct CToolchainPackager {
     kind: CCompilerKind,
     cwd: PathBuf,
     env_vars: Vec<(OsString, OsString)>,
+    driver_args: Vec<OsString>,
 }
 
 #[cfg(all(
@@ -2473,6 +2486,7 @@ fn real_cross_gcc_package_preserves_executable_helper_search_path() -> Result<()
         kind: CCompilerKind::Gcc,
         cwd: temp.path().to_owned(),
         env_vars: Vec::new(),
+        driver_args: Vec::new(),
     };
     let cache_key = pkg::ToolchainPackager::cache_key_extension(&packager)?;
     assert_eq!(
@@ -2489,6 +2503,66 @@ fn real_cross_gcc_package_preserves_executable_helper_search_path() -> Result<()
         "packaged GCC assembler must resolve using the driver's original path"
     );
     Ok(())
+}
+
+#[cfg(all(
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl CToolchainPackager {
+    fn named_tool(
+        &self,
+        kind: &str,
+        name: &str,
+        scope: pkg::ToolchainScope,
+    ) -> Result<Option<PathBuf>> {
+        use std::os::unix::ffi::OsStringExt;
+        let output = process::Command::new(&self.executable)
+            .args(&self.driver_args)
+            .arg(format!("-print-{kind}-name={name}"))
+            .current_dir(&self.cwd)
+            .env_clear()
+            .envs(self.env_vars.iter().cloned())
+            .output()?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let mut bytes = output.stdout;
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
+        let path = PathBuf::from(OsString::from_vec(bytes));
+        if path.is_absolute() {
+            return Ok(path.is_file().then_some(path));
+        }
+        if path.components().count() > 1 {
+            let path = self.cwd.join(path);
+            return Ok(path.is_file().then_some(path));
+        }
+        if kind != "prog" {
+            return Ok(None);
+        }
+        let search = self
+            .env_vars
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "PATH")
+            .map_or_else(
+                || OsString::from("/bin:/usr/bin"),
+                |(_, value)| value.clone(),
+            );
+        let Some(path) = which::which_in(path, Some(search), &self.cwd).ok() else {
+            return Ok(None);
+        };
+        // PATH aliases are not execution inputs. Package the selected
+        // executable, rather than the spelling of the caller's search dir.
+        if scope == pkg::ToolchainScope::PreprocessedC {
+            Ok(Some(path.canonicalize()?))
+        } else {
+            Ok(Some(path))
+        }
+    }
 }
 
 #[cfg(feature = "dist-client")]
@@ -2527,75 +2601,33 @@ impl pkg::DiscoverToolchain for CToolchainPackager {
         )?))
     }
 
-    fn package_builder(self, _scope: pkg::ToolchainScope) -> Result<pkg::ToolchainPackageBuilder> {
-        use std::os::unix::ffi::OsStringExt;
-
+    fn package_builder(self, scope: pkg::ToolchainScope) -> Result<pkg::ToolchainPackageBuilder> {
         info!("Generating toolchain {}", self.executable.display());
         let mut package_builder = pkg::ToolchainPackageBuilder::new();
         package_builder.add_common()?;
-        package_builder.add_executable_and_deps(self.executable.clone())?;
+        let mut executables = vec![self.executable.clone()];
+        let mut helpers = Vec::new();
 
-        // Helper to use -print-file-name and -print-prog-name to look up
-        // files by path.
-        let named_file = |kind: &str, name: &str| -> Option<PathBuf> {
-            let mut output = process::Command::new(&self.executable)
-                .arg(format!("-print-{kind}-name={name}"))
-                .current_dir(&self.cwd)
-                .envs(self.env_vars.iter().cloned())
-                .output()
-                .ok()?;
-            debug!(
-                "find named {kind} {name} output:\n{}\n===\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-            if !output.status.success() {
-                debug!("exit failure");
-                return None;
-            }
-
-            // Remove the trailing newline (if present)
-            if output.stdout.last() == Some(&b'\n') {
-                output.stdout.pop();
-            }
-
-            // Create our PathBuf from the raw bytes.  Assume that relative
-            // paths can be found via PATH.
-            let path: PathBuf = OsString::from_vec(output.stdout).into();
-            if path.is_absolute() {
-                Some(path)
-            } else {
-                let paths = self
-                    .env_vars
-                    .iter()
-                    .find(|(key, _)| key.as_os_str() == OsStr::new("PATH"))
-                    .map(|(_, value)| value.clone())
-                    .or_else(|| std::env::var_os("PATH"))
-                    .unwrap_or_default();
-                which::which_in(path, Some(paths), &self.cwd).ok()
-            }
-        };
-
-        // Helper to add a named file/program by to the package.
-        // We ignore the case where the file doesn't exist, as we don't need it.
-        let add_named_prog =
-            |builder: &mut pkg::ToolchainPackageBuilder, name: &str| -> Result<()> {
-                if let Some(path) = named_file("prog", name) {
-                    builder.add_executable_and_deps(path)?;
+        let mut add_named_prog = |name: &str| -> Result<()> {
+            if let Some(path) = self.named_tool("prog", name, scope)? {
+                if scope == pkg::ToolchainScope::PreprocessedC {
+                    helpers.push((OsString::from(name), path.clone()));
                 }
-                Ok(())
-            };
+                executables.push(path);
+            }
+            Ok(())
+        };
         let add_named_file =
             |builder: &mut pkg::ToolchainPackageBuilder, name: &str| -> Result<()> {
-                if let Some(path) = named_file("file", name) {
+                if let Some(path) = self.named_tool("file", name, scope)? {
                     builder.add_file(path)?;
                 }
                 Ok(())
             };
 
         // Add basic |as| and |objcopy| programs.
-        add_named_prog(&mut package_builder, "as")?;
-        add_named_prog(&mut package_builder, "objcopy")?;
+        add_named_prog("as")?;
+        add_named_prog("objcopy")?;
 
         // Linker configuration.
         if Path::new("/etc/ld.so.conf").is_file() {
@@ -2610,7 +2642,7 @@ impl pkg::DiscoverToolchain for CToolchainPackager {
         match self.kind {
             CCompilerKind::Clang => {
                 // Clang uses internal header files, so add them.
-                if let Some(limits_h) = named_file("file", "include/limits.h") {
+                if let Some(limits_h) = self.named_tool("file", "include/limits.h", scope)? {
                     info!("limits_h = {}", limits_h.display());
                     let include_dir = limits_h
                         .parent()
@@ -2621,12 +2653,12 @@ impl pkg::DiscoverToolchain for CToolchainPackager {
 
             CCompilerKind::Gcc => {
                 // Various external programs / files which may be needed by gcc
-                add_named_prog(&mut package_builder, "ld")?;
-                add_named_prog(&mut package_builder, "collect2")?;
-                add_named_prog(&mut package_builder, "lto-wrapper")?;
-                add_named_prog(&mut package_builder, "lto1")?;
-                add_named_prog(&mut package_builder, "cc1")?;
-                add_named_prog(&mut package_builder, "cc1plus")?;
+                add_named_prog("ld")?;
+                add_named_prog("collect2")?;
+                add_named_prog("lto-wrapper")?;
+                add_named_prog("lto1")?;
+                add_named_prog("cc1")?;
+                add_named_prog("cc1plus")?;
                 add_named_file(&mut package_builder, "specs")?;
                 add_named_file(&mut package_builder, "liblto_plugin.so")?;
             }
@@ -2641,8 +2673,8 @@ impl pkg::DiscoverToolchain for CToolchainPackager {
                 add_named_file(&mut package_builder, "cpp1")?;
                 add_named_file(&mut package_builder, "cpp2")?;
                 add_named_file(&mut package_builder, "opt")?;
-                add_named_prog(&mut package_builder, "llc")?;
-                add_named_prog(&mut package_builder, "acclnk")?;
+                add_named_prog("llc")?;
+                add_named_prog("acclnk")?;
             }
 
             CCompilerKind::Diab | CCompilerKind::Msvc | CCompilerKind::TaskingVX => {
@@ -2653,6 +2685,19 @@ impl pkg::DiscoverToolchain for CToolchainPackager {
             }
         }
 
+        if scope == pkg::ToolchainScope::PreprocessedC {
+            super::c_toolchain::prepare_search(
+                &mut package_builder,
+                &executables,
+                &helpers,
+                &self.env_vars,
+                &self.cwd,
+            )?;
+        } else {
+            for executable in executables {
+                package_builder.add_executable_and_deps(executable)?;
+            }
+        }
         // Bundle into a compressed tarfile.
         Ok(package_builder)
     }
