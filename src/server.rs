@@ -1578,7 +1578,7 @@ where
             let Message::WithoutBody(Request::ObservePhase(sample)) = request else {
                 bail!("unexpected request on compile observation connection");
             };
-            activity.observe(sample)?;
+            activity.observe(*sample)?;
             if let Some(reason) = activity.snapshot().deadline_error(self.compile_limits) {
                 send_ipc_frame(
                     sink,
@@ -3325,7 +3325,7 @@ mod tests {
         time::advance(Duration::from_secs(15)).await;
         client
             .send(Bytes::from(bincode::serialize(&Request::ObservePhase(
-                local.snapshot(),
+                Box::new(local.snapshot()),
             ))?))
             .await?;
         let frame = client.next().await.context("observer update missing")??;
@@ -3345,7 +3345,7 @@ mod tests {
         assert!(service.activities.cancel(&id));
         client
             .send(Bytes::from(bincode::serialize(&Request::ObservePhase(
-                local.snapshot(),
+                Box::new(local.snapshot()),
             ))?))
             .await?;
         let frame = client

@@ -1843,9 +1843,11 @@ mod server {
                 sccache_dashboard::server::spawn(
                     config.bind_address,
                     &config.assets,
-                    config.metrics_url.as_deref(),
-                    config.metrics_ingress_host.as_deref(),
-                    config.traces_url.as_deref(),
+                    sccache_dashboard::server::TelemetrySources {
+                        metrics_url: config.metrics_url.as_deref(),
+                        metrics_ingress_host: config.metrics_ingress_host.as_deref(),
+                        traces_url: config.traces_url.as_deref(),
+                    },
                     move || {
                         let mut snapshot = handler.handle_dashboard_snapshot()?;
                         dashboard::enrich(

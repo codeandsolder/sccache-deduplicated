@@ -129,6 +129,12 @@ pub(super) fn now() -> u64 {
         .as_secs()
 }
 
+pub struct TelemetrySources<'a> {
+    pub metrics_url: Option<&'a str>,
+    pub metrics_ingress_host: Option<&'a str>,
+    pub traces_url: Option<&'a str>,
+}
+
 /// Bind only a loopback listener. Assets and the metrics endpoint are explicit
 /// deployment configuration, not inferred from environment variables.
 ///
@@ -137,9 +143,7 @@ pub(super) fn now() -> u64 {
 pub fn spawn(
     address: SocketAddr,
     assets: &Path,
-    metrics_url: Option<&str>,
-    metrics_ingress_host: Option<&str>,
-    traces_url: Option<&str>,
+    sources: TelemetrySources<'_>,
     snapshot: impl Fn() -> Result<Snapshot> + Send + 'static,
     telemetry: impl Fn() -> Option<NativeTelemetry> + Send + 'static,
     wake: std::sync::mpsc::Receiver<()>,
@@ -162,8 +166,8 @@ pub fn spawn(
             "dashboard asset missing: {name}"
         );
     }
-    let metrics = metrics::MetricsService::new(metrics_url, metrics_ingress_host)?;
-    let traces = traces::TraceService::new(traces_url)?;
+    let metrics = metrics::MetricsService::new(sources.metrics_url, sources.metrics_ingress_host)?;
+    let traces = traces::TraceService::new(sources.traces_url)?;
     let listener = TcpListener::bind(address).context("bind scheduler dashboard")?;
     let address = listener.local_addr()?;
     listener.set_nonblocking(true)?;

@@ -309,7 +309,7 @@ impl CompileObserver {
             };
             let observation = self.activity.snapshot();
             let response = connection_task(Arc::clone(&self.connection), move |connection| {
-                connection.request(Request::ObservePhase(observation))
+                connection.request(Request::ObservePhase(Box::new(observation)))
             })
             .await?;
             ensure!(

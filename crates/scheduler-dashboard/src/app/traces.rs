@@ -20,13 +20,13 @@ async fn load_trace_detail(id: String) -> Result<TraceDetail, ServerFnError> {
 }
 
 fn ms(ns: u64) -> String {
-    format!("{:.3} ms", ns as f64 / 1_000_000.0)
+    format!("{}.{:03} ms", ns / 1_000_000, ns % 1_000_000 / 1_000)
 }
 
 fn span_row(span: TraceSpan, start: u64, extent: u64) -> impl IntoView {
     let offset = span.start_ns.saturating_sub(start);
-    let x = 100.0 * offset as f64 / extent as f64;
-    let width = 100.0 * span.duration_ns as f64 / extent as f64;
+    let x = u128::from(offset) * 100_000 / u128::from(extent);
+    let width = u128::from(span.duration_ns) * 100_000 / u128::from(extent);
     let fill = if span.error {
         "#e36c60"
     } else {
@@ -48,9 +48,9 @@ fn span_row(span: TraceSpan, start: u64, extent: u64) -> impl IntoView {
             <td>{span.host}" / "{span.name}</td>
             <td>{ms(span.duration_ns)}</td>
             <td style="width:55%;min-width:160px">
-                <svg viewBox="0 0 100 8" preserveAspectRatio="none" style="width:100%;height:20px">
+                <svg viewBox="0 0 100000 8" preserveAspectRatio="none" style="width:100%;height:20px">
                     <title>{title}</title>
-                    <rect x=x.to_string() y="0" width=width.max(0.1).to_string() height="8" fill=fill/>
+                    <rect x=x.to_string() y="0" width=width.max(1).to_string() height="8" fill=fill/>
                 </svg>
             </td>
         </tr>

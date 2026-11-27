@@ -245,7 +245,7 @@ impl TraceHistory {
             && self
                 .intervals
                 .iter()
-                .all(|interval| interval.start <= interval.end && interval.end <= self.elapsed)
+                .all(|interval| interval.start <= interval.end && self.elapsed >= interval.end)
     }
 
     fn append_spans(
@@ -585,54 +585,65 @@ impl Activity {
             attributes,
             error: outcome.error(),
         }];
-        if let Some(remote) = remote {
-            let child_start = remote.start.clamp(start, end);
-            let child_end = remote
-                .start
-                .saturating_add(remote.elapsed)
-                .clamp(child_start, end);
-            if child_start > start {
-                spans.push(LatencySpan::child(
-                    context,
-                    "sccache-client",
-                    "executor_startup",
-                    start,
-                    child_start,
-                ));
-            }
-            remote.append_spans(context, child_start, child_end, &mut spans);
-            // Only local transitions after the child returns are real local
-            // work. The initial local DetectCompiler phase is an observer.
-            if let Some(transition) = history
-                .transitions
-                .iter()
-                .find(|transition| start.saturating_add(transition.offset) >= child_end)
-            {
-                let after = start.saturating_add(transition.offset).min(end);
-                if after > child_end {
-                    spans.push(LatencySpan::child(
-                        context,
-                        "sccache-client",
-                        "executor_return",
-                        child_end,
-                        after,
-                    ));
-                }
-                history.append_spans(context, after, end, &mut spans);
-                spans.retain(|span| span.parent.is_none() || span.end > span.start);
-            } else if end > child_end {
+        append_request_spans(&history, remote.as_ref(), context, start, end, &mut spans);
+        crate::latency_trace::submit(spans);
+    }
+}
+
+fn append_request_spans(
+    history: &TraceHistory,
+    remote: Option<&TraceHistory>,
+    context: TraceContext,
+    start: u64,
+    end: u64,
+    spans: &mut Vec<LatencySpan>,
+) {
+    if let Some(remote) = remote {
+        let child_start = remote.start.clamp(start, end);
+        let child_end = remote
+            .start
+            .saturating_add(remote.elapsed)
+            .clamp(child_start, end);
+        if child_start > start {
+            spans.push(LatencySpan::child(
+                context,
+                "sccache-client",
+                "executor_startup",
+                start,
+                child_start,
+            ));
+        }
+        remote.append_spans(context, child_start, child_end, spans);
+        // Only local transitions after the child returns are real local
+        // work. The initial local DetectCompiler phase is an observer.
+        if let Some(transition) = history
+            .transitions
+            .iter()
+            .find(|transition| start.saturating_add(transition.offset) >= child_end)
+        {
+            let after = start.saturating_add(transition.offset).min(end);
+            if after > child_end {
                 spans.push(LatencySpan::child(
                     context,
                     "sccache-client",
                     "executor_return",
                     child_end,
-                    end,
+                    after,
                 ));
             }
-        } else {
-            history.append_spans(context, start, end, &mut spans);
+            history.append_spans(context, after, end, spans);
+            spans.retain(|span| span.parent.is_none() || span.end > span.start);
+        } else if end > child_end {
+            spans.push(LatencySpan::child(
+                context,
+                "sccache-client",
+                "executor_return",
+                child_end,
+                end,
+            ));
         }
-        crate::latency_trace::submit(spans);
+    } else {
+        history.append_spans(context, start, end, spans);
     }
 }
 
@@ -828,6 +839,7 @@ impl ChildActivity {
                     nanos(self.since.duration_since(activity.started)),
                     nanos(now.duration_since(activity.started)),
                 );
+                drop(state);
                 self.since = now;
             }
             self.running = true;

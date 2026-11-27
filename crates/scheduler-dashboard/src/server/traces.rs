@@ -1,4 +1,4 @@
-//! Bounded, typed VictoriaTraces queries. No browser-supplied query language
+//! Bounded, typed `VictoriaTraces` queries. No browser-supplied query language
 //! or backend URL is forwarded to the trace database.
 
 use anyhow::{Context, Result, ensure};
@@ -15,7 +15,7 @@ const SPAN_LIMIT: usize = 4096;
 const MAX_RESPONSE: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
-pub(crate) struct TraceService(Option<Arc<Source>>);
+pub struct TraceService(Option<Arc<Source>>);
 
 struct Source {
     base: url::Url,
@@ -128,7 +128,7 @@ fn search_queries(search: &TraceSearch) -> Result<(String, String)> {
         300 => "5m",
         3600 => "1h",
         86400 => "1d",
-        604800 => "7d",
+        604_800 => "7d",
         _ => anyhow::bail!("unsupported trace time range"),
     };
     let mut query = format!(
@@ -170,9 +170,9 @@ fn take(row: &mut Row, key: &str) -> String {
 }
 
 fn integer(row: &mut Row, key: &str) -> Result<u64> {
-    Ok(take(row, key)
+    take(row, key)
         .parse()
-        .with_context(|| format!("invalid trace field {key}"))?)
+        .with_context(|| format!("invalid trace field {key}"))
 }
 
 fn number(row: &mut Row, key: &str) -> Result<f64> {
