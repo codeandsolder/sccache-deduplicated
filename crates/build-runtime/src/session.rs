@@ -1647,8 +1647,8 @@ impl NativeSessions {
         Ok(CommitStart::Pending { session, pending })
     }
 
-    fn finish_commit(&self, session: SharedSession, result: Result<Ready>) -> Result<Committed> {
-        let mut state = Self::lock(&session)?;
+    fn finish_commit(&self, session: &SharedSession, result: Result<Ready>) -> Result<Committed> {
+        let mut state = Self::lock(session)?;
         state.expires = self.deadline();
         let reply = match result {
             Ok(lease) => {
@@ -1675,7 +1675,7 @@ impl NativeSessions {
             CommitStart::Ready(reply) => Ok(reply),
             CommitStart::Pending { session, pending } => {
                 let result = pending.publish(self.store());
-                self.finish_commit(session, result)
+                self.finish_commit(&session, result)
             }
         }
     }
@@ -1694,7 +1694,7 @@ impl NativeSessions {
                 CommitStart::Ready(reply) => Ok(reply),
                 CommitStart::Pending { session, pending } => {
                     let result = pending.publish_async(sessions.store()).await;
-                    sessions.finish_commit(session, result)
+                    sessions.finish_commit(&session, result)
                 }
             }
         })
