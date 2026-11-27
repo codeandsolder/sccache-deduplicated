@@ -258,7 +258,7 @@ fn with_native_service(
                         1024 * 1024,
                     )
                 },
-                commit_routes,
+                &commit_routes,
                 None,
                 1024 * 1024,
             )

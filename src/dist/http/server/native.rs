@@ -447,7 +447,7 @@ where
                     metadata_limit,
                 )
             },
-            commit_routes,
+            &commit_routes,
             package_routes,
             metadata_limit,
         ),
@@ -516,7 +516,7 @@ fn native_router<F, A, Fut, U, UFut>(
     handler: F,
     schedule: A,
     upload: U,
-    commits: CommitRoutes,
+    commits: &CommitRoutes,
     packages: Option<PackageRoutes>,
     metadata_limit: usize,
 ) -> Router
