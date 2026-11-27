@@ -994,6 +994,44 @@ fn opening_a_nonempty_unowned_directory_is_rejected() -> Result<()> {
 }
 
 #[test]
+fn garbage_candidates_are_rechecked_after_resurrection_and_new_reservations() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let stage = store.stage(&b"pending content"[..])?;
+    let blob = stage.reference();
+    let fingerprint = action("gc");
+    let manifest = result(blob);
+    let key = store
+        .publish(&fingerprint, &manifest, vec![stage], ActionMode::Reuse)?
+        .action;
+    assert!(matches!(store.evict(key)?, Eviction::Removed { .. }));
+    let selection = store.select_garbage(8)?;
+    assert_eq!(selection, vec![blob.id]);
+    let reservation = store.reserve_blobs(&BTreeMap::from([(blob.id, blob.size)]))?;
+    assert!(reservation.missing().is_empty());
+    assert_eq!(store.collect_selected_garbage(selection.clone())?.blobs, 0);
+    // A fully pinned pending queue can be inspected without mutation exclusion.
+    let mutation = store.inner.lock_mutations()?;
+    let collected = thread::scope(|scope| -> Result<_> {
+        let (send, receive) = std::sync::mpsc::channel();
+        let store = &store;
+        let worker = scope.spawn(move || send.send(store.collect_garbage(8)));
+        let observed = receive.recv_timeout(std::time::Duration::from_secs(2));
+        drop(mutation);
+        worker.join().map_err(|_| anyhow!("GC reader panicked"))??;
+        observed?
+    })?;
+    assert_eq!(collected.blobs, 0);
+    store.publish(&fingerprint, &manifest, Vec::new(), ActionMode::Reuse)?;
+    drop(reservation);
+    assert_eq!(store.collect_selected_garbage(selection)?.blobs, 0);
+    assert!(store.lookup(key)?.is_some());
+    assert!(matches!(store.evict(key)?, Eviction::Removed { .. }));
+    assert_eq!(store.collect_garbage(8)?.blobs, 1);
+    Ok(())
+}
+
+#[test]
 fn root_eviction_claim_excludes_only_its_target_and_releases_on_abort() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = NativeStore::open(dir.path())?;

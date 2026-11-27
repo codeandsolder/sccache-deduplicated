@@ -2005,6 +2005,10 @@ impl NativeStore {
     /// # Errors
     /// Returns an error for inconsistent metadata or storage failures.
     pub fn evict(&self, action: ActionKey) -> Result<Eviction> {
+        self.evict_action(action, None)
+    }
+
+    fn evict_action(&self, action: ActionKey, expected: Option<ResultId>) -> Result<Eviction> {
         let Some(mut claim) = self.inner.claim_eviction(space::Root::Action(action))? else {
             return Ok(Eviction::Pinned);
         };
@@ -2014,10 +2018,21 @@ impl NativeStore {
             let mut actions = write.open_table(ACTIONS)?;
             let mut results = write.open_table(RESULTS)?;
             let mut result_actions = write.open_multimap_table(RESULT_ACTIONS)?;
-            let Some(record) = actions.remove(&action.0)? else {
-                return Ok(Eviction::Missing);
+            let record: ActionRecord = {
+                let Some(record) = actions.get(&action.0)? else {
+                    return Ok(Eviction::Missing);
+                };
+                encoding().deserialize(record.value())?
             };
-            let record: ActionRecord = encoding().deserialize(record.value())?;
+            // Ranking is an advisory read snapshot. Never remove a new
+            // result just because its predecessor was a good candidate.
+            if expected.is_some_and(|id| id != record.result) {
+                return Ok(Eviction::Missing);
+            }
+            ensure!(
+                actions.remove(&action.0)?.is_some(),
+                "missing eviction action"
+            );
             let limit = self.inner.result_history_limit.load(Ordering::Acquire);
             if limit != 0 {
                 let manifest = results
@@ -2130,39 +2145,68 @@ impl NativeStore {
     /// Returns an error for database failures; per-file failures remain queued
     /// and are reported in the collection result.
     pub fn collect_garbage(&self, limit: usize) -> Result<GarbageCollected> {
-        // A read snapshot with no queued deletions needs no exclusion from
-        // concurrent publication. Later deletions belong to the next pass.
-        if limit == 0
-            || self
-                .inner
-                .db
-                .begin_read()?
-                .open_table(PENDING_DELETIONS)?
-                .len()?
-                == 0
-        {
+        self.collect_selected_garbage(self.select_garbage(limit)?)
+    }
+
+    fn select_garbage(&self, limit: usize) -> Result<Vec<ContentId>> {
+        // Scanning a large pending queue is advisory. Neither publication
+        // nor unrelated cache readers should wait for this enumeration.
+        const PIN_BATCH: usize = 256;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let read = self.inner.db.begin_read()?;
+        let pending = read.open_table(PENDING_DELETIONS)?;
+        if pending.len()? == 0 {
+            return Ok(Vec::new());
+        }
+        let mut entries = pending.iter()?;
+        let mut candidates = Vec::new();
+        let mut batch = Vec::with_capacity(PIN_BATCH);
+        while candidates.len() < limit {
+            batch.clear();
+            for entry in entries.by_ref().take(PIN_BATCH) {
+                let (id, _) = entry?;
+                batch.push(ContentId(*id.value()));
+            }
+            if batch.is_empty() {
+                break;
+            }
+            let remaining = limit - candidates.len();
+            let pins = self.inner.lock_pins()?;
+            candidates.extend(
+                batch
+                    .iter()
+                    .copied()
+                    .filter(|id| !pins.blobs.contains_key(id))
+                    .take(remaining),
+            );
+            drop(pins);
+        }
+        Ok(candidates)
+    }
+
+    fn collect_selected_garbage(&self, selected: Vec<ContentId>) -> Result<GarbageCollected> {
+        if selected.is_empty() {
             return Ok(GarbageCollected::default());
         }
         let _mutation = self.inner.lock_mutations()?;
-        let pins = self.inner.lock_pins()?;
-        let read = self.inner.db.begin_read()?;
-        let pending = read.open_table(PENDING_DELETIONS)?;
-        let mut candidates = Vec::new();
-        for entry in pending.iter()? {
-            if candidates.len() >= limit {
-                break;
+        let candidates = {
+            let read = self.inner.db.begin_read()?;
+            let pending = read.open_table(PENDING_DELETIONS)?;
+            let mut candidates = Vec::new();
+            for id in selected {
+                if let Some(size) = pending.get(&id.0)? {
+                    candidates.push((id, size.value()));
+                }
             }
-            let (id, size) = entry?;
-            let id = ContentId(*id.value());
-            if !pins.blobs.contains_key(&id) {
-                candidates.push((id, size.value()));
-            }
-        }
-        drop(pending);
-        drop(read);
-        // A new upload reservation requires the mutation lock. Committed
-        // result readers cannot acquire new pins on pending-only content.
-        drop(pins);
+            // No new pending-only reservation can be acquired while we
+            // own mutation exclusion. Current readers pin live roots only.
+            let pins = self.inner.lock_pins()?;
+            candidates.retain(|(id, _)| !pins.blobs.contains_key(id));
+            drop(pins);
+            candidates
+        };
         let mut completed = Vec::new();
         let mut failed = Vec::new();
         let mut logical_bytes = 0_u64;

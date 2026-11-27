@@ -17,7 +17,9 @@ use super::{
     ACTIONS, ActionRecord, BLOB_ROOTS, Eviction, Inner, NativeStore, PACKAGES, RESULT_ACTIONS,
     RESULTS, TREE_PACKAGES, TREES, encoding, packages::PackageRecord, persist_usage,
 };
-use crate::{ActionKey, BlobRef, ContentId, ResultManifest, SpacePolicy, TreeId, TreeManifest};
+use crate::{
+    ActionKey, BlobRef, ContentId, ResultId, ResultManifest, SpacePolicy, TreeId, TreeManifest,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Root {
@@ -48,6 +50,28 @@ impl Root {
             0 => Ok(Self::Action(ActionKey(digest))),
             1 => Ok(Self::Tree(TreeId(digest))),
             _ => Err(anyhow!("invalid native usage root type")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum EvictionTarget {
+    Action(ActionKey, ResultId),
+    Tree(TreeId),
+}
+
+impl EvictionTarget {
+    const fn root(self) -> Root {
+        match self {
+            Self::Action(key, _) => Root::Action(key),
+            Self::Tree(id) => Root::Tree(id),
+        }
+    }
+
+    fn evict(self, store: &NativeStore) -> Result<Eviction> {
+        match self {
+            Self::Action(key, result) => store.evict_action(key, Some(result)),
+            Self::Tree(id) => store.evict_tree(id),
         }
     }
 }
@@ -273,32 +297,38 @@ impl NativeStore {
             .checked_add(need)
             .context("native target space overflow")?;
         self.collect_garbage(policy.gc_batch)?;
-        let mut free = available()?;
-        let mut resident = self
-            .resident_bytes()?
-            .checked_add(need)
-            .context("native resident reservation overflow")?;
+        let mut observe = || -> Result<(u64, u64)> {
+            Ok((
+                available()?,
+                self.resident_bytes()?
+                    .checked_add(need)
+                    .context("native resident reservation overflow")?,
+            ))
+        };
+        let (mut free, mut resident) = observe()?;
         let mut evicted_roots = 0;
         if free < minimum || resident > policy.max_resident_bytes {
             #[cfg(target_os = "linux")]
             self.drop_idle_views(None)?;
-            for root in self.eviction_candidates(policy.max_evictions_per_pass, free < minimum)? {
-                let result = match root {
-                    Root::Action(key) => self.evict(key)?,
-                    Root::Tree(id) => self.evict_tree(id)?,
+            let candidates =
+                self.eviction_candidates(policy.max_evictions_per_pass, free < minimum)?;
+            (free, resident) = observe()?;
+            for candidate in candidates {
+                let (free_limit, resident_limit) = if evicted_roots == 0 {
+                    (minimum, policy.max_resident_bytes)
+                } else {
+                    (target, policy.target_resident_bytes)
                 };
-                if matches!(result, Eviction::Removed { .. }) {
+                if free >= free_limit && resident <= resident_limit {
+                    break;
+                }
+                if matches!(candidate.evict(self)?, Eviction::Removed { .. }) {
                     evicted_roots += 1;
                     self.collect_garbage(policy.gc_batch)?;
-                    free = available()?;
-                    resident = self
-                        .resident_bytes()?
-                        .checked_add(need)
-                        .context("native resident reservation overflow")?;
-                    if free >= target && resident <= policy.target_resident_bytes {
-                        break;
-                    }
                 }
+                // Ranking and pin checks may race with publication/GC;
+                // always observe actual capacity before further eviction.
+                (free, resident) = observe()?;
             }
         }
         Ok(SpaceReport {
@@ -338,10 +368,14 @@ impl NativeStore {
                 // but not snapshot/reflink exclusivity on ZFS. Validate real
                 // free space after GC rather than claiming exact release.
                 let bytes = if physical_pressure {
-                    std::fs::metadata(self.inner.blob_path(id))?
-                        .blocks()
-                        .checked_mul(512)
-                        .context("estimated allocated bytes overflow")?
+                    match std::fs::metadata(self.inner.blob_path(id)) {
+                        Ok(metadata) => metadata
+                            .blocks()
+                            .checked_mul(512)
+                            .context("estimated allocated bytes overflow")?,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                        Err(error) => return Err(error.into()),
+                    }
                 } else {
                     size
                 };
@@ -355,17 +389,17 @@ impl NativeStore {
 
     fn rank_eviction_candidate(
         &self,
-        root: Root,
+        candidate: EvictionTarget,
         blobs: &BTreeMap<ContentId, u64>,
         disappearing: &BTreeSet<[u8; 32]>,
         owners: &ReadOnlyMultimapTable<&[u8; 32], &[u8; 32]>,
         physical_pressure: bool,
         observed: u64,
-    ) -> Result<(u8, u128, std::cmp::Reverse<u64>, u64, Root)> {
+    ) -> Result<(u8, u128, std::cmp::Reverse<u64>, u64, EvictionTarget)> {
         // The pin lock must not be held while consulting filesystem blocks:
         // a slow ZFS metadata lookup must not delay normal cache hits.
         let pins = self.inner.lock_pins()?;
-        let usage = pins.usage.get(&root).copied();
+        let usage = pins.usage.get(&candidate.root()).copied();
         let pinned_blobs = blobs
             .keys()
             .filter(|id| pins.blobs.contains_key(*id))
@@ -390,17 +424,22 @@ impl NativeStore {
                 / u128::from(potential.max(1)),
             std::cmp::Reverse(potential),
             usage.map_or(0, |record| record.last_used_ms),
-            root,
+            candidate,
         ))
     }
 
-    fn eviction_candidates(&self, limit: usize, physical_pressure: bool) -> Result<Vec<Root>> {
-        // This is intentionally a pressure-only path: query committed reverse
-        // references and actual file allocation, never the lookup hot path.
-        // Freeze publications/GC until the file-allocation snapshot has been
-        // ranked, so a concurrent unlink cannot invalidate the blob metadata.
-        // The mutation lock is released before any candidate is evicted.
-        let _mutation = self.inner.lock_mutations()?;
+    fn eviction_candidates(
+        &self,
+        limit: usize,
+        physical_pressure: bool,
+    ) -> Result<Vec<EvictionTarget>> {
+        // Ranking is advisory: use one committed reverse-index snapshot
+        // without blocking writers. Allocation observations can change as
+        // files disappear; actual eviction revalidates the action generation
+        // and pins, and admission rechecks actual free space afterwards.
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let read = self.inner.db.begin_read()?;
         let actions = read.open_table(ACTIONS)?;
         let results = read.open_table(RESULTS)?;
@@ -412,12 +451,12 @@ impl NativeStore {
         let observed = now_ms();
         // Bound memory to K candidates even when the backing index is huge.
         let mut candidates = BinaryHeap::new();
-        let mut consider = |root: Root,
+        let mut consider = |candidate: EvictionTarget,
                             blobs: &BTreeMap<ContentId, u64>,
                             disappearing: &BTreeSet<[u8; 32]>|
          -> Result<()> {
             let rank = self.rank_eviction_candidate(
-                root,
+                candidate,
                 blobs,
                 disappearing,
                 &blob_roots,
@@ -453,7 +492,11 @@ impl NativeStore {
             } else {
                 BTreeSet::new()
             };
-            consider(Root::Action(key), &manifest.blobs()?, &disappearing)?;
+            consider(
+                EvictionTarget::Action(key, record.result),
+                &manifest.blobs()?,
+                &disappearing,
+            )?;
         }
         for entry in trees.iter()? {
             let (id, value) = entry?;
@@ -478,7 +521,7 @@ impl NativeStore {
                     ensure!(previous == size, "inconsistent archive content size");
                 }
             }
-            consider(Root::Tree(id), &blobs, &disappearing)?;
+            consider(EvictionTarget::Tree(id), &blobs, &disappearing)?;
         }
         Ok(candidates
             .into_sorted_vec()
