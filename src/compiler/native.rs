@@ -1174,6 +1174,7 @@ mod tests {
                 timeout: Duration::from_secs(60),
                 max_result_bytes: 64 * 1024 * 1024,
             },
+            None,
             || Ok(()),
         )?;
         if !result.status().success() {

@@ -621,14 +621,21 @@ impl NativeCacheClient {
         };
         let result = self.with_renewal(ticket, control.renewal_interval, |check| {
             self.verify_execution(ticket, spec.clone())?;
-            let prepared = self.prepare_execution(
+            let mut prepared = self.prepare_execution(
                 context,
                 control.grace.map(|grace| (grace, policy.max_result_bytes)),
                 |id, check, _| fetch(id, check),
                 check,
                 &mut |_| {},
             )?;
-            let captured = compile(context, control.queue, control.transport, check, || {})?;
+            let captured = compile(
+                context,
+                control.queue,
+                control.transport,
+                prepared.take_budget(),
+                check,
+                || {},
+            )?;
             crate::http_client::io_runtime()?.block_on(self.publish_execution(
                 context,
                 prepared,
@@ -685,7 +692,10 @@ impl NativeCacheClient {
                 warm = false;
                 std::thread::sleep(Duration::from_millis(100));
             };
-            Some((reservation, store.reserve_staging(policy.max_result_bytes)?))
+            Some(OutputReservation {
+                grace: reservation,
+                budget: Some(store.reserve_staging(policy.max_result_bytes)?),
+            })
         } else {
             None
         };
@@ -735,7 +745,7 @@ impl NativeCacheClient {
         transport: Option<&PackageTransportTracker>,
         check: &LeaseCheck<'_>,
     ) -> Result<CapturedExecution> {
-        let ExecutionContext { ticket, store, .. } = context;
+        let ExecutionContext { ticket, .. } = context;
         let MeasuredExecution { captured, duration } = measured;
         check()?;
         let Some(manifest) = captured.successful_result().cloned() else {
@@ -746,19 +756,7 @@ impl NativeCacheClient {
         let publication_started = Instant::now();
         prepared.request.validate_result(&manifest)?;
         let blobs = manifest.blobs()?;
-        let (captured, retained) = if let Some((grace, budget)) = prepared.output.take() {
-            grace
-                .retain(
-                    store.clone(),
-                    budget,
-                    prepared.request.action_fingerprint()?,
-                    captured,
-                    (context.policy.timeout, check),
-                )
-                .await?
-        } else {
-            (captured, None)
-        };
+        let (captured, retained) = prepared.retain_output(context, captured, check).await?;
         let begin: crate::build_runtime::wire::BeginResult = self
             .control_with_timeout_async(
                 "begin",
@@ -837,7 +835,7 @@ impl NativeCacheClient {
 }
 
 struct WorkerStorage {
-    output: Option<(super::grace::GraceReservation, StageBudget)>,
+    output: Option<OutputReservation>,
     cached: Vec<(TreeId, Option<TreeLease>)>,
     warm: bool,
 }
@@ -892,7 +890,12 @@ async fn prepare_worker_storage(
     let trees = request.input_trees.clone();
     tokio::task::spawn_blocking(move || {
         let output = reservation
-            .map(|reservation| Ok::<_, anyhow::Error>((reservation, store.reserve_staging(limit)?)))
+            .map(|reservation| {
+                Ok::<_, anyhow::Error>(OutputReservation {
+                    grace: reservation,
+                    budget: Some(store.reserve_staging(limit)?),
+                })
+            })
             .transpose()?;
         let cached = trees
             .into_iter()
@@ -940,11 +943,46 @@ struct ExecutionContext<'a> {
     policy: &'a ExecutionPolicy,
 }
 
+struct OutputReservation {
+    grace: super::grace::GraceReservation,
+    budget: Option<StageBudget>,
+}
+
 struct PreparedExecution {
     warm_staging: Option<Duration>,
     request: ActionRequest,
     _inputs: Vec<Arc<TreeLease>>,
-    output: Option<(super::grace::GraceReservation, StageBudget)>,
+    output: Option<OutputReservation>,
+}
+
+impl PreparedExecution {
+    fn take_budget(&mut self) -> Option<StageBudget> {
+        self.output.as_mut().and_then(|output| output.budget.take())
+    }
+
+    async fn retain_output(
+        &mut self,
+        context: ExecutionContext<'_>,
+        captured: CapturedExecution,
+        check: &LeaseCheck<'_>,
+    ) -> Result<(CapturedExecution, Option<super::grace::RetainedOutput>)> {
+        let Some(output) = self.output.take() else {
+            return Ok((captured, None));
+        };
+        ensure!(
+            output.budget.is_none(),
+            "compiler did not consume output reservation"
+        );
+        output
+            .grace
+            .retain(
+                context.store.clone(),
+                self.request.action_fingerprint()?,
+                captured,
+                (context.policy.timeout, check),
+            )
+            .await
+    }
 }
 
 fn service_nanoseconds(duration: Duration) -> Option<u64> {
@@ -962,13 +1000,14 @@ fn compile(
     context: ExecutionContext<'_>,
     queue: Option<&crate::dist::execution_queue::ExecutionQueue>,
     transport: Option<&PackageTransportTracker>,
+    budget: Option<StageBudget>,
     check: &LeaseCheck<'_>,
     on_start: impl FnOnce(),
 ) -> Result<MeasuredExecution> {
     let _permit = queue.map(|queue| queue.acquire(check)).transpose()?;
     on_start();
     let started = Instant::now();
-    let captured = execute(context.spec, context.store, context.policy, check)?;
+    let captured = execute(context.spec, context.store, context.policy, budget, check)?;
     let duration = started.elapsed();
     if captured.successful_result().is_some()
         && let Some(transport) = transport
@@ -1125,12 +1164,13 @@ impl PreparedWorker {
     /// Execute only after compiler admission, retaining output descriptors.
     #[must_use = "publication must finish the lease"]
     pub fn execute(
-        self,
+        mut self,
         store: &NativeStore,
         policy: &ExecutionPolicy,
         delivery: WorkerDelivery<'_>,
         on_start: impl FnOnce(),
     ) -> CompletedWorker {
+        let budget = self.prepared.take_budget();
         let context = ExecutionContext {
             ticket: self.lease.ticket,
             spec: &self.spec,
@@ -1141,6 +1181,7 @@ impl PreparedWorker {
             context,
             Some(delivery.execution_queue),
             Some(delivery.transport),
+            budget,
             &|| self.lease.check(),
             on_start,
         );
