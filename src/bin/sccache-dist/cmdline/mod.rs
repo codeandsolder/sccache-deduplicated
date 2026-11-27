@@ -21,6 +21,11 @@ pub use parse::try_parse_from;
 
 #[derive(Debug)]
 pub enum Command {
+    #[cfg(feature = "scheduler-dashboard")]
+    VerifyDashboard {
+        assets: std::path::PathBuf,
+        source: Option<std::path::PathBuf>,
+    },
     Auth(AuthSubcommand),
     ClusterInit {
         directory: std::path::PathBuf,

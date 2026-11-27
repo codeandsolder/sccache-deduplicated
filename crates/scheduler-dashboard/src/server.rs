@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use axum::{
     Router,
-    extract::{Query, Request},
+    extract::{Path as AxumPath, Query, Request},
     http::header,
     response::{
         IntoResponse,
@@ -18,13 +18,14 @@ use axum::{
     routing::{get, post},
 };
 use leptos::prelude::*;
-use tower_http::{services::ServeDir, set_header::SetResponseHeaderLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::{
     DashboardData, MetricsView, NativeEvent, NativeTelemetry, Sample, Snapshot, apply_event,
     make_patch,
 };
 
+mod assets;
 mod broadcast;
 mod metrics;
 
@@ -113,6 +114,22 @@ pub(super) fn now() -> u64 {
         .as_secs()
 }
 
+/// Verify the exact files and embedded WASM identity before packaging or startup.
+///
+/// # Errors
+/// Returns an error for an invalid manifest, corrupt assets or a generation
+/// that does not match the compiled scheduler or optional source checkout.
+pub fn verify_assets(directory: &Path, source: Option<&Path>) -> Result<()> {
+    if let Some(source) = source {
+        ensure!(
+            crate::fingerprint::generation(source)? == crate::GENERATION,
+            "compiled dashboard does not match the source checkout"
+        );
+    }
+    assets::Assets::load(directory)?;
+    Ok(())
+}
+
 /// Bind only a loopback listener. Assets and the metrics endpoint are explicit
 /// deployment configuration, not inferred from environment variables.
 ///
@@ -135,16 +152,7 @@ pub fn spawn(
         assets.is_absolute(),
         "dashboard assets must be an absolute path"
     );
-    for name in [
-        "sccache-dashboard.js",
-        "sccache-dashboard_bg.wasm",
-        "sccache-dashboard.css",
-    ] {
-        ensure!(
-            assets.join(name).is_file(),
-            "dashboard asset missing: {name}"
-        );
-    }
+    let assets = assets::Assets::load(assets)?;
     let metrics = metrics::MetricsService::new(metrics_url, metrics_ingress_host)?;
     let listener = TcpListener::bind(address).context("bind scheduler dashboard")?;
     let address = listener.local_addr()?;
@@ -224,13 +232,17 @@ fn sample_loop(
     }
 }
 
-fn router(state: DashboardState, metrics: metrics::MetricsService, assets: &Path) -> Router {
+fn router(
+    state: DashboardState,
+    metrics: metrics::MetricsService,
+    assets: assets::Assets,
+) -> Router {
     let _ = any_spawner::Executor::init_tokio();
     let ssr_state = state.clone();
     let api_state = state.clone();
     let options = leptos::config::LeptosOptions::builder()
         .output_name("sccache-dashboard")
-        .site_pkg_dir("pkg")
+        .site_pkg_dir(format!("pkg/{}", crate::GENERATION))
         .build();
     let render = leptos_axum::render_app_to_stream_with_context(
         move || provide_context(ssr_state.clone()),
@@ -267,7 +279,13 @@ fn router(state: DashboardState, metrics: metrics::MetricsService, assets: &Path
                 async move { metrics.events(view).into_response() }
             }),
         )
-        .nest_service("/pkg", ServeDir::new(assets))
+        .route(
+            &format!("/pkg/{}/{{*asset}}", crate::GENERATION),
+            get(move |AxumPath(name): AxumPath<String>| {
+                let assets = assets.clone();
+                async move { assets.response(&name) }
+            }),
+        )
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
             header::HeaderValue::from_static("no-store"),
@@ -444,7 +462,7 @@ mod tests {
         let metrics = metrics::MetricsService::new(None, None)?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
-        let router = router(state.clone(), metrics, Path::new("."));
+        let router = router(state.clone(), metrics, assets::Assets::default());
         let server = tokio::spawn(async move { axum::serve(listener, router).await });
         let client = wreq::Client::builder()
             .no_proxy()

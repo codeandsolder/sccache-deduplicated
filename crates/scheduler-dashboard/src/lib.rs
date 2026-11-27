@@ -8,6 +8,21 @@ pub mod server;
 #[cfg(any(feature = "ssr", feature = "hydrate"))]
 mod styles;
 
+/// Content-derived compatibility identity, independent of host architecture.
+pub const GENERATION: &str = include_str!(concat!(env!("OUT_DIR"), "/dashboard-generation"));
+
+#[cfg(feature = "ssr")]
+mod fingerprint;
+
+/// Keep the generation marker in the actual optimized WASM data, not in an
+/// unrelated sidecar. The native asset loader checks this embedded marker.
+#[cfg(all(feature = "hydrate", target_arch = "wasm32"))]
+#[wasm_bindgen::prelude::wasm_bindgen]
+#[must_use]
+pub fn dashboard_generation() -> String {
+    GENERATION.to_owned()
+}
+
 #[cfg(all(feature = "hydrate", target_arch = "wasm32"))]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn hydrate() {

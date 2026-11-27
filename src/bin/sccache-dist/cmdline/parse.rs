@@ -140,6 +140,17 @@ fn get_clap_command() -> ClapCommand {
             .arg(flag_infer_long("output").value_parser(clap::value_parser!(PathBuf)).required(true)),
     );
     let command = identity_commands(command, &config_with_help_message);
+    #[cfg(feature = "scheduler-dashboard")]
+    let command = command.subcommand(
+        ClapCommand::new("verify-dashboard")
+            .about("Verify matching dashboard asset generation and optional source checkout")
+            .arg(
+                flag_infer_long("assets")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .required(true),
+            )
+            .arg(flag_infer_long("source").value_parser(clap::value_parser!(PathBuf))),
+    );
     native_package_commands(command)
         .subcommand(
             ClapCommand::new("scheduler")
@@ -299,6 +310,14 @@ pub fn try_parse_from(
     let matches = get_clap_command().try_get_matches_from(args)?;
 
     Ok(match matches.subcommand() {
+        #[cfg(feature = "scheduler-dashboard")]
+        Some(("verify-dashboard", matches)) => Command::VerifyDashboard {
+            assets: matches
+                .get_one::<PathBuf>("assets")
+                .context("missing dashboard assets")?
+                .clone(),
+            source: matches.get_one::<PathBuf>("source").cloned(),
+        },
         Some(("cluster-init", matches)) => Command::ClusterInit {
             directory: matches
                 .get_one::<PathBuf>("directory")

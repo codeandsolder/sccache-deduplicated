@@ -10,6 +10,8 @@ assets="$(realpath "$2")"
 output="$(realpath -m "$3")"
 [[ -x "$binary" && -d "$assets" && ! -e "$output" && ! -e "$output.sha256" ]]
 cd "$(dirname "$0")/.."
+git diff --quiet HEAD -- Cargo.toml Cargo.lock rust-toolchain.toml src crates scripts/build-scheduler-dashboard.sh scripts/publish-dashboard-assets.sh contrib/codeandsolder/release-protocol.env
+[[ -z "$(git ls-files --others --exclude-standard -- src crates)" ]] || { echo "untracked dashboard source inputs" >&2; exit 1; }
 source_sha="$(git rev-parse HEAD)"
 source_epoch="$(git show -s --format=%ct HEAD)"
 source contrib/codeandsolder/release-protocol.env
@@ -20,13 +22,18 @@ install -m 0755 "$binary" "$stage/bundle/sccache-dist"
 for asset in sccache-dashboard.js sccache-dashboard_bg.wasm sccache-dashboard.css; do
     test -s "$assets/$asset"
 done
+# Verify the staged files, using the staged executable (not a sidecar claim).
+# The current source fingerprint must also match both actual compilations.
 # wasm-bindgen may generate additional snippet modules; retain the entire pkg.
 cp -a "$assets/." "$stage/bundle/pkg/"
 if [[ -n "$(find "$stage/bundle/pkg" ! -type f ! -type d -print -quit)" ]]; then
     echo "dashboard assets contain non-regular entries" >&2
     exit 1
 fi
+generation="$("$stage/bundle/sccache-dist" verify-dashboard --assets "$stage/bundle/pkg" --source "$PWD")"
+[[ "$generation" =~ ^sccache-dashboard-generation-v1:[0-9a-f]{64}$ ]]
 {
+    printf 'dashboard_generation=%s\n' "$generation"
     printf 'source_sha=%s\nrust_toolchain=%s\ndist_protocol=%s\nrollout_epoch=%s\n' "$source_sha" "$rust_toolchain" "$dist_protocol" "$rollout_epoch"
     printf 'build_kind=portable-dashboard-scheduler\n'
 } > "$stage/bundle/build.txt"

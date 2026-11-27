@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use leptos::prelude::*;
 
-use super::rate;
+use super::{native::row_text, rate};
 use crate::{HostRole, NetworkGraph, NetworkHost, NetworkLink, RouteEvidence, styles};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,7 +260,6 @@ fn RouteCells(link: Memo<Option<NetworkLink>>, hosts: Memo<Hosts>) -> impl IntoV
                 .map_or_else(|| short(id, 16), |host| host.name.clone())
         })
     };
-    use super::native::row_text;
     view! {
         <td><b>{row_text(link, move |link|name(&link.source))}</b><small>{row_text(link, |link|link.source_address.clone().unwrap_or_else(||"Unknown source".into()))}</small></td>
         <td><b>{row_text(link, move |link|name(&link.target))}</b><small>{row_text(link, |link|link.target_address.clone().unwrap_or_else(||"Unknown endpoint".into()))}</small></td>

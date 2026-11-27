@@ -15,7 +15,7 @@ fn diff_rows<T: Clone + PartialEq>(old: &[T], new: &[T], key: impl Fn(&T) -> &st
     Rows { upsert, remove }
 }
 
-fn has_rows<T>(rows: &Rows<T>) -> bool {
+const fn has_rows<T>(rows: &Rows<T>) -> bool {
     !rows.upsert.is_empty() || !rows.remove.is_empty()
 }
 

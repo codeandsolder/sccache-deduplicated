@@ -291,6 +291,12 @@ fn package_report(
 
 fn run(command: Command) -> Result<i32> {
     match command {
+        #[cfg(feature = "scheduler-dashboard")]
+        Command::VerifyDashboard { assets, source } => {
+            sccache_dashboard::server::verify_assets(&assets, source.as_deref())?;
+            println!("{}", sccache_dashboard::GENERATION);
+            Ok(0)
+        }
         Command::NativeDecodePackage {
             compression,
             max_tar_bytes,
