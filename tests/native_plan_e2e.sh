@@ -14,6 +14,7 @@ test "$(./target/debug/native-plan-fixture)" = native-plan-ok
 "$executor" build --locked --offline
 test "$(./target/debug/native-plan-fixture)" = native-plan-ok
 "$executor" check --locked --offline --all-targets
+"$executor" test --locked --offline --test executable
 # Same-length rewrite while explicitly restoring the original mtime.
 # The build must derive a different result solely from content changes.
 cp -p src/main.rs "$root/reference"

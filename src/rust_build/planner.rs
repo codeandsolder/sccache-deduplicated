@@ -82,6 +82,17 @@ fn path(value: &Path) -> Result<BuildPath> {
 fn crate_name(name: &str) -> String {
     name.replace('-', "_")
 }
+fn published_filename(filename: &str, target: &Target, tag: &str) -> String {
+    let name = filename.replace(&format!("-{tag}"), "");
+    if matches!(target.kind, TargetKind::Binary | TargetKind::Example) {
+        let crate_name = crate_name(&target.name);
+        if let Some(suffix) = name.strip_prefix(&crate_name) {
+            return format!("{}{suffix}", target.name);
+        }
+    }
+    name
+}
+
 fn envify(value: &str) -> String {
     value.replace('-', "_").to_uppercase()
 }
@@ -334,13 +345,14 @@ impl<'a> Planner<'a> {
                             .outputs
                             .first()
                             .context("missing binary output")?;
-                        self.final_root.join(
+                        self.final_root.join(published_filename(
                             source
                                 .file_name()
                                 .and_then(OsStr::to_str)
-                                .context("invalid binary filename")?
-                                .replace(&format!("-{tag}"), ""),
-                        )
+                                .context("invalid binary filename")?,
+                            target,
+                            tag,
+                        ))
                     };
                     self.binaries[unit].insert(target.name.clone(), (compiled, destination));
                     if needs_integration_binaries
@@ -432,7 +444,7 @@ impl<'a> Planner<'a> {
                 let final_name = if test {
                     filename.to_owned()
                 } else {
-                    filename.replace(&format!("-{tag}"), "")
+                    published_filename(filename, spec, &tag)
                 };
                 let destination = directory.join(final_name);
                 let publication = self.nodes.len();
