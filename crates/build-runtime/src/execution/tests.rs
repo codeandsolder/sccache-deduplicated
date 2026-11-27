@@ -191,7 +191,7 @@ fn read_shell_output(
     store: &NativeStore,
     policy: &ExecutionPolicy,
 ) -> Result<Vec<u8>> {
-    let execution = execute(spec, store, policy, || Ok(()))?;
+    let execution = execute(spec, store, policy, None, || Ok(()))?;
     let manifest = execution
         .successful_result()
         .context("shell action failed")?;
@@ -364,7 +364,7 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
         timeout: Duration::from_secs(10),
         max_result_bytes: 1024,
     };
-    let result = execute(&spec, &store, &policy, || Ok(()))?;
+    let result = execute(&spec, &store, &policy, None, || Ok(()))?;
     let manifest = result.successful_result().context("native shell failed")?;
     spec.action_request()?.validate_result(manifest)?;
     let object = manifest.outputs.get("obj").context("object missing")?;
@@ -384,11 +384,11 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
 
     let mut forged = spec.clone();
     forged.root.id = crate::TreeId([0xA5; 32]);
-    assert!(execute(&forged, &store, &policy, || Ok(())).is_err());
+    assert!(execute(&forged, &store, &policy, None, || Ok(())).is_err());
 
     // Failures must retain diagnostics without publishing a successful entry.
     spec.command.arguments[1] = b"printf 'failed' >&2; exit 7".to_vec();
-    let result = execute(&spec, &store, &policy, || Ok(()))?;
+    let result = execute(&spec, &store, &policy, None, || Ok(()))?;
     assert_eq!(result.status().code(), Some(7));
     assert!(result.successful_result().is_none());
     assert_eq!(
@@ -435,7 +435,7 @@ fn verify_writable_mounts_and_invalid_outputs(
         ),
     ]);
     spec.command.arguments[1] = br#"printf new > object; test ! -e /other/object || exit 8; IFS= read -r word < /other/input; printf '%s' "$word" > /tmp/result"#.to_vec();
-    let result = execute(spec, store, policy, || Ok(()))?;
+    let result = execute(spec, store, policy, None, || Ok(()))?;
     let manifest = result
         .successful_result()
         .context("in-place output execution failed")?;
@@ -463,7 +463,7 @@ fn verify_writable_mounts_and_invalid_outputs(
         },
     )]);
     spec.command.arguments[1] = b"printf generated > /src/first.o; printf second > /src/second.o; printf changed > /src/input".to_vec();
-    let result = execute(&spec, &store, &policy, || Ok(()))?;
+    let result = execute(&spec, &store, &policy, None, || Ok(()))?;
     let manifest = result
         .successful_result()
         .context("tree output execution failed")?;
@@ -496,7 +496,7 @@ fn verify_writable_mounts_and_invalid_outputs(
     spec.outputs.get_mut("codegen").context("output")?.kind = crate::OutputKind::GeneratedTree;
     spec.command.arguments[1] =
         b"printf generated > /src/first.o; printf second > /src/second.o".to_vec();
-    let result = execute(&spec, &store, &policy, || Ok(()))?;
+    let result = execute(&spec, &store, &policy, None, || Ok(()))?;
     let manifest = result
         .successful_result()
         .context("generated output execution failed")?;
@@ -523,7 +523,7 @@ fn verify_writable_mounts_and_invalid_outputs(
         assert!(result.open_blob(blob.id).is_ok());
     }
     spec.command.arguments[1] = b"printf replaced > /src/input".to_vec();
-    assert!(execute(&spec, &store, &policy, || Ok(())).is_err());
+    assert!(execute(&spec, &store, &policy, None, || Ok(())).is_err());
 
     spec.outputs = file_outputs;
     spec.command.arguments[1] = b"printf new > object".to_vec();
@@ -531,14 +531,14 @@ fn verify_writable_mounts_and_invalid_outputs(
     // A preexisting input cannot silently serve as a compiler output.
     spec.outputs.get_mut("object").context("output")?.path =
         BuildPath::new(b"/src/input".to_vec())?;
-    assert!(execute(spec, store, policy, || Ok(())).is_err());
+    assert!(execute(spec, store, policy, None, || Ok(())).is_err());
     spec.outputs.get_mut("object").context("output")?.path =
         BuildPath::new(b"/src/missing/object".to_vec())?;
-    assert!(execute(spec, store, policy, || Ok(())).is_err());
+    assert!(execute(spec, store, policy, None, || Ok(())).is_err());
     // A symlink must never make host bytes a cached output.
     spec.command.arguments[1] = b"printf ok > /out/nested/object".to_vec();
     spec.platform = ContentId::of(b"incorrect");
-    assert!(execute(spec, store, policy, || Ok(())).is_err());
+    assert!(execute(spec, store, policy, None, || Ok(())).is_err());
     Ok(())
 }
 
@@ -550,6 +550,8 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
     symlink("/etc/passwd", &output)?;
     let mut capture = Capture {
         files: BTreeMap::new(),
+        staged: BTreeMap::new(),
+        budget: None,
         remaining: 100,
         scratch: dir.path().to_path_buf(),
         encoding: crate::BlobEncoding::ZstdChunks,
@@ -596,5 +598,75 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
         0,
     )?;
     assert!(capture.outputs(&locations, &spec).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn captured_output_publication_reuses_original_inode() -> Result<()> {
+    use crate::{ActionFingerprint, ActionMode, SpacePolicy};
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open_managed(
+        dir.path(),
+        SpacePolicy {
+            min_available_bytes: 100,
+            target_available_bytes: 200,
+            max_resident_bytes: 1024 * 1024,
+            target_resident_bytes: 1024 * 1024,
+            max_evictions_per_pass: 4,
+            gc_batch: 16,
+        },
+    )?;
+    let mut capture = Capture {
+        files: BTreeMap::new(),
+        staged: BTreeMap::new(),
+        budget: Some(store.reserve_staging(4096)?),
+        remaining: 4096,
+        scratch: dir.path().to_path_buf(),
+        encoding: store.physical_encoding(),
+    };
+    let bytes = b"one physical compiler output, used twice";
+    let mut input = tempfile::tempfile_in(dir.path())?;
+    input.write_all(bytes)?;
+    let blob = capture.file(input.try_clone()?)?;
+    assert_eq!(capture.file(input)?, blob);
+    assert_eq!(capture.staged.len(), 1);
+    let mut result = CapturedExecution {
+        status: ExitStatus::from_raw(0),
+        manifest: ResultManifest {
+            outputs: BTreeMap::from([("obj".into(), Artifact::File { blob, mode: None })]),
+            stdout: None,
+            stderr: None,
+        },
+        files: capture.files,
+        staged: capture.staged,
+        encoding: capture.encoding,
+    };
+    drop(capture.budget);
+    assert_eq!(store.space_status()?.reserved_bytes, Some(blob.size));
+    let before = result.open_file(blob.id)?.metadata()?;
+    let existing = store.reserve_upload(&result.manifest)?;
+    assert_eq!(existing.missing(), &[blob]);
+    let staged = result.seal_staged(existing.missing()).await?;
+    let lease = store
+        .publish_pinned_async(
+            ActionFingerprint {
+                schema: "capture-test".into(),
+                components: BTreeMap::new(),
+            },
+            result.manifest.clone(),
+            staged,
+            ActionMode::Reuse,
+            existing,
+        )
+        .await?;
+    let after = lease.open_file(blob.id)?.metadata()?;
+    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    let mut decoded = Vec::new();
+    result.open_blob(blob.id)?.read_to_end(&mut decoded)?;
+    assert_eq!(decoded, bytes);
+    assert_eq!(store.space_status()?.reserved_bytes, Some(0));
+    assert_eq!(fs::read_dir(dir.path().join("staging"))?.count(), 0);
     Ok(())
 }

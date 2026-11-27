@@ -134,6 +134,35 @@ pub(super) fn send(
     }
 }
 
+/// A busy response is an explicit refusal of admission, not an uncertain
+/// completion. Immutable file uploads can replay their exact bytes in this
+/// case. Do not retry connection loss or a failed integrity check here.
+#[cfg(target_os = "linux")]
+pub(super) async fn retry_busy<F, Fut>(timeout: std::time::Duration, mut attempt: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut delay = std::time::Duration::from_millis(25);
+    tokio::time::timeout(timeout, async {
+        loop {
+            match attempt().await {
+                Err(error)
+                    if error.downcast_ref::<wreq::Error>().is_some_and(|error| {
+                        error.status() == Some(http::StatusCode::SERVICE_UNAVAILABLE)
+                    }) =>
+                {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_millis(250));
+                }
+                result => return result,
+            }
+        }
+    })
+    .await
+    .context("native output upload admission deadline exceeded")?
+}
+
 /// Demand-driven immutable file upload. There is no synchronous producer,
 /// no temporary copy, and at most one completion read per body poll.
 #[cfg(all(unix, feature = "native-store"))]
@@ -206,6 +235,20 @@ mod tests {
     use super::*;
     use std::net::{Ipv4Addr, TcpListener};
 
+    #[cfg(any(all(unix, feature = "native-store"), target_os = "linux"))]
+    async fn receive_request(stream: &mut tokio::net::TcpStream, expected: &[u8]) -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(stream.read_u8().await?);
+            ensure!(headers.len() <= 16 * 1024, "oversized request headers");
+        }
+        let mut actual = vec![0; expected.len()];
+        stream.read_exact(&mut actual).await?;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
     #[cfg(all(unix, feature = "native-store"))]
     #[tokio::test]
     async fn refused_connection_does_not_read_immutable_file() -> Result<()> {
@@ -241,7 +284,7 @@ mod tests {
             io::{Seek, SeekFrom, Write},
             sync::Arc,
         };
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let address = listener.local_addr()?;
         let bytes = (0..(3 * CHUNK + 17))
@@ -256,14 +299,7 @@ mod tests {
         let length = expected.len();
         let receiver = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
-            let mut headers = Vec::new();
-            while !headers.ends_with(b"\r\n\r\n") {
-                headers.push(stream.read_u8().await?);
-                ensure!(headers.len() <= 16 * 1024, "oversized request headers");
-            }
-            let mut actual = vec![0; length];
-            stream.read_exact(&mut actual).await?;
-            assert_eq!(actual, expected);
+            receive_request(&mut stream, &expected).await?;
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
                 .await?;
@@ -287,6 +323,128 @@ mod tests {
         assert_eq!(attempt.consumed, length as u64);
         receiver.await??;
         assert_eq!((&*file).stream_position()?, 123);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn busy_retry_replays_only_explicit_admission_rejections() -> Result<()> {
+        use std::{
+            sync::atomic::{AtomicUsize, Ordering},
+            time::Duration,
+        };
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let url = format!("http://{}/upload", listener.local_addr()?);
+        let receiver = tokio::spawn(async move {
+            for response in [
+                "503 Service Unavailable",
+                "503 Service Unavailable",
+                "200 OK",
+                "409 Conflict",
+            ] {
+                let (mut stream, _) = listener.accept().await?;
+                receive_request(&mut stream, b"payload").await?;
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {response}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let client = wreq::Client::builder().no_proxy().build()?;
+        let count = AtomicUsize::new(0);
+        let attempt = || async {
+            count.fetch_add(1, Ordering::Relaxed);
+            client
+                .post(&url)
+                .body("payload")
+                .send()
+                .await?
+                .error_for_status()?;
+            Ok(())
+        };
+        retry_busy(Duration::from_secs(3), attempt).await?;
+        assert_eq!(count.load(Ordering::Relaxed), 3);
+        assert!(retry_busy(Duration::from_secs(3), attempt).await.is_err());
+        assert_eq!(count.load(Ordering::Relaxed), 4);
+        receiver.await??;
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-store"))]
+    #[tokio::test]
+    #[ignore = "controlled immutable HTTP output pipeline benchmark"]
+    async fn benchmark_immutable_output_pipeline() -> Result<()> {
+        use std::{
+            io::Write,
+            num::NonZeroUsize,
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+        use tokio::io::AsyncWriteExt;
+        const COUNT: usize = 32;
+        let bytes = vec![0x5a; CHUNK];
+        let mut file = tempfile::tempfile()?;
+        file.write_all(&bytes)?;
+        let file = Arc::new(file);
+        let expected = Arc::<[u8]>::from([b"metadata".as_slice(), &bytes].concat());
+        for width in [1, 2, 4, 8] {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+            let url = format!("http://{}/upload", listener.local_addr()?);
+            let expected = Arc::clone(&expected);
+            let receiver = tokio::spawn(async move {
+                let mut tasks = tokio::task::JoinSet::new();
+                for _ in 0..COUNT {
+                    let (mut stream, _) = listener.accept().await?;
+                    let expected = Arc::clone(&expected);
+                    tasks.spawn(async move {
+                        receive_request(&mut stream, &expected).await?;
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+                        Ok::<_, anyhow::Error>(())
+                    });
+                }
+                while let Some(task) = tasks.join_next().await {
+                    task??;
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+            let client = wreq::Client::builder().no_proxy().build()?;
+            let start = Instant::now();
+            super::super::ingress::map_bounded(
+                0..COUNT,
+                NonZeroUsize::new(width).context("zero width")?,
+                |_| {
+                    let request = client.post(&url).timeout(Duration::from_secs(5));
+                    let file = Arc::clone(&file);
+                    async move {
+                        send_file(
+                            request,
+                            Bytes::from_static(b"metadata"),
+                            file,
+                            CHUNK as u64,
+                            1024,
+                            None,
+                        )
+                        .await?
+                        .result?;
+                        Ok(())
+                    }
+                },
+            )
+            .await?;
+            receiver.await??;
+            println!(
+                "OUTPUT_PIPELINE width={width} requests={COUNT} bytes={} service_delay_ms=5 wall_ms={:.3}",
+                COUNT * CHUNK,
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         Ok(())
     }
 

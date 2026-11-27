@@ -2878,3 +2878,245 @@ fn cargo_leased_intermediates_deliver_a_working_binary() -> Result<()> {
     fleet.finish()?;
     Ok(())
 }
+
+/// A dependency-free Cargo graph exercises actual generated inputs and native
+/// libraries, rather than assuming every intermediate is a plain Rust rlib.
+fn write_mixed_cargo_graph(workspace: &Path) -> Result<()> {
+    for directory in ["src", "dep/src", "mac/src"] {
+        fs::create_dir_all(workspace.join(directory))?;
+    }
+    for (path, contents) in [
+        (
+            "Cargo.toml",
+            r#"[package]
+name = "leased-mixed-app"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+leased-mixed-dep = { path = "dep" }
+"#,
+        ),
+        (
+            "dep/Cargo.toml",
+            r#"[package]
+name = "leased-mixed-dep"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+leased-mixed-mac = { path = "../mac" }
+"#,
+        ),
+        (
+            "mac/Cargo.toml",
+            r#"[package]
+name = "leased-mixed-mac"
+version = "0.1.0"
+edition = "2024"
+[lib]
+proc-macro = true
+"#,
+        ),
+        (
+            "mac/src/lib.rs",
+            r#"extern crate proc_macro;
+#[proc_macro]
+pub fn identity(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }
+"#,
+        ),
+        (
+            "dep/native.c",
+            "unsigned native_value(void) { return 7; }\n",
+        ),
+        (
+            "dep/build.rs",
+            r#"use std::{env, fs, path::PathBuf, process::Command};
+fn main() {
+    println!("cargo:rerun-if-changed=native.c");
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    assert!(Command::new(env::var_os("RUSTC_WRAPPER").unwrap())
+        .args(["/usr/bin/gcc", "-O2", "-c", "native.c", "-o"])
+        .arg(out.join("native.o")).status().unwrap().success());
+    assert!(Command::new("/usr/bin/ar").arg("crs")
+        .arg(out.join("libnative.a")).arg(out.join("native.o"))
+        .status().unwrap().success());
+    fs::write(out.join("generated.rs"), "const FACTOR: u32 = 6;").unwrap();
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=native");
+}
+"#,
+        ),
+        (
+            "dep/src/lib.rs",
+            r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+unsafe extern "C" { fn native_value() -> u32; }
+pub fn answer() -> u32 {
+    leased_mixed_mac::identity!(FACTOR * unsafe { native_value() })
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"fn main() { println!("{}", leased_mixed_dep::answer()); }
+#[test]
+fn actual_native_link() { assert_eq!(leased_mixed_dep::answer(), 42); }
+"#,
+        ),
+    ] {
+        fs::write(workspace.join(path), contents)?;
+    }
+    Ok(())
+}
+
+fn run_mixed_cargo(
+    service: &LocalService,
+    workspace: &Path,
+    root: &Path,
+    target: &Path,
+    mode: &str,
+    build_directory: Option<&Path>,
+) -> Result<()> {
+    for subcommand in ["build", "test"] {
+        let mut command = service.command(env!("CARGO_BIN_EXE_sccache"));
+        command
+            .current_dir(workspace)
+            .args([mode, "--", subcommand, "--offline", "-j", "2"])
+            .env("SCCACHE_CONF", root.join("direct.toml"))
+            .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
+            .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_sccache"))
+            .env("CARGO_TARGET_DIR", target)
+            .env("TMPDIR", root);
+        if let Some(directory) = build_directory {
+            command.arg("--config").arg(format!(
+                "build.build-dir={}",
+                serde_json::to_string(directory)?
+            ));
+        }
+        for key in [
+            "PATH",
+            "HOME",
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+            "RUSTUP_TOOLCHAIN",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        let output = command.output()?;
+        ensure!(
+            output.status.success(),
+            "mixed Cargo {mode} {subcommand} failed for {}: {}\n{}",
+            target.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if subcommand == "test" {
+            ensure!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "native-linked unit test was not executed"
+            );
+        }
+    }
+    let result = Command::new(target.join("debug/leased-mixed-app")).output()?;
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"42\n");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Linux FUSE, stock Cargo, GCC, ar and an isolated distributed test fleet"]
+fn cargo_leased_intermediates_support_parallel_mixed_graphs() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("native-mixed-cargo-")
+        .tempdir_in("/tmp")?;
+    let root = temp.path().canonicalize()?;
+    let fleet = Fleet::start(&root, BTreeMap::new())?;
+    let mut service = LocalService::start(&root, &fleet, None)?;
+    let workspace = root.join("workspace");
+    write_mixed_cargo_graph(&workspace)?;
+    fs::write(root.join("direct.toml"), "client_side_mode = false\n")?;
+    let cold_target = root.join("cold");
+    run_mixed_cargo(
+        &service,
+        &workspace,
+        &root,
+        &cold_target,
+        "--cargo-final",
+        None,
+    )?;
+    let cold = service.stats()?;
+    assert_eq!(cold.dist_errors, 0);
+    assert!(cold.dist_compiles.values().sum::<usize>() >= 3);
+    let warm_left = root.join("warm-left");
+    let warm_right = root.join("warm-right");
+    thread::scope(|scope| -> Result<()> {
+        let left = scope.spawn(|| {
+            run_mixed_cargo(
+                &service,
+                &workspace,
+                &root,
+                &warm_left,
+                "--cargo-final",
+                None,
+            )
+        });
+        let right = scope.spawn(|| {
+            run_mixed_cargo(
+                &service,
+                &workspace,
+                &root,
+                &warm_right,
+                "--cargo-final",
+                None,
+            )
+        });
+        let left = left
+            .join()
+            .map_err(|_| anyhow::anyhow!("left Cargo session panicked"))?;
+        let right = right
+            .join()
+            .map_err(|_| anyhow::anyhow!("right Cargo session panicked"))?;
+        left?;
+        right
+    })?;
+    let warm = service.stats()?;
+    assert_eq!(warm.dist_errors, 0);
+    assert!(warm.cache_hits.all() >= cold.cache_hits.all() + 4);
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("sccache-cargo-")
+        {
+            assert_eq!(
+                fs::read_dir(entry.path())?.count(),
+                0,
+                "expired lease remained"
+            );
+        }
+    }
+    // The full-export mode uses ordinary persistent Cargo build directories
+    // and must consume the same compiler graph without a FUSE session.
+    let all_target = root.join("all");
+    let all_intermediates = root.join("all-intermediates");
+    run_mixed_cargo(
+        &service,
+        &workspace,
+        &root,
+        &all_target,
+        "--cargo-all",
+        Some(&all_intermediates),
+    )?;
+    assert!(all_intermediates.is_dir());
+    assert_eq!(
+        fs::read(all_target.join("debug/leased-mixed-app"))?,
+        fs::read(cold_target.join("debug/leased-mixed-app"))?
+    );
+    let all = service.stats()?;
+    assert_eq!(all.dist_errors, 0);
+    assert!(all.cache_hits.all() > warm.cache_hits.all());
+    service.stop()?;
+    fleet.finish()?;
+    Ok(())
+}

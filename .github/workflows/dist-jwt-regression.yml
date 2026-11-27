@@ -1,24 +1,8 @@
 name: Distributed runtime regression
 
 on:
+  # Required status check: never skip a pull request by changed paths.
   pull_request:
-    paths:
-      - Cargo.toml
-      - Cargo.lock
-      - rust-toolchain.toml
-      - src/dist/**
-      - crates/build-runtime/**
-      - tests/native_dist.rs
-      - src/compiler/rust.rs
-      - src/compiler/rust_dlltool.rs
-      - src/compiler/dynamic_dependencies.rs
-      - src/compiler/compiler.rs
-      - src/compiler/canonical_paths.rs
-      - tests/dist.rs
-      - tests/dist/**
-      - tests/harness/**
-      - src/bin/sccache-dist/**
-      - .github/workflows/dist-jwt-regression.yml
   push:
     # Every main SHA must have a distributed-runtime result for fleet promotion.
     branches: [main]
@@ -33,10 +17,10 @@ permissions:
 jobs:
   distributed:
     name: Distributed runtime regression
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@2bf1fa8216c6b09836ea837d663ca616d0ec6427 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@4c7fc62a9f9ec37aaa7c155d263cd5025e446a53 # main
     with:
       runner: ubuntu-26.04
-      rust-toolchain: "nightly-2026-11-22"
+      rust-toolchain: "nightly-2026-11-23"
       rust-components: clippy
       rust-targets: x86_64-pc-windows-gnu
       isolate-public-sccache-server: true

@@ -39,6 +39,12 @@ pub use package::{
     validate_upstream_name,
 };
 
+#[cfg(any(
+    feature = "dist-server",
+    all(target_os = "linux", feature = "native-store")
+))]
+pub(super) const UPLOAD_PARALLELISM_HEADER: &str = "x-sccache-upload-parallelism";
+
 type LeaseCheck<'a> = dyn Fn() -> Result<()> + Sync + 'a;
 
 #[derive(Serialize, Deserialize)]
@@ -463,6 +469,22 @@ impl NativeCacheClient {
         value: &T,
         timeout: Duration,
     ) -> Result<R> {
+        self.control_with_metadata_async(operation, value, timeout, |_| Ok(()))
+            .await
+            .map(|(value, ())| value)
+    }
+
+    async fn control_with_metadata_async<T, R, H>(
+        &self,
+        operation: &str,
+        value: &T,
+        timeout: Duration,
+        metadata: impl FnOnce(&wreq::Response) -> Result<H>,
+    ) -> Result<(R, H)>
+    where
+        T: Serialize + Sync,
+        R: DeserializeOwned,
+    {
         ensure!(
             !timeout.is_zero(),
             "native control request deadline expired"
@@ -473,7 +495,12 @@ impl NativeCacheClient {
             let (response, _) = self
                 .send_to_cache_async(operation, data, timeout, None)
                 .await?;
-            decode_response_async(response.error_for_status()?, self.metadata_limit).await
+            let response = response.error_for_status()?;
+            let metadata = metadata(&response)?;
+            Ok((
+                decode_response_async(response, self.metadata_limit).await?,
+                metadata,
+            ))
         })
         .await
         .map_err(|_| {
@@ -1007,12 +1034,7 @@ impl NativeCacheClient {
                 for lease in &leases { on_tree(lease); }
                 acquired.extend(leases);
             }
-            let store = store.clone();
-            let tree = tokio::task::spawn_blocking(move || {
-                let tree = store.publish_tree_pinned(&manifest, Vec::new())?;
-                drop((acquired, packages, updated));
-                Ok::<_, anyhow::Error>(tree)
-            }).await??;
+            let tree = store.publish_tree_pinned_async(manifest, Vec::new(), (acquired, packages, updated)).await?;
             if log::log_enabled!(target: "native_cas_replay", log::Level::Trace) {
                 log::trace!(target: "native_cas_replay", "{}", serde_json::json!({
                     "kind": "tree_transfer", "tree": id, "raw_missing_blobs": raw_missing.len(),
@@ -1074,13 +1096,9 @@ impl NativeCacheClient {
             pins.extend(store.await_blobs(blobs, deadline, cancelled).await?);
         }
         check()?;
-        let owned = store.clone();
-        tokio::task::spawn_blocking(move || {
-            let tree = owned.publish_tree_pinned(&manifest, Vec::new())?;
-            drop(pins);
-            Ok(tree)
-        })
-        .await?
+        store
+            .publish_tree_pinned_async(manifest, Vec::new(), pins)
+            .await
     }
 
     #[cfg(all(target_os = "linux", feature = "native-store"))]
@@ -1170,13 +1188,32 @@ impl NativeCacheClient {
                     }
                 }
             };
-            let store = store.clone();
-            tokio::task::spawn_blocking(move || {
-                let tree = store.publish_tree_pinned(&manifest, staged)?;
-                drop(reservation);
-                Ok(tree)
-            }).await?
+            store.publish_tree_pinned_async(manifest, staged, reservation).await
         })).await.map(|(lease, _)| lease)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-store"))]
+    pub(super) async fn begin_result_upload(
+        &self,
+        ticket: Ticket,
+        manifest: crate::build_runtime::ResultManifest,
+    ) -> Result<(
+        crate::build_runtime::wire::BeginResult,
+        Option<std::num::NonZeroUsize>,
+    )> {
+        self.control_with_metadata_async(
+            "begin",
+            &ManifestRequest { ticket, manifest },
+            self.timeout,
+            |response| {
+                response
+                    .headers()
+                    .get(UPLOAD_PARALLELISM_HEADER)
+                    .map(|value| Ok(value.to_str()?.parse::<std::num::NonZeroUsize>()?))
+                    .transpose()
+            },
+        )
+        .await
     }
 
     /// Negotiate missing content for a successful result.

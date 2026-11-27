@@ -17,9 +17,9 @@ use super::{
     LeaseCheck, NativeCacheClient, PackagePlanRequest, ingress, retryable_transport_error,
 };
 use crate::build_runtime::{
-    ArchiveLength, BlobRef, CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeServiceBusy,
-    NativeStore, PackageArchive, PackageImportLimits, PackagePreparation, PackageTransferCost,
-    StageBudget, TreeId, TreeLease, VerifiedPackage, execute,
+    ArchiveLength, BlobRef, CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeStore,
+    PackageArchive, PackageImportLimits, PackagePreparation, PackageTransferCost, StageBudget,
+    TreeId, TreeLease, VerifiedPackage, execute,
     wire::{ActionObservation, ActionRequest, Ticket, WorkerTiming},
 };
 
@@ -30,12 +30,33 @@ use crate::build_runtime::{
 #[derive(Clone)]
 pub struct PackageTransportTracker {
     timing: Arc<Mutex<WorkerTiming>>,
-    slots: Arc<RawDownloadSlots>,
+    slots: Arc<TransferSlots>,
+    output_slots: Arc<TransferSlots>,
 }
 
-struct RawDownloadSlots {
+struct TransferSlots {
     limit: NonZeroUsize,
     permits: tokio::sync::Semaphore,
+}
+
+impl TransferSlots {
+    fn new(limit: NonZeroUsize) -> Self {
+        Self {
+            limit,
+            permits: tokio::sync::Semaphore::new(limit.get()),
+        }
+    }
+
+    async fn acquire(&self, check: &LeaseCheck<'_>) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        let mut acquire = std::pin::pin!(self.permits.acquire());
+        loop {
+            check()?;
+            tokio::select! {
+                permit = &mut acquire => return Ok(permit?),
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
 }
 
 impl PackageTransportTracker {
@@ -49,10 +70,8 @@ impl PackageTransportTracker {
             .context("zero raw download parallelism")?;
         Ok(Self {
             timing: Arc::new(Mutex::new(initial)),
-            slots: Arc::new(RawDownloadSlots {
-                limit,
-                permits: tokio::sync::Semaphore::new(limit.get()),
-            }),
+            slots: Arc::new(TransferSlots::new(limit)),
+            output_slots: Arc::new(TransferSlots::new(limit)),
         })
     }
 
@@ -70,14 +89,14 @@ impl PackageTransportTracker {
         &self,
         check: &LeaseCheck<'_>,
     ) -> Result<tokio::sync::SemaphorePermit<'_>> {
-        let mut acquire = std::pin::pin!(self.slots.permits.acquire());
-        loop {
-            check()?;
-            tokio::select! {
-                permit = &mut acquire => return Ok(permit?),
-                () = tokio::time::sleep(Duration::from_millis(50)) => {}
-            }
-        }
+        self.slots.acquire(check).await
+    }
+
+    async fn output_slot(
+        &self,
+        check: &LeaseCheck<'_>,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        self.output_slots.acquire(check).await
     }
 
     /// A point-in-time estimate to send with a package selection request.
@@ -259,6 +278,36 @@ mod transport_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn output_slots_are_shared_across_jobs_but_independent_of_downloads() -> Result<()> {
+        let tracker = PackageTransportTracker::new(WorkerTiming {
+            transfer: PackageTransferCost {
+                raw_parallelism: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        })?;
+        let job_a = tracker.clone();
+        let job_b = tracker.clone();
+        let first = job_a.output_slot(&|| Ok(())).await?;
+        let second = job_b.output_slot(&|| Ok(())).await?;
+        assert_eq!(tracker.output_slots.permits.available_permits(), 0);
+        let incoming = tracker.raw_slot(&|| Ok(())).await?;
+        let waiting = tracker.output_slot(&|| Ok(()));
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(first);
+        let third = tokio::time::timeout(Duration::from_secs(1), waiting).await??;
+        assert_eq!(tracker.output_slots.permits.available_permits(), 0);
+        drop((second, third, incoming));
+        assert_eq!(tracker.output_slots.permits.available_permits(), 2);
+        Ok(())
+    }
+
     #[test]
     fn observed_worker_timing_revisions_cover_every_published_service_update() -> Result<()> {
         let tracker = PackageTransportTracker::new(WorkerTiming::default())?;
@@ -401,70 +450,65 @@ impl NativeCacheClient {
             "invalid native original archive offer"
         );
         let start = Instant::now();
-        loop {
-            check()?;
-            let attempted = Instant::now();
-            let prepared = {
-                let store = store.clone();
-                tokio::task::spawn_blocking(move || {
-                    store.prepare_package(
-                        offer.source.identity,
-                        ArchiveLength::Exact(offer.source.size),
-                        limits,
-                        || Ok(()),
-                    )
-                })
-                .await?
-            };
-            let (package, downloaded) = match prepared {
-                Ok(PackagePreparation::Cached(package)) => (package, None),
-                Ok(PackagePreparation::Import(upload)) => {
-                    let transfer = Instant::now();
-                    let (mut response, encoding) = self
-                        .try_download_response_async(ticket, offer.blob, self.timeout)
-                        .await?
-                        .context("native original package unavailable")?;
-                    ensure!(
-                        encoding == crate::build_runtime::BlobEncoding::Raw,
-                        "package must be original bytes"
-                    );
-                    let (package, finished) = ingress::receive_package(
-                        upload,
-                        &mut response,
-                        None,
-                        ArchiveLength::Exact(offer.source.size),
-                    )
-                    .await?;
-                    (package, Some(finished.duration_since(transfer)))
-                }
-                Err(error) if error.is::<NativeServiceBusy>() => {
-                    ensure!(
-                        start.elapsed() < self.timeout,
-                        "native worker package reservation deadline exceeded"
-                    );
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            ensure!(
-                package.source() == offer.source && package.tree().id() == offer.tree,
-                "reconstructed original package identity mismatch"
-            );
-            if let Some(download) = downloaded {
-                transport.observe_archive(offer, attempted.elapsed(), download);
-                debug!(
-                    "native package transfer estimate after import: {:?}",
-                    transport.estimate()
-                );
-                info!(
-                    "native original package reconstructed from {} compressed bytes in {:.3}s",
-                    offer.source.size,
-                    start.elapsed().as_secs_f64()
-                );
+        let deadline = start
+            .checked_add(self.timeout)
+            .context("native worker package reservation deadline overflow")?;
+        let cancelled = async {
+            loop {
+                check()?;
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            return Ok(package);
+        };
+        let prepared = store
+            .await_package(
+                offer.source.identity,
+                ArchiveLength::Exact(offer.source.size),
+                limits,
+                deadline,
+                cancelled,
+            )
+            .await?;
+        check()?;
+        let attempted = Instant::now();
+        let (package, downloaded) = match prepared {
+            PackagePreparation::Cached(package) => (package, None),
+            PackagePreparation::Import(upload) => {
+                let transfer = Instant::now();
+                let (mut response, encoding) = self
+                    .try_download_response_async(ticket, offer.blob, self.timeout)
+                    .await?
+                    .context("native original package unavailable")?;
+                ensure!(
+                    encoding == crate::build_runtime::BlobEncoding::Raw,
+                    "package must be original bytes"
+                );
+                let (package, finished) = ingress::receive_package(
+                    upload,
+                    &mut response,
+                    None,
+                    ArchiveLength::Exact(offer.source.size),
+                )
+                .await?;
+                (package, Some(finished.duration_since(transfer)))
+            }
+        };
+        ensure!(
+            package.source() == offer.source && package.tree().id() == offer.tree,
+            "reconstructed original package identity mismatch"
+        );
+        if let Some(download) = downloaded {
+            transport.observe_archive(offer, attempted.elapsed(), download);
+            debug!(
+                "native package transfer estimate after import: {:?}",
+                transport.estimate()
+            );
+            info!(
+                "native original package reconstructed from {} compressed bytes in {:.3}s",
+                offer.source.size,
+                start.elapsed().as_secs_f64()
+            );
         }
+        Ok(package)
     }
 
     /// Acquire and pin an admitted worker action before it enters the compiler queue.
@@ -621,14 +665,21 @@ impl NativeCacheClient {
         };
         let result = self.with_renewal(ticket, control.renewal_interval, |check| {
             self.verify_execution(ticket, spec.clone())?;
-            let prepared = self.prepare_execution(
+            let mut prepared = self.prepare_execution(
                 context,
                 control.grace.map(|grace| (grace, policy.max_result_bytes)),
                 |id, check, _| fetch(id, check),
                 check,
                 &mut |_| {},
             )?;
-            let captured = compile(context, control.queue, control.transport, check, || {})?;
+            let captured = compile(
+                context,
+                control.queue,
+                control.transport,
+                prepared.take_budget(),
+                check,
+                || {},
+            )?;
             crate::http_client::io_runtime()?.block_on(self.publish_execution(
                 context,
                 prepared,
@@ -672,20 +723,13 @@ impl NativeCacheClient {
         // Reserve output headroom before staged inputs can consume it. Wait for
         // grace capacity without occupying a compiler slot.
         let output = if let Some((grace, predicted)) = grace {
-            let started = Instant::now();
-            let reservation = loop {
-                check()?;
-                if let Some(reservation) = grace.reserve(predicted)? {
-                    break reservation;
-                }
-                ensure!(
-                    started.elapsed() < policy.timeout,
-                    "native artifact grace admission timed out"
-                );
-                warm = false;
-                std::thread::sleep(Duration::from_millis(100));
-            };
-            Some((reservation, store.reserve_staging(policy.max_result_bytes)?))
+            let (reservation, waited) = crate::http_client::io_runtime()?
+                .block_on(grace.reserve_until(predicted, policy.timeout, check))?;
+            warm &= !waited;
+            Some(OutputReservation {
+                grace: reservation,
+                budget: Some(store.reserve_staging(policy.max_result_bytes)?),
+            })
         } else {
             None
         };
@@ -727,6 +771,42 @@ impl NativeCacheClient {
         })
     }
 
+    async fn upload_result_blobs(
+        &self,
+        ticket: Ticket,
+        captured: &CapturedExecution,
+        missing: Vec<BlobRef>,
+        scheduler_limit: Option<NonZeroUsize>,
+        transport: Option<&PackageTransportTracker>,
+        check: &LeaseCheck<'_>,
+    ) -> Result<()> {
+        let width = transport.map_or(NonZeroUsize::MIN, PackageTransportTracker::parallelism);
+        let width = scheduler_limit.map_or(width, |limit| limit.min(width));
+        ingress::map_bounded(missing, width, |blob| async move {
+            super::upload::retry_busy(self.timeout, || async {
+                check()?;
+                let slot = if let Some(transport) = transport {
+                    Some(transport.output_slot(check).await?)
+                } else {
+                    None
+                };
+                let result = self
+                    .upload_stored_file_async(
+                        ticket,
+                        blob,
+                        captured.physical_encoding(),
+                        captured.open_file(blob.id)?,
+                    )
+                    .await;
+                drop(slot);
+                result
+            })
+            .await
+        })
+        .await?;
+        Ok(())
+    }
+
     async fn publish_execution(
         &self,
         context: ExecutionContext<'_>,
@@ -735,7 +815,7 @@ impl NativeCacheClient {
         transport: Option<&PackageTransportTracker>,
         check: &LeaseCheck<'_>,
     ) -> Result<CapturedExecution> {
-        let ExecutionContext { ticket, store, .. } = context;
+        let ExecutionContext { ticket, .. } = context;
         let MeasuredExecution { captured, duration } = measured;
         check()?;
         let Some(manifest) = captured.successful_result().cloned() else {
@@ -746,30 +826,15 @@ impl NativeCacheClient {
         let publication_started = Instant::now();
         prepared.request.validate_result(&manifest)?;
         let blobs = manifest.blobs()?;
-        let (captured, retained) = if let Some((grace, budget)) = prepared.output.take() {
-            grace
-                .retain(
-                    store.clone(),
-                    budget,
-                    prepared.request.action_fingerprint()?,
-                    captured,
-                    (context.policy.timeout, check),
-                )
-                .await?
-        } else {
-            (captured, None)
-        };
-        let begin: crate::build_runtime::wire::BeginResult = self
-            .control_with_timeout_async(
-                "begin",
-                &super::ManifestRequest {
-                    ticket,
-                    manifest: manifest.clone(),
-                },
-                self.timeout,
-            )
-            .await?;
+        let (captured, retained) = prepared.retain_output(context, captured, check).await?;
+        let (begin, scheduler_limit) = self.begin_result_upload(ticket, manifest.clone()).await?;
         let missing = begin.missing;
+        ensure!(
+            missing
+                .iter()
+                .all(|blob| blobs.get(&blob.id) == Some(&blob.size)),
+            "scheduler requested undeclared output"
+        );
         let publication_setup = retained
             .as_ref()
             .is_none_or(|output| output.warm)
@@ -783,20 +848,15 @@ impl NativeCacheClient {
             .fold(0_u64, u64::saturating_add);
         let requests = u64::try_from(missing.len())?;
         let started = Instant::now();
-        for missing in missing {
-            check()?;
-            ensure!(
-                blobs.get(&missing.id) == Some(&missing.size),
-                "scheduler requested undeclared output"
-            );
-            self.upload_stored_file_async(
-                ticket,
-                missing,
-                captured.physical_encoding(),
-                captured.open_file(missing.id)?,
-            )
-            .await?;
-        }
+        self.upload_result_blobs(
+            ticket,
+            &captured,
+            missing,
+            scheduler_limit,
+            transport,
+            check,
+        )
+        .await?;
         let upload_duration = started.elapsed();
         let worker_timing = transport.map(|transport| {
             transport.observe_result(bytes, requests, upload_duration);
@@ -837,7 +897,7 @@ impl NativeCacheClient {
 }
 
 struct WorkerStorage {
-    output: Option<(super::grace::GraceReservation, StageBudget)>,
+    output: Option<OutputReservation>,
     cached: Vec<(TreeId, Option<TreeLease>)>,
     warm: bool,
 }
@@ -855,36 +915,24 @@ async fn prepare_worker_storage(
     let predicted = estimated_result_bytes
         .unwrap_or(policy.max_result_bytes)
         .clamp(1, policy.max_result_bytes);
-    let mut warm = true;
-    let reservation = if let Some(grace) = grace {
-        let mut reservation = {
-            let store = store.clone();
-            let grace = grace.clone();
-            tokio::task::spawn_blocking(move || {
-                grace.reap();
-                maintain_executor_space(&store)?;
-                grace.reserve(predicted)
-            })
-            .await??
-        };
-        let started = Instant::now();
-        warm = reservation.is_some();
-        while reservation.is_none() {
-            check()?;
-            ensure!(
-                started.elapsed() < policy.timeout,
-                "native artifact grace admission timed out"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            check()?;
-            let grace = grace.clone();
-            reservation = tokio::task::spawn_blocking(move || grace.reserve(predicted)).await??;
-        }
-        reservation
-    } else {
+    {
         let store = store.clone();
-        tokio::task::spawn_blocking(move || maintain_executor_space(&store)).await??;
-        None
+        let grace = grace.cloned();
+        tokio::task::spawn_blocking(move || {
+            if let Some(grace) = grace {
+                grace.reap();
+            }
+            maintain_executor_space(&store)
+        })
+        .await??;
+    }
+    let (reservation, warm) = if let Some(grace) = grace {
+        let (reservation, waited) = grace
+            .reserve_until(predicted, policy.timeout, check)
+            .await?;
+        (Some(reservation), !waited)
+    } else {
+        (None, true)
     };
     check()?;
     let store = store.clone();
@@ -892,7 +940,12 @@ async fn prepare_worker_storage(
     let trees = request.input_trees.clone();
     tokio::task::spawn_blocking(move || {
         let output = reservation
-            .map(|reservation| Ok::<_, anyhow::Error>((reservation, store.reserve_staging(limit)?)))
+            .map(|reservation| {
+                Ok::<_, anyhow::Error>(OutputReservation {
+                    grace: reservation,
+                    budget: Some(store.reserve_staging(limit)?),
+                })
+            })
             .transpose()?;
         let cached = trees
             .into_iter()
@@ -940,11 +993,46 @@ struct ExecutionContext<'a> {
     policy: &'a ExecutionPolicy,
 }
 
+struct OutputReservation {
+    grace: super::grace::GraceReservation,
+    budget: Option<StageBudget>,
+}
+
 struct PreparedExecution {
     warm_staging: Option<Duration>,
     request: ActionRequest,
     _inputs: Vec<Arc<TreeLease>>,
-    output: Option<(super::grace::GraceReservation, StageBudget)>,
+    output: Option<OutputReservation>,
+}
+
+impl PreparedExecution {
+    fn take_budget(&mut self) -> Option<StageBudget> {
+        self.output.as_mut().and_then(|output| output.budget.take())
+    }
+
+    async fn retain_output(
+        &mut self,
+        context: ExecutionContext<'_>,
+        captured: CapturedExecution,
+        check: &LeaseCheck<'_>,
+    ) -> Result<(CapturedExecution, Option<super::grace::RetainedOutput>)> {
+        let Some(output) = self.output.take() else {
+            return Ok((captured, None));
+        };
+        ensure!(
+            output.budget.is_none(),
+            "compiler did not consume output reservation"
+        );
+        output
+            .grace
+            .retain(
+                context.store.clone(),
+                self.request.action_fingerprint()?,
+                captured,
+                (context.policy.timeout, check),
+            )
+            .await
+    }
 }
 
 fn service_nanoseconds(duration: Duration) -> Option<u64> {
@@ -962,13 +1050,14 @@ fn compile(
     context: ExecutionContext<'_>,
     queue: Option<&crate::dist::execution_queue::ExecutionQueue>,
     transport: Option<&PackageTransportTracker>,
+    budget: Option<StageBudget>,
     check: &LeaseCheck<'_>,
     on_start: impl FnOnce(),
 ) -> Result<MeasuredExecution> {
     let _permit = queue.map(|queue| queue.acquire(check)).transpose()?;
     on_start();
     let started = Instant::now();
-    let captured = execute(context.spec, context.store, context.policy, check)?;
+    let captured = execute(context.spec, context.store, context.policy, budget, check)?;
     let duration = started.elapsed();
     if captured.successful_result().is_some()
         && let Some(transport) = transport
@@ -1125,12 +1214,13 @@ impl PreparedWorker {
     /// Execute only after compiler admission, retaining output descriptors.
     #[must_use = "publication must finish the lease"]
     pub fn execute(
-        self,
+        mut self,
         store: &NativeStore,
         policy: &ExecutionPolicy,
         delivery: WorkerDelivery<'_>,
         on_start: impl FnOnce(),
     ) -> CompletedWorker {
+        let budget = self.prepared.take_budget();
         let context = ExecutionContext {
             ticket: self.lease.ticket,
             spec: &self.spec,
@@ -1141,6 +1231,7 @@ impl PreparedWorker {
             context,
             Some(delivery.execution_queue),
             Some(delivery.transport),
+            budget,
             &|| self.lease.check(),
             on_start,
         );

@@ -39,6 +39,14 @@ fn publish(store: &NativeStore, name: &str) -> Result<ActionKey> {
         .action)
 }
 
+fn eviction_roots(store: &NativeStore, count: usize) -> Result<Vec<Root>> {
+    Ok(store
+        .eviction_candidates(count, false)?
+        .into_iter()
+        .map(EvictionTarget::root)
+        .collect())
+}
+
 #[test]
 fn physical_pressure_evicts_oldest_root_but_never_active_leases() -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -143,6 +151,81 @@ fn reuse_favors_a_hot_root_over_a_newer_cold_root() -> Result<()> {
     assert_eq!(report.evicted_roots, 1);
     assert!(store.lookup(hot)?.is_some());
     assert!(store.lookup(cold)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn empty_gc_and_healthy_space_maintenance_do_not_wait_for_publication() -> Result<()> {
+    use std::{sync::mpsc, thread};
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open_managed(temp.path(), policy())?;
+    let key = publish(&store, "data")?;
+    let mutation = store.inner.lock_mutations()?;
+    let report = thread::scope(|scope| -> Result<_> {
+        let (send, receive) = mpsc::channel();
+        let store = &store;
+        let worker = scope.spawn(move || send.send(store.maintain_space()));
+        let observed = receive.recv_timeout(Duration::from_secs(2));
+        drop(mutation);
+        worker
+            .join()
+            .map_err(|_| anyhow!("maintenance worker panicked"))??;
+        observed?
+    })?
+    .context("missing space policy")?;
+    assert!(report.minimum_satisfied);
+    assert_eq!(report.resident_bytes, 4);
+    // A due checkpoint was postponed, not dropped, while publication owned
+    // the mutation mutex.
+    assert!(
+        store
+            .inner
+            .lock_pins()?
+            .dirty_usage
+            .contains(&Root::Action(key))
+    );
+    store.maintain_space()?;
+    assert!(store.inner.lock_pins()?.dirty_usage.is_empty());
+    assert!(matches!(store.evict(key)?, Eviction::Removed { .. }));
+    assert_eq!(
+        store
+            .maintain_space()?
+            .context("missing space policy")?
+            .resident_bytes,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn usage_checkpoint_preserves_touches_after_its_snapshot() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    let key = publish(&store, "data")?;
+    let root = Root::Action(key);
+    let unchanged = Root::Action(publish(&store, "unchanged")?);
+    let snapshot = store.inner.lock_pins()?.usage_snapshot();
+    let before = store.inner.lock_pins()?.usage[&root];
+    drop(store.lookup(key)?.context("missing result")?);
+    persist_usage(&store.inner.db, &snapshot)?;
+    {
+        let mut pins = store.inner.lock_pins()?;
+        pins.finish_usage_checkpoint(&snapshot);
+        assert!(pins.dirty_usage.contains(&root));
+        assert!(!pins.dirty_usage.contains(&unchanged));
+        assert_eq!(pins.usage[&root].hits, before.hits + 1);
+    }
+    store.checkpoint_usage()?;
+    assert!(store.inner.lock_pins()?.dirty_usage.is_empty());
+    let read = store.inner.db.begin_read()?;
+    let usage = read.open_table(super::super::USAGE)?;
+    let saved: UsageRecord = encoding().deserialize(
+        usage
+            .get(&root.key())?
+            .context("missing checkpoint")?
+            .value(),
+    )?;
+    assert_eq!(saved.hits, before.hits + 1);
     Ok(())
 }
 
@@ -363,6 +446,61 @@ fn staged_release_never_waits_for_space_admission_lock() -> Result<()> {
 }
 
 #[test]
+fn eviction_ranking_does_not_block_publication_and_revalidates_action_generation() -> Result<()> {
+    use std::{sync::mpsc, thread};
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    let name = "old";
+    let key = publish(&store, name)?;
+    let mutation = store.inner.lock_mutations()?;
+    let candidates = thread::scope(|scope| -> Result<_> {
+        let (send, receive) = mpsc::channel();
+        let store = &store;
+        let worker = scope.spawn(move || send.send(store.eviction_candidates(1, true)));
+        let observed = receive.recv_timeout(Duration::from_secs(2));
+        drop(mutation);
+        worker
+            .join()
+            .map_err(|_| anyhow!("ranking worker panicked"))??;
+        observed?
+    })?;
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].root(), Root::Action(key));
+    let staged = store.stage(&b"new"[..])?;
+    let manifest = ResultManifest {
+        outputs: BTreeMap::from([(
+            "obj".into(),
+            Artifact::File {
+                blob: staged.reference(),
+                mode: None,
+            },
+        )]),
+        stdout: None,
+        stderr: None,
+    };
+    let fingerprint = ActionFingerprint {
+        schema: "test".into(),
+        components: BTreeMap::from([("source".into(), ContentId::of(name.as_bytes()))]),
+    };
+    store.publish(
+        &fingerprint,
+        &manifest,
+        vec![staged],
+        crate::ActionMode::Refresh,
+    )?;
+    assert_eq!(candidates[0].evict(&store)?, Eviction::Missing);
+    assert_eq!(
+        store
+            .lookup(key)?
+            .context("refreshed action missing")?
+            .manifest(),
+        &manifest
+    );
+    assert_eq!(store.collect_garbage(8)?.blobs, 1);
+    Ok(())
+}
+
+#[test]
 fn bounded_eviction_selection_keeps_only_lowest_utility_roots() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let store = NativeStore::open(temp.path())?;
@@ -375,16 +513,13 @@ fn bounded_eviction_selection_keeps_only_lowest_utility_roots() -> Result<()> {
     for _ in 0..8 {
         drop(store.lookup(warm)?.context("missing warm root")?);
     }
+    assert_eq!(eviction_roots(&store, 1)?, vec![Root::Action(cold)]);
     assert_eq!(
-        store.eviction_candidates(1, false)?,
-        vec![Root::Action(cold)]
-    );
-    assert_eq!(
-        store.eviction_candidates(2, false)?,
+        eviction_roots(&store, 2)?,
         vec![Root::Action(cold), Root::Action(warm)]
     );
     assert_eq!(
-        store.eviction_candidates(3, false)?,
+        eviction_roots(&store, 3)?,
         vec![Root::Action(cold), Root::Action(warm), Root::Action(hot)]
     );
     Ok(())
@@ -477,20 +612,14 @@ fn eviction_prefers_exclusive_blobs_over_shared_result_aliases() -> Result<()> {
                 .context("missing exclusive result")?,
         );
     }
-    assert_eq!(
-        store.eviction_candidates(1, false)?,
-        vec![Root::Action(exclusive)]
-    );
+    assert_eq!(eviction_roots(&store, 1)?, vec![Root::Action(exclusive)]);
     assert!(matches!(
         store.evict(first)?,
         Eviction::Removed {
             unreferenced_logical_bytes: 0
         }
     ));
-    assert_eq!(
-        store.eviction_candidates(1, false)?,
-        vec![Root::Action(alias)]
-    );
+    assert_eq!(eviction_roots(&store, 1)?, vec![Root::Action(alias)]);
     assert!(matches!(
         store.evict(alias)?,
         Eviction::Removed {
@@ -544,20 +673,14 @@ fn eviction_prefers_exclusive_tree_content_over_shared_tree_blobs() -> Result<()
                 .context("missing exclusive tree")?,
         );
     }
-    assert_eq!(
-        store.eviction_candidates(1, false)?,
-        vec![Root::Tree(exclusive)]
-    );
+    assert_eq!(eviction_roots(&store, 1)?, vec![Root::Tree(exclusive)]);
     assert!(matches!(
         store.evict_tree(first)?,
         Eviction::Removed {
             unreferenced_logical_bytes: 0
         }
     ));
-    assert_eq!(
-        store.eviction_candidates(1, false)?,
-        vec![Root::Tree(second)]
-    );
+    assert_eq!(eviction_roots(&store, 1)?, vec![Root::Tree(second)]);
     Ok(())
 }
 
@@ -640,10 +763,7 @@ fn eviction_counts_retained_package_archive_even_when_tree_files_are_shared() ->
 
     // The expanded file remains shared with sibling, but the original
     // compressed archive belongs exclusively to the package tree.
-    assert_eq!(
-        store.eviction_candidates(1, false)?,
-        vec![Root::Tree(original_id)]
-    );
+    assert_eq!(eviction_roots(&store, 1)?, vec![Root::Tree(original_id)]);
     assert!(matches!(
         store.evict_tree(original_id)?,
         Eviction::Removed {

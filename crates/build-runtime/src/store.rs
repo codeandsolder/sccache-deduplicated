@@ -5,8 +5,8 @@ use std::{
     os::unix::fs::{FileExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -226,6 +226,45 @@ pub struct StagedBlob {
     encoding: BlobEncoding,
     owner: Arc<Inner>,
     _reservation: space::StagingReservation,
+}
+
+/// A captured compiler output in its final physical representation.
+/// Publication cannot consume the staged blob until its bytes are durable.
+#[cfg(target_os = "linux")]
+pub struct CapturedStage {
+    stage: StagedBlob,
+    file: Arc<File>,
+}
+
+#[cfg(target_os = "linux")]
+impl CapturedStage {
+    pub(crate) const fn reference(&self) -> BlobRef {
+        self.stage.reference()
+    }
+
+    pub(crate) fn file(&self) -> Arc<File> {
+        Arc::clone(&self.file)
+    }
+
+    pub(crate) async fn seal(self) -> Result<StagedBlob> {
+        let Self { stage, file } = self;
+        #[cfg(feature = "async-io")]
+        {
+            crate::disk::run(move || async move {
+                crate::disk::sync_all(file).await?;
+                Ok(stage)
+            })
+            .await
+        }
+        #[cfg(not(feature = "async-io"))]
+        {
+            tokio::task::spawn_blocking(move || {
+                file.sync_all()?;
+                Ok(stage)
+            })
+            .await?
+        }
+    }
 }
 
 /// An admitted staging file and its incremental verifier. No I/O is
@@ -511,7 +550,7 @@ pub struct CacheStats {
 }
 
 /// Work completed by a bounded garbage collection pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GarbageCollected {
     pub blobs: u64,
     pub logical_bytes: u64,
@@ -523,12 +562,46 @@ struct Pins {
     actions: BTreeMap<ActionKey, usize>,
     trees: BTreeMap<crate::TreeId, usize>,
     blobs: BTreeMap<ContentId, usize>,
+    results: BTreeMap<ResultId, Weak<ResultContent>>,
+    evicting: Option<space::Root>,
     usage: BTreeMap<space::Root, space::UsageRecord>,
     dirty_usage: BTreeSet<space::Root>,
     last_usage_checkpoint: Option<Instant>,
 }
 
 impl Pins {
+    fn pin_result(
+        &mut self,
+        inner: &Arc<Inner>,
+        action: ActionKey,
+        result: ResultId,
+        prepared: &mut Option<ResultSnapshot>,
+    ) -> Result<Option<ResultLease>> {
+        let count = self
+            .actions
+            .get(&action)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("action pin count overflow")?;
+        let content = if let Some(content) = self.results.get(&result).and_then(Weak::upgrade) {
+            content
+        } else if let Some(snapshot) = prepared.take() {
+            self.reserve_content(snapshot.blobs.keys())?;
+            let content = Arc::new(ResultContent {
+                inner: Arc::clone(inner),
+                id: result,
+                snapshot,
+            });
+            self.results.insert(result, Arc::downgrade(&content));
+            content
+        } else {
+            return Ok(None);
+        };
+        self.actions.insert(action, count);
+        Ok(Some(ResultLease { action, content }))
+    }
+
     fn reserve_content<'a>(
         &mut self,
         ids: impl Iterator<Item = &'a ContentId> + Clone,
@@ -547,24 +620,20 @@ impl Pins {
 }
 
 // A single batched transaction serves both periodic checkpoints and orderly
-// shutdown, without any database activity on the lookup critical path.
-fn persist_usage(db: &Database, pins: &mut Pins) -> Result<()> {
-    if pins.dirty_usage.is_empty() {
+// shutdown, without holding the shared pin lock across a database write.
+fn persist_usage(db: &Database, records: &[(space::Root, space::UsageRecord)]) -> Result<()> {
+    if records.is_empty() {
         return Ok(());
     }
     let write = db.begin_write()?;
     {
         let mut usage = write.open_table(USAGE)?;
-        for root in &pins.dirty_usage {
-            if let Some(record) = pins.usage.get(root) {
-                let bytes = encoding().serialize(record)?;
-                usage.insert(&root.key(), bytes.as_slice())?;
-            }
+        for (root, record) in records {
+            let bytes = encoding().serialize(record)?;
+            usage.insert(&root.key(), bytes.as_slice())?;
         }
     }
     write.commit()?;
-    pins.dirty_usage.clear();
-    pins.last_usage_checkpoint = Some(Instant::now());
     Ok(())
 }
 
@@ -579,22 +648,160 @@ fn release_pin<K: Ord + std::fmt::Debug>(pins: &mut BTreeMap<K, usize>, key: &K)
     }
 }
 
+mod commit_queue;
+mod publications;
+mod results;
+
 struct Inner {
     root: PathBuf,
     db: Database,
     // Mutations serialize filesystem changes with durable metadata commits.
     // Readers only acquire the separate pin lock, not the publication lock.
     mutations: Mutex<()>,
+    // Under the mutation lock, remember newly created shard entries even
+    // if their publication aborts before synchronizing the parent.
+    dirty_blob_directory: AtomicBool,
     pins: Mutex<Pins>,
     package_imports: Mutex<BTreeSet<crate::PackageIdentity>>,
+    package_changes: tokio::sync::watch::Sender<()>,
     tree_flights: trees::TreeFlights,
-    publications: tokio::sync::watch::Sender<()>,
+    publication_queue: commit_queue::PublicationQueue,
+    publications: publications::PublicationWaits,
     space_policy: Option<SpacePolicy>,
     space: Mutex<space::SpaceState>,
     // Releases never acquire the space admission lock, avoiding lock-order
     // inversion with transactional publication and eviction.
     space_released: AtomicU64,
     result_history_limit: AtomicU64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Attachment {
+    Live,
+    Repair,
+    Resurrect,
+    Insert,
+}
+
+/// One consistent index view, shared by publication preflight and attachment.
+struct BlobIndex<'a, L, P, E> {
+    live: &'a L,
+    pending: &'a P,
+    layouts: &'a E,
+}
+
+impl<L, P, E> BlobIndex<'_, L, P, E>
+where
+    L: ReadableTable<&'static [u8; 32], u64>,
+    P: ReadableTable<&'static [u8; 32], u64>,
+    E: ReadableTable<&'static [u8; 32], u8>,
+{
+    fn open_available(&self, inner: &Inner, blob: BlobRef) -> Result<Option<(File, BlobEncoding)>> {
+        let live = self.live.get(&blob.id.0)?.map(|entry| entry.value());
+        let size = if live.is_some() {
+            live
+        } else {
+            self.pending.get(&blob.id.0)?.map(|entry| entry.value())
+        };
+        let Some(size) = size else {
+            return Ok(None);
+        };
+        ensure!(size == blob.size, "inconsistent indexed blob length");
+        inner.open_checked_blob(self.layouts, blob.id, blob.size)
+    }
+
+    fn inspect(
+        &self,
+        inner: &Inner,
+        blob: BlobRef,
+        existing_root: bool,
+        staged: Option<&StagedBlob>,
+    ) -> Result<Attachment> {
+        let BlobRef { id, size } = blob;
+        let live = self.live.get(&id.0)?.map(|entry| entry.value());
+        if let Some(existing_size) = live {
+            ensure!(existing_size == size, "content length mismatch for {id:?}");
+            if inner.blob_present(self.layouts, id, size)? {
+                return Ok(Attachment::Live);
+            }
+            Self::require_stage(blob, staged)?;
+            return Ok(Attachment::Repair);
+        }
+        ensure!(!existing_root, "indexed result is missing content {id:?}");
+        let pending = self.pending.get(&id.0)?.map(|entry| entry.value());
+        if let Some(old_size) = pending {
+            ensure!(
+                old_size == size,
+                "pending content length mismatch for {id:?}"
+            );
+            if inner.blob_present(self.layouts, id, size).unwrap_or(false) {
+                return Ok(Attachment::Resurrect);
+            }
+        }
+        Self::require_stage(blob, staged)?;
+        Ok(Attachment::Insert)
+    }
+
+    fn require_stage(blob: BlobRef, staged: Option<&StagedBlob>) -> Result<()> {
+        let staged = staged.with_context(|| format!("missing staged content {:?}", blob.id))?;
+        ensure!(
+            staged.reference == blob,
+            "staged content reference mismatch"
+        );
+        Ok(())
+    }
+}
+
+/// Files and staging accounting remain owned by a transaction until its
+/// durable index commit. Multiple roots and original archives share this set.
+#[derive(Default)]
+struct Publication {
+    directories: BTreeSet<PathBuf>,
+    reservations: Vec<space::StagingReservation>,
+    changed: Vec<ContentId>,
+}
+
+impl Publication {
+    fn commit(self, inner: &Inner, write: WriteTransaction) -> Result<()> {
+        inner.sync_publication_directories(&self.directories)?;
+        write.commit()?;
+        inner.publications.notify(&self.changed);
+        // Only release staging reservations after the live accounting commit.
+        drop(self);
+        Ok(())
+    }
+}
+
+// A mutation transaction excludes other evictions and refreshes, but
+// unrelated readers should never wait for the removal transaction. Only
+// this root stops accepting new delivery pins until the claim is released.
+struct EvictionClaim<'a> {
+    inner: &'a Inner,
+    root: space::Root,
+    committed: bool,
+    _mutation: MutexGuard<'a, ()>,
+}
+
+impl Drop for EvictionClaim<'_> {
+    fn drop(&mut self) {
+        match self.inner.lock_pins() {
+            Ok(mut pins) => {
+                if self.committed {
+                    pins.usage.remove(&self.root);
+                    pins.dirty_usage.remove(&self.root);
+                }
+                pins.evicting = None;
+            }
+            Err(error) => log::error!("could not release native eviction claim: {error:#}"),
+        }
+    }
+}
+
+enum ResultPin {
+    Missing,
+    Changed,
+    NeedSnapshot,
+    Acquired(ResultLease),
 }
 
 impl Inner {
@@ -610,6 +817,30 @@ impl Inner {
             .map_err(|_| anyhow!("native store mutation lock poisoned"))
     }
 
+    fn claim_eviction(&self, root: space::Root) -> Result<Option<EvictionClaim<'_>>> {
+        let mutation = self.lock_mutations()?;
+        let mut pins = self.lock_pins()?;
+        let pinned = match root {
+            space::Root::Action(action) => pins.actions.contains_key(&action),
+            space::Root::Tree(tree) => pins.trees.contains_key(&tree),
+        };
+        if pinned {
+            return Ok(None);
+        }
+        ensure!(
+            pins.evicting.is_none(),
+            "multiple concurrent native evictions"
+        );
+        pins.evicting = Some(root);
+        drop(pins);
+        Ok(Some(EvictionClaim {
+            inner: self,
+            root,
+            committed: false,
+            _mutation: mutation,
+        }))
+    }
+
     fn blob_path(&self, id: ContentId) -> PathBuf {
         let hex = blake3::Hash::from_bytes(id.0).to_hex();
         let hex = hex.as_str();
@@ -619,7 +850,13 @@ impl Inner {
 
     fn blob_encoding(&self, id: ContentId) -> Result<BlobEncoding> {
         let read = self.db.begin_read()?;
-        let layouts = read.open_table(BLOB_LAYOUTS)?;
+        Self::indexed_encoding(&read.open_table(BLOB_LAYOUTS)?, id)
+    }
+
+    fn indexed_encoding(
+        layouts: &impl ReadableTable<&'static [u8; 32], u8>,
+        id: ContentId,
+    ) -> Result<BlobEncoding> {
         let value = layouts
             .get(&id.0)?
             .with_context(|| format!("missing indexed physical encoding for {id:?}"))?
@@ -627,26 +864,48 @@ impl Inner {
         BlobEncoding::try_from(value)
     }
 
-    fn blob_present(&self, id: ContentId, size: u64) -> Result<bool> {
-        let path = self.blob_path(id);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() => {
-                Ok(BlobReader::open(File::open(path)?, self.blob_encoding(id)?)?.len() == size)
-            }
-            Ok(_) => Ok(false),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error.into()),
+    // Validate the same opened inode that will be returned to the caller.
+    // NOFOLLOW excludes symlinks, and NONBLOCK prevents an unexpected FIFO
+    // from pinning a cache thread. The index snapshot describes its encoding.
+    fn open_checked_blob(
+        &self,
+        layouts: &impl ReadableTable<&'static [u8; 32], u8>,
+        id: ContentId,
+        size: u64,
+    ) -> Result<Option<(File, BlobEncoding)>> {
+        use rustix::fs::{Mode, OFlags};
+        let file = match rustix::fs::open(
+            self.blob_path(id),
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => File::from(fd),
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Ok(None);
         }
+        let encoding = Self::indexed_encoding(layouts, id)?;
+        let reader = BlobReader::open_with_length(file, encoding, metadata.len())?;
+        Ok((reader.len() == size).then(|| (reader.into_file(), encoding)))
+    }
+
+    fn blob_present(
+        &self,
+        layouts: &impl ReadableTable<&'static [u8; 32], u8>,
+        id: ContentId,
+        size: u64,
+    ) -> Result<bool> {
+        Ok(self.open_checked_blob(layouts, id, size)?.is_some())
     }
 
     fn check_blob(&self, id: ContentId, size: u64) -> Result<()> {
-        let path = self.blob_path(id);
-        let metadata = fs::symlink_metadata(&path)
-            .with_context(|| format!("missing native store content {id:?}"))?;
-        ensure!(metadata.is_file(), "invalid native store content {id:?}");
+        let read = self.db.begin_read()?;
         ensure!(
-            BlobReader::open(File::open(&path)?, self.blob_encoding(id)?)?.len() == size,
-            "invalid native store content {id:?}"
+            self.blob_present(&read.open_table(BLOB_LAYOUTS)?, id, size)?,
+            "missing or invalid native store content {id:?}"
         );
         Ok(())
     }
@@ -668,11 +927,10 @@ impl Inner {
         let parent = path.parent().context("invalid blob storage path")?;
         if directories.insert(parent.to_owned()) {
             match fs::create_dir(parent) {
-                Ok(()) => {}
+                Ok(()) => self.dirty_blob_directory.store(true, Ordering::Relaxed),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
             }
-            directories.insert(self.root.join("blobs"));
         }
         // An unindexed file can remain after a failed transaction; replace it
         // with verified bytes rather than trusting its name or its length.
@@ -686,6 +944,20 @@ impl Inner {
         // The caller keeps this reservation alive until the redb transaction
         // commits the blob's index entry and its resident-byte accounting.
         Ok(reservation)
+    }
+
+    fn sync_publication_directories(&self, directories: &BTreeSet<PathBuf>) -> Result<()> {
+        for directory in directories {
+            File::open(directory)?.sync_all()?;
+        }
+        // Every newly created shard name must be durable before its content
+        // is indexed. Existing shard entries were synchronized at open or
+        // during the publication that created them.
+        if self.dirty_blob_directory.load(Ordering::Relaxed) {
+            File::open(self.root.join("blobs"))?.sync_all()?;
+            self.dirty_blob_directory.store(false, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     fn remove_blob(&self, id: ContentId) -> Result<()> {
@@ -771,7 +1043,7 @@ impl Drop for Inner {
             .pins
             .get_mut()
             .map_err(|_| anyhow!("native usage mutex poisoned at shutdown"))
-            .and_then(|pins| persist_usage(&self.db, pins));
+            .and_then(|pins| persist_usage(&self.db, &pins.usage_snapshot()));
         if let Err(error) = result {
             log::error!("could not persist native usage on shutdown: {error:#}");
         }
@@ -997,6 +1269,7 @@ impl NativeStore {
             }
         }
         clean_orphan_mounts(&root.join("mounts"))?;
+        File::open(root.join("blobs"))?.sync_all()?;
         File::open(&root)?.sync_all()?;
         let write = db.begin_write()?;
         write.open_table(ACTIONS)?;
@@ -1042,10 +1315,13 @@ impl NativeStore {
             root,
             db,
             mutations: Mutex::new(()),
+            dirty_blob_directory: AtomicBool::new(false),
             pins: Mutex::new(pins),
             package_imports: Mutex::new(BTreeSet::new()),
+            package_changes: tokio::sync::watch::Sender::new(()),
             tree_flights: trees::TreeFlights::default(),
-            publications: tokio::sync::watch::Sender::new(()),
+            publication_queue: commit_queue::PublicationQueue::default(),
+            publications: publications::PublicationWaits::default(),
             space_policy,
             space: Mutex::default(),
             space_released: AtomicU64::new(0),
@@ -1294,7 +1570,7 @@ impl NativeStore {
     /// # Errors
     /// Returns an error for malformed manifests, inconsistent metadata or I/O.
     pub fn reserve_upload(&self, manifest: &ResultManifest) -> Result<UploadReservation> {
-        self.reserve_blobs(manifest.blobs()?)
+        self.reserve_blobs(&manifest.blobs()?)
     }
 
     /// Pin the existing portion of an exact input closure, regardless of which
@@ -1302,88 +1578,144 @@ impl NativeStore {
     ///
     /// # Errors
     /// Returns an error for inconsistent lengths or storage failure.
-    pub fn reserve_blobs(&self, blobs: BTreeMap<ContentId, u64>) -> Result<UploadReservation> {
-        let _mutation = self.inner.lock_mutations()?;
+    pub fn reserve_blobs(&self, blobs: &BTreeMap<ContentId, u64>) -> Result<UploadReservation> {
+        // Live references can be pinned under the same lock used by GC's
+        // candidate selection. Only pending-only references require exclusion
+        // of a collector that may already have selected their files.
+        let live = self.reserve_indexed_blobs(blobs, false)?;
+        let mut reservation = if let Some(reservation) = live {
+            reservation
+        } else {
+            let _mutation = self.inner.lock_mutations()?;
+            self.reserve_indexed_blobs(blobs, true)?
+                .context("pending reservation unexpectedly declined")?
+        };
+        let read = self.inner.db.begin_read()?;
+        let layouts = read.open_table(BLOB_LAYOUTS)?;
+        let mut unavailable = Vec::new();
+        for &id in &reservation.reserved {
+            let size = blobs[&id];
+            if !self.inner.blob_present(&layouts, id, size)? {
+                unavailable.push(id);
+                reservation.missing.push(BlobRef { id, size });
+            }
+        }
+        if !unavailable.is_empty() {
+            let mut pins = self.inner.lock_pins()?;
+            for id in &unavailable {
+                release_pin(&mut pins.blobs, id);
+            }
+            drop(pins);
+            reservation
+                .reserved
+                .retain(|id| unavailable.binary_search(id).is_err());
+            reservation.missing.sort_unstable_by_key(|blob| blob.id);
+        }
+        Ok(reservation)
+    }
+
+    fn reserve_indexed_blobs(
+        &self,
+        blobs: &BTreeMap<ContentId, u64>,
+        allow_pending: bool,
+    ) -> Result<Option<UploadReservation>> {
+        let mut pins = self.inner.lock_pins()?;
         let read = self.inner.db.begin_read()?;
         let live = read.open_table(BLOBS)?;
         let pending = read.open_table(PENDING_DELETIONS)?;
         let mut missing = Vec::new();
         let mut reserved = Vec::new();
-        for (id, size) in blobs {
+        for (&id, &size) in blobs {
             let live_size = live.get(&id.0)?.map(|entry| entry.value());
-            let pending_size = pending.get(&id.0)?.map(|entry| entry.value());
-            if let Some(indexed_size) = live_size.or(pending_size) {
-                ensure!(indexed_size == size, "inconsistent indexed content length");
-                if self.inner.blob_present(id, size)? {
-                    reserved.push(id);
-                } else {
-                    missing.push(BlobRef { id, size });
+            let indexed = if live_size.is_some() {
+                live_size
+            } else {
+                let pending_size = pending.get(&id.0)?.map(|entry| entry.value());
+                if pending_size.is_some() && !allow_pending {
+                    return Ok(None);
                 }
+                pending_size
+            };
+            if let Some(indexed_size) = indexed {
+                ensure!(indexed_size == size, "inconsistent indexed content length");
+                reserved.push(id);
             } else {
                 missing.push(BlobRef { id, size });
             }
         }
-        let mut pins = self.inner.lock_pins()?;
-        // Validate every count before changing any pin.
         pins.reserve_content(reserved.iter())?;
         drop(pins);
-        Ok(UploadReservation {
+        Ok(Some(UploadReservation {
             inner: Arc::clone(&self.inner),
             reserved,
             missing,
-        })
+        }))
     }
 
     /// Wait for independently produced content, pinning each available subset.
-    /// A publication notification is registered before checking residency, so
-    /// a concurrent commit cannot be lost between the check and the wait.
+    /// Register the desired content IDs before reading residency; subsequent
+    /// committed publications notify only consumers of the changed content.
     /// This does not claim acquisition ownership or request any network I/O.
     ///
     /// # Errors
     /// Returns an error for cancellation, timeout, invalid content or storage failure.
     pub async fn await_blobs<Cancel>(
         &self,
-        mut blobs: BTreeMap<ContentId, u64>,
+        blobs: BTreeMap<ContentId, u64>,
         deadline: Instant,
         cancelled: Cancel,
     ) -> Result<Vec<UploadReservation>>
     where
         Cancel: std::future::Future<Output = Result<()>> + Send,
     {
-        let mut publications = self.inner.publications.subscribe();
-        let mut cancelled = std::pin::pin!(cancelled);
+        if blobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        tokio::select! {
+            result = tokio::time::timeout_at(deadline.into(), self.wait_for_blobs(blobs)) => {
+                result.context("native content publication deadline exceeded")?
+            }
+            result = cancelled => {
+                result?;
+                anyhow::bail!("native content publication cancelled");
+            }
+        }
+    }
+
+    async fn wait_for_blobs(
+        &self,
+        mut missing: BTreeMap<ContentId, u64>,
+    ) -> Result<Vec<UploadReservation>> {
+        let subscription = self.inner.publications.register(missing.keys().copied())?;
+        let mut candidates = missing.clone();
         let mut pins = Vec::new();
-        while !blobs.is_empty() {
-            ensure!(
-                Instant::now() < deadline,
-                "native content publication deadline exceeded"
-            );
-            // Forget prior changes, then check the current durable index.
-            let _ = publications.borrow_and_update();
-            let count = blobs.len();
+        loop {
             let store = self.clone();
-            let ready = tokio::task::spawn_blocking(move || store.reserve_blobs(blobs)).await??;
-            blobs = ready
-                .missing()
-                .iter()
-                .map(|blob| (blob.id, blob.size))
-                .collect();
-            if blobs.len() < count {
+            let ready =
+                tokio::task::spawn_blocking(move || store.reserve_blobs(&candidates)).await??;
+            for id in &ready.reserved {
+                missing.remove(id);
+            }
+            if !ready.reserved.is_empty() {
                 pins.push(ready);
             }
-            if !blobs.is_empty() {
-                tokio::select! {
-                    result = tokio::time::timeout_at(deadline.into(), publications.changed()) => {
-                        result.context("native content publication deadline exceeded")??;
-                    }
-                    result = &mut cancelled => {
-                        result?;
-                        anyhow::bail!("native content publication cancelled");
-                    }
+            if missing.is_empty() {
+                return Ok(pins);
+            }
+            // Only check newly published content. Accumulated events cannot
+            // overflow or be lost: each subscription has a finite ID set.
+            loop {
+                candidates = subscription
+                    .next()
+                    .await
+                    .into_iter()
+                    .filter_map(|id| missing.get(&id).map(|&size| (id, size)))
+                    .collect();
+                if !candidates.is_empty() {
+                    break;
                 }
             }
         }
-        Ok(pins)
     }
 
     /// Atomically publish a successful result. All newly referenced blobs must
@@ -1430,136 +1762,37 @@ impl NativeStore {
         staged: Vec<StagedBlob>,
         mode: ActionMode,
     ) -> Result<Published> {
-        let action = fingerprint.key()?;
-        let result = manifest.id()?;
-        let blobs = manifest.blobs()?;
-        let staged = self.prepare_staging(&blobs, staged)?;
-        let write = self.inner.db.begin_write()?;
-        let mut staged_reservations = Vec::new();
-        let new_action;
-        {
-            let mut actions = write.open_table(ACTIONS)?;
-            let mut results = write.open_table(RESULTS)?;
-            let mut result_actions = write.open_multimap_table(RESULT_ACTIONS)?;
-            let previous = actions
-                .get(&action.0)?
-                .map(|value| encoding().deserialize::<ActionRecord>(value.value()))
-                .transpose()?;
-            new_action = previous.is_none();
-            if let Some(stored) = &previous {
-                ensure!(
-                    stored.fingerprint == *fingerprint,
-                    "conflicting native action fingerprint"
-                );
-                if stored.result == result {
-                    let published = Published {
-                        action,
-                        result,
-                        new_action: false,
-                    };
-                    if self.blobs_present(&blobs)? {
-                        self.inner.lock_pins()?.touch(space::Root::Action(action));
-                        return Ok(published);
-                    }
-                    // A physically incomplete indexed result can be repaired
-                    // in place without changing its references or accounting.
-                    self.attach_blobs(
-                        &write,
-                        &result.0,
-                        &blobs,
-                        staged,
-                        true,
-                        &mut staged_reservations,
-                    )?;
-                    drop(result_actions);
-                    drop(results);
-                    drop(actions);
-                    return self.commit_result(write, staged_reservations, published);
-                }
-                // A fresh build may replace an unavailable result; ordinary
-                // reuse must still never overwrite a complete result.
-                let old = results
-                    .get(&stored.result.0)?
-                    .context("missing indexed result")?;
-                let old: ResultManifest = encoding().deserialize(old.value())?;
-                ensure!(
-                    mode == ActionMode::Refresh || !self.blobs_present(&old.blobs()?)?,
-                    "conflicting result for action {action:?}"
-                );
-            }
-            let existing_result = if let Some(stored) = results.get(&result.0)? {
-                let stored: ResultManifest = encoding().deserialize(stored.value())?;
-                ensure!(stored == *manifest, "conflicting native result manifest");
-                true
-            } else {
-                false
-            };
-            self.attach_blobs(
-                &write,
-                &result.0,
-                &blobs,
-                staged,
-                existing_result,
-                &mut staged_reservations,
-            )?;
-            if !existing_result {
-                let bytes = encoding().serialize(manifest)?;
-                results.insert(&result.0, bytes.as_slice())?;
-            }
-            let record = ActionRecord {
-                fingerprint: fingerprint.clone(),
-                result,
-            };
-            let bytes = encoding().serialize(&record)?;
-            actions.insert(&action.0, bytes.as_slice())?;
-            result_actions.insert(&result.0, &action.0)?;
-            if let Some(previous) = previous {
-                Self::release_result_reference(
-                    &write,
-                    &mut results,
-                    &mut result_actions,
-                    action,
-                    previous.result,
-                )?;
-            }
+        use std::borrow::Cow;
+        let mut prepared = results::PreparedResult::new(
+            self,
+            Cow::Borrowed(fingerprint),
+            Cow::Borrowed(manifest),
+            staged,
+            mode,
+        )?;
+        let plan = prepared.preflight(self, &self.inner.db.begin_read()?)?;
+        let published = prepared.published(&plan);
+        if !plan.unchanged {
+            let write = self.inner.db.begin_write()?;
+            let mut publication = Publication::default();
+            prepared.attach(self, &write, &mut publication, &plan)?;
+            publication.commit(&self.inner, write)?;
         }
-        self.commit_result(
-            write,
-            staged_reservations,
-            Published {
-                action,
-                result,
-                new_action,
-            },
-        )
-    }
-
-    fn blobs_present(&self, blobs: &BTreeMap<ContentId, u64>) -> Result<bool> {
-        for (&id, &size) in blobs {
-            if !self.inner.blob_present(id, size)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    fn commit_result(
-        &self,
-        write: WriteTransaction,
-        staged_reservations: Vec<space::StagingReservation>,
-        published: Published,
-    ) -> Result<Published> {
-        history::forget(&write, published.action)?;
-        // Files and their directory entries are durable before the index
-        // exposes them. Orphans from an interrupted write are harmless.
-        write.commit()?;
-        self.inner.publications.send_modify(|()| {});
-        // Keep the staging budget reserved until the resident count includes the new bytes.
-        drop(staged_reservations);
         self.inner
             .lock_pins()?
             .touch(space::Root::Action(published.action));
         Ok(published)
+    }
+
+    fn blobs_present(&self, blobs: &BTreeMap<ContentId, u64>) -> Result<bool> {
+        let read = self.inner.db.begin_read()?;
+        let layouts = read.open_table(BLOB_LAYOUTS)?;
+        for (&id, &size) in blobs {
+            if !self.inner.blob_present(&layouts, id, size)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn prepare_staging(
@@ -1591,70 +1824,71 @@ impl NativeStore {
         blobs: &BTreeMap<ContentId, u64>,
         mut staged: BTreeMap<ContentId, StagedBlob>,
         existing_result: bool,
-        reservations: &mut Vec<space::StagingReservation>,
+        publication: &mut Publication,
     ) -> Result<()> {
         let mut blob_table = write.open_table(BLOBS)?;
         let mut layouts = write.open_table(BLOB_LAYOUTS)?;
         let mut blob_roots = write.open_multimap_table(BLOB_ROOTS)?;
         let mut pending = write.open_table(PENDING_DELETIONS)?;
         let mut accounting = write.open_table(ACCOUNTING)?;
-        let mut resurrected = Vec::new();
-        let mut repair = BTreeSet::new();
-        for (&id, &size) in blobs {
-            if let Some(existing_size) = blob_table.get(&id.0)?.map(|entry| entry.value()) {
-                ensure!(existing_size == size, "content length mismatch for {id:?}");
-                if !self.inner.blob_present(id, size)? {
-                    let blob = staged.get(&id).context("missing staged repair content")?;
-                    ensure!(blob.reference.size == size, "staged repair length mismatch");
-                    repair.insert(id);
-                }
-            } else {
-                ensure!(!existing_result, "indexed result is missing content {id:?}");
-                if let Some(old_size) = pending.get(&id.0)?.map(|entry| entry.value()) {
-                    ensure!(
-                        old_size == size,
-                        "pending content length mismatch for {id:?}"
-                    );
-                    if self.inner.check_blob(id, size).is_ok() {
-                        resurrected.push(id);
-                        continue;
-                    }
-                }
-                let blob = staged
-                    .get(&id)
-                    .with_context(|| format!("missing staged content {id:?}"))?;
-                ensure!(
-                    blob.reference.size == size,
-                    "staged length mismatch for {id:?}"
-                );
-            }
-        }
+        let plans = {
+            let index = BlobIndex {
+                live: &blob_table,
+                pending: &pending,
+                layouts: &layouts,
+            };
+            blobs
+                .iter()
+                .map(|(&id, &size)| {
+                    let disposition = index.inspect(
+                        &self.inner,
+                        BlobRef { id, size },
+                        existing_result,
+                        staged.get(&id),
+                    )?;
+                    Ok((id, size, disposition))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         let mut added = 0_u64;
         let mut pending_removed = 0_u64;
-        let mut directories = BTreeSet::new();
-        for (&id, &size) in blobs {
-            if repair.contains(&id) {
-                let blob = staged.remove(&id).context("validated repair disappeared")?;
-                layouts.insert(&id.0, blob.encoding as u8)?;
-                reservations.push(self.inner.install_blob(blob, &mut directories)?);
-            } else if blob_table.get(&id.0)?.is_none() {
-                if resurrected.binary_search(&id).is_err() {
-                    let blob = staged
-                        .remove(&id)
-                        .context("validated staged content disappeared")?;
-                    let encoding = blob.encoding;
-                    reservations.push(self.inner.install_blob(blob, &mut directories)?);
-                    ensure!(
-                        layouts.insert(&id.0, encoding as u8)?.is_none(),
-                        "physical encoding already indexed for new CAS content"
+        for (id, size, disposition) in plans {
+            if disposition != Attachment::Live {
+                publication.changed.push(id);
+            }
+            match disposition {
+                Attachment::Live => {}
+                Attachment::Repair => {
+                    let blob = staged.remove(&id).context("validated repair disappeared")?;
+                    layouts.insert(&id.0, blob.encoding as u8)?;
+                    publication.reservations.push(
+                        self.inner
+                            .install_blob(blob, &mut publication.directories)?,
                     );
                 }
-                blob_table.insert(&id.0, size)?;
-                added = added.checked_add(size).context("store size overflow")?;
-                if let Some(old) = pending.remove(&id.0)? {
-                    pending_removed = pending_removed
-                        .checked_add(old.value())
-                        .context("pending GC size overflow")?;
+                Attachment::Resurrect | Attachment::Insert => {
+                    if disposition == Attachment::Insert {
+                        let blob = staged
+                            .remove(&id)
+                            .context("validated staged content disappeared")?;
+                        let encoding = blob.encoding;
+                        publication.reservations.push(
+                            self.inner
+                                .install_blob(blob, &mut publication.directories)?,
+                        );
+                        let previous_layout = layouts.insert(&id.0, encoding as u8)?;
+                        ensure!(
+                            previous_layout.is_none() || pending.get(&id.0)?.is_some(),
+                            "physical encoding already indexed for new CAS content"
+                        );
+                    }
+                    blob_table.insert(&id.0, size)?;
+                    added = added.checked_add(size).context("store size overflow")?;
+                    if let Some(old) = pending.remove(&id.0)? {
+                        pending_removed = pending_removed
+                            .checked_add(old.value())
+                            .context("pending GC size overflow")?;
+                    }
                 }
             }
             if !existing_result {
@@ -1683,11 +1917,6 @@ impl NativeStore {
                     .context("pending GC size underflow")?,
             )?;
         }
-        // Every staged inode was synced before admission. Sync each affected
-        // shard once, before the transaction exposes any of its content.
-        for directory in directories.iter().rev() {
-            File::open(directory)?.sync_all()?;
-        }
         Ok(())
     }
 
@@ -1696,17 +1925,40 @@ impl NativeStore {
     /// # Errors
     /// Returns an error for corrupt metadata, missing blobs or I/O failure.
     pub fn lookup(&self, action: ActionKey) -> Result<Option<ResultLease>> {
-        let mut pins = self.inner.lock_pins()?;
+        loop {
+            let lease = match self.lookup_result_snapshot(action)? {
+                ResultPin::Missing => return Ok(None),
+                ResultPin::Changed => continue,
+                ResultPin::NeedSnapshot => {
+                    anyhow::bail!("validated result snapshot was not pinned")
+                }
+                ResultPin::Acquired(lease) => lease,
+            };
+            if !self.blobs_present(lease.blobs())? {
+                return Ok(None);
+            }
+            self.inner.lock_pins()?.touch(space::Root::Action(action));
+            return Ok(Some(lease));
+        }
+    }
+
+    fn lookup_result_snapshot(&self, action: ActionKey) -> Result<ResultPin> {
         let read = self.inner.db.begin_read()?;
         let actions = read.open_table(ACTIONS)?;
-        let Some(record) = actions.get(&action.0)? else {
-            return Ok(None);
+        let Some(encoded) = actions.get(&action.0)? else {
+            return Ok(ResultPin::Missing);
         };
-        let record: ActionRecord = encoding().deserialize(record.value())?;
+        let record: ActionRecord = encoding().deserialize(encoded.value())?;
         ensure!(
             record.fingerprint.key()? == action,
             "invalid indexed action fingerprint"
         );
+        let mut prepared = None;
+        let existing =
+            self.pin_current_result(action, encoded.value(), record.result, &mut prepared)?;
+        if !matches!(existing, ResultPin::NeedSnapshot) {
+            return Ok(existing);
+        }
         let results = read.open_table(RESULTS)?;
         let manifest = results
             .get(&record.result.0)?
@@ -1717,30 +1969,45 @@ impl NativeStore {
             "invalid indexed result manifest"
         );
         let blobs = manifest.blobs()?;
-        for (&id, &size) in &blobs {
-            if !self.inner.blob_present(id, size)? {
-                return Ok(None);
-            }
+        prepared = Some(ResultSnapshot { manifest, blobs });
+        self.pin_current_result(action, encoded.value(), record.result, &mut prepared)
+    }
+
+    fn pin_current_result(
+        &self,
+        action: ActionKey,
+        encoded: &[u8],
+        result: ResultId,
+        prepared: &mut Option<ResultSnapshot>,
+    ) -> Result<ResultPin> {
+        let mut pins = self.inner.lock_pins()?;
+        if pins.evicting == Some(space::Root::Action(action)) {
+            return Ok(ResultPin::Missing);
         }
-        let count = pins
-            .actions
-            .get(&action)
-            .copied()
-            .unwrap_or(0)
-            .checked_add(1)
-            .context("action pin count overflow")?;
-        // A refresh can retire the old result while its delivery lease
-        // survives. Pin its content independently of the action mapping.
-        pins.reserve_content(blobs.keys())?;
-        pins.actions.insert(action, count);
-        pins.touch(space::Root::Action(action));
+        // Avoid a second index read if the immutable snapshot still needs
+        // decoding. No content pin may be acquired until revalidation.
+        if prepared.is_none()
+            && pins
+                .results
+                .get(&result)
+                .is_none_or(|content| content.strong_count() == 0)
+        {
+            return Ok(ResultPin::NeedSnapshot);
+        }
+        let read = self.inner.db.begin_read()?;
+        let actions = read.open_table(ACTIONS)?;
+        let Some(current) = actions.get(&action.0)? else {
+            return Ok(ResultPin::Missing);
+        };
+        if current.value() != encoded {
+            return Ok(ResultPin::Changed);
+        }
+        // The current mapping was confirmed while excluding GC candidate
+        // selection. Even if a refresh now retires it, its content is pinned
+        // before any collector can select the newly pending files.
+        let lease = pins.pin_result(&self.inner, action, result, prepared)?;
         drop(pins);
-        Ok(Some(ResultLease {
-            inner: Arc::clone(&self.inner),
-            action,
-            manifest,
-            blobs,
-        }))
+        Ok(lease.map_or(ResultPin::NeedSnapshot, ResultPin::Acquired))
     }
 
     /// Find all actions that yielded the same complete result, retaining their
@@ -1773,21 +2040,34 @@ impl NativeStore {
     /// # Errors
     /// Returns an error for inconsistent metadata or storage failures.
     pub fn evict(&self, action: ActionKey) -> Result<Eviction> {
-        let _mutation = self.inner.lock_mutations()?;
-        let mut pins = self.inner.lock_pins()?;
-        if pins.actions.contains_key(&action) {
+        self.evict_action(action, None)
+    }
+
+    fn evict_action(&self, action: ActionKey, expected: Option<ResultId>) -> Result<Eviction> {
+        let Some(mut claim) = self.inner.claim_eviction(space::Root::Action(action))? else {
             return Ok(Eviction::Pinned);
-        }
+        };
         let write = self.inner.db.begin_write()?;
         let unreferenced_logical_bytes;
         {
             let mut actions = write.open_table(ACTIONS)?;
             let mut results = write.open_table(RESULTS)?;
             let mut result_actions = write.open_multimap_table(RESULT_ACTIONS)?;
-            let Some(record) = actions.remove(&action.0)? else {
-                return Ok(Eviction::Missing);
+            let record: ActionRecord = {
+                let Some(record) = actions.get(&action.0)? else {
+                    return Ok(Eviction::Missing);
+                };
+                encoding().deserialize(record.value())?
             };
-            let record: ActionRecord = encoding().deserialize(record.value())?;
+            // Ranking is an advisory read snapshot. Never remove a new
+            // result just because its predecessor was a good candidate.
+            if expected.is_some_and(|id| id != record.result) {
+                return Ok(Eviction::Missing);
+            }
+            ensure!(
+                actions.remove(&action.0)?.is_some(),
+                "missing eviction action"
+            );
             let limit = self.inner.result_history_limit.load(Ordering::Acquire);
             if limit != 0 {
                 let manifest = results
@@ -1811,10 +2091,8 @@ impl NativeStore {
         // Durable deletion intent precedes physical deletion. The collector
         // can batch work and retry failures without scanning the live store.
         write.commit()?;
-        // Lookup and eviction must serialize until removal is committed.
-        pins.usage.remove(&space::Root::Action(action));
-        pins.dirty_usage.remove(&space::Root::Action(action));
-        drop(pins);
+        claim.committed = true;
+        drop(claim);
         Ok(Eviction::Removed {
             unreferenced_logical_bytes,
         })
@@ -1902,26 +2180,68 @@ impl NativeStore {
     /// Returns an error for database failures; per-file failures remain queued
     /// and are reported in the collection result.
     pub fn collect_garbage(&self, limit: usize) -> Result<GarbageCollected> {
-        let _mutation = self.inner.lock_mutations()?;
-        let pins = self.inner.lock_pins()?;
+        self.collect_selected_garbage(self.select_garbage(limit)?)
+    }
+
+    fn select_garbage(&self, limit: usize) -> Result<Vec<ContentId>> {
+        // Scanning a large pending queue is advisory. Neither publication
+        // nor unrelated cache readers should wait for this enumeration.
+        const PIN_BATCH: usize = 256;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let read = self.inner.db.begin_read()?;
         let pending = read.open_table(PENDING_DELETIONS)?;
+        if pending.len()? == 0 {
+            return Ok(Vec::new());
+        }
+        let mut entries = pending.iter()?;
         let mut candidates = Vec::new();
-        for entry in pending.iter()? {
-            if candidates.len() >= limit {
+        let mut batch = Vec::with_capacity(PIN_BATCH);
+        while candidates.len() < limit {
+            batch.clear();
+            for entry in entries.by_ref().take(PIN_BATCH) {
+                let (id, _) = entry?;
+                batch.push(ContentId(*id.value()));
+            }
+            if batch.is_empty() {
                 break;
             }
-            let (id, size) = entry?;
-            let id = ContentId(*id.value());
-            if !pins.blobs.contains_key(&id) {
-                candidates.push((id, size.value()));
-            }
+            let remaining = limit - candidates.len();
+            let pins = self.inner.lock_pins()?;
+            candidates.extend(
+                batch
+                    .iter()
+                    .copied()
+                    .filter(|id| !pins.blobs.contains_key(id))
+                    .take(remaining),
+            );
+            drop(pins);
         }
-        drop(pending);
-        drop(read);
-        // A new upload reservation requires the mutation lock. Committed
-        // result readers cannot acquire new pins on pending-only content.
-        drop(pins);
+        Ok(candidates)
+    }
+
+    fn collect_selected_garbage(&self, selected: Vec<ContentId>) -> Result<GarbageCollected> {
+        if selected.is_empty() {
+            return Ok(GarbageCollected::default());
+        }
+        let _mutation = self.inner.lock_mutations()?;
+        let candidates = {
+            let read = self.inner.db.begin_read()?;
+            let pending = read.open_table(PENDING_DELETIONS)?;
+            let mut candidates = Vec::new();
+            for id in selected {
+                if let Some(size) = pending.get(&id.0)? {
+                    candidates.push((id, size.value()));
+                }
+            }
+            // No new pending-only reservation can be acquired while we
+            // own mutation exclusion. Current readers pin live roots only.
+            let pins = self.inner.lock_pins()?;
+            candidates.retain(|(id, _)| !pins.blobs.contains_key(id));
+            drop(pins);
+            candidates
+        };
         let mut completed = Vec::new();
         let mut failed = Vec::new();
         let mut logical_bytes = 0_u64;
@@ -2033,20 +2353,58 @@ impl Drop for UploadReservation {
 
 /// A snapshot of a result whose content cannot be evicted during consumption.
 pub struct ResultLease {
-    inner: Arc<Inner>,
     action: ActionKey,
+    content: Arc<ResultContent>,
+}
+
+struct ResultSnapshot {
     manifest: ResultManifest,
     blobs: BTreeMap<ContentId, u64>,
 }
 
+// One verified immutable content closure per concurrently leased result
+// identity, irrespective of how many action aliases refer to it.
+struct ResultContent {
+    inner: Arc<Inner>,
+    id: ResultId,
+    snapshot: ResultSnapshot,
+}
+
+impl Drop for ResultContent {
+    fn drop(&mut self) {
+        match self.inner.lock_pins() {
+            Ok(mut pins) => {
+                for id in self.snapshot.blobs.keys() {
+                    release_pin(&mut pins.blobs, id);
+                }
+                // A new generation can be installed after our strong count
+                // reaches zero but before this destructor acquires the lock.
+                // Never remove that newer content pin.
+                if pins
+                    .results
+                    .get(&self.id)
+                    .is_some_and(|weak| std::ptr::eq(weak.as_ptr(), self))
+                {
+                    pins.results.remove(&self.id);
+                }
+            }
+            Err(error) => log::error!("could not release native result content pin: {error:#}"),
+        }
+    }
+}
+
 impl ResultLease {
     #[must_use = "the manifest identifies the leased result"]
-    pub const fn manifest(&self) -> &ResultManifest {
-        &self.manifest
+    pub fn manifest(&self) -> &ResultManifest {
+        &self.content.snapshot.manifest
+    }
+
+    pub(crate) fn blobs(&self) -> &BTreeMap<ContentId, u64> {
+        &self.content.snapshot.blobs
     }
 
     pub(crate) fn blob_size(&self, id: ContentId) -> Result<u64> {
-        self.blobs
+        self.blobs()
             .get(&id)
             .copied()
             .context("undeclared result content")
@@ -2058,7 +2416,7 @@ impl ResultLease {
     /// # Errors
     /// Returns an error for undeclared content or filesystem failure.
     pub fn open_file(&self, id: ContentId) -> Result<File> {
-        self.inner.open_declared(&self.blobs, id)
+        self.content.inner.open_declared(self.blobs(), id)
     }
 
     /// The immutable physical CAS encoding of a declared result blob.
@@ -2066,8 +2424,8 @@ impl ResultLease {
     /// # Errors
     /// Returns an error for undeclared content or missing index metadata.
     pub fn physical_encoding(&self, id: ContentId) -> Result<BlobEncoding> {
-        ensure!(self.blobs.contains_key(&id), "undeclared result content");
-        self.inner.blob_encoding(id)
+        ensure!(self.blobs().contains_key(&id), "undeclared result content");
+        self.content.inner.blob_encoding(id)
     }
 
     /// Open a blob belonging to this result. The reader borrows the lease and
@@ -2077,7 +2435,7 @@ impl ResultLease {
     /// Returns an error for an undeclared blob or filesystem failure.
     pub fn open_blob(&self, id: ContentId) -> Result<impl Read + Seek + '_> {
         Ok(LeasedReader {
-            file: BlobReader::open(self.open_file(id)?, self.inner.blob_encoding(id)?)?,
+            file: BlobReader::open(self.open_file(id)?, self.content.inner.blob_encoding(id)?)?,
             _lease: self,
         })
     }
@@ -2085,12 +2443,9 @@ impl ResultLease {
 
 impl Drop for ResultLease {
     fn drop(&mut self) {
-        match self.inner.lock_pins() {
+        match self.content.inner.lock_pins() {
             Ok(mut pins) => {
                 release_pin(&mut pins.actions, &self.action);
-                for id in self.blobs.keys() {
-                    release_pin(&mut pins.blobs, id);
-                }
             }
             Err(error) => log::error!("could not release native store result lease: {error:#}"),
         }

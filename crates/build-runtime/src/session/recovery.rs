@@ -320,12 +320,9 @@ impl NativeSessions {
                         );
                         vec![staged]
                     };
-                    let owned = store.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let _reservation = reservation;
-                        owned.publish_tree_pinned(&retention, staged)
-                    })
-                    .await?
+                    store
+                        .publish_tree_pinned_async(retention, staged, reservation)
+                        .await
                 },
             )
             .await

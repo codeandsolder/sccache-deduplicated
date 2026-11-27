@@ -17,7 +17,9 @@ use super::{
     ACTIONS, ActionRecord, BLOB_ROOTS, Eviction, Inner, NativeStore, PACKAGES, RESULT_ACTIONS,
     RESULTS, TREE_PACKAGES, TREES, encoding, packages::PackageRecord, persist_usage,
 };
-use crate::{ActionKey, BlobRef, ContentId, ResultManifest, SpacePolicy, TreeId, TreeManifest};
+use crate::{
+    ActionKey, BlobRef, ContentId, ResultId, ResultManifest, SpacePolicy, TreeId, TreeManifest,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Root {
@@ -48,6 +50,28 @@ impl Root {
             0 => Ok(Self::Action(ActionKey(digest))),
             1 => Ok(Self::Tree(TreeId(digest))),
             _ => Err(anyhow!("invalid native usage root type")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum EvictionTarget {
+    Action(ActionKey, ResultId),
+    Tree(TreeId),
+}
+
+impl EvictionTarget {
+    const fn root(self) -> Root {
+        match self {
+            Self::Action(key, _) => Root::Action(key),
+            Self::Tree(id) => Root::Tree(id),
+        }
+    }
+
+    fn evict(self, store: &NativeStore) -> Result<Eviction> {
+        match self {
+            Self::Action(key, result) => store.evict_action(key, Some(result)),
+            Self::Tree(id) => store.evict_tree(id),
         }
     }
 }
@@ -141,10 +165,17 @@ impl NativeStore {
     }
 
     fn resident_bytes(&self) -> Result<u64> {
-        let stats = self.stats()?;
-        stats
-            .logical_bytes
-            .checked_add(stats.pending_gc_bytes)
+        let read = self.inner.db.begin_read()?;
+        let accounting = read.open_table(super::ACCOUNTING)?;
+        let live = accounting
+            .get(super::LIVE_BYTES)?
+            .context("missing live accounting")?
+            .value();
+        let pending = accounting
+            .get(super::PENDING_BYTES)?
+            .context("missing pending accounting")?
+            .value();
+        live.checked_add(pending)
             .context("native resident byte overflow")
     }
 
@@ -188,28 +219,42 @@ impl NativeStore {
 
     /// Persist only dirty usage records in one bounded write transaction,
     /// avoiding synchronous database writes on cache hits.
-    ///
     /// # Errors
     /// Returns an error if the usage index is unavailable.
     pub fn checkpoint_usage(&self) -> Result<()> {
         let _mutation = self.inner.lock_mutations()?;
-        let mut pins = self.inner.lock_pins()?;
-        persist_usage(&self.inner.db, &mut pins)
+        self.checkpoint_usage_locked(false)
+    }
+
+    fn checkpoint_usage_locked(&self, only_due: bool) -> Result<()> {
+        // Mutation exclusion prevents eviction from removing these roots
+        // while their checkpoint is in progress. Readers may still touch
+        // them; keep any newer usage dirty for the next checkpoint.
+        let records = {
+            let pins = self.inner.lock_pins()?;
+            if only_due && !pins.usage_checkpoint_due() {
+                return Ok(());
+            }
+            pins.usage_snapshot()
+        };
+        if !records.is_empty() {
+            persist_usage(&self.inner.db, &records)?;
+            self.inner.lock_pins()?.finish_usage_checkpoint(&records);
+        }
+        Ok(())
     }
 
     fn checkpoint_usage_if_due(&self) -> Result<()> {
-        const INTERVAL: Duration = Duration::from_secs(60);
-        let due = {
-            let pins = self.inner.lock_pins()?;
-            !pins.dirty_usage.is_empty()
-                && pins
-                    .last_usage_checkpoint
-                    .is_none_or(|last| last.elapsed() >= INTERVAL)
-        };
-        if due {
-            self.checkpoint_usage()?;
+        if !self.inner.lock_pins()?.usage_checkpoint_due() {
+            return Ok(());
         }
-        Ok(())
+        // Maintenance is opportunistic. A concurrent publication or
+        // checkpoint can finish before the next maintenance pass.
+        match self.inner.mutations.try_lock() {
+            Ok(_mutation) => self.checkpoint_usage_locked(true),
+            Err(TryLockError::WouldBlock) => Ok(()),
+            Err(TryLockError::Poisoned(_)) => Err(anyhow!("native store mutation lock poisoned")),
+        }
     }
 
     /// Reclaim queued garbage before considering eviction. Keep leases intact
@@ -252,32 +297,38 @@ impl NativeStore {
             .checked_add(need)
             .context("native target space overflow")?;
         self.collect_garbage(policy.gc_batch)?;
-        let mut free = available()?;
-        let mut resident = self
-            .resident_bytes()?
-            .checked_add(need)
-            .context("native resident reservation overflow")?;
+        let mut observe = || -> Result<(u64, u64)> {
+            Ok((
+                available()?,
+                self.resident_bytes()?
+                    .checked_add(need)
+                    .context("native resident reservation overflow")?,
+            ))
+        };
+        let (mut free, mut resident) = observe()?;
         let mut evicted_roots = 0;
         if free < minimum || resident > policy.max_resident_bytes {
             #[cfg(target_os = "linux")]
             self.drop_idle_views(None)?;
-            for root in self.eviction_candidates(policy.max_evictions_per_pass, free < minimum)? {
-                let result = match root {
-                    Root::Action(key) => self.evict(key)?,
-                    Root::Tree(id) => self.evict_tree(id)?,
+            let candidates =
+                self.eviction_candidates(policy.max_evictions_per_pass, free < minimum)?;
+            (free, resident) = observe()?;
+            for candidate in candidates {
+                let (free_limit, resident_limit) = if evicted_roots == 0 {
+                    (minimum, policy.max_resident_bytes)
+                } else {
+                    (target, policy.target_resident_bytes)
                 };
-                if matches!(result, Eviction::Removed { .. }) {
+                if free >= free_limit && resident <= resident_limit {
+                    break;
+                }
+                if matches!(candidate.evict(self)?, Eviction::Removed { .. }) {
                     evicted_roots += 1;
                     self.collect_garbage(policy.gc_batch)?;
-                    free = available()?;
-                    resident = self
-                        .resident_bytes()?
-                        .checked_add(need)
-                        .context("native resident reservation overflow")?;
-                    if free >= target && resident <= policy.target_resident_bytes {
-                        break;
-                    }
                 }
+                // Ranking and pin checks may race with publication/GC;
+                // always observe actual capacity before further eviction.
+                (free, resident) = observe()?;
             }
         }
         Ok(SpaceReport {
@@ -317,10 +368,14 @@ impl NativeStore {
                 // but not snapshot/reflink exclusivity on ZFS. Validate real
                 // free space after GC rather than claiming exact release.
                 let bytes = if physical_pressure {
-                    std::fs::metadata(self.inner.blob_path(id))?
-                        .blocks()
-                        .checked_mul(512)
-                        .context("estimated allocated bytes overflow")?
+                    match std::fs::metadata(self.inner.blob_path(id)) {
+                        Ok(metadata) => metadata
+                            .blocks()
+                            .checked_mul(512)
+                            .context("estimated allocated bytes overflow")?,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                        Err(error) => return Err(error.into()),
+                    }
                 } else {
                     size
                 };
@@ -334,17 +389,17 @@ impl NativeStore {
 
     fn rank_eviction_candidate(
         &self,
-        root: Root,
+        candidate: EvictionTarget,
         blobs: &BTreeMap<ContentId, u64>,
         disappearing: &BTreeSet<[u8; 32]>,
         owners: &ReadOnlyMultimapTable<&[u8; 32], &[u8; 32]>,
         physical_pressure: bool,
         observed: u64,
-    ) -> Result<(u8, u128, std::cmp::Reverse<u64>, u64, Root)> {
+    ) -> Result<(u8, u128, std::cmp::Reverse<u64>, u64, EvictionTarget)> {
         // The pin lock must not be held while consulting filesystem blocks:
         // a slow ZFS metadata lookup must not delay normal cache hits.
         let pins = self.inner.lock_pins()?;
-        let usage = pins.usage.get(&root).copied();
+        let usage = pins.usage.get(&candidate.root()).copied();
         let pinned_blobs = blobs
             .keys()
             .filter(|id| pins.blobs.contains_key(*id))
@@ -369,17 +424,22 @@ impl NativeStore {
                 / u128::from(potential.max(1)),
             std::cmp::Reverse(potential),
             usage.map_or(0, |record| record.last_used_ms),
-            root,
+            candidate,
         ))
     }
 
-    fn eviction_candidates(&self, limit: usize, physical_pressure: bool) -> Result<Vec<Root>> {
-        // This is intentionally a pressure-only path: query committed reverse
-        // references and actual file allocation, never the lookup hot path.
-        // Freeze publications/GC until the file-allocation snapshot has been
-        // ranked, so a concurrent unlink cannot invalidate the blob metadata.
-        // The mutation lock is released before any candidate is evicted.
-        let _mutation = self.inner.lock_mutations()?;
+    fn eviction_candidates(
+        &self,
+        limit: usize,
+        physical_pressure: bool,
+    ) -> Result<Vec<EvictionTarget>> {
+        // Ranking is advisory: use one committed reverse-index snapshot
+        // without blocking writers. Allocation observations can change as
+        // files disappear; actual eviction revalidates the action generation
+        // and pins, and admission rechecks actual free space afterwards.
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let read = self.inner.db.begin_read()?;
         let actions = read.open_table(ACTIONS)?;
         let results = read.open_table(RESULTS)?;
@@ -391,12 +451,12 @@ impl NativeStore {
         let observed = now_ms();
         // Bound memory to K candidates even when the backing index is huge.
         let mut candidates = BinaryHeap::new();
-        let mut consider = |root: Root,
+        let mut consider = |candidate: EvictionTarget,
                             blobs: &BTreeMap<ContentId, u64>,
                             disappearing: &BTreeSet<[u8; 32]>|
          -> Result<()> {
             let rank = self.rank_eviction_candidate(
-                root,
+                candidate,
                 blobs,
                 disappearing,
                 &blob_roots,
@@ -432,7 +492,11 @@ impl NativeStore {
             } else {
                 BTreeSet::new()
             };
-            consider(Root::Action(key), &manifest.blobs()?, &disappearing)?;
+            consider(
+                EvictionTarget::Action(key, record.result),
+                &manifest.blobs()?,
+                &disappearing,
+            )?;
         }
         for entry in trees.iter()? {
             let (id, value) = entry?;
@@ -457,7 +521,7 @@ impl NativeStore {
                     ensure!(previous == size, "inconsistent archive content size");
                 }
             }
-            consider(Root::Tree(id), &blobs, &disappearing)?;
+            consider(EvictionTarget::Tree(id), &blobs, &disappearing)?;
         }
         Ok(candidates
             .into_sorted_vec()
@@ -487,6 +551,30 @@ fn reuse_utility(usage: Option<&UsageRecord>, bytes: u64, now: u64) -> u64 {
 }
 
 impl super::Pins {
+    fn usage_checkpoint_due(&self) -> bool {
+        const INTERVAL: Duration = Duration::from_secs(60);
+        !self.dirty_usage.is_empty()
+            && self
+                .last_usage_checkpoint
+                .is_none_or(|last| last.elapsed() >= INTERVAL)
+    }
+
+    pub(super) fn usage_snapshot(&self) -> Vec<(Root, UsageRecord)> {
+        self.dirty_usage
+            .iter()
+            .filter_map(|root| self.usage.get(root).map(|record| (*root, *record)))
+            .collect()
+    }
+
+    fn finish_usage_checkpoint(&mut self, records: &[(Root, UsageRecord)]) {
+        for (root, record) in records {
+            if self.usage.get(root) == Some(record) {
+                self.dirty_usage.remove(root);
+            }
+        }
+        self.last_usage_checkpoint = Some(super::Instant::now());
+    }
+
     pub(super) fn touch(&mut self, root: Root) {
         let record = self.usage.entry(root).or_default();
         record.hits = record.hits.saturating_add(1);
@@ -523,15 +611,7 @@ impl StageBudget {
             .size
             .checked_add(1)
             .context("blob length overflow")?;
-        ensure!(
-            expected.size <= self.reserved,
-            "blob exceeds reserved staging headroom"
-        );
-        self.reserved -= expected.size;
-        let child = Self {
-            store: self.store.clone(),
-            reserved: expected.size,
-        };
+        let child = self.split(expected.size)?;
         let staged =
             self.store
                 .stage_local_inner(reader.take(limit), Some(expected.size), child)?;
@@ -545,6 +625,67 @@ impl StageBudget {
         );
         ensure!(actual.id == expected.id, super::BlobIntegrityError::Digest);
         Ok(staged)
+    }
+
+    fn split(&mut self, size: u64) -> Result<Self> {
+        ensure!(
+            size <= self.reserved,
+            "blob exceeds reserved staging headroom"
+        );
+        self.reserved -= size;
+        Ok(Self {
+            store: self.store.clone(),
+            reserved: size,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn belongs_to(&self, store: &NativeStore) -> bool {
+        Arc::ptr_eq(&self.store.inner, &store.inner)
+    }
+
+    /// Encode and hash a private compiler output straight into its CAS inode.
+    /// Durability is deferred until publication, outside compiler admission.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn stage_capture(
+        &mut self,
+        size: u64,
+        reader: impl std::io::Read,
+    ) -> Result<super::CapturedStage> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let budget = self.split(size)?;
+        let limit = size.checked_add(1).context("blob length overflow")?;
+        let mut file = tempfile::NamedTempFile::new_in(self.store.inner.root.join("staging"))?;
+        let encoding = self.store.physical_encoding();
+        let reader = reader.take(limit);
+        let reference = match encoding {
+            crate::BlobEncoding::Raw => {
+                crate::encode_native_raw_blob(reader, file.as_file_mut(), Some(size))?
+            }
+            crate::BlobEncoding::ZstdChunks => {
+                crate::encode_native_blob(reader, file.as_file_mut(), Some(size))?
+            }
+        };
+        ensure!(
+            reference.size == size,
+            super::BlobIntegrityError::Length {
+                expected: size,
+                actual: reference.size
+            }
+        );
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o400))?;
+        let metadata = file.as_file().metadata()?;
+        let stage = super::StagedBlob {
+            path: file.into_temp_path(),
+            metadata,
+            reference,
+            encoding,
+            owner: Arc::clone(&self.store.inner),
+            _reservation: budget.finish(size)?,
+        };
+        let file = Arc::new(stage.open_file()?);
+        Ok(super::CapturedStage { stage, file })
     }
 
     pub(super) fn grow_to(&mut self, size: u64) -> Result<()> {

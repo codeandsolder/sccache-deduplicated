@@ -869,6 +869,10 @@ fn rust_cargo_env_for_hash(
         ));
     }
 
+    if let Some(value) = canonical.and_then(|paths| paths.implicit_build_directory(env)) {
+        hashed.push((OsString::from("CARGO_BUILD_BUILD_DIR"), value));
+    }
+
     hashed.sort();
     hashed
 }
@@ -8294,6 +8298,80 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             "ordinary fallback did not preserve the caller's dep-info emission"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_cargo_build_directory_is_independent_of_configuration_source() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("workspace");
+        let target = temp.path().join("target");
+        let lease = temp.path().join("lease");
+        let intermediate = lease.join("ab/0123456789abcdef");
+        let output = intermediate.join("debug/deps");
+        fs::create_dir_all(&root)?;
+        fs::create_dir_all(&target)?;
+        fs::create_dir_all(&output)?;
+        fs::write(intermediate.join("CACHEDIR.TAG"), "cargo build root")?;
+        let base = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            (
+                "SCCACHE_CANONICAL_BUILD_ROOT".into(),
+                root.clone().into_os_string(),
+            ),
+            ("CARGO_TARGET_DIR".into(), target.into_os_string()),
+        ];
+        let name = OsString::from("CARGO_BUILD_BUILD_DIR");
+        let mut template = base.clone();
+        template.push((
+            name.clone(),
+            lease.join("{workspace-path-hash}").into_os_string(),
+        ));
+        let mut concrete = base.clone();
+        concrete.push((name.clone(), intermediate.clone().into_os_string()));
+        let mut unrelated = base.clone();
+        unrelated.push((name.clone(), temp.path().join("other").into_os_string()));
+        let paths = CanonicalRustPaths::from_env_with_output_dir(
+            &base,
+            &root,
+            Path::new("/rust"),
+            Some(&output),
+            None,
+        )
+        .context("canonical paths missing")?;
+        assert_eq!(
+            paths.intermediate_root.as_deref(),
+            Some(intermediate.as_path())
+        );
+        let hash_env = rust_cargo_env_for_hash(&base, Some(&paths));
+        assert_eq!(hash_env, rust_cargo_env_for_hash(&template, Some(&paths)));
+        assert_eq!(hash_env, rust_cargo_env_for_hash(&concrete, Some(&paths)));
+        assert_ne!(hash_env, rust_cargo_env_for_hash(&unrelated, Some(&paths)));
+        assert_ne!(
+            rust_cargo_env_for_hash(&base, None),
+            rust_cargo_env_for_hash(&template, None)
+        );
+        for env in [&base, &template, &concrete] {
+            let rewritten = paths.env_to_canonical(env);
+            assert_eq!(rewritten.iter().filter(|(key, _)| key == &name).count(), 1);
+            assert!(rewritten.contains(&(name.clone(), "/intermediate".into())));
+        }
+        // option_env! may observe absence; env! may observe the actual template.
+        let observed = HashSet::from([name.clone()]);
+        assert!(
+            !paths
+                .env_to_canonical_preserving(&base, &observed)
+                .iter()
+                .any(|(key, _)| key == &name)
+        );
+        assert!(
+            paths
+                .env_to_canonical_preserving(&template, &observed)
+                .contains(&(
+                    name.clone(),
+                    lease.join("{workspace-path-hash}").into_os_string()
+                ))
+        );
         Ok(())
     }
 
