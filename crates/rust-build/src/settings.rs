@@ -290,6 +290,13 @@ impl Settings {
                 .map(OsString::from)
                 .collect());
         }
+        if let Some(value) = self.target_env(platform, "rustflags") {
+            return Ok(value
+                .to_string_lossy()
+                .split_whitespace()
+                .map(OsString::from)
+                .collect());
+        }
         let mut result = Vec::new();
         if let Some(targets) = self.document.get("target").and_then(Value::as_table) {
             for (selector, value) in targets {
@@ -312,29 +319,68 @@ impl Settings {
         Ok(result)
     }
 
-    pub fn linker(&self, platform: &Platform) -> Result<Option<OsString>> {
+    fn target_setting(&self, platform: &Platform, name: &str) -> Result<Option<Value>> {
         let Some(targets) = self.document.get("target").and_then(Value::as_table) else {
             return Ok(None);
         };
         if let Some(value) = targets
             .get(&platform.triple)
             .and_then(Value::as_table)
-            .and_then(|t| t.get("linker"))
+            .and_then(|t| t.get(name))
         {
-            return Ok(Some(
-                value.as_str().context("linker is not a string")?.into(),
-            ));
+            return Ok(Some(value.clone()));
         }
         let mut selected = None;
         for (selector, value) in targets {
             if selector.starts_with("cfg(")
                 && platform.matches(selector)?
-                && let Some(value) = value.as_table().and_then(|t| t.get("linker"))
+                && let Some(value) = value.as_table().and_then(|t| t.get(name))
             {
-                ensure!(selected.is_none(), "multiple matching cfg linkers");
-                selected = Some(value.as_str().context("linker is not a string")?.into());
+                ensure!(selected.is_none(), "multiple matching cfg {name} settings");
+                selected = Some(value.clone());
             }
         }
         Ok(selected)
+    }
+
+    fn target_env(&self, platform: &Platform, name: &str) -> Option<&OsString> {
+        let variable = format!(
+            "CARGO_TARGET_{}_{}",
+            platform.triple.replace('-', "_").to_uppercase(),
+            name.to_uppercase()
+        );
+        self.environment.get(OsStr::new(&variable))
+    }
+
+    pub fn linker(&self, platform: &Platform) -> Result<Option<OsString>> {
+        if let Some(value) = self.target_env(platform, "linker") {
+            return Ok(Some(value.clone()));
+        }
+        self.target_setting(platform, "linker")?
+            .map(|value| Ok(value.as_str().context("linker is not a string")?.into()))
+            .transpose()
+    }
+
+    pub fn runner(
+        &self,
+        platform: &Platform,
+        cwd: &Path,
+    ) -> Result<Option<(PathBuf, Vec<OsString>)>> {
+        let mut words = if let Some(value) = self.target_env(platform, "runner") {
+            value
+                .to_string_lossy()
+                .split_whitespace()
+                .map(OsString::from)
+                .collect()
+        } else if let Some(value) = self.target_setting(platform, "runner")? {
+            flags(&value)?
+        } else {
+            return Ok(None);
+        };
+        ensure!(!words.is_empty(), "empty target runner");
+        let executable = words.remove(0);
+        let executable =
+            which::which_in(executable, self.environment.get(OsStr::new("PATH")), cwd)?;
+        Ok(Some((executable, words)))
     }
 }

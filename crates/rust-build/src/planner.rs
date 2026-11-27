@@ -720,6 +720,7 @@ impl<'a> Planner<'a> {
                 ]
                 .contains(&name)
         });
+        env.remove(OsStr::new("CARGO"));
         let package = &manifest.package;
         let mut set = |key: &str, value: OsString| {
             env.insert(key.into(), value);
@@ -1118,6 +1119,64 @@ impl<'a> Planner<'a> {
         })
     }
 
+    fn runtime_libraries(
+        &self,
+        unit: usize,
+        host: bool,
+        script: bool,
+        env: &mut BTreeMap<OsString, OsString>,
+    ) -> Result<()> {
+        let mut directories = vec![self.output_dir(host)];
+        let kind = if script {
+            DependencyKind::Build
+        } else {
+            DependencyKind::Normal
+        };
+        for search in self.native_search(unit, kind)? {
+            let path = PathBuf::from(search.split_once('=').map_or(search.as_str(), |(_, p)| p));
+            if path.starts_with(&self.intermediate) {
+                directories.push(path);
+            }
+        }
+        if !script && let Some(script) = self.read_script(unit)? {
+            for link in script.links {
+                if let LinkDirective::Search(search) = link {
+                    let path =
+                        PathBuf::from(search.split_once('=').map_or(search.as_str(), |(_, p)| p));
+                    if path.starts_with(&self.intermediate) {
+                        directories.push(path);
+                    }
+                }
+            }
+        }
+        if let Some(sysroot) = self.toolchain.rustc.parent().and_then(Path::parent) {
+            directories.push(sysroot.join("lib"));
+            let platform = if host {
+                &self.toolchain.host
+            } else {
+                &self.toolchain.target
+            };
+            directories.push(
+                sysroot
+                    .join("lib/rustlib")
+                    .join(&platform.triple)
+                    .join("lib"),
+            );
+        }
+        let variable = if cfg!(target_os = "macos") {
+            "DYLD_FALLBACK_LIBRARY_PATH"
+        } else if cfg!(windows) {
+            "PATH"
+        } else {
+            "LD_LIBRARY_PATH"
+        };
+        if let Some(existing) = env.get(OsStr::new(variable)) {
+            directories.extend(std::env::split_paths(existing));
+        }
+        env.insert(variable.into(), std::env::join_paths(directories)?);
+        Ok(())
+    }
+
     fn script_action(
         &self,
         unit: usize,
@@ -1219,6 +1278,8 @@ impl<'a> Planner<'a> {
                 }
             }
         }
+        env.insert("CARGO".into(), std::env::current_exe()?.into_os_string());
+        self.runtime_libraries(unit, true, true, &mut env)?;
         let executable = self.nodes[compiler]
             .outputs
             .first()
@@ -1277,13 +1338,25 @@ impl<'a> Planner<'a> {
                 if let Some(output) = self.read_script(*unit)? {
                     env.extend(output.env.into_iter().map(|(k, v)| (k.into(), v.into())));
                 }
+                env.insert("CARGO".into(), std::env::current_exe()?.into_os_string());
+                let host = self.host(*unit, false);
+                self.runtime_libraries(*unit, host, false, &mut env)?;
+                let platform = if host {
+                    &self.toolchain.host
+                } else {
+                    &self.toolchain.target
+                };
+                let cwd = &self.unit_manifest(*unit).root;
+                let (executable, arguments) =
+                    if let Some((runner, mut arguments)) = self.settings.runner(platform, cwd)? {
+                        arguments.push(executable.as_os_str().to_owned());
+                        arguments.extend(self.options.trailing.iter().cloned());
+                        (runner, arguments)
+                    } else {
+                        (executable.to_path_buf(), self.options.trailing.clone())
+                    };
                 PlanAction::Process {
-                    command: command(
-                        executable,
-                        &self.unit_manifest(*unit).root,
-                        self.options.trailing.clone(),
-                        env,
-                    )?,
+                    command: command(&executable, cwd, arguments, env)?,
                     stdout: None,
                     stderr: None,
                     inherit_stdin: self.options.mode == Mode::Run,
