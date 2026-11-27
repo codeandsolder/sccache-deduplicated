@@ -43,7 +43,8 @@ impl State {
         }
     }
 
-    fn reap(&mut self, now: Instant) {
+    fn reap(&mut self, now: Instant) -> Vec<ProtectedResult> {
+        let mut expired = Vec::new();
         while self
             .results
             .front()
@@ -51,9 +52,14 @@ impl State {
         {
             if let Some(entry) = self.results.pop_front() {
                 self.release(&entry.contents);
-                drop(entry);
+                expired.push(entry);
             }
         }
+        expired
+    }
+
+    fn next_expiry(&self) -> Option<Instant> {
+        self.results.front().map(|result| result.expires)
     }
 }
 
@@ -63,6 +69,7 @@ pub struct ArtifactGrace {
     duration: Duration,
     max_bytes: u64,
     state: Arc<Mutex<State>>,
+    changed: tokio::sync::watch::Sender<()>,
 }
 
 impl ArtifactGrace {
@@ -77,39 +84,120 @@ impl ArtifactGrace {
             duration,
             max_bytes,
             state: Arc::new(Mutex::new(State::default())),
+            changed: tokio::sync::watch::Sender::new(()),
         })
     }
 
     /// Expiry releases only grace leases, not consumer input leases.
     pub fn reap(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .reap(Instant::now());
+        self.with_reaped(|_| ());
     }
 
-    pub(super) fn reserve(&self, limit: u64) -> Result<Option<GraceReservation>> {
+    fn notify(&self) {
+        self.changed.send_modify(|()| {});
+    }
+
+    fn with_reaped<R>(&self, operation: impl FnOnce(&mut State) -> R) -> R {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let expired = state.reap(Instant::now());
+        let result = operation(&mut state);
+        drop(state);
+        if !expired.is_empty() {
+            // Release CAS pins outside the grace mutex.
+            drop(expired);
+            self.notify();
+        }
+        result
+    }
+
+    fn try_reserve(&self, limit: u64) -> Result<(Option<GraceReservation>, Option<Instant>)> {
         ensure!(
             limit <= self.max_bytes,
             "result limit exceeds worker artifact grace budget"
         );
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.reap(Instant::now());
-        if state.waiting_publishers != 0
-            || limit
-                > self
-                    .max_bytes
-                    .saturating_sub(state.bytes)
-                    .saturating_sub(state.pending)
-        {
-            return Ok(None);
+        let (admitted, expires) = self.with_reaped(|state| {
+            let admitted = state.waiting_publishers == 0
+                && limit
+                    <= self
+                        .max_bytes
+                        .saturating_sub(state.bytes)
+                        .saturating_sub(state.pending);
+            if admitted {
+                state.pending += limit;
+            }
+            (admitted, state.next_expiry())
+        });
+        Ok((
+            admitted.then(|| GraceReservation {
+                pool: self.clone(),
+                limit,
+            }),
+            expires,
+        ))
+    }
+
+    #[cfg(test)]
+    fn reserve(&self, limit: u64) -> Result<Option<GraceReservation>> {
+        self.try_reserve(limit).map(|(reservation, _)| reservation)
+    }
+
+    pub(super) async fn reserve_until(
+        &self,
+        limit: u64,
+        timeout: Duration,
+        check: &super::LeaseCheck<'_>,
+    ) -> Result<(GraceReservation, bool)> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .context("grace admission deadline overflow")?;
+        let mut changed = self.changed.subscribe();
+        let mut waited = false;
+        loop {
+            check()?;
+            let (reservation, expires) = self.try_reserve(limit)?;
+            if let Some(reservation) = reservation {
+                return Ok((reservation, waited));
+            }
+            waited = true;
+            wait_for_change(
+                &mut changed,
+                deadline,
+                expires,
+                check,
+                "native artifact grace admission",
+            )
+            .await?;
         }
-        state.pending += limit;
-        drop(state);
-        Ok(Some(GraceReservation {
-            pool: self.clone(),
-            limit,
-        }))
+    }
+}
+
+// A reservation release or exact publication changes admission immediately.
+// The only timer which can change capacity independently is the oldest
+// retained result's expiry. Lease checks remain cheap and periodic while
+// parked, without repeating the content-accounting scan.
+async fn wait_for_change(
+    changed: &mut tokio::sync::watch::Receiver<()>,
+    deadline: Instant,
+    expires: Option<Instant>,
+    check: &super::LeaseCheck<'_>,
+    operation: &str,
+) -> Result<()> {
+    ensure!(Instant::now() < deadline, "{operation} timed out");
+    let wake = expires.map_or(deadline, |expires| expires.min(deadline));
+    let sleep = tokio::time::sleep_until(wake.into());
+    tokio::pin!(sleep);
+    let period = Duration::from_millis(50);
+    let mut cancellation = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    cancellation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            result = changed.changed() => { result?; return Ok(()); }
+            () = &mut sleep => {
+                ensure!(Instant::now() < deadline, "{operation} timed out");
+                return Ok(());
+            }
+            _ = cancellation.tick() => check()?,
+        }
     }
 }
 
@@ -173,6 +261,7 @@ impl GraceReservation {
             .unwrap_or_else(PoisonError::into_inner);
         state.pending -= std::mem::take(&mut self.limit);
         drop(state);
+        self.pool.notify();
         Publication {
             pool: self.pool.clone(),
             waiting: false,
@@ -200,63 +289,90 @@ impl Publication {
             "actual result exceeds worker artifact grace pool"
         );
         let (timeout, check) = wait;
-        let started = Instant::now();
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .context("grace publication deadline overflow")?;
+        let mut changed = self.pool.changed.subscribe();
+        let mut pending = (contents, lease);
         loop {
             check()?;
-            {
-                let mut state = self
-                    .pool
-                    .state
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                state.reap(Instant::now());
-                let mut additional = 0_u64;
-                for (&id, &size) in &contents {
-                    if let Some(&(previous, count)) = state.refs.get(&id) {
-                        ensure!(
-                            previous == size && count < usize::MAX,
-                            "invalid grace content accounting"
-                        );
-                    } else {
-                        additional = additional
-                            .checked_add(size)
-                            .context("grace bytes overflow")?;
-                    }
-                }
-                // The published result lease pins its content while it waits.
-                // Charge only the exact unique union, not outstanding forecasts.
-                if additional <= self.pool.max_bytes - state.bytes {
-                    let expires = Instant::now()
-                        .checked_add(self.pool.duration)
-                        .context("grace deadline overflow")?;
-                    for (&id, &size) in &contents {
-                        state.refs.entry(id).or_insert((size, 0)).1 += 1;
-                    }
-                    state.bytes += additional;
-                    state.results.push_back(ProtectedResult {
+            match self.try_commit(pending)? {
+                PublicationAttempt::Committed(expires) => return Ok((expires, self.waiting)),
+                PublicationAttempt::Wait { result, expires } => {
+                    pending = result;
+                    wait_for_change(
+                        &mut changed,
+                        deadline,
                         expires,
-                        contents,
-                        _lease: lease,
-                    });
-                    drop(state);
-                    return Ok((expires, self.waiting));
+                        check,
+                        "native artifact grace publication",
+                    )
+                    .await?;
                 }
+            }
+        }
+    }
+
+    fn try_commit(
+        &mut self,
+        (contents, lease): (Contents, ResultLease),
+    ) -> Result<PublicationAttempt> {
+        let outcome = self.pool.with_reaped(|state| -> Result<_> {
+            let mut additional = 0_u64;
+            for (&id, &size) in &contents {
+                if let Some(&(previous, count)) = state.refs.get(&id) {
+                    ensure!(
+                        previous == size && count < usize::MAX,
+                        "invalid grace content accounting"
+                    );
+                } else {
+                    additional = additional
+                        .checked_add(size)
+                        .context("grace bytes overflow")?;
+                }
+            }
+            // Exact publications charge only the unique union, not the
+            // outstanding forecasts. The pending lease pins its content.
+            if additional <= self.pool.max_bytes - state.bytes {
+                let expires = Instant::now()
+                    .checked_add(self.pool.duration)
+                    .context("grace deadline overflow")?;
+                for (&id, &size) in &contents {
+                    state.refs.entry(id).or_insert((size, 0)).1 += 1;
+                }
+                state.bytes += additional;
+                state.results.push_back(ProtectedResult {
+                    expires,
+                    contents,
+                    _lease: lease,
+                });
+                Ok(PublicationAttempt::Committed(expires))
+            } else {
                 if !self.waiting {
                     state.waiting_publishers += 1;
                     self.waiting = true;
                 }
-                drop(state);
+                Ok(PublicationAttempt::Wait {
+                    result: (contents, lease),
+                    expires: state.next_expiry(),
+                })
             }
-            ensure!(
-                started.elapsed() < timeout,
-                "native artifact grace publication timed out"
-            );
-            tokio::time::sleep(
-                Duration::from_millis(100).min(timeout.saturating_sub(started.elapsed())),
-            )
-            .await;
+        })?;
+        // A newly retained result can reduce another publisher's unique
+        // incremental charge, even if total protected bytes increased.
+        if matches!(outcome, PublicationAttempt::Committed(_)) {
+            self.pool.notify();
         }
+        Ok(outcome)
     }
+}
+
+enum PublicationAttempt {
+    Committed(Instant),
+    Wait {
+        result: (Contents, ResultLease),
+        expires: Option<Instant>,
+    },
 }
 
 impl Drop for Publication {
@@ -267,6 +383,7 @@ impl Drop for Publication {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .waiting_publishers -= 1;
+            self.pool.notify();
         }
     }
 }
@@ -279,6 +396,7 @@ impl Drop for GraceReservation {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .pending -= self.limit;
+            self.pool.notify();
         }
     }
 }
@@ -341,9 +459,10 @@ mod tests {
         let mut state = pool.state.lock().unwrap();
         assert_eq!(state.bytes, 4);
         assert_eq!(state.pending, 0);
-        state.reap(Instant::now() + Duration::from_secs(301));
+        let expired = state.reap(Instant::now() + Duration::from_secs(301));
         assert_eq!(state.bytes, 0);
         drop(state);
+        drop(expired);
         assert!(matches!(store.evict(a.key()?)?, Eviction::Removed { .. }));
         assert!(matches!(store.evict(b.key()?)?, Eviction::Removed { .. }));
         Ok(())
@@ -448,9 +567,10 @@ mod tests {
         assert_eq!(state.pending, 0);
         assert_eq!(state.waiting_publishers, 0);
         assert_eq!(state.results.len(), 1);
-        state.reap(Instant::now() + Duration::from_secs(301));
+        let expired = state.reap(Instant::now() + Duration::from_secs(301));
         assert_eq!(state.bytes, 0);
         drop(state);
+        drop(expired);
         assert!(pool.reserve(8)?.is_some());
         Ok(())
     }

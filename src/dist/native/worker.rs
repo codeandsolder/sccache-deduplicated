@@ -728,19 +728,9 @@ impl NativeCacheClient {
         // Reserve output headroom before staged inputs can consume it. Wait for
         // grace capacity without occupying a compiler slot.
         let output = if let Some((grace, predicted)) = grace {
-            let started = Instant::now();
-            let reservation = loop {
-                check()?;
-                if let Some(reservation) = grace.reserve(predicted)? {
-                    break reservation;
-                }
-                ensure!(
-                    started.elapsed() < policy.timeout,
-                    "native artifact grace admission timed out"
-                );
-                warm = false;
-                std::thread::sleep(Duration::from_millis(100));
-            };
+            let (reservation, waited) = crate::http_client::io_runtime()?
+                .block_on(grace.reserve_until(predicted, policy.timeout, check))?;
+            warm &= !waited;
             Some(OutputReservation {
                 grace: reservation,
                 budget: Some(store.reserve_staging(policy.max_result_bytes)?),
@@ -930,36 +920,24 @@ async fn prepare_worker_storage(
     let predicted = estimated_result_bytes
         .unwrap_or(policy.max_result_bytes)
         .clamp(1, policy.max_result_bytes);
-    let mut warm = true;
-    let reservation = if let Some(grace) = grace {
-        let mut reservation = {
-            let store = store.clone();
-            let grace = grace.clone();
-            tokio::task::spawn_blocking(move || {
-                grace.reap();
-                maintain_executor_space(&store)?;
-                grace.reserve(predicted)
-            })
-            .await??
-        };
-        let started = Instant::now();
-        warm = reservation.is_some();
-        while reservation.is_none() {
-            check()?;
-            ensure!(
-                started.elapsed() < policy.timeout,
-                "native artifact grace admission timed out"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            check()?;
-            let grace = grace.clone();
-            reservation = tokio::task::spawn_blocking(move || grace.reserve(predicted)).await??;
-        }
-        reservation
-    } else {
+    {
         let store = store.clone();
-        tokio::task::spawn_blocking(move || maintain_executor_space(&store)).await??;
-        None
+        let grace = grace.cloned();
+        tokio::task::spawn_blocking(move || {
+            if let Some(grace) = grace {
+                grace.reap();
+            }
+            maintain_executor_space(&store)
+        })
+        .await??;
+    }
+    let (reservation, warm) = if let Some(grace) = grace {
+        let (reservation, waited) = grace
+            .reserve_until(predicted, policy.timeout, check)
+            .await?;
+        (Some(reservation), !waited)
+    } else {
+        (None, true)
     };
     check()?;
     let store = store.clone();
