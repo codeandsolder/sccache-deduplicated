@@ -1082,7 +1082,7 @@ where
                 .map(|(path, digest)| (digest, path))
                 .collect();
             files.sort_unstable_by(|a, b| a.1.cmp(&b.1));
-            preprocessor_cache_entry.add_result(start_of_compilation, &key, files);
+            preprocessor_cache_entry.add_result(&key, files);
 
             if let Err(e) = storage
                 .put_preprocessor_cache_entry(&preprocessor_key, preprocessor_cache_entry)
@@ -2338,17 +2338,9 @@ fn gcc_program_search_fingerprint(
             }
         };
         digest.update(b"present");
-        for field in [
-            metadata.dev(),
-            metadata.ino(),
-            metadata.len(),
-            metadata.mode().into(),
-            metadata.mtime().cast_unsigned(),
-            metadata.mtime_nsec().cast_unsigned(),
-            metadata.ctime().cast_unsigned(),
-            metadata.ctime_nsec().cast_unsigned(),
-        ] {
-            digest.update(&field.to_le_bytes());
+        digest.update(&metadata.mode().to_le_bytes());
+        if metadata.is_file() {
+            digest.delimiter(Digest::reader_sync(fs::File::open(path)?)?.as_bytes());
         }
         Ok(metadata.is_dir())
     }
@@ -2361,7 +2353,7 @@ fn gcc_program_search_fingerprint(
         .split(|&byte| byte == b'\n')
         .find_map(|line| line.strip_prefix(b"install: "));
     let mut digest = Digest::new();
-    digest.delimiter(b"gcc-toolchain-helper-search-v2");
+    digest.delimiter(b"gcc-toolchain-helper-search-v3");
     for bytes in program_line
         .split(|&byte| byte == b':')
         .chain(installation_directory)
@@ -2435,7 +2427,9 @@ fn gcc_program_search_fingerprint_tracks_helper_changes() -> Result<()> {
     fs::write(dir.join("as"), b"assembler version 1")?;
     let with_assembler = fingerprint()?;
     assert_ne!(initial, with_assembler);
-    fs::write(dir.join("as"), b"assembler version 2 with new size")?;
+    let modified = fs::metadata(dir.join("as"))?.modified()?;
+    fs::write(dir.join("as"), b"assembler version 2")?;
+    fs::File::open(dir.join("as"))?.set_times(std::fs::FileTimes::new().set_modified(modified))?;
     let with_new_assembler = fingerprint()?;
     assert_ne!(with_assembler, with_new_assembler);
     fs::write(dir.join("ld"), b"linker")?;

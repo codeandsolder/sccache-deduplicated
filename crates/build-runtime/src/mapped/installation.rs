@@ -6,7 +6,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
+    fs::File,
     io::Write,
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},

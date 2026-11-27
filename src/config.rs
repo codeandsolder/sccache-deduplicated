@@ -266,15 +266,6 @@ pub struct AzureCacheConfig {
 pub struct PreprocessorCacheModeConfig {
     /// Whether to use preprocessor cache mode entirely
     pub use_preprocessor_cache_mode: bool,
-    /// If false (default), only compare header files by hashing their contents.
-    /// If true, will use size + ctime + mtime to check whether a file has changed.
-    /// See other flags below for more control over this behavior.
-    pub file_stat_matches: bool,
-    /// If true (default), uses the ctime (file status change on UNIX,
-    /// creation time on Windows) to check that a file has/hasn't changed.
-    /// Can be useful to disable when backdating modification times
-    /// in a controlled manner.
-    pub use_ctime_for_stat: bool,
     /// If true, ignore `__DATE__`, `__TIME__` and `__TIMESTAMP__` being present
     /// in the source code. Will speed up preprocessor cache mode,
     /// but can result in false positives.
@@ -291,8 +282,6 @@ impl Default for PreprocessorCacheModeConfig {
     fn default() -> Self {
         Self {
             use_preprocessor_cache_mode: false,
-            file_stat_matches: false,
-            use_ctime_for_stat: true,
             ignore_time_macros: false,
             skip_system_headers: false,
             hash_working_directory: true,

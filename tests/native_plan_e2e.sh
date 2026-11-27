@@ -1,20 +1,33 @@
 #!/usr/bin/env bash
-# Requires an already-configured managed sccache endpoint and the matching
-# cargo-ephemeral native-planner build. Never starts a new cache server.
 set -euo pipefail
-if (( $# != 2 )); then
-    echo "usage: $0 /absolute/path/to/sccache /absolute/path/to/cargo-planner" >&2
+if (( $# != 1 )); then
+    echo "usage: $0 /absolute/path/to/managed-native-sccache" >&2
     exit 2
 fi
 executor=$(realpath "$1")
-planner=$(realpath "$2")
 root=$(mktemp -d)
 trap 'rm -rf -- "$root"' EXIT
 cp -a "$(dirname "$0")/fixtures/native-plan/." "$root"
 cd "$root"
-"$executor" --execute-planner "$planner" --leased-intermediates -- build --native-build-plan --locked --offline
+"$executor" build --locked --offline
 test "$(./target/debug/native-plan-fixture)" = native-plan-ok
-"$executor" --execute-planner "$planner" --leased-intermediates -- build --native-build-plan --locked --offline
+"$executor" build --locked --offline
 test "$(./target/debug/native-plan-fixture)" = native-plan-ok
-"$executor" --execute-planner "$planner" --leased-intermediates -- check --native-build-plan --locked --offline --all-targets
-printf '%s\n' 'native-plan build, warm rebuild, and all-target check passed'
+"$executor" check --locked --offline --all-targets
+# Same-length rewrite while explicitly restoring the original mtime.
+# The build must derive a different result solely from content changes.
+cp -p src/main.rs "$root/reference"
+sed -i 's/native-plan-ok/native-plan-OK/' src/main.rs
+touch -r "$root/reference" src/main.rs
+"$executor" build --locked --offline
+test "$(./target/debug/native-plan-fixture)" = native-plan-OK
+mv "$root/reference" src/main.rs
+"$executor" build --locked --offline
+test "$(./target/debug/native-plan-fixture)" = native-plan-ok
+# Generate a new lock with no external Cargo executable.
+rm Cargo.lock
+"$executor" build --offline
+test -s Cargo.lock
+"$executor" build --locked --offline
+test "$(./target/debug/native-plan-fixture)" = native-plan-ok
+printf '%s\n' 'native build, warm rebuild, all-target check, content invalidation and native lock generation passed'

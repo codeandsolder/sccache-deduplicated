@@ -83,10 +83,7 @@ size = 7516192768 # 7 GiBytes
 [cache.disk.preprocessor_cache_mode]
 # Whether to use the preprocessor cache mode
 use_preprocessor_cache_mode = true
-# Whether to use file times to check for changes
-file_stat_matches = true
-# Whether to also use ctime (file status change) time to check for changes
-use_ctime_for_stat = true
+# Header freshness is always verified from contents.
 # Whether to ignore `__TIME__` when caching
 ignore_time_macros = false
 # Whether to skip (meaning not cache, only hash) system headers
