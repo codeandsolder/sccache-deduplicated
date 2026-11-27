@@ -1277,9 +1277,13 @@ impl Drop for AssignmentGuard {
     }
 }
 
-struct NoCapacity(usize);
+struct NoCapacity {
+    servers: usize,
+    saturated_native: bool,
+}
 
 struct CandidateSet {
+    saturated_native: bool,
     healthy: Vec<(ServerId, f64)>,
     retry: Vec<(ServerId, f64)>,
     predictions: BTreeMap<ServerId, placement::PlacementEstimate>,
@@ -1299,6 +1303,7 @@ fn collect_candidates(
     let mut healthy = Vec::new();
     let mut retry = Vec::new();
     let mut predictions = BTreeMap::new();
+    let mut saturated_native = false;
     for (&server_id, details) in servers {
         let compatible = match native_platform {
             Some(platform) => details.capabilities.native_platform == Some(platform),
@@ -1307,9 +1312,13 @@ fn collect_candidates(
         if !compatible {
             continue;
         }
+        let native_worker = native.is_some()
+            && details.cpu_capacity > 0.0
+            && details.capabilities.native_placement.is_some();
         let Some(weight) =
             admission_weight(details.compiler_demand(), details.cpu_capacity, job_slack)
         else {
+            saturated_native |= native_worker;
             continue;
         };
         let weight = if let (Some(inputs), Some(plan)) = (native_inputs, transfer_plan) {
@@ -1322,6 +1331,7 @@ fn collect_candidates(
                     .iter()
                     .filter_map(|(&id, inputs)| inputs.is_some().then_some(id)),
             ) {
+                saturated_native |= native_worker;
                 continue;
             }
             let learned = class.zip(native_platform).map(|(class, platform)| {
@@ -1358,6 +1368,7 @@ fn collect_candidates(
     }
 
     CandidateSet {
+        saturated_native,
         healthy,
         retry,
         predictions,
@@ -1462,12 +1473,16 @@ impl Scheduler {
             now,
         );
         let CandidateSet {
+            saturated_native,
             healthy,
             predictions,
             ..
         } = candidates;
         let Some(server_id) = selected else {
-            return Ok(Err(NoCapacity(servers.len())));
+            return Ok(Err(NoCapacity {
+                servers: servers.len(),
+                saturated_native,
+            }));
         };
         let server_details = servers.get_mut(&server_id).ok_or_else(|| {
             anyhow::anyhow!("selected worker disappeared while scheduler lock held")
@@ -1532,7 +1547,16 @@ impl Scheduler {
             let reservation =
                 match scheduler.reserve_job(&assignment, &network, &packages, assigned_at)? {
                     Ok(reservation) => reservation,
-                    Err(NoCapacity(count)) => {
+                    Err(NoCapacity {
+                        saturated_native: true,
+                        ..
+                    }) => {
+                        // This ticket remains unassigned. The native HTTP
+                        // service returns 503 and the origin retries within
+                        // its existing allocation deadline.
+                        return Err(sccache::build_runtime::NativeServiceBusy.into());
+                    }
+                    Err(NoCapacity { servers: count, .. }) => {
                         return Ok(Err(AllocJobResult::Fail {
                             msg: format!("Insufficient capacity across {count} available servers"),
                         }));
@@ -3593,17 +3617,44 @@ mod scheduler_tests {
                 .map(|job| &job.inputs),
             Some(&BTreeMap::from([(ContentId([1; 32]), 10)]))
         );
+        let saturated = Arc::clone(&scheduler)
+            .handle_alloc_native_job(
+                &AcceptAssign,
+                assignment.clone(),
+                &NetworkSnapshot::default(),
+                Default::default(),
+            )
+            .await;
+        assert!(
+            matches!(saturated, Err(error) if error.is::<sccache::build_runtime::NativeServiceBusy>())
+        );
+        // Incompatible platforms are not temporary queue pressure.
+        let missing =
+            native_test_assignment(ContentId::of(b"no compatible platform"), BTreeMap::new())?;
         assert!(matches!(
             Arc::clone(&scheduler)
                 .handle_alloc_native_job(
                     &AcceptAssign,
-                    assignment,
+                    missing,
                     &NetworkSnapshot::default(),
-                    Default::default(),
+                    Default::default()
                 )
                 .await?,
             AllocJobResult::Fail { .. }
         ));
+        scheduler.handle_update_job_state(job_alloc.job_id, a, JobState::Complete)?;
+        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
+            .handle_alloc_native_job(
+                &AcceptAssign,
+                assignment,
+                &NetworkSnapshot::default(),
+                Default::default(),
+            )
+            .await?
+        else {
+            bail!("native worker did not become available after completion");
+        };
+        assert_eq!(job_alloc.server_id, a);
         let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
             .handle_alloc_job(&AcceptAssign, test_toolchain('a'))
             .await?
