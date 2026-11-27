@@ -140,7 +140,7 @@ fn AdmissionPanel(
                     let rows = [("5 minutes",Some(300)), ("15 minutes",Some(900)), ("Since scheduler start",None)];
                     rows.into_iter().map(|(name,seconds)| {
                         let values = latest.get().and_then(|(now,current)| {
-                            seconds.map_or_else(|| Some((0,current)), |seconds| history.with(|history| admission_window(history,now,current,seconds)))
+                            seconds.map_or(Some((0,current)), |seconds| history.with(|history| admission_window(history,now,current,seconds)))
                         });
                         view! {
                             <tr><td>{name}<small>{values.filter(|(elapsed,_)| *elapsed != 0).map(|(elapsed,_)| format!("{elapsed} s observed"))}</small></td>
@@ -323,7 +323,7 @@ where
     T: Send + Sync + 'static,
     F: Fn(&T) -> String + Send + Sync + Copy + 'static,
 {
-    move || row.with(|value| value.as_ref().map_or_else(String::new, &format))
+    move || row.with(|value| value.as_ref().map_or_else(String::new, format))
 }
 
 fn native_text(
@@ -331,7 +331,7 @@ fn native_text(
     format: impl Fn(&crate::NativeWorker) -> String + Send + Sync + Copy + 'static,
 ) -> impl Fn() -> String + Send + Sync + Copy + 'static {
     row_text(worker, move |worker| {
-        worker.native.as_ref().map_or_else(|| "—".into(), &format)
+        worker.native.as_ref().map_or_else(|| "—".into(), format)
     })
 }
 
