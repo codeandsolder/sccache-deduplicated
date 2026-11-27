@@ -195,28 +195,42 @@ impl NativeStore {
 
     /// Persist only dirty usage records in one bounded write transaction,
     /// avoiding synchronous database writes on cache hits.
-    ///
     /// # Errors
     /// Returns an error if the usage index is unavailable.
     pub fn checkpoint_usage(&self) -> Result<()> {
         let _mutation = self.inner.lock_mutations()?;
-        let mut pins = self.inner.lock_pins()?;
-        persist_usage(&self.inner.db, &mut pins)
+        self.checkpoint_usage_locked(false)
+    }
+
+    fn checkpoint_usage_locked(&self, only_due: bool) -> Result<()> {
+        // Mutation exclusion prevents eviction from removing these roots
+        // while their checkpoint is in progress. Readers may still touch
+        // them; keep any newer usage dirty for the next checkpoint.
+        let records = {
+            let pins = self.inner.lock_pins()?;
+            if only_due && !pins.usage_checkpoint_due() {
+                return Ok(());
+            }
+            pins.usage_snapshot()
+        };
+        if !records.is_empty() {
+            persist_usage(&self.inner.db, &records)?;
+            self.inner.lock_pins()?.finish_usage_checkpoint(&records);
+        }
+        Ok(())
     }
 
     fn checkpoint_usage_if_due(&self) -> Result<()> {
-        const INTERVAL: Duration = Duration::from_secs(60);
-        let due = {
-            let pins = self.inner.lock_pins()?;
-            !pins.dirty_usage.is_empty()
-                && pins
-                    .last_usage_checkpoint
-                    .is_none_or(|last| last.elapsed() >= INTERVAL)
-        };
-        if due {
-            self.checkpoint_usage()?;
+        if !self.inner.lock_pins()?.usage_checkpoint_due() {
+            return Ok(());
         }
-        Ok(())
+        // Maintenance is opportunistic. A concurrent publication or
+        // checkpoint can finish before the next maintenance pass.
+        match self.inner.mutations.try_lock() {
+            Ok(_mutation) => self.checkpoint_usage_locked(true),
+            Err(TryLockError::WouldBlock) => Ok(()),
+            Err(TryLockError::Poisoned(_)) => Err(anyhow!("native store mutation lock poisoned")),
+        }
     }
 
     /// Reclaim queued garbage before considering eviction. Keep leases intact
@@ -494,6 +508,30 @@ fn reuse_utility(usage: Option<&UsageRecord>, bytes: u64, now: u64) -> u64 {
 }
 
 impl super::Pins {
+    fn usage_checkpoint_due(&self) -> bool {
+        const INTERVAL: Duration = Duration::from_secs(60);
+        !self.dirty_usage.is_empty()
+            && self
+                .last_usage_checkpoint
+                .is_none_or(|last| last.elapsed() >= INTERVAL)
+    }
+
+    pub(super) fn usage_snapshot(&self) -> Vec<(Root, UsageRecord)> {
+        self.dirty_usage
+            .iter()
+            .filter_map(|root| self.usage.get(root).map(|record| (*root, *record)))
+            .collect()
+    }
+
+    fn finish_usage_checkpoint(&mut self, records: &[(Root, UsageRecord)]) {
+        for (root, record) in records {
+            if self.usage.get(root) == Some(record) {
+                self.dirty_usage.remove(root);
+            }
+        }
+        self.last_usage_checkpoint = Some(super::Instant::now());
+    }
+
     pub(super) fn touch(&mut self, root: Root) {
         let record = self.usage.entry(root).or_default();
         record.hits = record.hits.saturating_add(1);
