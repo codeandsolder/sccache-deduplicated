@@ -552,6 +552,9 @@ impl NativeStore {
         read: &ReadTransaction,
         mut pins: MutexGuard<'_, Pins>,
     ) -> Result<Option<TreeLease>> {
+        if pins.evicting == Some(Root::Tree(id)) {
+            return Ok(None);
+        }
         let trees = read.open_table(TREES)?;
         let Some(record) = trees.get(&id.0)? else {
             return Ok(None);
@@ -589,10 +592,9 @@ impl NativeStore {
         #[cfg(target_os = "linux")]
         self.drop_idle_views(Some(id))?;
         let _mutation = self.inner.lock_mutations()?;
-        let mut pins = self.inner.lock_pins()?;
-        if pins.trees.contains_key(&id) {
+        let Some(mut claim) = self.inner.claim_eviction(Root::Tree(id))? else {
             return Ok(Eviction::Pinned);
-        }
+        };
         let write = self.inner.db.begin_write()?;
         let bytes = {
             let mut trees = write.open_table(TREES)?;
@@ -636,9 +638,8 @@ impl NativeStore {
         };
         write.open_table(USAGE)?.remove(&Root::Tree(id).key())?;
         write.commit()?;
-        pins.usage.remove(&Root::Tree(id));
-        pins.dirty_usage.remove(&Root::Tree(id));
-        drop(pins);
+        claim.committed = true;
+        drop(claim);
         Ok(Eviction::Removed {
             unreferenced_logical_bytes: bytes,
         })

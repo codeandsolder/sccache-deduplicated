@@ -562,6 +562,7 @@ struct Pins {
     actions: BTreeMap<ActionKey, usize>,
     trees: BTreeMap<crate::TreeId, usize>,
     blobs: BTreeMap<ContentId, usize>,
+    evicting: Option<space::Root>,
     usage: BTreeMap<space::Root, space::UsageRecord>,
     dirty_usage: BTreeSet<space::Root>,
     last_usage_checkpoint: Option<Instant>,
@@ -751,6 +752,36 @@ impl Publication {
     }
 }
 
+// A mutation transaction excludes other evictions and refreshes, but
+// unrelated readers should never wait for the removal transaction. Only
+// this root stops accepting new delivery pins until the claim is released.
+struct EvictionClaim<'a> {
+    inner: &'a Inner,
+    root: space::Root,
+    committed: bool,
+}
+
+impl Drop for EvictionClaim<'_> {
+    fn drop(&mut self) {
+        match self.inner.lock_pins() {
+            Ok(mut pins) => {
+                if self.committed {
+                    pins.usage.remove(&self.root);
+                    pins.dirty_usage.remove(&self.root);
+                }
+                pins.evicting = None;
+            }
+            Err(error) => log::error!("could not release native eviction claim: {error:#}"),
+        }
+    }
+}
+
+enum ResultPin {
+    Missing,
+    Changed,
+    Acquired,
+}
+
 impl Inner {
     fn lock_pins(&self) -> Result<MutexGuard<'_, Pins>> {
         self.pins
@@ -762,6 +793,28 @@ impl Inner {
         self.mutations
             .lock()
             .map_err(|_| anyhow!("native store mutation lock poisoned"))
+    }
+
+    fn claim_eviction(&self, root: space::Root) -> Result<Option<EvictionClaim<'_>>> {
+        let mut pins = self.lock_pins()?;
+        let pinned = match root {
+            space::Root::Action(action) => pins.actions.contains_key(&action),
+            space::Root::Tree(tree) => pins.trees.contains_key(&tree),
+        };
+        if pinned {
+            return Ok(None);
+        }
+        ensure!(
+            pins.evicting.is_none(),
+            "multiple concurrent native evictions"
+        );
+        pins.evicting = Some(root);
+        drop(pins);
+        Ok(Some(EvictionClaim {
+            inner: self,
+            root,
+            committed: false,
+        }))
     }
 
     fn blob_path(&self, id: ContentId) -> PathBuf {
@@ -1848,44 +1901,72 @@ impl NativeStore {
     /// # Errors
     /// Returns an error for corrupt metadata, missing blobs or I/O failure.
     pub fn lookup(&self, action: ActionKey) -> Result<Option<ResultLease>> {
+        loop {
+            let read = self.inner.db.begin_read()?;
+            let actions = read.open_table(ACTIONS)?;
+            let Some(encoded) = actions.get(&action.0)? else {
+                return Ok(None);
+            };
+            let record: ActionRecord = encoding().deserialize(encoded.value())?;
+            ensure!(
+                record.fingerprint.key()? == action,
+                "invalid indexed action fingerprint"
+            );
+            let results = read.open_table(RESULTS)?;
+            let manifest = results
+                .get(&record.result.0)?
+                .context("missing indexed result")?;
+            let manifest: ResultManifest = encoding().deserialize(manifest.value())?;
+            ensure!(
+                manifest.id()? == record.result,
+                "invalid indexed result manifest"
+            );
+            let blobs = manifest.blobs()?;
+            // Decode, hash and validate immutable metadata outside the pin
+            // mutex. A refresh may change its action mapping while we work.
+            match self.pin_current_result(action, encoded.value(), &blobs)? {
+                ResultPin::Missing => return Ok(None),
+                ResultPin::Changed => continue,
+                ResultPin::Acquired => {}
+            }
+            let lease = ResultLease {
+                inner: Arc::clone(&self.inner),
+                action,
+                manifest,
+                blobs,
+            };
+            if !self.blobs_present(&lease.blobs)? {
+                return Ok(None);
+            }
+            self.inner.lock_pins()?.touch(space::Root::Action(action));
+            return Ok(Some(lease));
+        }
+    }
+
+    fn pin_current_result(
+        &self,
+        action: ActionKey,
+        encoded: &[u8],
+        blobs: &BTreeMap<ContentId, u64>,
+    ) -> Result<ResultPin> {
         let mut pins = self.inner.lock_pins()?;
+        if pins.evicting == Some(space::Root::Action(action)) {
+            return Ok(ResultPin::Missing);
+        }
         let read = self.inner.db.begin_read()?;
         let actions = read.open_table(ACTIONS)?;
-        let Some(record) = actions.get(&action.0)? else {
-            return Ok(None);
+        let Some(current) = actions.get(&action.0)? else {
+            return Ok(ResultPin::Missing);
         };
-        let record: ActionRecord = encoding().deserialize(record.value())?;
-        ensure!(
-            record.fingerprint.key()? == action,
-            "invalid indexed action fingerprint"
-        );
-        let results = read.open_table(RESULTS)?;
-        let manifest = results
-            .get(&record.result.0)?
-            .context("missing indexed result")?;
-        let manifest: ResultManifest = encoding().deserialize(manifest.value())?;
-        ensure!(
-            manifest.id()? == record.result,
-            "invalid indexed result manifest"
-        );
-        let blobs = manifest.blobs()?;
-        // A refresh can retire the old result while its delivery lease
-        // survives. Pin its content independently of the action mapping.
-        pins.pin_result(action, &blobs)?;
-        drop(pins);
-        let lease = ResultLease {
-            inner: Arc::clone(&self.inner),
-            action,
-            manifest,
-            blobs,
-        };
-        // Refresh can retire this result, but the provisional content pins
-        // above keep its closure alive throughout physical validation.
-        if !self.blobs_present(&lease.blobs)? {
-            return Ok(None);
+        if current.value() != encoded {
+            return Ok(ResultPin::Changed);
         }
-        self.inner.lock_pins()?.touch(space::Root::Action(action));
-        Ok(Some(lease))
+        // The current mapping was confirmed while excluding GC candidate
+        // selection. Even if a refresh now retires it, its content is pinned
+        // before any collector can select the newly pending files.
+        pins.pin_result(action, blobs)?;
+        drop(pins);
+        Ok(ResultPin::Acquired)
     }
 
     /// Find all actions that yielded the same complete result, retaining their
@@ -1919,10 +2000,9 @@ impl NativeStore {
     /// Returns an error for inconsistent metadata or storage failures.
     pub fn evict(&self, action: ActionKey) -> Result<Eviction> {
         let _mutation = self.inner.lock_mutations()?;
-        let mut pins = self.inner.lock_pins()?;
-        if pins.actions.contains_key(&action) {
+        let Some(mut claim) = self.inner.claim_eviction(space::Root::Action(action))? else {
             return Ok(Eviction::Pinned);
-        }
+        };
         let write = self.inner.db.begin_write()?;
         let unreferenced_logical_bytes;
         {
@@ -1956,10 +2036,8 @@ impl NativeStore {
         // Durable deletion intent precedes physical deletion. The collector
         // can batch work and retry failures without scanning the live store.
         write.commit()?;
-        // Lookup and eviction must serialize until removal is committed.
-        pins.usage.remove(&space::Root::Action(action));
-        pins.dirty_usage.remove(&space::Root::Action(action));
-        drop(pins);
+        claim.committed = true;
+        drop(claim);
         Ok(Eviction::Removed {
             unreferenced_logical_bytes,
         })
