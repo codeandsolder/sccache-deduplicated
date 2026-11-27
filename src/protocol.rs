@@ -150,6 +150,18 @@ pub enum TransferRequest {
         path: String,
         offline: bool,
     },
+    IntermediateImpactLookup {
+        session: crate::build_runtime::wire::Ticket,
+        scope: crate::build_runtime::ContentId,
+    },
+    IntermediateImpactBegin {
+        session: crate::build_runtime::wire::Ticket,
+        scope: crate::build_runtime::ContentId,
+        expected: Option<crate::build_runtime::TreeId>,
+        blob: crate::build_runtime::BlobRef,
+    },
+    IntermediateImpactWrite(#[serde(with = "serde_bytes")] Vec<u8>),
+    IntermediateImpactCommit,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -169,6 +181,9 @@ pub enum TransferReply {
     WorkerLabel(String),
     Ack,
     IntermediateOpened(crate::build_runtime::wire::Ticket),
+    ImpactHead(Option<crate::build_runtime::wire::ImpactHead>),
+    ImpactUploadStarted(usize),
+    ImpactUpdated(crate::build_runtime::wire::ImpactUpdate),
 }
 
 impl TransferRequest {
@@ -180,6 +195,10 @@ impl TransferRequest {
                 | Self::IntermediateRead { .. }
                 | Self::IntermediateChunk
                 | Self::IntermediatePackage { .. }
+                | Self::IntermediateImpactLookup { .. }
+                | Self::IntermediateImpactBegin { .. }
+                | Self::IntermediateImpactWrite(_)
+                | Self::IntermediateImpactCommit
         )
     }
 }
@@ -207,6 +226,10 @@ impl std::fmt::Debug for TransferRequest {
             Self::IntermediateRead { .. } => "IntermediateRead",
             Self::IntermediateChunk => "IntermediateChunk",
             Self::IntermediatePackage { .. } => "IntermediatePackage",
+            Self::IntermediateImpactLookup { .. } => "IntermediateImpactLookup",
+            Self::IntermediateImpactBegin { .. } => "IntermediateImpactBegin",
+            Self::IntermediateImpactWrite(_) => "IntermediateImpactWrite",
+            Self::IntermediateImpactCommit => "IntermediateImpactCommit",
             Self::WriteChunk(_) => "WriteChunk",
             Self::FinishWrite => "FinishWrite",
             Self::ReadChunk => "ReadChunk",
@@ -230,6 +253,9 @@ impl std::fmt::Debug for TransferReply {
             Self::WorkerLabel(_) => f.write_str("WorkerLabel"),
             Self::Ack => f.write_str("Ack"),
             Self::IntermediateOpened(_) => f.write_str("IntermediateOpened"),
+            Self::ImpactHead(_) => f.write_str("ImpactHead"),
+            Self::ImpactUploadStarted(_) => f.write_str("ImpactUploadStarted"),
+            Self::ImpactUpdated(_) => f.write_str("ImpactUpdated"),
         }
     }
 }

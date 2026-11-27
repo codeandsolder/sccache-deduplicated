@@ -8,6 +8,7 @@ pub struct NativeResultSession {
     client: NativeCacheClient,
     group: Ticket,
     renewals: Option<Renewals>,
+    interval: Duration,
     blobs: Mutex<BTreeMap<ContentId, u64>>,
 }
 
@@ -18,6 +19,7 @@ impl NativeResultSession {
             client,
             group,
             renewals: None,
+            interval,
             blobs: Mutex::new(BTreeMap::new()),
         };
         let renewals = Renewals::start_retention(session.client.clone(), interval)?;
@@ -88,6 +90,30 @@ impl NativeResultSession {
             self.record_blobs(package.manifest.blobs()?)?;
         }
         Ok(package)
+    }
+
+    pub fn retain_impact_head(
+        &self,
+        scope: ContentId,
+    ) -> Result<Option<crate::build_runtime::wire::ImpactHead>> {
+        self.check()?;
+        let head = self.client.retain_impact_head(self.group, scope)?;
+        if let Some(head) = head {
+            self.record_blobs(BTreeMap::from([(head.blob.id, head.blob.size)]))?;
+        }
+        Ok(head)
+    }
+
+    pub fn publish_impact_head(
+        &self,
+        scope: ContentId,
+        expected: Option<crate::build_runtime::TreeId>,
+        blob: BlobRef,
+        file: File,
+    ) -> Result<crate::build_runtime::wire::ImpactUpdate> {
+        self.check()?;
+        self.client
+            .publish_impact_head(self.group, scope, expected, blob, file, self.interval)
     }
 
     pub fn read(&self, blob: BlobRef) -> Result<File> {

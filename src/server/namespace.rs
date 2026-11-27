@@ -96,6 +96,17 @@ struct Allocation {
     ready: bool,
 }
 
+#[cfg(all(feature = "dist-client", target_os = "linux"))]
+struct ImpactUpload {
+    group: std::sync::Arc<crate::dist::native::result_session::NativeResultSession>,
+    scope: crate::build_runtime::ContentId,
+    expected: Option<crate::build_runtime::TreeId>,
+    blob: crate::build_runtime::BlobRef,
+    remaining: u64,
+    hash: blake3::Hasher,
+    file: tokio::fs::File,
+}
+
 pub(super) struct TransferSession {
     state: Transfer,
     chunk_bytes: usize,
@@ -117,6 +128,8 @@ pub(super) struct TransferSession {
     intermediate: Option<std::sync::Arc<crate::dist::native::result_session::NativeResultSession>>,
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
     intermediate_read: Option<(tokio::fs::File, u64)>,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    impact_upload: Option<ImpactUpload>,
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
     uid: u32,
 }
@@ -147,6 +160,8 @@ impl TransferSession {
             intermediate: None,
             #[cfg(all(feature = "dist-client", target_os = "linux"))]
             intermediate_read: None,
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            impact_upload: None,
             #[cfg(all(feature = "dist-client", target_os = "linux"))]
             uid: 0,
         }
@@ -299,6 +314,73 @@ impl TransferSession {
                 }
                 Ok(TransferReply::ReadStarted(Some(size)))
             }
+            TransferRequest::IntermediateImpactLookup { session, scope } => {
+                let group = client.intermediate(uid, session)?;
+                let head =
+                    tokio::task::spawn_blocking(move || group.retain_impact_head(scope)).await??;
+                Ok(TransferReply::ImpactHead(head))
+            }
+            TransferRequest::IntermediateImpactBegin {
+                session,
+                scope,
+                expected,
+                blob,
+            } => {
+                ensure!(self.impact_upload.is_none(), "impact upload already active");
+                ensure!(
+                    blob.size > 0 && blob.size <= client.namespace_policy().max_result_bytes,
+                    "invalid impact record size"
+                );
+                let group = client.intermediate(uid, session)?;
+                let file = tokio::fs::File::from_std(tempfile::tempfile()?);
+                self.impact_upload = Some(ImpactUpload {
+                    group,
+                    scope,
+                    expected,
+                    blob,
+                    remaining: blob.size,
+                    hash: blake3::Hasher::new(),
+                    file,
+                });
+                Ok(TransferReply::ImpactUploadStarted(self.chunk_bytes))
+            }
+            TransferRequest::IntermediateImpactWrite(bytes) => {
+                let mut upload = self
+                    .impact_upload
+                    .take()
+                    .context("no impact upload active")?;
+                let count = u64::try_from(bytes.len())?;
+                ensure!(
+                    count > 0 && bytes.len() <= self.chunk_bytes && count <= upload.remaining,
+                    "invalid impact upload chunk"
+                );
+                upload.file.write_all(&bytes).await?;
+                upload.hash.update(&bytes);
+                upload.remaining -= count;
+                self.impact_upload = Some(upload);
+                Ok(TransferReply::Ack)
+            }
+            TransferRequest::IntermediateImpactCommit => {
+                let upload = self
+                    .impact_upload
+                    .take()
+                    .context("no impact upload active")?;
+                ensure!(
+                    upload.remaining == 0 && upload.hash.finalize().as_bytes() == &upload.blob.id.0,
+                    "incomplete or corrupt impact record"
+                );
+                let file = rewind_file(upload.file).await?;
+                let updated = tokio::task::spawn_blocking(move || {
+                    upload.group.publish_impact_head(
+                        upload.scope,
+                        upload.expected,
+                        upload.blob,
+                        file,
+                    )
+                })
+                .await??;
+                Ok(TransferReply::ImpactUpdated(updated))
+            }
             TransferRequest::IntermediateChunk => {
                 let (file, remaining) = self
                     .intermediate_read
@@ -391,6 +473,7 @@ impl TransferSession {
         {
             self.native_exchange = None;
             self.intermediate_read = None;
+            self.impact_upload = None;
         }
         #[cfg(feature = "dist-client")]
         {

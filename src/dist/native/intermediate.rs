@@ -35,6 +35,95 @@ pub struct Content {
 }
 
 impl Content {
+    pub fn lookup_impact_head(
+        &self,
+        scope: crate::build_runtime::ContentId,
+    ) -> Result<Option<(crate::build_runtime::wire::ImpactHead, File)>> {
+        let TransferReply::ImpactHead(head) =
+            connection()?.transfer(TransferRequest::IntermediateImpactLookup {
+                session: self.session,
+                scope,
+            })?
+        else {
+            anyhow::bail!("unexpected impact lookup reply");
+        };
+        let Some(head) = head else {
+            return Ok(None);
+        };
+        let mut file = tempfile::tempfile()?;
+        fetch_retained(
+            IntermediateReference {
+                session: self.session,
+                blob: head.blob,
+            },
+            &mut file,
+        )?;
+        file.rewind()?;
+        let mut hash = blake3::Hasher::new();
+        std::io::copy(&mut file, &mut hash)?;
+        ensure!(
+            file.metadata()?.len() == head.blob.size
+                && hash.finalize().as_bytes() == &head.blob.id.0,
+            "invalid retained impact record"
+        );
+        file.rewind()?;
+        Ok(Some((head, file)))
+    }
+
+    pub fn publish_impact_head(
+        &self,
+        scope: crate::build_runtime::ContentId,
+        expected: Option<crate::build_runtime::TreeId>,
+        mut file: File,
+    ) -> Result<crate::build_runtime::wire::ImpactUpdate> {
+        use std::io::Read as _;
+        file.rewind()?;
+        let mut hash = blake3::Hasher::new();
+        let size = std::io::copy(&mut file, &mut hash)?;
+        let blob = crate::build_runtime::BlobRef {
+            id: crate::build_runtime::ContentId(*hash.finalize().as_bytes()),
+            size,
+        };
+        file.rewind()?;
+        let mut connection = connection()?;
+        let TransferReply::ImpactUploadStarted(chunk_bytes) =
+            connection.transfer(TransferRequest::IntermediateImpactBegin {
+                session: self.session,
+                scope,
+                expected,
+                blob,
+            })?
+        else {
+            anyhow::bail!("unexpected impact upload reply");
+        };
+        ensure!(
+            chunk_bytes > 0 && chunk_bytes <= crate::protocol::TRANSFER_CHUNK_BYTES,
+            "invalid impact upload chunk limit"
+        );
+        let mut buffer = vec![0; chunk_bytes];
+        let mut remaining = size;
+        while remaining > 0 {
+            let count = usize::try_from(remaining.min(chunk_bytes as u64))?;
+            file.read_exact(&mut buffer[..count])?;
+            ensure!(
+                matches!(
+                    connection.transfer(TransferRequest::IntermediateImpactWrite(
+                        buffer[..count].to_vec()
+                    ))?,
+                    TransferReply::Ack
+                ),
+                "unexpected impact upload acknowledgement"
+            );
+            remaining -= count as u64;
+        }
+        let TransferReply::ImpactUpdated(updated) =
+            connection.transfer(TransferRequest::IntermediateImpactCommit)?
+        else {
+            anyhow::bail!("unexpected impact commit reply");
+        };
+        Ok(updated)
+    }
+
     fn register_package(&self, package: &crate::build_runtime::RetainedPackage) -> Result<()> {
         let blobs = package.manifest.blobs()?;
         let mut packages = self
