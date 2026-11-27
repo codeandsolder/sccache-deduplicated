@@ -139,6 +139,8 @@ thirtyfour = "0.38"
 # Cargo unifies this feature with all Wreq/TLS users in the same graph.
 [target.'cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))'.dependencies]
 wreq = { workspace = true, optional = true, features = ["static-cxx-runtime"] }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "e40a202c3218fa4fc5adcdf01b55082be2c91e9f", optional = true, features = ["static-cxx-runtime"] }
+jsonwebtoken-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "c94b59be27af2bcd8531cc005fd1ea6fdd281bcb", optional = true, features = ["static-cxx-runtime"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["net", "process"], optional = true }
