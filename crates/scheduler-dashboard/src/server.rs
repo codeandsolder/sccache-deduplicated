@@ -27,6 +27,7 @@ use crate::{
 
 mod broadcast;
 mod metrics;
+pub(crate) mod traces;
 
 #[derive(Clone)]
 pub(crate) struct DashboardState {
@@ -116,6 +117,7 @@ pub fn spawn(
     assets: &Path,
     metrics_url: Option<&str>,
     metrics_ingress_host: Option<&str>,
+    traces_url: Option<&str>,
     snapshot: impl Fn() -> Result<Snapshot> + Send + 'static,
     telemetry: impl Fn() -> Option<NativeTelemetry> + Send + 'static,
     wake: std::sync::mpsc::Receiver<()>,
@@ -139,6 +141,7 @@ pub fn spawn(
         );
     }
     let metrics = metrics::MetricsService::new(metrics_url, metrics_ingress_host)?;
+    let traces = traces::TraceService::new(traces_url)?;
     let listener = TcpListener::bind(address).context("bind scheduler dashboard")?;
     let address = listener.local_addr()?;
     listener.set_nonblocking(true)?;
@@ -152,7 +155,7 @@ pub fn spawn(
         .spawn(move || {
             sample_loop(&status_state, snapshot, telemetry, &wake);
         })?;
-    let router = router(state, metrics, assets);
+    let router = router(state, metrics, traces, assets);
     std::thread::Builder::new()
         .name("scheduler-dashboard-http".into())
         .spawn(move || {
@@ -206,7 +209,12 @@ fn sample_loop(
     }
 }
 
-fn router(state: DashboardState, metrics: metrics::MetricsService, assets: &Path) -> Router {
+fn router(
+    state: DashboardState,
+    metrics: metrics::MetricsService,
+    traces: traces::TraceService,
+    assets: &Path,
+) -> Router {
     let _ = any_spawner::Executor::init_tokio();
     let ssr_state = state.clone();
     let api_state = state.clone();
@@ -218,8 +226,20 @@ fn router(state: DashboardState, metrics: metrics::MetricsService, assets: &Path
         move || provide_context(ssr_state.clone()),
         move || crate::app::shell(options.clone()),
     );
+    let trace_rpc = move |request: Request| {
+        let traces = traces.clone();
+        async move {
+            leptos_axum::handle_server_fns_with_context(
+                move || provide_context(traces.clone()),
+                request,
+            )
+            .await
+        }
+    };
     Router::new()
         .route("/", get(render))
+        .route("/api/trace_search", post(trace_rpc.clone()))
+        .route("/api/trace_detail", post(trace_rpc))
         .route(
             "/api/snapshot",
             post(move |request: Request| {
@@ -399,7 +419,12 @@ mod tests {
         let metrics = metrics::MetricsService::new(None, None)?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
-        let router = router(state.clone(), metrics, Path::new("."));
+        let router = router(
+            state.clone(),
+            metrics,
+            traces::TraceService::new(None)?,
+            Path::new("."),
+        );
         let server = tokio::spawn(async move { axum::serve(listener, router).await });
         let client = wreq::Client::builder()
             .no_proxy()

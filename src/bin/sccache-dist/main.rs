@@ -638,6 +638,7 @@ fn start_scheduler(config: scheduler_config::Config) -> Result<i32> {
         job_slack,
         native_cache,
         local_worker,
+        traces,
     } = config;
 
     let check_client_auth: Box<dyn dist::http::ClientAuthCheck> = match client_auth {
@@ -694,6 +695,7 @@ fn start_scheduler(config: scheduler_config::Config) -> Result<i32> {
         bail!("scheduler maintenance_drain_file must be absolute")
     }
     daemonize(&[])?;
+    sccache::latency_trace::configure(traces.as_ref())?;
     info!(
         "Distributed scheduler job slack: static={} percent={}%",
         job_slack.static_jobs, job_slack.percent
@@ -777,7 +779,9 @@ fn start_worker(
         toolchain_cache_size,
         toolchain_archive_sources,
         native_worker,
+        traces,
     } = config;
+    sccache::latency_trace::configure(traces.as_ref())?;
 
     let builder: Option<Box<dyn dist::BuilderIncoming>> = match builder {
         server_config::BuilderType::Native => None,
@@ -3148,6 +3152,7 @@ mod scheduler_tests {
             TreeTimestamp, wire::Ticket,
         };
         Ok(NativeAssignment {
+            trace: None,
             ticket: Ticket([42; 32]),
             input_blobs,
             estimated_result_bytes: None,

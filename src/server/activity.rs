@@ -1,7 +1,10 @@
 //! Observable compile-request lifetimes. Heartbeats prove transport liveness;
 //! only actual phase transitions reset the phase deadline.
 
-use crate::protocol::{Compile, CompileIdentity};
+use crate::{
+    latency_trace::{LatencySpan, TraceContext, nanos, unix_nanos},
+    protocol::{Compile, CompileFinished, CompileIdentity, NativeBuildSource},
+};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -89,6 +92,207 @@ pub enum CompileOwner {
     Namespace,
 }
 
+const MAX_TRACE_INTERVALS: usize = 128;
+
+impl Phase {
+    const fn trace_name(self) -> &'static str {
+        match self {
+            Self::DetectCompiler => "detect_compiler",
+            Self::ParseArguments => "parse_arguments",
+            Self::ResolveDistribution => "resolve_distribution",
+            Self::HashInputs => "hash_inputs",
+            Self::CacheLookup => "cache_lookup",
+            Self::RestoreOutputs => "restore_outputs",
+            Self::PlanCompile => "plan_compile",
+            Self::IdentifyToolchain => "identify_toolchain",
+            Self::AllocateWorker => "allocate_worker",
+            Self::UploadToolchain => "upload_toolchain",
+            Self::StageInputs => "stage_inputs",
+            Self::RunDistributed => "run_distributed",
+            Self::LocalCompile => "local_compile",
+            Self::PublishOutputs => "publish_outputs",
+            Self::PackResult => "pack_result",
+            Self::RecordResult => "record_result",
+            Self::WriteCache => "write_cache",
+            Self::SendReply => "send_reply",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceOutcome {
+    Hit,
+    Miss,
+    Local,
+    Worker,
+    Uncacheable,
+    Success,
+    Failed,
+    Cancelled,
+    Abandoned,
+}
+
+impl TraceOutcome {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Local => "local",
+            Self::Worker => "worker",
+            Self::Uncacheable => "uncacheable",
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    const fn error(self) -> bool {
+        matches!(self, Self::Failed | Self::Cancelled | Self::Abandoned)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct Transition {
+    phase: Phase,
+    offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum IntervalKind {
+    JobserverWait,
+    CompilerChild,
+}
+
+impl IntervalKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::JobserverWait => "jobserver_wait",
+            Self::CompilerChild => "compiler_child",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct Interval {
+    kind: IntervalKind,
+    start: u64,
+    end: u64,
+}
+
+/// Complete, bounded history from the process that owns the compilation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TraceHistory {
+    start: u64,
+    elapsed: u64,
+    transitions: Vec<Transition>,
+    intervals: Vec<Interval>,
+    omitted_transitions: u64,
+    omitted_intervals: u64,
+    outcome: Option<TraceOutcome>,
+    action: Option<crate::build_runtime::ActionKey>,
+}
+
+impl TraceHistory {
+    pub(crate) fn new() -> Self {
+        Self {
+            start: unix_nanos(),
+            elapsed: 0,
+            transitions: vec![Transition {
+                phase: Phase::DetectCompiler,
+                offset: 0,
+            }],
+            intervals: Vec::new(),
+            omitted_transitions: 0,
+            omitted_intervals: 0,
+            outcome: None,
+            action: None,
+        }
+    }
+
+    fn transition(&mut self, phase: Phase, offset: u64) {
+        if self.transitions.len() < MAX_TRACE_INTERVALS {
+            self.transitions.push(Transition { phase, offset });
+        } else {
+            self.omitted_transitions = self.omitted_transitions.saturating_add(1);
+        }
+    }
+
+    fn interval(&mut self, kind: IntervalKind, start: u64, end: u64) {
+        if self.intervals.len() < MAX_TRACE_INTERVALS {
+            self.intervals.push(Interval { kind, start, end });
+        } else {
+            self.omitted_intervals = self.omitted_intervals.saturating_add(1);
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.transitions.len() <= MAX_TRACE_INTERVALS
+            && self.intervals.len() <= MAX_TRACE_INTERVALS
+            && self
+                .transitions
+                .first()
+                .is_some_and(|first| first.offset == 0)
+            && self
+                .transitions
+                .windows(2)
+                .all(|pair| pair[0].offset <= pair[1].offset)
+            && self
+                .transitions
+                .last()
+                .is_some_and(|last| last.offset <= self.elapsed)
+            && self
+                .intervals
+                .iter()
+                .all(|interval| interval.start <= interval.end && interval.end <= self.elapsed)
+    }
+
+    fn append_spans(
+        &self,
+        parent: TraceContext,
+        start: u64,
+        end: u64,
+        spans: &mut Vec<LatencySpan>,
+    ) {
+        let boundary = self.start.saturating_add(self.elapsed).min(end);
+        for (index, transition) in self.transitions.iter().enumerate() {
+            let from = self
+                .start
+                .saturating_add(transition.offset)
+                .clamp(start, end);
+            let until = self
+                .transitions
+                .get(index + 1)
+                .map_or(boundary, |next| self.start.saturating_add(next.offset))
+                .clamp(from, end);
+            // Once the history is truncated the final transition has an
+            // unknown end; never attribute the omitted tail to that phase.
+            if index + 1 == self.transitions.len() && self.omitted_transitions != 0 {
+                break;
+            }
+            spans.push(LatencySpan::child(
+                parent,
+                "sccache-client",
+                transition.phase.trace_name(),
+                from,
+                until,
+            ));
+        }
+        for interval in &self.intervals {
+            let from = self.start.saturating_add(interval.start).clamp(start, end);
+            let until = self.start.saturating_add(interval.end).clamp(from, end);
+            spans.push(LatencySpan::child(
+                parent,
+                "sccache-client",
+                interval.kind.name(),
+                from,
+                until,
+            ));
+        }
+    }
+}
+
 /// Snapshot of one request, using monotonic elapsed time instead of wall time.
 /// No command arguments or environment variables are exposed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +314,7 @@ pub struct CompileActivity {
     pub compiler_children: usize,
     pub distributed_job: Option<u64>,
     pub worker: Option<String>,
+    pub trace: TraceHistory,
 }
 
 struct State {
@@ -122,6 +327,8 @@ struct State {
     compiler_children: usize,
     distributed_job: Option<u64>,
     worker: Option<String>,
+    history: TraceHistory,
+    remote_history: Option<TraceHistory>,
 }
 
 pub(crate) struct Activity {
@@ -170,6 +377,8 @@ impl Activity {
                 compiler_children: 0,
                 distributed_job: None,
                 worker: None,
+                history: TraceHistory::new(),
+                remote_history: None,
             }),
         }
     }
@@ -180,12 +389,21 @@ impl Activity {
             state.phase = phase;
             state.sequence = state.sequence.saturating_add(1);
             state.changed = Instant::now();
+            let offset = nanos(state.changed.duration_since(self.started));
+            state.history.transition(phase, offset);
         }
     }
 
     pub(crate) fn snapshot(&self) -> CompileActivity {
         let state = lock(&self.state);
         let now = Instant::now();
+        let mut history = state
+            .remote_history
+            .clone()
+            .unwrap_or_else(|| state.history.clone());
+        if state.remote_history.is_none() {
+            history.elapsed = nanos(now.duration_since(self.started));
+        }
         CompileActivity {
             id: self.id.clone(),
             client_pid: self.client_pid,
@@ -205,6 +423,7 @@ impl Activity {
             compiler_children: state.compiler_children,
             distributed_job: state.distributed_job,
             worker: state.worker.clone(),
+            trace: history,
         }
     }
 
@@ -235,6 +454,7 @@ impl Activity {
                 && sample.cwd == self.cwd,
             "compile observation identity mismatch"
         );
+        ensure!(sample.trace.valid(), "invalid compile trace history");
         let now = Instant::now();
         let age = Duration::from_millis(sample.phase_age_ms).min(now.duration_since(self.started));
         let changed = now - age;
@@ -254,14 +474,165 @@ impl Activity {
                 state.changed = changed;
             }
         }
+        if let Some(previous) = &state.remote_history {
+            ensure!(
+                sample.trace.start == previous.start
+                    && sample.trace.elapsed >= previous.elapsed
+                    && sample.trace.transitions.starts_with(&previous.transitions)
+                    && sample.trace.intervals.starts_with(&previous.intervals),
+                "inconsistent remote trace history"
+            );
+        }
         state.observed = Some(now);
         state.output = sample.output;
         state.waiting_for_jobserver = sample.waiting_for_jobserver;
         state.compiler_children = sample.compiler_children;
         state.distributed_job = sample.distributed_job;
         state.worker = sample.worker;
+        state.remote_history = Some(sample.trace);
         drop(state);
         Ok(())
+    }
+
+    pub(crate) fn outcome(&self, outcome: TraceOutcome) {
+        lock(&self.state).history.outcome = Some(outcome);
+    }
+
+    pub(super) fn finished(&self, result: &CompileFinished) {
+        let mut state = lock(&self.state);
+        if let Some(report) = result.native {
+            state.history.action = Some(report.key);
+            state.history.outcome = Some(match report.source {
+                NativeBuildSource::Hit => TraceOutcome::Hit,
+                NativeBuildSource::Local => TraceOutcome::Local,
+                NativeBuildSource::Worker(_) => TraceOutcome::Worker,
+            });
+        }
+        if result.retcode != Some(0) || result.signal.is_some() {
+            state.history.outcome = Some(TraceOutcome::Failed);
+        } else if state.history.outcome.is_none()
+            && state
+                .remote_history
+                .as_ref()
+                .and_then(|history| history.outcome)
+                .is_none()
+        {
+            state.history.outcome = Some(TraceOutcome::Success);
+        }
+    }
+
+    fn export(&self) {
+        if !crate::latency_trace::enabled() {
+            return;
+        }
+        let state = lock(&self.state);
+        let mut history = state.history.clone();
+        history.elapsed = nanos(self.started.elapsed());
+        let context = TraceContext::request(&self.id);
+        let start = history.start;
+        let end = start.saturating_add(history.elapsed);
+        let remote = state.remote_history.clone();
+        let outcome = if self.cancellation.is_cancelled() {
+            TraceOutcome::Cancelled
+        } else {
+            history
+                .outcome
+                .or_else(|| remote.as_ref().and_then(|history| history.outcome))
+                .unwrap_or(TraceOutcome::Abandoned)
+        };
+        let mut attributes = vec![
+            ("sccache.request_id", self.id.clone()),
+            ("sccache.compiler", self.compiler.clone()),
+            ("sccache.outcome", outcome.name().into()),
+        ];
+        if let Some(output) = &state.output {
+            attributes.push(("sccache.output", output.clone()));
+        }
+        if let Some(worker) = &state.worker {
+            attributes.push(("sccache.worker", worker.clone()));
+        }
+        if let Some(job) = state.distributed_job {
+            attributes.push(("sccache.job_id", job.to_string()));
+        }
+        if let Some(action) = history
+            .action
+            .or_else(|| remote.as_ref().and_then(|history| history.action))
+        {
+            attributes.push((
+                "sccache.action_key",
+                blake3::Hash::from_bytes(action.0).to_hex().to_string(),
+            ));
+        }
+        drop(state);
+        let omitted = history
+            .omitted_transitions
+            .saturating_add(history.omitted_intervals)
+            .saturating_add(remote.as_ref().map_or(0, |history| {
+                history
+                    .omitted_transitions
+                    .saturating_add(history.omitted_intervals)
+            }));
+        if omitted != 0 {
+            attributes.push(("sccache.omitted_intervals", omitted.to_string()));
+        }
+        let mut spans = vec![LatencySpan {
+            context,
+            parent: None,
+            service: "sccache-client",
+            name: "compile",
+            start,
+            end,
+            attributes,
+            error: outcome.error(),
+        }];
+        if let Some(remote) = remote {
+            let child_start = remote.start.clamp(start, end);
+            let child_end = remote
+                .start
+                .saturating_add(remote.elapsed)
+                .clamp(child_start, end);
+            if child_start > start {
+                spans.push(LatencySpan::child(
+                    context,
+                    "sccache-client",
+                    "executor_startup",
+                    start,
+                    child_start,
+                ));
+            }
+            remote.append_spans(context, child_start, child_end, &mut spans);
+            // Only local transitions after the child returns are real local
+            // work. The initial local DetectCompiler phase is an observer.
+            if let Some(transition) = history
+                .transitions
+                .iter()
+                .find(|transition| start.saturating_add(transition.offset) >= child_end)
+            {
+                let after = start.saturating_add(transition.offset).min(end);
+                if after > child_end {
+                    spans.push(LatencySpan::child(
+                        context,
+                        "sccache-client",
+                        "executor_return",
+                        child_end,
+                        after,
+                    ));
+                }
+                history.append_spans(context, after, end, &mut spans);
+                spans.retain(|span| span.parent.is_none() || span.end > span.start);
+            } else if end > child_end {
+                spans.push(LatencySpan::child(
+                    context,
+                    "sccache-client",
+                    "executor_return",
+                    child_end,
+                    end,
+                ));
+            }
+        } else {
+            history.append_spans(context, start, end, &mut spans);
+        }
+        crate::latency_trace::submit(spans);
     }
 }
 
@@ -344,6 +715,7 @@ pub(super) struct Registration<'a> {
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
         lock(&self.registry.active).remove(&self.activity.id);
+        self.activity.export();
     }
 }
 
@@ -380,6 +752,34 @@ pub(crate) fn sync_scope<F: FnOnce() -> R, R>(activity: Option<Arc<Activity>>, w
     CURRENT.sync_scope(activity, work)
 }
 
+#[must_use = "downstream spans require the active request context"]
+pub fn trace_context() -> Option<TraceContext> {
+    CURRENT
+        .try_with(|current| {
+            current
+                .as_ref()
+                .map(|activity| TraceContext::request(&activity.id))
+        })
+        .ok()
+        .flatten()
+}
+
+pub(super) fn outcome(outcome: TraceOutcome) {
+    let _ = CURRENT.try_with(|current| {
+        if let Some(activity) = current {
+            activity.outcome(outcome);
+        }
+    });
+}
+
+pub(super) fn finished(result: &CompileFinished) {
+    let _ = CURRENT.try_with(|current| {
+        if let Some(activity) = current {
+            activity.finished(result);
+        }
+    });
+}
+
 pub fn phase(phase: Phase) {
     let _ = CURRENT.try_with(|current| {
         if let Some(activity) = current {
@@ -400,6 +800,7 @@ pub(super) fn output(name: String) {
 pub struct ChildActivity {
     activity: Option<Arc<Activity>>,
     running: bool,
+    since: Instant,
 }
 
 impl ChildActivity {
@@ -411,6 +812,7 @@ impl ChildActivity {
         Self {
             activity,
             running: false,
+            since: Instant::now(),
         }
     }
 
@@ -420,6 +822,13 @@ impl ChildActivity {
                 let mut state = lock(&activity.state);
                 state.waiting_for_jobserver -= 1;
                 state.compiler_children += 1;
+                let now = Instant::now();
+                state.history.interval(
+                    IntervalKind::JobserverWait,
+                    nanos(self.since.duration_since(activity.started)),
+                    nanos(now.duration_since(activity.started)),
+                );
+                self.since = now;
             }
             self.running = true;
         }
@@ -430,6 +839,16 @@ impl Drop for ChildActivity {
     fn drop(&mut self) {
         if let Some(activity) = &self.activity {
             let mut state = lock(&activity.state);
+            let kind = if self.running {
+                IntervalKind::CompilerChild
+            } else {
+                IntervalKind::JobserverWait
+            };
+            state.history.interval(
+                kind,
+                nanos(self.since.duration_since(activity.started)),
+                nanos(activity.started.elapsed()),
+            );
             if self.running {
                 state.compiler_children -= 1;
             } else {
@@ -555,6 +974,20 @@ mod tests {
         daemon.observe(caller.snapshot())?;
         let snapshot = daemon.snapshot();
         assert_eq!(snapshot.phase_sequence, 2);
+        assert_eq!(
+            snapshot
+                .trace
+                .transitions
+                .iter()
+                .map(|transition| transition.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                Phase::DetectCompiler,
+                Phase::HashInputs,
+                Phase::DetectCompiler
+            ]
+        );
+        assert_eq!(snapshot.trace.transitions[1].offset, 11_000_000_000);
         assert_eq!(snapshot.phase_age_ms, 3000);
         assert_eq!(snapshot.observation_age_ms, Some(0));
         assert!(snapshot.deadline_error(limits).is_none());

@@ -885,18 +885,40 @@ where
             .read_bounded(limit)
             .await
             .map_err(|error| anyhow::anyhow!("native schedule body: {error:?}"))?;
-        let prepared = tokio::task::spawn_blocking(move || {
-            let schedule: ScheduleRequest = codec().with_limit(limit as u64).deserialize(&bytes)?;
-            prepare_schedule(&sessions, &network, requester, schedule)
-        })
-        .await??;
-        let reply = match prepared {
-            Ok((reservation, assignment, snapshot, packages)) => {
-                let reply = allocate(assignment, snapshot, packages).await?;
-                reservation.finish(reply)?
+        let schedule: ScheduleRequest = codec().with_limit(limit as u64).deserialize(&bytes)?;
+        ensure!(
+            schedule
+                .trace
+                .is_none_or(crate::latency_trace::TraceContext::valid),
+            "invalid schedule trace context"
+        );
+        let mut trace = schedule
+            .trace
+            .filter(|_| crate::latency_trace::enabled())
+            .map(|parent| {
+                crate::latency_trace::SpanGuard::new(parent, "sccache-scheduler", "allocate_worker")
+            });
+        let result = async {
+            let prepared = tokio::task::spawn_blocking(move || {
+                prepare_schedule(&sessions, &network, requester, schedule)
+            })
+            .await??;
+            match prepared {
+                Ok((reservation, assignment, snapshot, packages)) => {
+                    let reply = allocate(assignment, snapshot, packages).await?;
+                    reservation.finish(reply)
+                }
+                Err(replay) => Ok(replay),
             }
-            Err(replay) => replay,
-        };
+        }
+        .await;
+        if let Some(trace) = &mut trace
+            && result.is_ok()
+            && !matches!(&result, Ok(ScheduleReply::Unavailable { .. }))
+        {
+            trace.succeed();
+        }
+        let reply = result?;
         encode(&reply, limit)
     }
     .await;
@@ -918,6 +940,7 @@ fn prepare_schedule(
 ) -> Result<std::result::Result<PreparedSchedule, ScheduleReply>> {
     let ScheduleRequest {
         ticket,
+        trace,
         spec,
         receiver,
         selected,
@@ -948,6 +971,7 @@ fn prepare_schedule(
     Ok(Ok((
         reservation,
         crate::dist::NativeAssignment {
+            trace,
             ticket,
             spec,
             input_blobs: inputs,

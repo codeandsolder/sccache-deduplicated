@@ -24,6 +24,7 @@ use sccache::{
         execution_queue::ExecutionQueue,
         native::{CompletedWorker, PreparedWorker, WorkerPreparation},
     },
+    latency_trace::{PhaseTrace, enabled},
 };
 
 use super::{NativeInputPins, NativeWorker};
@@ -76,6 +77,7 @@ struct Reservation {
     remaining: RemainingInputs,
     cancelled: Arc<AtomicBool>,
     state: State,
+    trace: Option<PhaseTrace>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -93,6 +95,19 @@ impl RemainingInputs {
                 .fold(0, u64::saturating_add),
             blobs: u64::try_from(missing.len()).unwrap_or(u64::MAX),
         }
+    }
+}
+
+fn trace_phase(phase: NativeJobPhase) -> &'static str {
+    match phase {
+        NativeJobPhase::Assigned => "assigned",
+        NativeJobPhase::Queued => "staging_queue",
+        NativeJobPhase::Staging => "stage_inputs",
+        NativeJobPhase::Ready => "compiler_queue",
+        NativeJobPhase::Executing => "execute",
+        NativeJobPhase::AwaitingPublication => "publication_queue",
+        NativeJobPhase::Publishing => "publish_outputs",
+        NativeJobPhase::Terminal => "terminal",
     }
 }
 
@@ -158,6 +173,9 @@ impl Shared {
         if let Some(entry) = reservations.get_mut(&job) {
             entry.state = State::Active(phase);
             entry.phase_since = Instant::now();
+            if let Some(trace) = &mut entry.trace {
+                trace.phase(trace_phase(phase));
+            }
             if phase.inputs_ready() {
                 entry.remaining = RemainingInputs::default();
             }
@@ -179,7 +197,8 @@ impl Shared {
             .reservations
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(entry) = reservations.get_mut(&job) {
+        let failed = !matches!(&result, Terminal::Stored);
+        let trace = if let Some(entry) = reservations.get_mut(&job) {
             let now = Instant::now();
             entry.state = State::Terminal {
                 result: Arc::new(result),
@@ -187,6 +206,13 @@ impl Shared {
             };
             entry.phase_since = now;
             entry.remaining = RemainingInputs::default();
+            entry.trace.take()
+        } else {
+            None
+        };
+        drop(reservations);
+        if let Some(trace) = trace {
+            trace.finish(failed);
         }
     }
 
@@ -456,6 +482,20 @@ impl NativeDispatcher {
         spec: NativeAssignment,
         requester: Arc<dyn ServerOutgoing>,
     ) -> Result<()> {
+        ensure!(
+            spec.trace
+                .is_none_or(sccache::latency_trace::TraceContext::valid),
+            "invalid worker trace context"
+        );
+        let mut trace = spec.trace.filter(|_| enabled()).map(|parent| {
+            PhaseTrace::new(
+                parent,
+                "sccache-worker",
+                "worker_job",
+                "assignment",
+                vec![("sccache.job_id", id.0.to_string())],
+            )
+        });
         spec.spec.validate()?;
         let pins = self.shared.worker.pin_resident_inputs(&spec)?;
         let remaining = RemainingInputs::from_missing(pins.blobs.missing());
@@ -475,12 +515,16 @@ impl NativeDispatcher {
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let now = Instant::now();
+        if let Some(trace) = &mut trace {
+            trace.phase("staging_queue");
+        }
         entry.insert(Reservation {
             accepted_at: now,
             phase_since: now,
             remaining,
             cancelled: Arc::clone(&cancelled),
             state: State::Active(NativeJobPhase::Queued),
+            trace,
         });
         let task = Staging {
             job: Job {

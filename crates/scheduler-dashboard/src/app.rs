@@ -29,6 +29,7 @@ mod native;
 #[cfg(target_arch = "wasm32")]
 mod sse;
 mod topology;
+mod traces;
 
 fn keyed_index<T: Clone + PartialEq + Send + Sync + 'static>(
     rows: Memo<Vec<T>>,
@@ -138,18 +139,22 @@ pub fn App() -> impl IntoView {
         });
     });
     let data = Memo::new(move |_| live.get().or_else(|| initial.get().and_then(Result::ok)));
+    let show_traces = RwSignal::new(false);
     view! {
         <Title text="sccache | Scheduler status"/>
         <header class=styles::top>
             <div><small>"SCCACHE / DISTRIBUTED BUILD"</small><h1>"Scheduler status"</h1></div>
-            <nav><a href="#workers">"Workers"</a><a href="#jobs">"Jobs"</a><a href="#cas">"CAS"</a><a href="#cache-analytics">"Cache analytics"</a><a href="#topology">"Topology"</a><a href="#network">"Network"</a><a href="#metrics">"Fleet metrics"</a></nav>
+            <nav><button on:click=move |_| show_traces.set(!show_traces.get())>{move || if show_traces.get() {"Overview"} else {"Traces"}}</button><a href="#workers">"Workers"</a><a href="#jobs">"Jobs"</a><a href="#cas">"CAS"</a><a href="#cache-analytics">"Cache analytics"</a><a href="#topology">"Topology"</a><a href="#network">"Network"</a><a href="#metrics">"Fleet metrics"</a></nav>
         </header>
         <main>
             <ConnectionIndicator status=status retry=retry/>
+            <Show when=move || !show_traces.get()>
             <Suspense fallback=|| view! { <p>"Waiting for initial scheduler snapshot…"</p> }>
                 <native::NativeStatus data=data/>
             </Suspense>
             <FleetMetrics/>
+            </Show>
+            <Show when=move || show_traces.get()><traces::TracePanel/></Show>
         </main>
     }
 }

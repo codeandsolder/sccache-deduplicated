@@ -269,6 +269,7 @@ pub fn sccache_client_cfg(
         shared_daemon: None,
         compiler_aliases: Default::default(),
         compile_limits: Default::default(),
+        traces: None,
     }
 }
 
@@ -280,6 +281,7 @@ fn sccache_scheduler_cfg(address: SocketAddr) -> sccache::config::scheduler::Con
         dashboard: None,
         native_cache: None,
         local_worker: None,
+        traces: None,
         job_slack: Default::default(),
         public_addr: address,
         client_auth: sccache::config::scheduler::ClientAuth::Insecure,
@@ -324,6 +326,7 @@ fn sccache_server_cfg(
         toolchain_cache_size: TC_CACHE_SIZE,
         toolchain_archive_sources: vec![],
         native_worker: None,
+        traces: None,
     }
 }
 

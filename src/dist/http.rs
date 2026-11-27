@@ -1845,6 +1845,7 @@ mod server {
                     &config.assets,
                     config.metrics_url.as_deref(),
                     config.metrics_ingress_host.as_deref(),
+                    config.traces_url.as_deref(),
                     move || {
                         let mut snapshot = handler.handle_dashboard_snapshot()?;
                         dashboard::enrich(

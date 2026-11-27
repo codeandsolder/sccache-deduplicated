@@ -634,6 +634,7 @@ fn bind_server(
     storage: Arc<dyn Storage>,
     config: &Config,
 ) -> io::Result<(crate::net::SocketAddr, StartupRunner)> {
+    crate::latency_trace::configure(config.traces.as_ref()).map_err(io::Error::other)?;
     let compiler_aliases = config.compiler_aliases.clone();
     let compile_limits = config.compile_limits;
     #[cfg(target_os = "linux")]
@@ -1614,6 +1615,7 @@ where
                 .await?
             {
                 Message::WithoutBody(message) => {
+                    activity.outcome(activity::TraceOutcome::Uncacheable);
                     activity.phase(Phase::SendReply);
                     send_ipc_frame(sink, Frame::Message { message }).await?;
                 }
@@ -1623,6 +1625,9 @@ where
                         util::spawn(activity::inherit(body)).await?
                     });
                     let message = self.monitor_compile(activity, sink, body).await?;
+                    if let Response::CompileFinished(finished) = &message {
+                        activity.finished(finished);
+                    }
                     activity.phase(Phase::SendReply);
                     send_ipc_frame(sink, Frame::Body { chunk: message }).await?;
                 }
@@ -1631,6 +1636,7 @@ where
         }
         .await;
         if let Err(error) = result {
+            activity.outcome(activity::TraceOutcome::Abandoned);
             // The monitored future has been dropped. Some blocking I/O
             // may still finish, so the outcome is explicitly ambiguous.
             if !error.is::<IpcSendFailure>() {
@@ -1789,9 +1795,13 @@ where
                     bail!("unexpected body response from compile_direct")
                 };
                 self.storage.validate_session()?;
+                activity::finished(&finished);
                 Ok((resp, Some(finished)))
             }
-            Message::WithoutBody(Response::Compile(resp)) => Ok((resp, None)),
+            Message::WithoutBody(Response::Compile(resp)) => {
+                activity::outcome(activity::TraceOutcome::Uncacheable);
+                Ok((resp, None))
+            }
             _ => bail!("unexpected response from handle_compile in compile_direct"),
         }
     }
@@ -2117,12 +2127,14 @@ where
                             stats.cache_errors.increment(&kind, lang);
                         }
                         CompileResult::CacheHit(duration) => {
+                            activity::outcome(activity::TraceOutcome::Hit);
                             debug!("[{out_pretty}]: compile result: cache hit");
 
                             stats.cache_hits.increment(&kind, lang);
                             stats.cache_read_hit_duration += duration;
                         }
                         CompileResult::CacheMiss(miss_type, dt, duration, future) => {
+                            activity::outcome(activity::TraceOutcome::Miss);
                             debug!("[{out_pretty}]: compile result: cache miss");
                             dist_type = dt;
 

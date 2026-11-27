@@ -7,6 +7,7 @@ mod app;
 pub mod server;
 #[cfg(any(feature = "ssr", feature = "hydrate"))]
 mod styles;
+pub mod traces;
 
 #[cfg(all(feature = "hydrate", target_arch = "wasm32"))]
 #[wasm_bindgen::prelude::wasm_bindgen]

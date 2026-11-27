@@ -56,6 +56,7 @@ pub(super) struct ExecutionRequest {
 #[derive(Serialize, Deserialize)]
 pub(super) struct ScheduleRequest {
     pub ticket: Ticket,
+    pub trace: Option<crate::latency_trace::TraceContext>,
     pub spec: ExecutionSpec,
     pub receiver: crate::build_runtime::wire::ClientDeliveryRates,
     pub selected: std::collections::BTreeSet<String>,
@@ -736,6 +737,7 @@ impl NativeCacheClient {
             "schedule",
             &ScheduleRequest {
                 ticket,
+                trace: crate::server::activity::trace_context(),
                 spec,
                 receiver,
                 selected,
