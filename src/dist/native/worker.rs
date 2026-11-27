@@ -745,7 +745,7 @@ impl NativeCacheClient {
         transport: Option<&PackageTransportTracker>,
         check: &LeaseCheck<'_>,
     ) -> Result<CapturedExecution> {
-        let ExecutionContext { ticket, store, .. } = context;
+        let ExecutionContext { ticket, .. } = context;
         let MeasuredExecution { captured, duration } = measured;
         check()?;
         let Some(manifest) = captured.successful_result().cloned() else {
