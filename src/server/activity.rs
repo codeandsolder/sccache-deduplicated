@@ -292,7 +292,11 @@ impl TraceHistory {
                 from,
                 until,
             );
-            span.links.extend(transition.producer);
+            if let Some(producer) = transition.producer {
+                span.links.push(producer);
+                span.attributes
+                    .push(("sccache.producer_trace_id", producer.hex_id()));
+            }
             spans.push(span);
         }
         for interval in &self.intervals {

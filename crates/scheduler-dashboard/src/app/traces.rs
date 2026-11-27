@@ -23,7 +23,13 @@ fn ms(ns: u64) -> String {
     format!("{}.{:03} ms", ns / 1_000_000, ns % 1_000_000 / 1_000)
 }
 
-fn span_row(span: TraceSpan, start: u64, extent: u64) -> impl IntoView {
+fn span_row(
+    span: TraceSpan,
+    start: u64,
+    extent: u64,
+    selected: RwSignal<String>,
+    lookup: RwSignal<String>,
+) -> impl IntoView {
     let offset = span.start_ns.saturating_sub(start);
     let x = u128::from(offset) * 100_000 / u128::from(extent);
     let width = u128::from(span.duration_ns) * 100_000 / u128::from(extent);
@@ -45,7 +51,9 @@ fn span_row(span: TraceSpan, start: u64, extent: u64) -> impl IntoView {
     );
     view! {
         <tr>
-            <td>{span.host}" / "{span.name}</td>
+            <td>{span.host}" / "{span.name}
+                {span.producer.map(|id| view!{<button on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Producer"</button>})}
+            </td>
             <td>{ms(span.duration_ns)}</td>
             <td style="width:55%;min-width:160px">
                 <svg viewBox="0 0 100000 8" preserveAspectRatio="none" style="width:100%;height:20px">
@@ -58,7 +66,11 @@ fn span_row(span: TraceSpan, start: u64, extent: u64) -> impl IntoView {
 }
 
 #[component]
-fn Timeline(detail: TraceDetail) -> impl IntoView {
+fn Timeline(
+    detail: TraceDetail,
+    selected: RwSignal<String>,
+    lookup: RwSignal<String>,
+) -> impl IntoView {
     let start = detail
         .spans
         .iter()
@@ -91,7 +103,7 @@ fn Timeline(detail: TraceDetail) -> impl IntoView {
             {detail.truncated.then(|| view!{<p class=styles::warning>"Span limit reached."</p>})}
             {skew.then(|| view!{<p class=styles::warning>"Spans extend outside the client interval: clock skew or asynchronous completion."</p>})}
             <table><thead><tr><th>"Host / phase"</th><th>"Elapsed"</th><th>"Timeline"</th></tr></thead>
-                <tbody>{detail.spans.into_iter().map(|span| span_row(span,start,extent)).collect_view()}</tbody>
+                <tbody>{detail.spans.into_iter().map(|span| span_row(span,start,extent,selected,lookup)).collect_view()}</tbody>
             </table>
         </article>
     }
@@ -112,17 +124,14 @@ fn LiveRequests(
     });
     let rows = Memo::new(move |_| {
         report.with(|report| {
-            report
-                .as_ref()
-                .map(|report| {
-                    report
-                        .rows
-                        .iter()
-                        .cloned()
-                        .map(|row| (row.request.trace.hex_id(), row))
-                        .collect::<std::collections::BTreeMap<_, _>>()
-                })
-                .unwrap_or_default()
+            report.as_ref().map_or_default(|report| {
+                report
+                    .rows
+                    .iter()
+                    .cloned()
+                    .map(|row| (row.request.trace.hex_id(), row))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            })
         })
     });
     let keys = Memo::new(move |_| rows.with(|rows| rows.keys().cloned().collect::<Vec<_>>()));
@@ -228,7 +237,7 @@ pub(super) fn TracePanel(data: Memo<Option<crate::DashboardData>>) -> impl IntoV
             </Suspense>
             <Suspense fallback=|| view!{<p>"Loading timeline…"</p>}>
                 {move || detail.get().map(|result| match result {
-                    Ok(Some(detail)) => view!{<Timeline detail=detail/>}.into_any(),
+                    Ok(Some(detail)) => view!{<Timeline detail=detail selected=selected lookup=lookup/>}.into_any(),
                     Ok(None) => ().into_any(),
                     Err(error) => view!{<p class=styles::warning>{error.to_string()}</p>}.into_any(),
                 })}

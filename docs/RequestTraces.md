@@ -56,7 +56,7 @@ seconds through the existing authenticated native service. Snapshots expire
 after ten seconds and empty reports clear prior observations. The reporter
 selects at most 256 requests and the scheduler retains at most 128 reporters,
 displaying up to 2048 longest requests while reporting the total. Non-native
-clients can still inspect live requests locally via `sccache --show-active-compiles`.
+clients can still inspect live requests locally via `sccache --active-compiles`.
 
 ## Rollout
 

@@ -51,6 +51,7 @@ impl LiveTraces {
                 batch: Arc::new(batch),
             },
         );
+        drop(reports);
         Ok(())
     }
 

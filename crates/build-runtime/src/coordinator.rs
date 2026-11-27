@@ -132,6 +132,7 @@ impl CompilePermit {
         *running
             .get_mut(&self.key)
             .ok_or_else(|| anyhow!("native compilation permit lost its reservation"))? = None;
+        drop(running);
         Ok(())
     }
 

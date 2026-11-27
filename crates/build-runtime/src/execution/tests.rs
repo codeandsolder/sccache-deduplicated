@@ -709,7 +709,9 @@ fn resident_execution_isolates_concurrent_writable_state() -> Result<()> {
                     let script = format!("test ! -e /tmp/marker && test ! -e /out/nested/object || exit 9; printf '{index}' > /tmp/marker; printf '{index}' > /out/nested/object");
                     spec.command.arguments[1] = script.into_bytes();
                     barrier.wait();
-                    let captured = execute(&spec, store, policy, inputs, None, || Ok(()), |_| {})?;
+                    let mut phases = Vec::new();
+                    let captured = execute(&spec, store, policy, inputs, None, || Ok(()), |phase| phases.push(phase))?;
+                    assert_eq!(phases, [ExecutionPhase::Preparation, ExecutionPhase::Process, ExecutionPhase::Capture]);
                     let result = captured.successful_result().context("isolated job failed")?;
                     let mut output = Vec::new();
                     captured.open_blob(result.outputs["object"].test_file_blob().id)?.read_to_end(&mut output)?;

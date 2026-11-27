@@ -48,6 +48,7 @@ pub struct TraceSpan {
     pub start_ns: u64,
     pub duration_ns: u64,
     pub error: bool,
+    pub producer: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

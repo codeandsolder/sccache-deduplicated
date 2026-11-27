@@ -244,7 +244,7 @@ impl Fleet {
         package_upstreams: BTreeMap<String, scheduler::PackageUpstream>,
         transfer: sccache::build_runtime::PackageTransferCost,
     ) -> Result<Self> {
-        Self::start_with_mode(root, package_upstreams, transfer, false)
+        Self::start_with_mode(root, package_upstreams, transfer, false, None)
     }
 
     fn start_with_mode(
@@ -252,6 +252,7 @@ impl Fleet {
         package_upstreams: BTreeMap<String, scheduler::PackageUpstream>,
         transfer: sccache::build_runtime::PackageTransferCost,
         colocated: bool,
+        trace_endpoint: Option<&str>,
     ) -> Result<Self> {
         let [scheduler_address, cache_address, worker_address] = addresses()?;
         let scheduler_url = url::Url::parse(&format!("https://{scheduler_address}/"))?;
@@ -291,6 +292,7 @@ impl Fleet {
             PLATFORM,
             transfer,
         );
+        worker_config.traces = trace_endpoint.map(|endpoint| trace_config(endpoint, "worker"));
         let (local_worker, standalone_worker) = if colocated {
             let native = worker_config
                 .native_worker
@@ -306,7 +308,7 @@ impl Fleet {
             root,
             "scheduler",
             &scheduler::Config {
-                traces: None,
+                traces: trace_endpoint.map(|endpoint| trace_config(endpoint, "scheduler")),
                 cluster_directory,
                 local_worker,
                 public_addr: scheduler_address,
@@ -2140,6 +2142,109 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
 
 /// A test-owned in-process service, not a separately launched managed
 /// sccache daemon. It listens exclusively on a temporary Unix socket.
+fn trace_config(endpoint: &str, instance: &str) -> sccache::latency_trace::TraceConfig {
+    sccache::latency_trace::TraceConfig {
+        endpoint: endpoint.into(),
+        instance: instance.into(),
+    }
+}
+
+struct TraceCollector {
+    endpoint: String,
+    receiver: std::sync::mpsc::Receiver<opentelemetry_proto::tonic::trace::v1::Span>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl TraceCollector {
+    fn start() -> Result<Self> {
+        use axum::{Router, body::Bytes, routing::post};
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use prost::Message as _;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let endpoint = format!("http://{}/v1/traces", listener.local_addr()?);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (stop, shutdown) = tokio::sync::oneshot::channel();
+        let router = Router::new().route(
+            "/v1/traces",
+            post(move |body: Bytes| {
+                let sender = sender.clone();
+                async move {
+                    let Ok(request) = ExportTraceServiceRequest::decode(body) else {
+                        return http::StatusCode::BAD_REQUEST;
+                    };
+                    for span in request
+                        .resource_spans
+                        .into_iter()
+                        .flat_map(|resource| resource.scope_spans)
+                        .flat_map(|scope| scope.spans)
+                    {
+                        if sender.send(span).is_err() {
+                            return http::StatusCode::SERVICE_UNAVAILABLE;
+                        }
+                    }
+                    http::StatusCode::OK
+                }
+            }),
+        );
+        let worker = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("trace runtime")
+                .block_on(async {
+                    let listener =
+                        tokio::net::TcpListener::from_std(listener).expect("trace listener");
+                    axum::serve(listener, router)
+                        .with_graceful_shutdown(async {
+                            let _ = shutdown.await;
+                        })
+                        .await
+                        .expect("trace HTTP server");
+                });
+        });
+        Ok(Self {
+            endpoint,
+            receiver,
+            stop: Some(stop),
+            thread: Some(worker),
+        })
+    }
+
+    fn collect(
+        &self,
+        ready: impl Fn(&[opentelemetry_proto::tonic::trace::v1::Span]) -> bool,
+    ) -> Result<Vec<opentelemetry_proto::tonic::trace::v1::Span>> {
+        let start = Instant::now();
+        let mut spans = Vec::new();
+        while !ready(&spans) {
+            spans.push(
+                self.receiver
+                    .recv_timeout(Duration::from_secs(20).saturating_sub(start.elapsed()))
+                    .with_context(|| {
+                        format!(
+                            "trace collection timed out: {:?}",
+                            spans.iter().map(|span| &span.name).collect::<Vec<_>>()
+                        )
+                    })?,
+            );
+        }
+        Ok(spans)
+    }
+}
+
+impl Drop for TraceCollector {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.thread.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 struct LocalService {
     socket: PathBuf,
     caller_config: PathBuf,
@@ -2153,6 +2258,15 @@ impl LocalService {
         fleet: &Fleet,
         local_execution: Option<NativeLocalConfig>,
     ) -> Result<Self> {
+        Self::start_configured(root, fleet, local_execution, None)
+    }
+
+    fn start_configured(
+        root: &Path,
+        fleet: &Fleet,
+        local_execution: Option<NativeLocalConfig>,
+        traces: Option<sccache::latency_trace::TraceConfig>,
+    ) -> Result<Self> {
         let _ = env_logger::builder()
             .is_test(true)
             .filter_level(log::LevelFilter::Warn)
@@ -2162,7 +2276,10 @@ impl LocalService {
         let caller_config = root.join("caller.toml");
         let cached_config = root.join("caller-cached.toml");
         fs::write(&caller_config, "client_side_mode = true\n")?;
-        let mut config = Config::default();
+        let mut config = Config {
+            traces,
+            ..Default::default()
+        };
         config.dist.cluster = Some(fleet.cluster.clone());
         config.dist.scheduler_url = Some(HTTPUrl::from_url(fleet.scheduler_url.clone()));
         config.dist.auth = DistAuth::Token {
@@ -2272,6 +2389,109 @@ impl Drop for LocalService {
     fn drop(&mut self) {
         let _ = self.stop();
     }
+}
+
+#[test]
+#[ignore = "requires Linux Bubblewrap, GCC and ldd"]
+fn request_traces_follow_real_worker_and_cache_hit() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("native-trace-")
+        .tempdir_in("/tmp")?;
+    let root = temp.path();
+    let collector = TraceCollector::start()?;
+    let fleet = Fleet::start_with_mode(
+        root,
+        BTreeMap::new(),
+        Default::default(),
+        false,
+        Some(&collector.endpoint),
+    )?;
+    let mut service = LocalService::start_configured(
+        root,
+        &fleet,
+        None,
+        Some(trace_config(&collector.endpoint, "client")),
+    )?;
+    fs::write(root.join("probe.c"), "int trace_probe(void) { return 42; }")?;
+    for _ in 0..2 {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .args(["/usr/bin/gcc", "-c", "probe.c", "-o", "probe.o"])
+            .current_dir(root)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "compile failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_file(root.join("probe.o"))?;
+    }
+    let spans = collector.collect(|spans| {
+        spans
+            .iter()
+            .filter(|span| span.name == "compile" && span.parent_span_id.is_empty())
+            .count()
+            >= 2
+            && spans.iter().any(|span| span.name == "worker_job")
+            && spans.iter().any(|span| span.name == "allocate_worker")
+    })?;
+    verify_trace_pair(&spans)?;
+    service.stop()?;
+    fleet.finish()?;
+    Ok(())
+}
+
+fn verify_trace_pair(spans: &[opentelemetry_proto::tonic::trace::v1::Span]) -> Result<()> {
+    use opentelemetry_proto::tonic::{common::v1::any_value::Value, trace::v1::Span};
+    let attr = |span: &Span, key: &str| -> Option<String> {
+        span.attributes
+            .iter()
+            .find(|attr| attr.key == key)
+            .and_then(|attr| attr.value.as_ref())
+            .and_then(|value| match &value.value {
+                Some(Value::StringValue(value)) => Some(value.clone()),
+                _ => None,
+            })
+    };
+    let root_for = |outcome: &str| {
+        spans.iter().find(|span| {
+            span.name == "compile"
+                && span.parent_span_id.is_empty()
+                && attr(span, "sccache.outcome").as_deref() == Some(outcome)
+        })
+    };
+    let miss = root_for("worker").context("missing worker trace root")?;
+    let hit = root_for("hit").context("missing hit trace root")?;
+    assert_ne!(miss.trace_id, hit.trace_id);
+    let action = attr(miss, "sccache.action_key").context("missing native action identity")?;
+    assert_eq!(
+        attr(hit, "sccache.action_key").as_deref(),
+        Some(action.as_str())
+    );
+    for name in [
+        "allocate_worker",
+        "worker_job",
+        "prepare_sandbox",
+        "compiler_process",
+        "capture_outputs",
+    ] {
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.name == name && span.trace_id == miss.trace_id),
+            "missing {name} in miss trace"
+        );
+        assert!(
+            !spans
+                .iter()
+                .any(|span| span.name == name && span.trace_id == hit.trace_id),
+            "unexpected {name} in hit trace"
+        );
+    }
+    for span in spans {
+        assert!(span.end_time_unix_nano >= span.start_time_unix_nano);
+    }
+    Ok(())
 }
 
 fn compiler_script() -> &'static str {
@@ -2577,7 +2797,7 @@ fn native_compiler_semantic_reuse_across_ephemeral_inputs() -> Result<()> {
 fn colocated_native_worker_shares_one_store_and_commits_results() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path();
-    let fleet = Fleet::start_with_mode(root, BTreeMap::new(), Default::default(), true)?;
+    let fleet = Fleet::start_with_mode(root, BTreeMap::new(), Default::default(), true, None)?;
     let mut service = LocalService::start(root, &fleet, None)?;
     let source = root.join("compile");
     fs::create_dir(&source)?;

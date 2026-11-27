@@ -58,7 +58,7 @@ impl TraceService {
     pub(crate) async fn detail(&self, id: String) -> Result<TraceDetail> {
         ensure!(valid_id(&id, 32), "invalid trace ID");
         let query = format!(
-            "_time:7d trace_id:={quoted} | sort by (start_time_unix_nano) | limit {limit} | fields span_id,parent_span_id,name,start_time_unix_nano,duration,status_code,\"resource_attr:service.name\",\"resource_attr:host.name\"",
+            "_time:7d trace_id:={quoted} | sort by (start_time_unix_nano) | limit {limit} | fields span_id,parent_span_id,name,start_time_unix_nano,duration,status_code,\"resource_attr:service.name\",\"resource_attr:host.name\",\"span_attr:sccache.producer_trace_id\"",
             quoted = serde_json::to_string(&id)?,
             limit = SPAN_LIMIT + 1
         );
@@ -206,6 +206,7 @@ fn span(mut row: Row) -> Result<TraceSpan> {
         valid_id(&id, 16) && (parent.is_empty() || valid_id(&parent, 16)),
         "invalid stored span ID"
     );
+    let producer = take(&mut row, "span_attr:sccache.producer_trace_id");
     Ok(TraceSpan {
         id,
         parent,
@@ -215,6 +216,7 @@ fn span(mut row: Row) -> Result<TraceSpan> {
         start_ns: integer(&mut row, "start_time_unix_nano")?,
         duration_ns: integer(&mut row, "duration")?,
         error: take(&mut row, "status_code") == "2",
+        producer: valid_id(&producer, 32).then_some(producer),
     })
 }
 
