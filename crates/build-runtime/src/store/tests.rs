@@ -1119,7 +1119,15 @@ fn stale_action_snapshot_cannot_pin_content_retired_by_refresh_or_eviction() -> 
     )?;
     assert_eq!(store.collect_garbage(8)?.blobs, 1);
     assert!(matches!(
-        store.pin_current_result(key, &encoded, &manifest.blobs()?)?,
+        store.pin_current_result(
+            key,
+            &encoded,
+            manifest.id()?,
+            &mut Some(ResultSnapshot {
+                manifest: manifest.clone(),
+                blobs: manifest.blobs()?
+            })
+        )?,
         ResultPin::Changed
     ));
     assert_eq!(
@@ -1131,7 +1139,15 @@ fn stale_action_snapshot_cannot_pin_content_retired_by_refresh_or_eviction() -> 
     );
     assert!(matches!(store.evict(key)?, Eviction::Removed { .. }));
     assert!(matches!(
-        store.pin_current_result(key, &encoded, &manifest.blobs()?)?,
+        store.pin_current_result(
+            key,
+            &encoded,
+            manifest.id()?,
+            &mut Some(ResultSnapshot {
+                manifest: manifest.clone(),
+                blobs: manifest.blobs()?
+            })
+        )?,
         ResultPin::Missing
     ));
     assert_eq!(store.collect_garbage(8)?.blobs, 1);
