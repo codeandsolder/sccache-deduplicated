@@ -1147,6 +1147,49 @@ mod tests {
     }
 
     #[test]
+    fn original_lookup_pins_exact_verified_archive() -> Result<()> {
+        use std::io::Read;
+        let bytes = example_tar()?;
+        let src = source(&bytes, PackageCompression::Tar);
+        let directory = tempfile::tempdir()?;
+        let store = NativeStore::open(directory.path())?;
+        let policy = PackagePolicy {
+            retain_original: true,
+            ..policy()
+        };
+        assert!(
+            store
+                .lookup_package_archive(src.identity, policy)?
+                .is_none()
+        );
+        let package = store.import_package(
+            src.identity,
+            ArchiveLength::Exact(src.size),
+            policy,
+            &bytes[..],
+            PackageDecoder::InProcess,
+        )?;
+        let id = package.tree().id();
+        drop(package);
+        let archive = store
+            .lookup_package_archive(src.identity, policy)?
+            .context("missing original")?;
+        assert_eq!(archive.archive().source, src);
+        assert_eq!(store.evict_tree(id)?, super::super::Eviction::Pinned);
+        let mut actual = Vec::new();
+        archive.open_file()?.read_to_end(&mut actual)?;
+        assert_eq!(actual, bytes);
+        drop(archive);
+        store.evict_tree(id)?;
+        assert!(
+            store
+                .lookup_package_archive(src.identity, policy)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn original_package_import_and_recipe_share_files_without_repacking() -> Result<()> {
         use std::io::Write;
         let tar = example_tar()?;

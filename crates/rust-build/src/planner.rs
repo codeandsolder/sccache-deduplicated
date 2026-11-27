@@ -1335,3 +1335,95 @@ fn applies(scope: &LinkScope, target: &Target, test: bool) -> bool {
         LinkScope::Cdylib => target.crate_types.iter().any(|t| t == "cdylib"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Lockfile, ResolveOptions, Sources};
+    use std::fs;
+
+    #[test]
+    fn build_and_test_graphs_publish_declared_names_and_order_prerequisites() -> Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/native-plan")
+            .canonicalize()?;
+        let temp = tempfile::tempdir()?;
+        let workspace = Workspace::discover(&fixture.join("Cargo.toml"))?;
+        let toolchain = Toolchain::discover(&fixture, None, None, None, false, false)?;
+        let mut sources = Sources::new(
+            &workspace,
+            Lockfile::load(&fixture.join("Cargo.lock"))?,
+            None,
+            temp.path().join("sources"),
+        );
+        let graph = Graph::resolve(
+            &mut sources,
+            ResolveOptions {
+                selected: workspace.defaults.clone(),
+                features: BTreeSet::new(),
+                default_features: true,
+                all_features: false,
+                dev_dependencies: true,
+                host: toolchain.host.clone(),
+                target: toolchain.target.clone(),
+            },
+        )?;
+        let settings = Settings::default();
+        for mode in [Mode::Build, Mode::Check, Mode::Test, Mode::Run] {
+            let final_root = temp.path().join("target");
+            let options = PlanOptions {
+                mode,
+                no_doc: true,
+                all_targets: mode == Mode::Check,
+                test_targets: if mode == Mode::Test {
+                    vec!["executable".into()]
+                } else {
+                    vec![]
+                },
+                ..PlanOptions::default()
+            };
+            let planner = Planner::new(
+                &graph,
+                &workspace,
+                &settings,
+                &toolchain,
+                &options,
+                temp.path().join("intermediate"),
+                final_root.clone(),
+            )?;
+            let mut ready = planner.graph()?;
+            let mut seen = BTreeSet::new();
+            while let Some(index) = ready.take_ready() {
+                let node = &planner.nodes[index];
+                assert!(node.deps.iter().all(|dep| seen.contains(dep)));
+                if let Action::Script { stdout, .. } = &node.action {
+                    fs::create_dir_all(stdout.parent().context("missing stdout parent")?)?;
+                    fs::write(stdout, b"cargo::rustc-env=TEST_VALUE=123\n")?;
+                }
+                let prepared = planner.prepare(index)?;
+                assert_eq!(
+                    prepared.dependencies,
+                    node.deps.iter().copied().collect::<Vec<_>>()
+                );
+                if let Action::Compile { unit, target, .. } = &node.action
+                    && planner.target(*unit, *target).kind == TargetKind::Test
+                {
+                    assert!(
+                        planner.binary_publications[*unit]
+                            .iter()
+                            .all(|p| seen.contains(p))
+                    );
+                }
+                planner.complete(index)?;
+                seen.insert(index);
+                ready.complete(index)?;
+            }
+            assert!(ready.is_complete());
+            if mode != Mode::Check {
+                assert!(planner.nodes.iter().any(|node| matches!(&node.action,
+                    Action::Publish { destination, .. } if destination == &final_root.join("native-plan-fixture"))));
+            }
+        }
+        Ok(())
+    }
+}
