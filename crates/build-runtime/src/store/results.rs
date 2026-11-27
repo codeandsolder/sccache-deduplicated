@@ -136,6 +136,34 @@ impl<'a> PreparedResult<'a> {
         }
     }
 
+    /// Recheck a conditional replacement against the transaction's current
+    /// contents: an earlier publication may have repaired the old result.
+    pub(super) fn revalidate_replacement(
+        &self,
+        store: &NativeStore,
+        write: &WriteTransaction,
+        plan: &ResultPlan,
+    ) -> Result<()> {
+        let Some(previous) = &plan.previous else {
+            return Ok(());
+        };
+        if self.mode != ActionMode::Reuse || previous.result == self.result {
+            return Ok(());
+        }
+        let results = write.open_table(RESULTS)?;
+        let old = results
+            .get(&previous.result.0)?
+            .context("missing indexed result")?;
+        let old: ResultManifest = encoding().deserialize(old.value())?;
+        let layouts = write.open_table(BLOB_LAYOUTS)?;
+        for (id, size) in old.blobs()? {
+            if !store.inner.blob_present(&layouts, id, size)? {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("conflicting result for action {:?}", self.action)
+    }
+
     pub(super) fn attach(
         &mut self,
         store: &NativeStore,

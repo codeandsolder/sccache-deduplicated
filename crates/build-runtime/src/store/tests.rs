@@ -557,6 +557,47 @@ async fn result_batch_resurrects_alias_retired_by_earlier_refresh() -> Result<()
 }
 
 #[tokio::test]
+async fn repaired_result_prevents_conditional_replacement_in_same_batch() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let original = store.stage(&b"original result"[..])?;
+    let old_blob = original.reference();
+    let old = result(old_blob);
+    store.publish_pinned(&action("old"), &old, vec![original], ActionMode::Reuse)?;
+    std::fs::remove_file(store.inner.blob_path(old_blob.id))?;
+    let repair = store.stage(&b"original result"[..])?;
+    let replacement = store.stage(&b"replacement result"[..])?;
+    let replacement_manifest = result(replacement.reference());
+    let (repaired, replaced) = tokio::join!(
+        store.publish_pinned_async(
+            action("alias"),
+            old.clone(),
+            vec![repair],
+            ActionMode::Reuse,
+            ()
+        ),
+        store.publish_pinned_async(
+            action("old"),
+            replacement_manifest,
+            vec![replacement],
+            ActionMode::Reuse,
+            ()
+        ),
+    );
+    assert_eq!(repaired?.manifest(), &old);
+    assert!(replaced.is_err());
+    assert_eq!(
+        store
+            .lookup(action("old").key()?)?
+            .context("missing repaired result")?
+            .manifest(),
+        &old
+    );
+    assert_eq!(store.stats()?.results, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancelled_result_publication_still_commits_and_releases_admission() -> Result<()> {
     use std::{
         future::{Future, poll_fn},

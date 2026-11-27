@@ -197,6 +197,13 @@ enum Validated {
 }
 
 impl Validated {
+    fn revalidate(&self, store: &NativeStore, write: &WriteTransaction) -> Result<()> {
+        match self {
+            Self::Tree(..) => Ok(()),
+            Self::Result(result, plan, _) => result.revalidate_replacement(store, write, plan),
+        }
+    }
+
     fn attach(
         &mut self,
         store: &NativeStore,
@@ -367,8 +374,17 @@ impl NativeStore {
         }
         let write = self.inner.db.begin_write()?;
         let mut publication = Publication::default();
-        for request in validated.iter_mut() {
-            request.attach(self, &write, &mut publication)?;
+        let mut index = 0;
+        while index < validated.len() {
+            if let Err(error) = validated[index].revalidate(self, &write) {
+                validated.remove(index).fail(error);
+            } else {
+                validated[index].attach(self, &write, &mut publication)?;
+                index += 1;
+            }
+        }
+        if validated.is_empty() {
+            return Ok(());
         }
         publication.commit(&self.inner, write)?;
         log::trace!(target: "native_cas_publication", "committed CAS batch with {} requests", validated.len());
