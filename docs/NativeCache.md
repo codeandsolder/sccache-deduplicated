@@ -188,7 +188,7 @@ not serialize filesystem work under a global cache mutex.
 Each action still launches a fresh Bubblewrap namespace and allocates only
 its required private writable scratch. There is no separate runtime cache,
 Docker daemon, or mutable sandbox state shared between compiler jobs.
-Linux pidfd readiness releases the execution slot immediately at child exit;
+Linux pidfd readiness detects child exit immediately;
 a bounded 50 ms interval is retained for lease renewal and cancellation
 checks, not for detecting normal completion. Execution phase diagnostics
 report preparation, child process wall time (including namespace startup),

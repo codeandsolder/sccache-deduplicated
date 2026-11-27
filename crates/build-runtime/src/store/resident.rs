@@ -25,13 +25,21 @@ type MemoSlot<V> = Arc<Mutex<Weak<V>>>;
 /// Per-identity coordination without serializing unrelated builds. The map
 /// retains neither content nor filesystem views after their final owner drops.
 struct WeakMemo<K, V> {
-    slots: Mutex<BTreeMap<K, MemoSlot<V>>>,
+    slots: Mutex<MemoIndex<K, V>>,
+}
+
+struct MemoIndex<K, V> {
+    slots: BTreeMap<K, MemoSlot<V>>,
+    sweep_at: usize,
 }
 
 impl<K, V> Default for WeakMemo<K, V> {
     fn default() -> Self {
         Self {
-            slots: Mutex::new(BTreeMap::new()),
+            slots: Mutex::new(MemoIndex {
+                slots: BTreeMap::new(),
+                sweep_at: MEMO_SWEEP_THRESHOLD,
+            }),
         }
     }
 }
@@ -42,20 +50,22 @@ impl<K: Ord + Copy, V> WeakMemo<K, V> {
             .slots
             .lock()
             .map_err(|_| anyhow!("resident memo lock poisoned"))?;
-        if let Some(slot) = slots.get(&key) {
+        if let Some(slot) = slots.slots.get(&key) {
             return Ok(Arc::clone(slot));
         }
-        if slots.len() >= MEMO_SWEEP_THRESHOLD {
+        if slots.slots.len() >= slots.sweep_at {
             // Never remove a slot that another caller owns, even if its
             // producer has not yet finished constructing the value.
-            slots.retain(|_, slot| {
+            slots.slots.retain(|_, slot| {
                 Arc::strong_count(slot) > 1
                     || slot
                         .try_lock()
                         .map_or(true, |value| value.strong_count() > 0)
             });
+            // Avoid repeatedly scanning a large set of live in-flight jobs.
+            slots.sweep_at = MEMO_SWEEP_THRESHOLD.max(slots.slots.len().saturating_mul(2));
         }
-        Ok(Arc::clone(slots.entry(key).or_default()))
+        Ok(Arc::clone(slots.slots.entry(key).or_default()))
     }
 }
 
@@ -233,6 +243,9 @@ impl ResidentRuntime {
             let Some(plan) = plan_overlays(view.manifest(), lease.manifest(), protected) else {
                 continue;
             };
+            if plan.materialized_entries >= lease.manifest().entries.len().div_ceil(2) {
+                continue;
+            }
             if best.as_ref().is_none_or(|(_, _, previous)| {
                 plan.materialized_entries < previous.materialized_entries
             }) {
@@ -311,6 +324,29 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("independent preparation");
         });
+        Ok(())
+    }
+
+    #[test]
+    fn memo_sweep_preserves_active_flights_and_discards_dead_slots() -> Result<()> {
+        let memo = WeakMemo::<usize, usize>::default();
+        let held = memo.slot(0)?;
+        let value = Arc::new(1);
+        *memo.slot(1)?.lock().expect("value slot") = Arc::downgrade(&value);
+        for id in 2..MEMO_SWEEP_THRESHOLD * 4 {
+            drop(memo.slot(id)?);
+        }
+        assert!(Arc::ptr_eq(&held, &memo.slot(0)?));
+        assert!(Arc::ptr_eq(
+            &value,
+            &memo
+                .slot(1)?
+                .lock()
+                .expect("value slot")
+                .upgrade()
+                .context("live value")?
+        ));
+        assert!(memo.slots.lock().expect("memo index").slots.len() <= MEMO_SWEEP_THRESHOLD);
         Ok(())
     }
 

@@ -761,13 +761,12 @@ pub fn execute(
     let stderr = tempfile::tempfile_in(&policy.scratch)?;
     progress()?;
     let preparation = started.elapsed();
-    let remaining = policy.timeout.saturating_sub(preparation);
     ensure!(
-        !remaining.is_zero(),
+        preparation < policy.timeout,
         "native execution preparation timed out"
     );
     let running = Instant::now();
-    let status = RunningChild(
+    let mut child = RunningChild(
         build
             .plan
             .command(&policy.bubblewrap, &invocation)?
@@ -775,8 +774,11 @@ pub fn execute(
             .stdout(stdout.try_clone()?)
             .stderr(stderr.try_clone()?)
             .spawn()?,
-    )
-    .wait(remaining, &mut progress)?;
+    );
+    let status = child.wait(
+        policy.timeout.saturating_sub(started.elapsed()),
+        &mut progress,
+    )?;
     let process = running.elapsed();
     progress()?;
     let mut capture = Capture {
