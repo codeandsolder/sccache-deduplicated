@@ -376,7 +376,7 @@ pub fn build_function_map_with(
                     .filenames
                     .get(file_id)
                     .context("coverage region refers to an unknown file")?;
-                let Some(file) = keys.key(Path::new(filename)) else {
+                let Some(file) = key(Path::new(filename))? else {
                     continue;
                 };
                 let range = HitRange {
@@ -564,6 +564,31 @@ mod tests {
         let top = top_level_keys(Path::new("/repo"));
         assert_eq!(key(&top, "/repo/src/lib.rs").as_deref(), Some("src/lib.rs"));
         assert_eq!(key(&top, "/elsewhere/x.rs"), None);
+    }
+
+    #[test]
+    fn coverage_path_mapping_uses_producing_action_namespace() -> Result<()> {
+        let json = export_json(&[function_json(
+            "function",
+            &[Path::new("/build/src/lib.rs")],
+            "[1,1,3,1,0,0,0,0]",
+        )]);
+        let result = build_function_map_with(&json, |path| {
+            assert_eq!(path, Path::new("/build/src/lib.rs"));
+            Ok(Some("nested/crate/src/lib.rs".to_owned()))
+        })?;
+        assert_eq!(result["function"][0].file, "nested/crate/src/lib.rs");
+        assert!(
+            build_function_map_with(&json, |_| anyhow::bail!("ambiguous canonical source path"))
+                .is_err()
+        );
+        let invalid = export_json(&[function_json(
+            "function",
+            &[Path::new("/build/src/lib.rs")],
+            "[1,1,3,1,0,2,0,0]",
+        )]);
+        assert!(build_function_map_with(&invalid, |_| Ok(None)).is_err());
+        Ok(())
     }
 
     /// A project with two source files: the map records each function's full
