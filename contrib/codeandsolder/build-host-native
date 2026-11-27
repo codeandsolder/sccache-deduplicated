@@ -41,6 +41,9 @@ if (( dashboard )); then
     scripts/install-scheduler-dashboard-tools.sh "$tmp/dashboard-tools"
     env -u RUSTFLAGS -u CFLAGS -u CXXFLAGS scripts/build-scheduler-dashboard.sh "$tmp/dashboard-tools/wasm-bindgen" "$tmp/dashboard-tools/stylance"
     cp -a "$CARGO_TARGET_DIR/scheduler-dashboard/pkg" "$stage/pkg"
+    mkdir "$tmp/source"
+    git archive "$source_sha" | tar -xf - -C "$tmp/source"
+    "$stage/sccache-dist" verify-dashboard --assets "$stage/pkg" --source "$tmp/source"
 fi
 "$stage/sccache" --version
 "$stage/sccache-dist" --version

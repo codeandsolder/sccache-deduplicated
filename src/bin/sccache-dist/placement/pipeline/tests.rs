@@ -93,6 +93,8 @@ fn phase_assignments(
             (
                 id,
                 Some(AssignedNative {
+                    #[cfg(feature = "scheduler-dashboard")]
+                    dashboard: None,
                     packages: Default::default(),
                     inputs: inputs.clone(),
                     class: None,
@@ -140,6 +142,8 @@ fn native_pipeline_waits_for_staging_slots_and_reuses_future_content() {
     let assigned = Assignments::from([(
         JobId(1),
         Some(AssignedNative {
+            #[cfg(feature = "scheduler-dashboard")]
+            dashboard: None,
             packages: Default::default(),
             inputs: inputs.clone(),
             class: None,
@@ -254,6 +258,8 @@ fn native_pipeline_uses_each_reservations_learned_service_time() {
     let assigned = Assignments::from([(
         JobId(1),
         Some(AssignedNative {
+            #[cfg(feature = "scheduler-dashboard")]
+            dashboard: None,
             packages: Default::default(),
             inputs: inputs.clone(),
             class: None,
@@ -310,6 +316,8 @@ fn native_pipeline_charges_warm_preparation_and_publication_without_uploads() {
     let assigned = Assignments::from([(
         JobId(1),
         Some(AssignedNative {
+            #[cfg(feature = "scheduler-dashboard")]
+            dashboard: None,
             packages: Default::default(),
             inputs: inputs.clone(),
             class: None,

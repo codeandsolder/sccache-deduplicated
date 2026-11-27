@@ -36,6 +36,8 @@ struct PanelDefinition {
     queries: Vec<QueryDefinition>,
     #[serde(default)]
     requires_client: bool,
+    #[serde(default)]
+    group: crate::MetricGroup,
 }
 
 #[derive(Clone, Deserialize)]
@@ -367,10 +369,23 @@ async fn query(
         .append_pair("end", &window.end.to_string())
         .append_pair("step", &view.range.step().to_string());
     let data: QueryData = get_json(source, url).await?;
+    decode_series(data, definition, window, view.range.step(), index)
+}
+
+fn decode_series(
+    data: QueryData,
+    definition: &QueryDefinition,
+    window: QueryWindow,
+    step: u64,
+    index: usize,
+) -> Result<Vec<MetricSeries>> {
     ensure!(data.result.len() <= MAX_SERIES, "too many metric series");
+    let mut keys = std::collections::BTreeSet::new();
     data.result
         .into_iter()
         .map(|series| {
+            let key = format!("{index}:{}", serde_json::to_string(&series.metric)?);
+            ensure!(keys.insert(key.clone()), "duplicate metric series");
             ensure!(series.values.len() <= MAX_POINTS, "too many metric points");
             let mut points = series
                 .values
@@ -382,14 +397,25 @@ async fn query(
                     )
                 })
                 .collect::<Vec<_>>();
+            let start = timestamp_seconds(window.start);
+            let end = timestamp_seconds(window.end);
+            let step = timestamp_seconds(step);
             ensure!(
-                points.iter().all(|(time, _)| time.is_finite()),
-                "invalid metric timestamp"
+                points.iter().all(|(time, _)| time.is_finite()
+                    && *time >= start
+                    && *time <= end
+                    && (time - start).rem_euclid(step).total_cmp(&0.0).is_eq()),
+                "metric timestamp outside the requested grid"
             );
             points.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-            points.dedup_by(|a, b| a.0.total_cmp(&b.0).is_eq());
+            ensure!(
+                points
+                    .windows(2)
+                    .all(|pair| pair[0].0.total_cmp(&pair[1].0).is_lt()),
+                "duplicate metric timestamp"
+            );
             Ok(MetricSeries {
-                key: format!("{index}:{}", serde_json::to_string(&series.metric)?),
+                key,
                 label: series_label(&series.metric, &definition.legend),
                 points,
             })
@@ -428,20 +454,29 @@ impl QueryWindow {
 }
 
 fn merge_window(
-    previous: Vec<MetricSeries>,
+    previous: &[MetricSeries],
     incoming: Vec<MetricSeries>,
     window: QueryWindow,
-) -> Vec<MetricSeries> {
+) -> Result<Vec<MetricSeries>> {
     let mut merged = BTreeMap::new();
-    for mut series in previous {
-        // A successful query is authoritative for its entire interval,
-        // including absent points and disappeared series.
-        series.points.retain(|(time, _)| {
-            *time >= timestamp_seconds(window.retain_from)
-                && *time < timestamp_seconds(window.start)
-        });
-        if !series.points.is_empty() {
-            merged.insert(series.key.clone(), series);
+    for series in previous {
+        // Successful responses replace the entire requested interval,
+        // including disappearing series. Copy only retained older points.
+        let first = series
+            .points
+            .partition_point(|(time, _)| *time < timestamp_seconds(window.retain_from));
+        let end = series
+            .points
+            .partition_point(|(time, _)| *time < timestamp_seconds(window.start));
+        if first < end {
+            merged.insert(
+                series.key.clone(),
+                MetricSeries {
+                    key: series.key.clone(),
+                    label: series.label.clone(),
+                    points: series.points[first..end].to_vec(),
+                },
+            );
         }
     }
     for mut series in incoming {
@@ -451,7 +486,35 @@ fn merge_window(
         }
         merged.insert(series.key.clone(), series);
     }
-    merged.into_values().collect()
+    // A series cap must apply to the retained history, not merely to
+    // individual incremental responses whose labels can change over time.
+    ensure!(
+        merged.len() <= MAX_SERIES,
+        "too many retained metric series"
+    );
+    ensure!(
+        merged
+            .values()
+            .all(|series| series.points.len() <= MAX_POINTS),
+        "too many retained metric points"
+    );
+    Ok(merged.into_values().collect())
+}
+
+const fn current_only(kind: PanelKind) -> bool {
+    matches!(kind, PanelKind::Stat | PanelKind::Bargauge)
+}
+
+fn retained_on_error(
+    previous: Vec<MetricSeries>,
+    window: QueryWindow,
+) -> impl Iterator<Item = MetricSeries> {
+    previous.into_iter().filter_map(move |mut series| {
+        series.points.retain(|(time, _)| {
+            *time >= timestamp_seconds(window.retain_from) && *time <= timestamp_seconds(window.end)
+        });
+        (!series.points.is_empty()).then_some(series)
+    })
 }
 
 async fn read_panel(
@@ -464,6 +527,7 @@ async fn read_panel(
 ) -> MetricPanel {
     let mut panel = MetricPanel {
         key,
+        group: definition.group,
         kind: definition.kind,
         title: definition.title,
         unit: definition.unit,
@@ -499,22 +563,32 @@ async fn read_panel(
     let count = definition.queries.len();
     for (index, definition) in definition.queries.iter().enumerate() {
         let previous = previous_by_query.remove(&index).unwrap_or_default();
-        match query(&source, definition, &view, window, index).await {
-            Ok(series) => panel.series.extend(merge_window(previous, series, window)),
+        let instantaneous = current_only(panel.kind);
+        let query_window = if instantaneous {
+            QueryWindow {
+                start: window.end,
+                ..window
+            }
+        } else {
+            window
+        };
+        let result = query(&source, definition, &view, query_window, index)
+            .await
+            .and_then(|series| {
+                if instantaneous {
+                    Ok(series)
+                } else {
+                    merge_window(&previous, series, window)
+                }
+            });
+        match result {
+            Ok(series) => panel.series.extend(series),
             Err(error) => {
                 log::warn!("dashboard metrics panel {}: {error:#}", panel.title);
                 failed += 1;
                 // Keep the last successful data within the selected range.
                 // The failure message makes the stale part explicit.
-                panel
-                    .series
-                    .extend(previous.into_iter().filter_map(|mut series| {
-                        series.points.retain(|(time, _)| {
-                            *time >= timestamp_seconds(window.retain_from)
-                                && *time <= timestamp_seconds(window.end)
-                        });
-                        (!series.points.is_empty()).then_some(series)
-                    }));
+                panel.series.extend(retained_on_error(previous, window));
             }
         }
     }
@@ -569,6 +643,7 @@ async fn refresh(source: Arc<Source>, feed: &Feed, view: MetricsView) {
             .clone()
             .into_iter()
             .enumerate()
+            .filter(|(_, definition)| definition.group == view.group)
             .map(|(key, definition)| {
                 let old = old_panels.remove(&key);
                 let full = full || old.as_ref().is_none_or(|panel| panel.error.is_some());
@@ -656,7 +731,7 @@ mod tests {
             series("a", &[(4.0, Some(40.0)), (6.0, None), (7.0, Some(7.0))]),
             series("d", &[(7.0, Some(1.0))]),
         ];
-        let merged = merge_window(previous, incoming, window);
+        let merged = merge_window(&previous, incoming, window).unwrap();
         assert_eq!(
             merged,
             vec![
@@ -674,6 +749,59 @@ mod tests {
                 series("d", &[(7.0, Some(1.0))]),
             ]
         );
+    }
+
+    #[test]
+    fn metric_grid_rejects_duplicate_out_of_range_and_off_grid_points() {
+        let definition = QueryDefinition {
+            expr: "vector(1)".into(),
+            legend: "".into(),
+        };
+        let window = QueryWindow {
+            start: 10,
+            end: 20,
+            retain_from: 10,
+        };
+        for values in [
+            vec![(10.0, "1".into()), (10.0, "2".into())],
+            vec![(9.0, "1".into())],
+            vec![(21.0, "1".into())],
+            vec![(11.0, "1".into())],
+        ] {
+            let data = QueryData {
+                result: vec![QuerySeries {
+                    metric: BTreeMap::new(),
+                    values,
+                }],
+            };
+            assert!(decode_series(data, &definition, window, 5, 0).is_err());
+        }
+        let data = QueryData {
+            result: vec![QuerySeries {
+                metric: BTreeMap::new(),
+                values: vec![(15.0, "NaN".into()), (10.0, "1".into())],
+            }],
+        };
+        let series = decode_series(data, &definition, window, 5, 0).unwrap();
+        assert_eq!(series[0].points, [(10.0, Some(1.0)), (15.0, None)]);
+    }
+
+    #[test]
+    fn incremental_series_churn_cannot_exceed_history_cap() {
+        let previous = (0..MAX_SERIES)
+            .map(|key| series(&key.to_string(), &[(1.0, Some(1.0))]))
+            .collect::<Vec<_>>();
+        let incoming = vec![series("new", &[(2.0, Some(2.0))])];
+        let window = QueryWindow {
+            retain_from: 1,
+            start: 2,
+            end: 2,
+        };
+        assert!(merge_window(&previous, incoming, window).is_err());
+        assert!(current_only(PanelKind::Stat));
+        assert!(current_only(PanelKind::Bargauge));
+        assert!(!current_only(PanelKind::Timeseries));
+        assert!(!current_only(PanelKind::Table));
     }
 
     #[test]
@@ -701,7 +829,24 @@ mod tests {
     #[test]
     fn manifest_is_complete_and_client_cannot_inject_promql() -> Result<()> {
         let panels: Vec<PanelDefinition> = serde_json::from_str(include_str!("../panels.json"))?;
-        assert_eq!(panels.len(), 42);
+        assert_eq!(panels.len(), 50);
+        assert_eq!(
+            panels
+                .iter()
+                .filter(|panel| panel.group == crate::MetricGroup::CacheStorage)
+                .count(),
+            10
+        );
+        assert!(
+            panels
+                .iter()
+                .any(|panel| panel.group == crate::MetricGroup::CacheHits)
+        );
+        assert!(
+            panels
+                .iter()
+                .any(|panel| panel.group == crate::MetricGroup::Fleet)
+        );
         let view = MetricsView {
             client: "host.*\"} or vector(1) #".into(),
             ..Default::default()

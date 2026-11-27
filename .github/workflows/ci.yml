@@ -330,7 +330,9 @@ jobs:
         scripts/install-scheduler-dashboard-tools.sh "$target_dir/dashboard-tools"
         env -u RUSTFLAGS scripts/build-scheduler-dashboard.sh "$target_dir/dashboard-tools/wasm-bindgen" "$target_dir/dashboard-tools/stylance"
         cargo build --locked --target x86_64-unknown-linux-gnu --no-default-features --features=scheduler-dashboard --bin sccache-dist
-        scripts/test-scheduler-dashboard-browser.sh "$target_dir/x86_64-unknown-linux-gnu/debug/sccache-dist" "$target_dir/scheduler-dashboard/pkg"
+        cargo build --locked --target x86_64-unknown-linux-gnu -p sccache-dashboard --features ssr --example browser-fixture
+        scripts/test-scheduler-dashboard-package.sh "$target_dir/x86_64-unknown-linux-gnu/debug/sccache-dist" "$target_dir/scheduler-dashboard/pkg"
+        scripts/test-scheduler-dashboard-browser.sh "$target_dir/x86_64-unknown-linux-gnu/debug/sccache-dist" "$target_dir/scheduler-dashboard/pkg" "$target_dir/x86_64-unknown-linux-gnu/debug/examples/browser-fixture"
       test-suites: |
         [
           {"name":"default-unit","cargo":["--locked","--target","x86_64-unknown-linux-gnu","--lib","--bins"],"nextest":["--profile","ci-isolated"]},

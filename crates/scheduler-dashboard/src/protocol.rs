@@ -1,6 +1,6 @@
 //! Shared deterministic delta protocol; neither a browser nor a slow SSE
 //! consumer can silently continue with a missing revision.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{DashboardData, HISTORY_CAPACITY, NativeEvent, NativePatch, Rows, Sample, Snapshot};
 
@@ -13,6 +13,63 @@ fn diff_rows<T: Clone + PartialEq>(old: &[T], new: &[T], key: impl Fn(&T) -> &st
         .collect();
     let remove = previous.into_keys().map(str::to_owned).collect();
     Rows { upsert, remove }
+}
+
+const fn has_rows<T>(rows: &Rows<T>) -> bool {
+    !rows.upsert.is_empty() || !rows.remove.is_empty()
+}
+
+fn unique<T: Ord>(keys: impl IntoIterator<Item = T>) -> bool {
+    let mut seen = BTreeSet::new();
+    keys.into_iter().all(|key| seen.insert(key))
+}
+
+fn valid_rows<T>(old: &[T], delta: &Rows<T>, key: impl Fn(&T) -> &str) -> bool {
+    unique(
+        delta
+            .upsert
+            .iter()
+            .map(&key)
+            .chain(delta.remove.iter().map(String::as_str)),
+    ) && (delta.remove.is_empty() || {
+        let previous = old.iter().map(&key).collect::<BTreeSet<_>>();
+        delta.remove.iter().all(|id| previous.contains(id.as_str()))
+    })
+}
+
+fn valid_native_reset(reset: &DashboardData) -> bool {
+    reset.history.len() <= HISTORY_CAPACITY
+        && reset
+            .history
+            .windows(2)
+            .all(|pair| pair[0].unix_secs < pair[1].unix_secs)
+        && reset.snapshot.as_ref().is_none_or(|snapshot| {
+            unique(snapshot.workers.iter().map(|row| row.id.as_str()))
+                && unique(snapshot.jobs.iter().map(|row| row.id.as_str()))
+                && unique(snapshot.topology.hosts.iter().map(|row| row.id.as_str()))
+                && unique(snapshot.topology.links.iter().map(|row| row.id.as_str()))
+        })
+}
+
+fn valid_native_rows(state: &DashboardData, patch: &NativePatch) -> bool {
+    let snapshot = state.snapshot.as_ref();
+    valid_rows(
+        snapshot.map_or(&[][..], |s| s.workers.as_slice()),
+        &patch.workers,
+        |row| &row.id,
+    ) && valid_rows(
+        snapshot.map_or(&[][..], |s| s.jobs.as_slice()),
+        &patch.jobs,
+        |row| &row.id,
+    ) && valid_rows(
+        snapshot.map_or(&[][..], |s| s.topology.hosts.as_slice()),
+        &patch.hosts,
+        |row| &row.id,
+    ) && valid_rows(
+        snapshot.map_or(&[][..], |s| s.topology.links.as_slice()),
+        &patch.links,
+        |row| &row.id,
+    )
 }
 
 fn apply_rows<T>(rows: &mut Vec<T>, delta: Rows<T>, key: impl Fn(&T) -> &str) {
@@ -64,17 +121,39 @@ pub fn make_patch(
 pub fn apply_event(state: &mut DashboardData, event: NativeEvent) -> bool {
     let patch = match event {
         NativeEvent::Reset(reset) => {
+            if !valid_native_reset(&reset) {
+                return false;
+            }
             *state = *reset;
             return true;
         }
         NativeEvent::Patch(patch) => *patch,
     };
-    if patch.revision != state.revision.saturating_add(1) {
+    if patch.revision != state.revision.saturating_add(1)
+        || (patch.sampled_at.is_none()
+            && (patch.totals.is_some()
+                || has_rows(&patch.workers)
+                || has_rows(&patch.jobs)
+                || has_rows(&patch.hosts)
+                || has_rows(&patch.links)))
+        || !valid_native_rows(state, &patch)
+    {
         return false;
     }
     state.revision = patch.revision;
     state.error = patch.error;
     if let Some(sample) = patch.sample {
+        // The wall clock may step backwards. Do not retain an unsorted
+        // time axis or calculate counter deltas across a clock discontinuity.
+        if let Some(last) = state.history.last() {
+            match sample.unix_secs.cmp(&last.unix_secs) {
+                std::cmp::Ordering::Less => state.history.clear(),
+                std::cmp::Ordering::Equal => {
+                    state.history.pop();
+                }
+                std::cmp::Ordering::Greater => {}
+            }
+        }
         if state.history.len() >= HISTORY_CAPACITY {
             state.history.remove(0);
         }
@@ -116,6 +195,7 @@ mod tests {
     fn job(id: &str) -> Job {
         Job {
             id: id.into(),
+            description: None,
             worker: "worker".into(),
             worker_id: "127.0.0.1:1".into(),
             state: "ready".into(),
@@ -126,6 +206,49 @@ mod tests {
             remaining_input_bytes: None,
             remaining_input_blobs: None,
             predicted_completion_secs: None,
+        }
+    }
+
+    #[test]
+    fn native_invalid_resets_and_row_deltas_preserve_last_good_state() {
+        let mut state = DashboardData::default();
+        let snapshot = Snapshot {
+            jobs: vec![job("one")],
+            ..Default::default()
+        };
+        let patch = make_patch(&state, Some(&snapshot), Some(1), None, None);
+        assert!(apply_event(&mut state, NativeEvent::Patch(Box::new(patch))));
+        let previous = state.clone();
+        let mut reset = state.clone();
+        reset.snapshot.as_mut().unwrap().jobs.push(job("one"));
+        assert!(!apply_event(
+            &mut state,
+            NativeEvent::Reset(Box::new(reset))
+        ));
+        assert_eq!(state, previous);
+        let mut reset = previous.clone();
+        reset.history = [2, 1]
+            .into_iter()
+            .map(|unix_secs| Sample {
+                unix_secs,
+                admission: None,
+                totals: None,
+            })
+            .collect();
+        assert!(!apply_event(
+            &mut state,
+            NativeEvent::Reset(Box::new(reset))
+        ));
+        assert_eq!(state, previous);
+        for remove in ["one", "unknown"] {
+            let mut patch = make_patch(&state, Some(&snapshot), Some(2), None, None);
+            patch.jobs.upsert.push(job("one"));
+            patch.jobs.remove.push(remove.into());
+            assert!(!apply_event(
+                &mut state,
+                NativeEvent::Patch(Box::new(patch))
+            ));
+            assert_eq!(state, previous);
         }
     }
 
@@ -179,8 +302,9 @@ mod tests {
             ..Default::default()
         };
         let sample = Sample {
+            admission: None,
             unix_secs: 1,
-            totals: Totals::default(),
+            totals: Some(Totals::default()),
         };
         let patch = make_patch(
             &state,
@@ -266,6 +390,43 @@ mod tests {
     }
 
     #[test]
+    fn history_replaces_duplicate_timestamps_and_clears_on_clock_reversal() {
+        let mut state = DashboardData::default();
+        for (time, hits) in [(10, 1), (12, 2), (12, 3), (9, 4), (11, 5)] {
+            let patch = make_patch(
+                &state,
+                None,
+                None,
+                Some(Sample {
+                    admission: Some(crate::AdmissionCounts {
+                        hits,
+                        ..Default::default()
+                    }),
+                    unix_secs: time,
+                    totals: None,
+                }),
+                None,
+            );
+            assert!(apply_event(&mut state, NativeEvent::Patch(Box::new(patch))));
+            if time == 12 {
+                assert_eq!(state.history.len(), 2);
+                assert_eq!(
+                    state.history[1].admission.map(|counts| counts.hits),
+                    Some(hits)
+                );
+            }
+        }
+        assert_eq!(
+            state
+                .history
+                .iter()
+                .map(|sample| sample.unix_secs)
+                .collect::<Vec<_>>(),
+            [9, 11]
+        );
+    }
+
+    #[test]
     fn unchanged_sample_carries_no_rows_or_history() {
         let snapshot = Snapshot::default();
         let state = DashboardData {
@@ -277,8 +438,9 @@ mod tests {
             Some(&snapshot),
             Some(1),
             Some(Sample {
+                admission: None,
                 unix_secs: 1,
-                totals: Totals::default(),
+                totals: Some(Totals::default()),
             }),
             None,
         );
@@ -345,7 +507,11 @@ fn series_patch(old: &MetricSeries, new: &MetricSeries) -> Option<SeriesPatch> {
 }
 
 fn panel_patch(old: &MetricPanel, new: &MetricPanel) -> Option<PanelPatch> {
-    if old.title != new.title || old.unit != new.unit || old.kind != new.kind {
+    if old.title != new.title
+        || old.unit != new.unit
+        || old.kind != new.kind
+        || old.group != new.group
+    {
         return Some(PanelPatch::Replace(new.clone()));
     }
     let mut previous: BTreeMap<_, _> = old
@@ -378,7 +544,7 @@ fn panel_patch(old: &MetricPanel, new: &MetricPanel) -> Option<PanelPatch> {
 
 #[must_use = "the patch advances the metrics feed revision"]
 pub fn make_metrics_patch(old: &MetricsData, new: &MetricsData) -> MetricsPatch {
-    let previous: BTreeMap<_, _> = old.panels.iter().map(|panel| (panel.key, panel)).collect();
+    let mut previous: BTreeMap<_, _> = old.panels.iter().map(|panel| (panel.key, panel)).collect();
     MetricsPatch {
         revision: old.revision.saturating_add(1),
         sampled_at: new.sampled_at,
@@ -388,12 +554,13 @@ pub fn make_metrics_patch(old: &MetricsData, new: &MetricsData) -> MetricsPatch 
             .panels
             .iter()
             .filter_map(|panel| {
-                previous.get(&panel.key).map_or_else(
+                previous.remove(&panel.key).map_or_else(
                     || Some(PanelPatch::Replace(panel.clone())),
                     |old| panel_patch(old, panel),
                 )
             })
             .collect(),
+        removed: previous.into_keys().collect(),
     }
 }
 
@@ -433,15 +600,114 @@ fn apply_series_patch(panel: &mut MetricPanel, patch: SeriesPatch) -> bool {
     true
 }
 
+fn valid_points(points: &[(f64, Option<f64>)]) -> bool {
+    points
+        .iter()
+        .all(|(time, value)| time.is_finite() && *time >= 0.0 && value.is_none_or(f64::is_finite))
+        && points
+            .windows(2)
+            .all(|pair| pair[0].0.total_cmp(&pair[1].0).is_lt())
+}
+
+fn valid_panel(panel: &MetricPanel, group: crate::MetricGroup) -> bool {
+    panel.group == group
+        && unique(panel.series.iter().map(|series| series.key.as_str()))
+        && panel
+            .series
+            .iter()
+            .all(|series| valid_points(&series.points))
+}
+
+fn valid_series_delta(
+    previous: &MetricSeries,
+    upsert: &[(f64, Option<f64>)],
+    remove: &[f64],
+) -> bool {
+    valid_points(upsert)
+        && remove
+            .windows(2)
+            .all(|pair| pair[0].total_cmp(&pair[1]).is_lt())
+        && remove.iter().all(|time| {
+            previous
+                .points
+                .binary_search_by(|point| point.0.total_cmp(time))
+                .is_ok()
+                && upsert
+                    .binary_search_by(|point| point.0.total_cmp(time))
+                    .is_err()
+        })
+}
+
+fn valid_metrics_patch(state: &MetricsData, patch: &MetricsPatch) -> bool {
+    let mut keys = BTreeSet::new();
+    if !patch
+        .removed
+        .iter()
+        .all(|key| keys.insert(*key) && state.panels.iter().any(|panel| panel.key == *key))
+    {
+        return false;
+    }
+    patch.panels.iter().all(|change| match change {
+        PanelPatch::Replace(panel) => {
+            keys.insert(panel.key) && valid_panel(panel, state.view.group)
+        }
+        PanelPatch::Update {
+            key,
+            series,
+            removed,
+            ..
+        } => {
+            if !keys.insert(*key) {
+                return false;
+            }
+            let Some(panel) = state.panels.iter().find(|panel| panel.key == *key) else {
+                return false;
+            };
+            let mut series_keys = BTreeSet::new();
+            if !removed.iter().all(|key| {
+                series_keys.insert(key.as_str())
+                    && panel.series.iter().any(|series| series.key == *key)
+            }) {
+                return false;
+            }
+            series.iter().all(|change| match change {
+                SeriesPatch::Replace(series) => {
+                    series_keys.insert(series.key.as_str()) && valid_points(&series.points)
+                }
+                SeriesPatch::Update {
+                    key,
+                    upsert,
+                    remove,
+                } => {
+                    series_keys.insert(key.as_str())
+                        && panel
+                            .series
+                            .iter()
+                            .find(|series| series.key == *key)
+                            .is_some_and(|previous| valid_series_delta(previous, upsert, remove))
+                }
+            })
+        }
+    })
+}
+
 pub fn apply_metrics_event(state: &mut MetricsData, event: MetricsEvent) -> bool {
     let patch = match event {
         MetricsEvent::Reset(data) => {
+            if !unique(data.panels.iter().map(|panel| panel.key))
+                || !data
+                    .panels
+                    .iter()
+                    .all(|panel| valid_panel(panel, data.view.group))
+            {
+                return false;
+            }
             *state = data;
             return true;
         }
         MetricsEvent::Patch(patch) => patch,
     };
-    if patch.revision != state.revision.saturating_add(1) {
+    if patch.revision != state.revision.saturating_add(1) || !valid_metrics_patch(state, &patch) {
         return false;
     }
     state.revision = patch.revision;
@@ -450,6 +716,9 @@ pub fn apply_metrics_event(state: &mut MetricsData, event: MetricsEvent) -> bool
     if let Some(clients) = patch.clients {
         state.clients = clients;
     }
+    state
+        .panels
+        .retain(|panel| !patch.removed.contains(&panel.key));
     for patch in patch.panels {
         match patch {
             PanelPatch::Replace(panel) => {
@@ -487,9 +756,97 @@ pub fn apply_metrics_event(state: &mut MetricsData, event: MetricsEvent) -> bool
 mod metrics_tests {
     use super::*;
     #[test]
+    fn removed_panels_and_invalid_patches_are_atomic() {
+        let panel = MetricPanel {
+            key: 1,
+            group: crate::MetricGroup::Fleet,
+            kind: crate::PanelKind::Stat,
+            title: "Test".into(),
+            unit: "s".into(),
+            series: Vec::new(),
+            error: None,
+        };
+        let mut state = MetricsData {
+            panels: vec![panel],
+            ..Default::default()
+        };
+        let mut next = state.clone();
+        next.revision = 1;
+        next.panels.clear();
+        let patch = make_metrics_patch(&state, &next);
+        assert!(apply_metrics_event(&mut state, MetricsEvent::Patch(patch)));
+        assert_eq!(state, next);
+        let mut invalid = make_metrics_patch(&state, &next);
+        invalid.error = Some("must not mutate".into());
+        invalid.panels.push(PanelPatch::Update {
+            key: 99,
+            error: None,
+            series: Vec::new(),
+            removed: Vec::new(),
+        });
+        assert!(!apply_metrics_event(
+            &mut state,
+            MetricsEvent::Patch(invalid)
+        ));
+        assert_eq!(state, next);
+    }
+
+    #[test]
+    fn malformed_series_and_resets_do_not_mutate_last_good_metrics() {
+        let panel = MetricPanel {
+            key: 0,
+            group: crate::MetricGroup::Fleet,
+            kind: crate::PanelKind::Timeseries,
+            title: "Test".into(),
+            unit: "s".into(),
+            error: None,
+            series: vec![MetricSeries {
+                key: "a".into(),
+                label: "A".into(),
+                points: vec![(1.0, Some(3.0)), (2.0, None)],
+            }],
+        };
+        let previous = MetricsData {
+            panels: vec![panel],
+            configured: true,
+            ..Default::default()
+        };
+        let mut state = previous.clone();
+        let mut reset = previous.clone();
+        reset.panels[0].series[0].points.reverse();
+        assert!(!apply_metrics_event(&mut state, MetricsEvent::Reset(reset)));
+        assert_eq!(state, previous);
+        let mut reset = previous.clone();
+        reset.panels.push(reset.panels[0].clone());
+        assert!(!apply_metrics_event(&mut state, MetricsEvent::Reset(reset)));
+        assert_eq!(state, previous);
+        for (upsert, remove) in [
+            (vec![(3.0, None), (3.0, Some(4.0))], vec![]),
+            (vec![(2.0, Some(4.0))], vec![2.0]),
+            (vec![], vec![3.0]),
+            (vec![(3.0, Some(f64::INFINITY))], vec![]),
+        ] {
+            let mut patch = make_metrics_patch(&state, &state);
+            patch.panels.push(PanelPatch::Update {
+                key: 0,
+                error: None,
+                removed: vec![],
+                series: vec![SeriesPatch::Update {
+                    key: "a".into(),
+                    upsert,
+                    remove,
+                }],
+            });
+            assert!(!apply_metrics_event(&mut state, MetricsEvent::Patch(patch)));
+            assert_eq!(state, previous);
+        }
+    }
+
+    #[test]
     fn rolling_range_and_late_correction_reconstruct_exact_data() {
         let panel = MetricPanel {
             key: 0,
+            group: crate::MetricGroup::Fleet,
             kind: crate::PanelKind::Timeseries,
             title: "Test".into(),
             unit: "s".into(),

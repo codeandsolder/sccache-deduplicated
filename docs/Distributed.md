@@ -626,6 +626,16 @@ docker run -ti --rm -v $PWD:/sccache luser/sccache-musl-build:0.1 /bin/bash -c "
 
 ## Local scheduler status dashboard
 
+The dashboard opens on Overview. The remaining tabs are Workers, Jobs, CAS,
+Cache hits, Cache storage, Topology, Network and Fleet metrics. Only the active tab is rendered, with filters, pagination and topology selection
+kept outside its view lifetime. Updates retain keyed table cells and fixed column
+widths instead of rebuilding rows. The optional fleet metrics stream disconnects
+when leaving its tabs, avoiding inactive query and rendering load. Native SSE
+updates invalidate only their affected projections; job updates do not clone
+history or cache telemetry. Overview tiles and keyed chart paths update in place.
+Percentage charts retain a 0–100% baseline; series colors remain stable as
+other series appear or disappear.
+
 ### Live network topology
 
 The dashboard's **Topology** view projects authenticated scheduler, worker,
@@ -666,7 +676,26 @@ On other platforms install the versions of wasm-bindgen-cli and stylance-cli
 specified by Cargo.lock and call the build script with their executable paths
 (or put the matching tools on PATH). The generated package is under the Cargo
 target directory at `scheduler-dashboard/pkg`; install the complete directory
-alongside the corresponding scheduler release. Configure its absolute path:
+alongside the corresponding scheduler release. The asset manifest and
+content-derived generation identity are mandatory. The build requires
+ripgrep, and replacing an existing generated directory requires GNU
+coreutils with atomic `mv --exchange --no-copy` support. Initial publication
+uses a same-directory atomic rename. The old directory is retained until
+the complete new generation is ready.
+
+The native executable and optimized WASM embed the same source identity
+independently; generated JS and CSS carry that identity as well. The
+packager verifies the actual staged binary and full asset set against the
+source checkout. Validate an installed pair before activation:
+
+```sh
+sccache-dist verify-dashboard --assets /opt/sccache/dashboard/pkg
+```
+
+Add `--source /path/to/checkout` to validate the source inputs as well.
+At startup the scheduler verifies and loads all assets into an immutable
+in-memory generation, served under generation-scoped URLs. A filesystem
+replacement cannot mix assets in a running scheduler. Configure its absolute path:
 
 ```toml
 [dashboard]
@@ -688,10 +717,15 @@ invalid metrics URLs. Builds without the feature reject dashboard configuration.
 The initial typed SSR snapshot hydrates once. `GET /api/events` then streams
 a full reset followed by ordered deltas. Worker and job rows are keyed by
 identity; unchanged rows are not retransmitted just to update their age.
-Scheduler mutations wake the sampler, coalesced to at most ten projections
-per second. The periodic two-second sample covers time-based state changes
-and CAS/network observations and appends one history point (900 retained).
-History resets with the scheduler. Reconnection and broadcast lag both
+Scheduler mutations wake the sampler while a native SSE client is connected,
+coalesced to at most ten projections per second. Without viewers only the
+two-second periodic sample runs. The dashboard never waits for the scheduler's
+jobs, servers or recent-client locks; a contended intermediate observation is
+skipped. A failed periodic scheduler observation leaves a gap in its activity
+series but does not discard independently sampled CAS/admission telemetry.
+History retains up to 900 samples and resets on scheduler restart or a
+backward wall-clock step. Stale CAS counters retain their own last-successful
+timestamp. Reconnection and broadcast lag both
 produce a fresh reset; revision gaps cannot be silently ignored.
 
 The UI includes worker heartbeat age, capacity, errors, reservations and
@@ -702,15 +736,43 @@ are not recomputed in response to scheduler mutations.
 All scheduler-owned reservations, including assignment RPCs in flight, are
 available through a searchable, paginated table. Archive and native admission
 headroom are shown separately; they share compiler capacity and must not be added.
+Worker protocol labels distinguish CAS execution, legacy archive, both, or
+neither; CAS execution describes the transport/execution protocol, not the
+compiler's target architecture. Native job rows include the executable basename,
+Rust crate name or declared output basename, explicit target when present,
+requester identity and total/remaining input bytes and blob counts. The Jobs
+tab supports multi-term search, a phase filter, sorting by age, input backlog,
+worker or phase, and a declared-input availability bar (not network transfer
+progress). Unknown ages and backlog sizes are sorted after known values. The dashboard
+does not retain full command lines, environment variables or authorization data.
 No thousand-job truncation. Expired workers are excluded without
 mutating scheduling state. Native compiler slots are not legacy allocations;
 logical CAS bytes are not physical filesystem usage; measured transport
 goodput is not physical link capacity.
 
+### Cache hit statistics
+
+The Cache hits tab includes native scheduler admissions independently of the
+fleet metrics backend. Counts are available since scheduler start and for
+observed rolling one-, five- and fifteen-minute windows. One- and five-minute
+native hit-rate histories are charted directly from the scheduler samples. The admission hit rate is
+hits divided by hits plus reuse-mode compile admissions. Forced refreshes,
+in-flight requests, missing-input responses, busy responses and errors are
+reported separately rather than counted as cache misses. Admissions are not
+completed compilations or guarantees of successful result delivery.
+An idle denominator or unavailable window is displayed as unavailable.
+
+Fleet metrics separately report completed client cache outcomes over the selected
+range and rolling windows, broken down by client and compiler/language, plus
+legacy tier operations, bypasses and errors. The two sources are not summed.
+Counter increases account for restarts; absent samples remain absent.
+
 ### Fleet history
 
-If configured, Liberta supplies the existing Grafana dashboard plus cache-tier analytics (42 query
-panels total). Select an exact client or all clients and a range from 15 minutes
+If configured, Liberta supplies the existing Grafana dashboard plus cache-tier analytics (50 query
+panels total: 20 cache-result, 10 cache-storage and 20 fleet panels).
+Only the selected category is queried and transmitted; the category is part
+of the shared metrics-feed key. Select an exact client or all clients and a range from 15 minutes
 to seven days. Requests use fixed server-side PromQL templates; user labels
 are escaped as literal regular expressions. Linux host-wide panels include monitored Linux hosts rather than claiming all
 are workers. Ingress panels require an explicit Certifex virtual host. Range-dependent resolution is 5–1800 seconds;

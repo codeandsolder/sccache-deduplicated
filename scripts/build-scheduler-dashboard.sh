@@ -31,18 +31,28 @@ fi
 "${release_cargo[@]}" build --locked -p sccache-dashboard --no-default-features --features hydrate --release --target wasm32-unknown-unknown
 mkdir -p "$(dirname "$output_dir")"
 stage="$(mktemp -d "$(dirname "$output_dir")/pkg.XXXXXXXX")"
-trap 'rm -rf "$stage"' EXIT
+trap 'rm -rf "$stage"; rm -f "$stage.sha256sums"' EXIT
 "$bindgen" --target web --no-typescript --out-dir "$stage" --out-name sccache-dashboard \
     "$target_dir/wasm32-unknown-unknown/release/sccache_dashboard.wasm"
 "$stylance" crates/scheduler-dashboard --output-file "$stage/sccache-dashboard.css"
 for asset in sccache-dashboard.js sccache-dashboard_bg.wasm sccache-dashboard.css; do
     test -s "$stage/$asset"
 done
+# Stamp every generated script/stylesheet with the identity extracted from
+# the actual optimized WASM. A recomputed manifest cannot hide a mixed package.
+generation="$(rg --text --only-matching --no-filename 'sccache-dashboard-generation-v1:[0-9a-f]{64}' "$stage/sccache-dashboard_bg.wasm" | LC_ALL=C sort -u)"
+[[ "$generation" =~ ^sccache-dashboard-generation-v1:[0-9a-f]{64}$ ]]
+while IFS= read -r -d '' asset; do
+    printf '\n/* %s */\n' "$generation" >> "$asset"
+done < <(find "$stage" -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.css' \) -print0)
+# Hash every generated file before publishing; the scheduler verifies the
+# full manifest and the fingerprint embedded in the WASM itself.
+(cd "$stage" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$stage.sha256sums")
+mv "$stage.sha256sums" "$stage/SHA256SUMS"
 # The installed scheduler runs under a separate service account. The build
 # directory remains private, but the published asset tree must be readable.
 find "$stage" -type d -exec chmod 0755 {} +
 find "$stage" -type f -exec chmod 0644 {} +
 # Only replace an existing generation after all build steps have succeeded.
-rm -rf "$output_dir"
-mv "$stage" "$output_dir"
+scripts/publish-dashboard-assets.sh "$stage" "$output_dir"
 printf 'Dashboard assets: %s\n' "$output_dir"

@@ -164,9 +164,12 @@ The scheduler bundle must be readable by the scheduler service account; all
 files and directories must be root-owned and non-group/world-writable.
 On the managed fleet, `[dashboard]` uses loopback port 10604 and
 `/var/lib/sccache-dashboard/current`. Activation and automatic update verify
-the role-specific feature set and complete asset manifest, stop the scheduler,
-select that immutable generation atomically alongside the executable, verify
-HTTP/cluster readiness, and restore the old asset symlink and binary on rollback.
+the role-specific feature set and complete asset manifest, including the
+generation identity embedded in the candidate executable and optimized WASM,
+before stopping the scheduler. They select that immutable generation atomically
+alongside the executable and verify HTTP/cluster readiness by comparing all
+three entry assets at generation-specific URLs. Rollback restores the old asset
+symlink and binary and checks service reachability.
 A configured dashboard never falls back to an ordinary portable worker bundle.
 Keep the old selected generation until rollback is no longer needed.
 Build provisioning is separate from the root updater: no automatic root

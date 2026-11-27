@@ -21,7 +21,7 @@ use leptos::prelude::*;
 use leptos_meta::MetaTags;
 use leptos_meta::{Title, provide_meta_context};
 
-use crate::{DashboardData, MetricsData, MetricsView, TimeRange, styles};
+use crate::{DashboardData, MetricGroup, MetricsData, MetricsView, TimeRange, styles};
 
 mod analytics;
 mod chart;
@@ -56,6 +56,107 @@ async fn snapshot() -> Result<DashboardData, ServerFnError> {
     Ok(state.snapshot())
 }
 
+/// Independent invalidation domains for the native SSE projection. A job
+/// update must not copy or rebuild the 900-sample history or cache analytics.
+#[derive(Clone, Copy)]
+enum Projection {
+    Clock,
+    Totals,
+    History,
+    Workers,
+    Jobs,
+    Topology,
+    Telemetry,
+    Error,
+}
+
+const PROJECTION_COUNT: usize = 8;
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn changed_projections(event: &crate::NativeEvent) -> [bool; PROJECTION_COUNT] {
+    use crate::NativeEvent;
+    match event {
+        NativeEvent::Reset(_) => [true; PROJECTION_COUNT],
+        NativeEvent::Patch(patch) => {
+            let snapshot = patch.sampled_at.is_some();
+            let changed =
+                |upserts: usize, removals: usize| snapshot && (upserts != 0 || removals != 0);
+            [
+                snapshot,
+                snapshot && patch.totals.is_some(),
+                patch.sample.is_some(),
+                changed(patch.workers.upsert.len(), patch.workers.remove.len()),
+                changed(patch.jobs.upsert.len(), patch.jobs.remove.len()),
+                changed(patch.hosts.upsert.len(), patch.hosts.remove.len())
+                    || changed(patch.links.upsert.len(), patch.links.remove.len()),
+                patch.telemetry.is_some(),
+                true, // A successful patch also clears a previous error.
+            ]
+        }
+    }
+}
+
+/// Read the SSR resource or the in-place SSE state without cloning the
+/// complete snapshot. Only the changed projection's revision invalidates it.
+#[derive(Clone, Copy)]
+struct DashboardSource {
+    initial: Resource<Result<DashboardData, ServerFnError>>,
+    live: RwSignal<Option<DashboardData>>,
+    epochs: RwSignal<[u64; PROJECTION_COUNT]>,
+}
+
+impl DashboardSource {
+    fn project<T: PartialEq + Send + Sync + 'static>(
+        self,
+        projection: Projection,
+        read: impl Fn(Option<&DashboardData>) -> T + Send + Sync + 'static,
+    ) -> Memo<T> {
+        let version = Memo::new(move |_| self.epochs.with(|epochs| epochs[projection as usize]));
+        Memo::new(move |_| {
+            let _ = version.get();
+            self.live.with_untracked(|live| {
+                live.as_ref().map_or_else(
+                    || {
+                        self.initial.with(|initial| {
+                            read(initial.as_ref().and_then(|result| result.as_ref().ok()))
+                        })
+                    },
+                    |live| read(Some(live)),
+                )
+            })
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn apply(self, event: crate::NativeEvent) -> bool {
+        let changes = changed_projections(&event);
+        let valid = self.live.update_untracked(|data| {
+            if let Some(current) = data {
+                return crate::apply_event(current, event);
+            }
+            if !matches!(&event, crate::NativeEvent::Reset(_)) {
+                return false;
+            }
+            let mut current = DashboardData::default();
+            if !crate::apply_event(&mut current, event) {
+                return false;
+            }
+            *data = Some(current);
+            true
+        });
+        if valid {
+            self.epochs.update(|epochs| {
+                for (epoch, changed) in epochs.iter_mut().zip(changes) {
+                    if changed {
+                        *epoch = epoch.wrapping_add(1);
+                    }
+                }
+            });
+        }
+        valid
+    }
+}
+
 #[cfg(feature = "ssr")]
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
@@ -64,7 +165,7 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
             <head>
                 <meta charset="utf-8"/>
                 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-                <link rel="stylesheet" href="/pkg/sccache-dashboard.css"/>
+                <link rel="stylesheet" href=format!("/pkg/{}/sccache-dashboard.css",crate::GENERATION)/>
                 <leptos::hydration::HydrationScripts options=options/>
                 <MetaTags/>
             </head>
@@ -80,6 +181,8 @@ enum ConnectionStatus {
     #[cfg(target_arch = "wasm32")]
     Reconnecting,
     #[cfg(target_arch = "wasm32")]
+    Stalled,
+    #[cfg(target_arch = "wasm32")]
     ProtocolError,
     #[cfg(target_arch = "wasm32")]
     Unavailable,
@@ -92,6 +195,8 @@ impl ConnectionStatus {
             Self::Connected => "Live",
             #[cfg(target_arch = "wasm32")]
             Self::Reconnecting => "Disconnected — reconnecting",
+            #[cfg(target_arch = "wasm32")]
+            Self::Stalled => "No recent samples",
             #[cfg(target_arch = "wasm32")]
             Self::ProtocolError => "Resynchronizing",
             #[cfg(target_arch = "wasm32")]
@@ -112,58 +217,128 @@ fn ConnectionIndicator(status: RwSignal<ConnectionStatus>, retry: RwSignal<u64>)
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Overview,
+    Workers,
+    Jobs,
+    Cas,
+    CacheHits,
+    CacheAnalytics,
+    Topology,
+    Network,
+    Fleet,
+}
+
+impl Tab {
+    const ALL: [(Self, &'static str); 9] = [
+        (Self::Overview, "Overview"),
+        (Self::Workers, "Workers"),
+        (Self::Jobs, "Jobs"),
+        (Self::Cas, "CAS"),
+        (Self::CacheHits, "Cache hits"),
+        (Self::CacheAnalytics, "Cache storage"),
+        (Self::Topology, "Topology"),
+        (Self::Network, "Network"),
+        (Self::Fleet, "Fleet metrics"),
+    ];
+
+    const fn metric_group(self) -> Option<MetricGroup> {
+        match self {
+            Self::CacheHits => Some(MetricGroup::CacheHits),
+            Self::CacheAnalytics => Some(MetricGroup::CacheStorage),
+            Self::Fleet => Some(MetricGroup::Fleet),
+            _ => None,
+        }
+    }
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
     // The SSR resource is fetched once. After hydration the live stream
     // replaces it atomically; neither history nor snapshots are polled.
-    let initial = Resource::new(|| (), |()| snapshot());
-    let live = RwSignal::new(None::<DashboardData>);
+    let data = DashboardSource {
+        initial: Resource::new(|| (), |()| snapshot()),
+        live: RwSignal::new(None),
+        epochs: RwSignal::new([0; PROJECTION_COUNT]),
+    };
     let status = RwSignal::new(ConnectionStatus::Connecting);
     let retry = RwSignal::new(0_u64);
+    let tab = RwSignal::new(Tab::Overview);
     #[cfg(target_arch = "wasm32")]
     Effect::new(move |_| {
         let _ = retry.get();
-        sse::connect::<crate::NativeEvent>("/api/events", status, retry, move |event| {
-            let mut valid = false;
-            live.update(|data| {
-                if matches!(&event, crate::NativeEvent::Reset(_)) {
-                    *data = Some(DashboardData::default());
-                }
-                if let Some(data) = data {
-                    valid = crate::apply_event(data, event);
-                }
-            });
-            valid
-        });
+        sse::connect::<crate::NativeEvent>(
+            "/api/events",
+            status,
+            retry,
+            || Some(std::time::Duration::from_secs(10)),
+            move |event| data.apply(event),
+        );
     });
-    let data = Memo::new(move |_| live.get().or_else(|| initial.get().and_then(Result::ok)));
     view! {
         <Title text="sccache | Scheduler status"/>
         <header class=styles::top>
             <div><small>"SCCACHE / DISTRIBUTED BUILD"</small><h1>"Scheduler status"</h1></div>
-            <nav><a href="#workers">"Workers"</a><a href="#jobs">"Jobs"</a><a href="#cas">"CAS"</a><a href="#cache-analytics">"Cache analytics"</a><a href="#topology">"Topology"</a><a href="#network">"Network"</a><a href="#metrics">"Fleet metrics"</a></nav>
+            <nav aria-label="Dashboard views">
+                {Tab::ALL.into_iter().map(|(item, label)| view! {
+                    <button class=styles::tab aria-pressed=move || (tab.get() == item).to_string()
+                        on:click=move |_| tab.set(item)>{label}</button>
+                }).collect_view()}
+            </nav>
         </header>
         <main>
             <ConnectionIndicator status=status retry=retry/>
             <Suspense fallback=|| view! { <p>"Waiting for initial scheduler snapshot…"</p> }>
-                <native::NativeStatus data=data/>
+                <native::NativeStatus data=data tab=tab/>
             </Suspense>
-            <FleetMetrics/>
+            <FleetMetrics tab=tab/>
         </main>
+    }
+    .into_any()
+}
+
+/// The initial metrics query can fan out across many panels, while later
+/// updates are spaced by the selected sampling grid. A disabled backend is
+/// intentionally silent after its reset and must not be marked stalled.
+#[cfg(any(target_arch = "wasm32", test))]
+const fn metrics_watchdog(
+    configured: bool,
+    sampled: bool,
+    connecting: bool,
+    range: TimeRange,
+) -> Option<std::time::Duration> {
+    if !configured && !connecting {
+        None
+    } else {
+        let delay = if sampled {
+            range.step().saturating_add(120)
+        } else {
+            120
+        };
+        Some(std::time::Duration::from_secs(delay))
     }
 }
 
 #[component]
-fn FleetMetrics() -> impl IntoView {
+fn FleetMetrics(tab: RwSignal<Tab>) -> impl IntoView {
     let view = RwSignal::new(MetricsView::default());
     let data = RwSignal::new(MetricsData::default());
     let clients = RwSignal::new(Vec::<String>::new());
     let status = RwSignal::new(ConnectionStatus::Connecting);
     let retry = RwSignal::new(0_u64);
+    let group = Memo::new(move |_| tab.get().metric_group());
     #[cfg(target_arch = "wasm32")]
     Effect::new(move |_| {
-        let selected = view.get();
+        let Some(group) = group.get() else {
+            status.set(ConnectionStatus::Connecting);
+            return;
+        };
+        let selected = MetricsView {
+            group,
+            ..view.get()
+        };
         let _ = retry.get();
         data.set(MetricsData {
             view: selected.clone(),
@@ -173,26 +348,55 @@ fn FleetMetrics() -> impl IntoView {
             status.set(ConnectionStatus::Unavailable);
             return;
         };
+        let range = selected.range;
         sse::connect::<crate::MetricsEvent>(
             &format!("/api/metrics/events?{query}"),
             status,
             retry,
+            move || {
+                data.with_untracked(|data| {
+                    metrics_watchdog(
+                        data.configured,
+                        data.sampled_at.is_some(),
+                        status.get_untracked() == ConnectionStatus::Connecting,
+                        range,
+                    )
+                })
+            },
             move |event| {
+                if matches!(&event, crate::MetricsEvent::Reset(reset) if reset.view != selected) {
+                    return false;
+                }
                 let mut valid = false;
+                let mut discovered = None;
                 data.update(|data| {
                     valid = crate::apply_metrics_event(data, event);
-                    if valid && !data.clients.is_empty() {
-                        clients.set(data.clients.clone());
+                    if valid && data.sampled_at.is_some() && data.error.is_none() {
+                        discovered = Some(data.clients.clone());
                     }
                 });
+                if let Some(discovered) = discovered {
+                    clients.set(discovered);
+                }
                 valid
             },
         );
+    });
+    let client_options = Memo::new(move |_| {
+        let mut available = clients.get();
+        let selected = view.with(|view| view.client.clone());
+        if !selected.is_empty() && !available.contains(&selected) {
+            available.push(selected);
+        }
+        available.sort_unstable();
+        available.dedup();
+        available
     });
     let panels = Memo::new(move |_| {
         data.with(|data| {
             data.panels
                 .iter()
+                .filter(|panel| Some(panel.group) == group.get())
                 .map(|panel| panel.key)
                 .collect::<Vec<_>>()
         })
@@ -206,8 +410,20 @@ fn FleetMetrics() -> impl IntoView {
         })
     });
     let step = Signal::derive(move || data.with(|data| data.view.range.step()));
+    let sampled_at = Memo::new(move |_| data.with(|data| data.sampled_at));
+    let window = Signal::derive(move || {
+        data.with(|data| {
+            data.sampled_at
+                .map(|end| (end.saturating_sub(data.view.range.seconds()), end))
+        })
+    });
     view! {
-        <section id="metrics"><h2>"Fleet telemetry"</h2>
+        <Show when=move || group.get().is_some()>
+        <section id="metrics">
+            <h2>{move || match group.get() { Some(MetricGroup::CacheHits) => "Completed cache results", Some(MetricGroup::CacheStorage) => "Historical cache storage", _ => "Fleet telemetry" }}</h2>
+            <p class=styles::muted hidden=move || tab.get() != Tab::CacheHits>
+                "Hit rate = hits / (hits + misses), including native and legacy compiler results. Forced refreshes, read errors and timeouts may also be counted as misses by the client; event counters are not disjoint from completed outcomes. Tier lookups are not compile requests. Window counts are counter increases (extrapolated at scrape boundaries). No traffic or unavailable telemetry is not a 0% hit rate."
+            </p>
             <ConnectionIndicator status=status retry=retry/>
             <div class=styles::controls>
                 <label>"Range"
@@ -223,7 +439,7 @@ fn FleetMetrics() -> impl IntoView {
                 <label>"Client"
                     <select prop:value=move || view.with(|view| view.client.clone()) on:change=move |event| view.update(|view| view.client = event_target_value(&event))>
                         <option value="">"All clients"</option>
-                        <For each=move || clients.get() key=Clone::clone children=|client| { let value = client.clone(); view!{<option value=value>{client}</option>} }/>
+                        <For each=move || client_options.get() key=Clone::clone children=move |client| { let value = client.clone(); view!{<option value=value>{move || if clients.with(|clients| clients.contains(&client)) {client.clone()} else {format!("{client} (not observed in range)")}}</option>} }/>
                     </select>
                 </label>
                 <span class=styles::muted>{move || format!("{} s resolution · missing samples are not zero",view.with(|view| view.range.step()))}</span>
@@ -234,22 +450,12 @@ fn FleetMetrics() -> impl IntoView {
             <div class=styles::panels>
                 <For each=move || panels.get() key=|key| *key children=move |key| {
                     let panel = Memo::new(move |_| panel_data.with(|panels| panels.get(&key).cloned()));
-                    view! {
-                        <article>{move || panel.get().map(|panel| {
-                            let title = panel.title.clone();
-                            let error = panel.error.clone();
-                            let sampled_at = data.with(|data| data.sampled_at);
-                            view! {
-                                <h3>{title}</h3>
-                                {error.map(|error| view!{<p class=styles::warning>{error}</p>})}
-                                <chart::PanelContent panel=panel step=step.get() sampled_at=sampled_at/>
-                            }
-                        })}</article>
-                    }
+                    view! { <chart::MetricCard panel=panel step=step sampled_at=sampled_at window=window/> }
                 }/>
             </div>
         </section>
-    }
+        </Show>
+    }.into_any()
 }
 
 // These values feed rounded human-readable labels and SVG coordinates, never
@@ -312,4 +518,49 @@ fn timestamp_formats_utc_without_local_timezone() {
     assert_eq!(timestamp(Some(1_704_067_200)), "2024-01-01 00:00:00 UTC");
     assert_eq!(timestamp(None), "Not yet sampled");
     assert_eq!(timestamp(Some(u64::MAX)), "Not yet sampled");
+}
+
+#[cfg(test)]
+#[test]
+fn native_patch_invalidates_only_affected_projections() {
+    let patch = crate::NativePatch {
+        sampled_at: Some(1),
+        jobs: crate::Rows {
+            upsert: Vec::new(),
+            remove: vec!["1".into()],
+        },
+        ..Default::default()
+    };
+    let changes = changed_projections(&crate::NativeEvent::Patch(Box::new(patch)));
+    assert!(changes[Projection::Clock as usize]);
+    assert!(changes[Projection::Jobs as usize]);
+    assert!(changes[Projection::Error as usize]);
+    assert!(!changes[Projection::History as usize]);
+    assert!(!changes[Projection::Telemetry as usize]);
+    assert!(!changes[Projection::Workers as usize]);
+    assert!(
+        changed_projections(&crate::NativeEvent::Reset(Box::default()))
+            .into_iter()
+            .all(|change| change)
+    );
+}
+#[test]
+fn metrics_watchdog_distinguishes_disabled_backend_from_stalled_samples() {
+    use std::time::Duration;
+    assert_eq!(
+        metrics_watchdog(false, false, false, TimeRange::OneHour),
+        None
+    );
+    assert_eq!(
+        metrics_watchdog(false, false, true, TimeRange::OneHour),
+        Some(Duration::from_secs(120))
+    );
+    assert_eq!(
+        metrics_watchdog(true, true, false, TimeRange::OneHour),
+        Some(Duration::from_secs(135))
+    );
+    assert_eq!(
+        metrics_watchdog(true, true, false, TimeRange::SevenDays),
+        Some(Duration::from_secs(1920))
+    );
 }

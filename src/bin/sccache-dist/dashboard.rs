@@ -6,12 +6,66 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use sccache_dashboard::{
-    HostRole, Job, NativeWorker, NetworkHost, NetworkLink, RouteEvidence, Snapshot, Worker,
+    HostRole, Job, JobDescription, NativeWorker, NetworkHost, NetworkLink, RouteEvidence, Snapshot,
+    Worker,
 };
 
-use super::{Scheduler, ServerDetails};
+use super::{JobDetail, Scheduler, ServerDetails};
 use sccache::build_runtime::wire::NativeJobPhase;
-use sccache::dist::{self, ServerId};
+use sccache::dist::{self, JobId, ServerId};
+
+// Keep only bounded, human-facing labels. Never retain argv, environment,
+// authorization, or absolute paths in the dashboard's job roster.
+fn label(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(96)
+        .collect()
+}
+
+fn basename(path: &[u8]) -> String {
+    label(path.rsplit(|byte| *byte == b'/').next().unwrap_or(path))
+}
+
+fn argument_value(arguments: &[Vec<u8>], flag: &[u8]) -> Option<String> {
+    arguments.iter().enumerate().find_map(|(index, argument)| {
+        let value = if argument == flag {
+            arguments.get(index + 1)?.as_slice()
+        } else {
+            argument.strip_prefix(flag)?.strip_prefix(b"=")?
+        };
+        // A custom target JSON path is not a target triple. Use only its basename.
+        let value = basename(value);
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+pub fn describe_native(assignment: &dist::NativeAssignment) -> JobDescription {
+    let spec = &assignment.spec;
+    let subject = argument_value(&spec.command.arguments, b"--crate-name").or_else(|| {
+        let mut outputs = spec.outputs.values();
+        let first = basename(outputs.next()?.path.as_bytes());
+        let remaining = outputs.len();
+        Some(if remaining == 0 {
+            first
+        } else {
+            format!("{first} (+{remaining} outputs)")
+        })
+    });
+    JobDescription {
+        executable: basename(spec.command.executable.as_bytes()),
+        subject,
+        target: argument_value(&spec.command.arguments, b"--target"),
+        requester: assignment.receiver.as_ref().map(|(id, _)| id.to_string()),
+        input_bytes: assignment
+            .input_blobs
+            .values()
+            .copied()
+            .fold(0, u64::saturating_add),
+        input_blobs: assignment.input_blobs.len(),
+    }
+}
 
 fn timestamp_ms(instant: Instant) -> u64 {
     static ORIGIN: std::sync::OnceLock<(Instant, u64)> = std::sync::OnceLock::new();
@@ -203,17 +257,67 @@ fn accumulate_worker(snapshot: &mut Snapshot, worker: &Worker) {
     }
 }
 
+fn project_job(
+    job_id: JobId,
+    details: &ServerDetails,
+    worker: &Worker,
+    detail: Option<&JobDetail>,
+) -> Job {
+    let progress = details
+        .capabilities
+        .native_placement
+        .as_ref()
+        .and_then(|placement| placement.queue.jobs.get(&job_id));
+    let (state, assigned_at, state_since, prediction) = detail.map_or_else(
+        || {
+            details.jobs_assigning.get(&job_id).map_or_else(
+                // Preserve the reservation in the count, but never invent a timestamp.
+                || ("Missing scheduler state".into(), None, None, None),
+                |&since| ("Assigning".into(), Some(since), Some(since), None),
+            )
+        },
+        |detail| {
+            (
+                detail.state.to_string(),
+                Some(detail.assigned_at),
+                Some(detail.state_since),
+                detail.prediction,
+            )
+        },
+    );
+    Job {
+        id: job_id.to_string(),
+        description: details
+            .jobs_assigned
+            .get(&job_id)
+            .and_then(Option::as_ref)
+            .and_then(|native| native.dashboard.clone()),
+        worker: worker.name.clone(),
+        worker_id: worker.id.clone(),
+        state,
+        native_phase: progress.map(|progress| format!("{:?}", progress.phase)),
+        native_phase_observed_ns: progress.map(|progress| progress.phase_nanoseconds),
+        assigned_at_ms: assigned_at.map(timestamp_ms),
+        state_since_ms: state_since.map(timestamp_ms),
+        remaining_input_bytes: progress.map(|progress| progress.remaining_input_bytes),
+        remaining_input_blobs: progress.map(|progress| progress.remaining_input_blobs),
+        predicted_completion_secs: prediction
+            .map(|estimate| estimate.completion_seconds)
+            .filter(|value| value.is_finite()),
+    }
+}
+
 pub fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
     // Filesystem checks and ordering work must not hold the scheduler mutexes.
     let draining = scheduler.is_draining();
     let jobs = scheduler
         .jobs
-        .lock()
-        .map_err(|_| anyhow!("jobs mutex poisoned"))?;
+        .try_lock()
+        .map_err(|error| anyhow!("dashboard jobs lock unavailable: {error}"))?;
     let servers = scheduler
         .servers
-        .lock()
-        .map_err(|_| anyhow!("servers mutex poisoned"))?;
+        .try_lock()
+        .map_err(|error| anyhow!("dashboard servers lock unavailable: {error}"))?;
     let now = Instant::now();
     let mut snapshot = Snapshot::default();
     snapshot.totals.draining = draining;
@@ -240,44 +344,10 @@ pub fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
             peer_links(&mut snapshot, id, &placement.peer_download_rates);
         }
         accumulate_worker(&mut snapshot, &worker);
-        for job_id in details.jobs_assigned.keys() {
-            let progress = details
-                .capabilities
-                .native_placement
-                .as_ref()
-                .and_then(|placement| placement.queue.jobs.get(job_id));
-            let (state, assigned_at, state_since, prediction) = jobs.get(job_id).map_or_else(
-                || {
-                    details.jobs_assigning.get(job_id).map_or_else(
-                        // Preserve the reservation in the count, but never invent a timestamp.
-                        || ("Missing scheduler state".into(), None, None, None),
-                        |&since| ("Assigning".into(), Some(since), Some(since), None),
-                    )
-                },
-                |detail| {
-                    (
-                        detail.state.to_string(),
-                        Some(detail.assigned_at),
-                        Some(detail.state_since),
-                        detail.prediction,
-                    )
-                },
-            );
-            snapshot.jobs.push(Job {
-                id: job_id.to_string(),
-                worker: worker.name.clone(),
-                worker_id: worker.id.clone(),
-                state,
-                native_phase: progress.map(|progress| format!("{:?}", progress.phase)),
-                native_phase_observed_ns: progress.map(|progress| progress.phase_nanoseconds),
-                assigned_at_ms: assigned_at.map(timestamp_ms),
-                state_since_ms: state_since.map(timestamp_ms),
-                remaining_input_bytes: progress.map(|progress| progress.remaining_input_bytes),
-                remaining_input_blobs: progress.map(|progress| progress.remaining_input_blobs),
-                predicted_completion_secs: prediction
-                    .map(|estimate| estimate.completion_seconds)
-                    .filter(|value| value.is_finite()),
-            });
+        for &job_id in details.jobs_assigned.keys() {
+            snapshot
+                .jobs
+                .push(project_job(job_id, details, &worker, jobs.get(&job_id)));
         }
         snapshot.workers.push(worker);
     }
@@ -285,8 +355,8 @@ pub fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
     drop(jobs);
     let clients = scheduler
         .dashboard_clients
-        .lock()
-        .map_err(|_| anyhow!("dashboard client registry poisoned"))?;
+        .try_lock()
+        .map_err(|error| anyhow!("dashboard client registry unavailable: {error}"))?;
     for (&id, (seen, rates)) in clients.iter() {
         if now.saturating_duration_since(*seen) > dist::http::HEARTBEAT_TIMEOUT {
             continue;
