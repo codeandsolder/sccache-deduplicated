@@ -100,6 +100,9 @@ authorized UID and socket-access group):
 [shared_daemon]
 socket_gid = 1000
 allowed_uids = [1000]
+# Optional: bound outstanding executors separately from local compiler jobs.
+# Defaults to three times the local jobserver capacity.
+# max_executors = 36
 ```
 
 Run the managed server as root with a root-owned runtime directory such as

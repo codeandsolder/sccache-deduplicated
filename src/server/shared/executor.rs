@@ -1,8 +1,8 @@
 //! The single-threaded trusted entry point drops privileges before decoding
 //! the user's compile request or running any compiler-related code.
 use super::{
-    BROKER_FD, Credentials, ExecutorEvent, Job, MOUNT_FD, PIDNS_FD, ROOT_FD, STDIN_FD, frame,
-    read_sync_frame,
+    BROKER_FD, Credentials, ExecutorEvent, Job, MOUNT_FD, PERMIT_FD, PIDNS_FD, ROOT_FD, STDIN_FD,
+    frame, read_sync_frame,
 };
 use crate::cache::IpcStorage;
 use crate::client::{ServerConnection, connection_task};
@@ -164,6 +164,7 @@ fn assume(
 async fn compile(
     job: Job,
     broker: UnixStream,
+    permit: UnixStream,
     #[cfg(feature = "dist-client")] digest_provider: crate::build_runtime::DescriptorDigestProvider,
 ) -> Result<CompileFinished> {
     let Job {
@@ -190,7 +191,7 @@ async fn compile(
         drop(config);
         crate::server::DistClientContainer::new_disabled()
     };
-    let jobserver = Client::new_num(1);
+    let jobserver = Client::with_remote(permit)?;
     let (tx, _rx) = futures::channel::mpsc::channel(1);
     let (_, info) = WaitUntilZero::new();
     let service = SccacheService::<ProcessCommandCreator>::new(
@@ -213,6 +214,9 @@ async fn compile(
             // The client must never execute this fallback. It runs here, in
             // the exact same credential and filesystem context as cache hits.
             activity::phase(activity::Phase::LocalCompile);
+            let mut child = activity::ChildActivity::waiting();
+            let _token = jobserver.acquire().await?;
+            child.started();
             let output = tokio::process::Command::new(&compile.exe)
                 .args(&compile.args)
                 .env_clear()
@@ -248,6 +252,7 @@ pub(super) fn run() -> Result<()> {
         "shared executor must be launched by root daemon"
     );
     let broker = inherited(BROKER_FD)?;
+    let permit = inherited(PERMIT_FD)?;
     let mount = inherited(MOUNT_FD)?;
     let root = inherited(ROOT_FD)?;
     let pid_namespace = inherited(PIDNS_FD)?;
@@ -280,6 +285,7 @@ pub(super) fn run() -> Result<()> {
     runtime.block_on(report_compile(
         job,
         UnixStream::from(broker),
+        UnixStream::from(permit),
         &mut io::stdout().lock(),
         #[cfg(feature = "dist-client")]
         super::digests::provider(UnixStream::from(digest)),
@@ -289,6 +295,7 @@ pub(super) fn run() -> Result<()> {
 async fn report_compile(
     job: Job,
     broker: UnixStream,
+    permit: UnixStream,
     output: &mut impl Write,
     #[cfg(feature = "dist-client")] digest_provider: crate::build_runtime::DescriptorDigestProvider,
 ) -> Result<()> {
@@ -302,6 +309,7 @@ async fn report_compile(
         compile(
             job,
             broker,
+            permit,
             #[cfg(feature = "dist-client")]
             digest_provider,
         ),

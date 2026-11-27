@@ -2527,7 +2527,7 @@ impl pkg::DiscoverToolchain for CToolchainPackager {
         )?))
     }
 
-    fn package_builder(self) -> Result<pkg::ToolchainPackageBuilder> {
+    fn package_builder(self, _scope: pkg::ToolchainScope) -> Result<pkg::ToolchainPackageBuilder> {
         use std::os::unix::ffi::OsStringExt;
 
         info!("Generating toolchain {}", self.executable.display());

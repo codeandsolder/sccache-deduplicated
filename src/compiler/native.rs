@@ -186,22 +186,19 @@ impl NativeCompilerClient {
         files: &[PathBuf],
         pool: &tokio::runtime::Handle,
     ) -> Result<Vec<String>> {
-        let jobs = files.iter().map(|path| {
-            let client = Arc::clone(self);
-            let path = path.clone();
-            pool.spawn_blocking(move || {
-                let file = std::fs::File::open(path)?;
-                if let Some((blob, _)) = client.reference(&file)? {
-                    Ok(crate::util::hex(&blob.id.0))
-                } else {
-                    crate::util::Digest::reader_sync(file)
-                }
-            })
-        });
-        futures::future::try_join_all(jobs)
-            .await?
-            .into_iter()
-            .collect()
+        let client = Arc::clone(self);
+        crate::util::hash_path_batch(files, pool, move |path| {
+            let file = std::fs::File::open(path)?;
+            if let Some((blob, _)) = client.reference(&file)? {
+                Ok(crate::util::hex(&blob.id.0))
+            } else {
+                // Check the opened descriptor for mutation while hashing;
+                // do not memoize mutable build inputs by timestamps.
+                let blob = crate::build_runtime::hash_descriptor(&file)?;
+                Ok(crate::util::hex(&blob.id.0))
+            }
+        })
+        .await
     }
 
     pub fn toolchain_digests(&self) -> Arc<SourceDigestCache> {
@@ -648,37 +645,6 @@ impl CompilerPlan {
             destinations.insert(output.name, output.destination);
         }
         let (inputs, toolchain) = packagers;
-        let before = toolchain_digests.catalog_hits();
-        let start = Instant::now();
-        let toolchain = toolchain
-            .native_mapping()?
-            .prepare_with_cache(toolchain_digests)?;
-        let after = toolchain_digests.catalog_hits();
-        debug!(
-            "native toolchain preparation took {:.3}s; verified installation memo: {} files, {} bytes (process totals: {} files, {} bytes)",
-            start.elapsed().as_secs_f64(),
-            after.0.saturating_sub(before.0),
-            after.1.saturating_sub(before.1),
-            after.0,
-            after.1
-        );
-        let mapped = inputs.native_mapping()?;
-        let inputs = if let Some(native) = native {
-            mapped.prepare_with_references(&|file, _| native.reference(file))?
-        } else {
-            mapped.prepare()?
-        };
-        let layout = layout.into_native_mapping(|_| false)?.prepare()?;
-        let directories = pkg::native_directory_metadata()?;
-        let inputs = vec![toolchain, inputs, layout];
-        let recipe = TreeRecipe::union(directories, inputs.iter().map(PreparedTree::id));
-        let root = ExecutionRoot::resolve(
-            recipe,
-            &inputs
-                .iter()
-                .map(|tree| (tree.id(), tree.manifest()))
-                .collect(),
-        )?;
         let command = CommandSpec {
             umask: command
                 .umask
@@ -696,6 +662,44 @@ impl CompilerPlan {
                 .map(|(name, value)| (name.into_bytes(), value.into_bytes()))
                 .collect(),
         };
+        let mapped = inputs.native_mapping()?;
+        let inputs = if let Some(native) = native {
+            mapped.prepare_with_references(&|file, _| native.reference(file))?
+        } else {
+            mapped.prepare()?
+        };
+        let scope = if result_policy == ResultIdentityPolicy::Rust
+            && !opaque_compiler_extension(&command, inputs.manifest())
+        {
+            pkg::ToolchainScope::RustCompiler
+        } else {
+            pkg::ToolchainScope::Default
+        };
+        let before = toolchain_digests.catalog_hits();
+        let start = Instant::now();
+        let toolchain = toolchain
+            .native_mapping(scope)?
+            .prepare_with_cache(toolchain_digests)?;
+        let after = toolchain_digests.catalog_hits();
+        debug!(
+            "native toolchain preparation took {:.3}s; verified installation memo: {} files, {} bytes (process totals: {} files, {} bytes)",
+            start.elapsed().as_secs_f64(),
+            after.0.saturating_sub(before.0),
+            after.1.saturating_sub(before.1),
+            after.0,
+            after.1
+        );
+        let layout = layout.into_native_mapping(|_| false)?.prepare()?;
+        let directories = pkg::native_directory_metadata()?;
+        let inputs = vec![toolchain, inputs, layout];
+        let recipe = TreeRecipe::union(directories, inputs.iter().map(PreparedTree::id));
+        let root = ExecutionRoot::resolve(
+            recipe,
+            &inputs
+                .iter()
+                .map(|tree| (tree.id(), tree.manifest()))
+                .collect(),
+        )?;
         let compiler_result =
             result_policy.identity(key, &command, inputs[0].id(), inputs[1].manifest())?;
         let spec = ExecutionSpec {

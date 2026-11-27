@@ -46,9 +46,15 @@ enum ClientState {
 #[derive(Clone)]
 pub struct Client {
     state: ClientState,
+    #[cfg(target_os = "linux")]
+    capacity: usize,
+    #[cfg(target_os = "linux")]
+    remote: Option<remote::RemoteClient>,
 }
 
 pub struct Acquired {
+    #[cfg(target_os = "linux")]
+    _remote: Option<remote::RemotePermit>,
     _token: Option<jobserver::Acquired>,
 }
 
@@ -74,6 +80,10 @@ impl Client {
             Ok(jobs) => Self::new_num(jobs),
             Err(error) => Self {
                 state: ClientState::Failed(Arc::from(format!("{error:#}"))),
+                #[cfg(target_os = "linux")]
+                capacity: 1,
+                #[cfg(target_os = "linux")]
+                remote: None,
             },
         }
     }
@@ -86,6 +96,10 @@ impl Client {
                     state: ClientState::Failed(Arc::from(format!(
                         "failed to create jobserver: {error}"
                     ))),
+                    #[cfg(target_os = "linux")]
+                    capacity: num,
+                    #[cfg(target_os = "linux")]
+                    remote: None,
                 };
             }
         };
@@ -110,7 +124,27 @@ impl Client {
             ))),
         };
 
-        Self { state }
+        Self {
+            state,
+            #[cfg(target_os = "linux")]
+            capacity: num,
+            #[cfg(target_os = "linux")]
+            remote: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// The private executor owns a one-slot local jobserver for compiler
+    /// subprocesses, but obtains physical execution permits from its daemon.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_remote(stream: std::os::unix::net::UnixStream) -> Result<Self> {
+        let mut client = Self::new_num(1);
+        client.remote = Some(remote::RemoteClient::new(stream)?);
+        Ok(client)
     }
 
     /// Configures this jobserver to be inherited by the specified command.
@@ -146,11 +180,21 @@ impl Client {
             .context("jobserver helper panicked")?
             .context("failed to acquire jobserver token")?;
 
+        #[cfg(target_os = "linux")]
+        let remote = match &self.remote {
+            Some(client) => Some(client.acquire().await?),
+            None => None,
+        };
         Ok(Acquired {
+            #[cfg(target_os = "linux")]
+            _remote: remote,
             _token: Some(acquired),
         })
     }
 }
+
+#[cfg(target_os = "linux")]
+pub mod remote;
 
 #[cfg(test)]
 mod tests {

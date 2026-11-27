@@ -4849,6 +4849,24 @@ struct RustToolchainPackager {
     target: Option<String>,
 }
 
+// Rustup's installation transaction ledger records all installed components.
+// The ordinary compiler does not consult it. These files are not standard
+// library content, codegen inputs, or executable dependencies. If source code
+// explicitly reads one, input discovery packages that file separately. Opaque
+// compiler extensions retain the normal installation inventory.
+#[cfg(all(feature = "dist-client", target_os = "linux"))]
+fn rustup_installation_ledger(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(
+            "components"
+                | "rust-installer-version"
+                | "multirust-config.toml"
+                | "multirust-channel-manifest.toml"
+        )
+    )
+}
+
 // Keep the runtime and unknown rustlib extensions. Only remove directories
 // explicitly identified as standard libraries for other installed targets.
 #[cfg(all(feature = "dist-client", target_os = "linux"))]
@@ -5002,7 +5020,7 @@ fn test_dist_toolchain_archive_contains_only_required_installed_targets() -> Res
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 impl pkg::DiscoverToolchain for RustToolchainPackager {
-    fn package_builder(self) -> Result<pkg::ToolchainPackageBuilder> {
+    fn package_builder(self, scope: pkg::ToolchainScope) -> Result<pkg::ToolchainPackageBuilder> {
         info!(
             "Packaging Rust compiler for sysroot {}",
             self.sysroot.display()
@@ -5047,6 +5065,12 @@ impl pkg::DiscoverToolchain for RustToolchainPackager {
                         vec![path]
                     };
                     for path in entries {
+                        if scope == pkg::ToolchainScope::RustCompiler
+                            && path.parent() == Some(rustlib.as_path())
+                            && path.file_name().is_some_and(rustup_installation_ledger)
+                        {
+                            continue;
+                        }
                         if path.is_dir() {
                             package_builder.add_dir_contents(&path)?;
                         } else if path.is_file() {
@@ -5063,6 +5087,70 @@ impl pkg::DiscoverToolchain for RustToolchainPackager {
 
         Ok(package_builder)
     }
+}
+
+#[cfg(all(
+    test,
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn test_native_rust_toolchain_ignores_only_installation_ledger() -> Result<()> {
+    use crate::dist::pkg::{ToolchainPackager, ToolchainScope};
+    let temp = tempfile::tempdir()?;
+    let sysroot = temp.path();
+    let host = "x86_64-unknown-linux-gnu";
+    let rustlib = sysroot.join(LIBS_DIR).join("rustlib");
+    let std = rustlib.join(host).join("lib");
+    let bins = sysroot.join(BINS_DIR);
+    fs::create_dir_all(&std)?;
+    fs::create_dir_all(&bins)?;
+    fs::copy("/bin/true", bins.join("rustc"))?;
+    fs::write(std.join("libstd.rlib"), b"std")?;
+    fs::write(
+        rustlib.join("manifest-rust-std-x86_64-unknown-linux-gnu"),
+        b"installed",
+    )?;
+    fs::write(rustlib.join("custom-runtime"), b"extension")?;
+    let ledger = [
+        "components",
+        "rust-installer-version",
+        "multirust-config.toml",
+        "multirust-channel-manifest.toml",
+    ];
+    for name in ledger {
+        fs::write(rustlib.join(name), b"first")?;
+    }
+    let tree = |scope| -> Result<_> {
+        Ok(Box::new(RustToolchainPackager {
+            sysroot: sysroot.to_owned(),
+            canonical: true,
+            host: Some(host.into()),
+            target: Some(host.into()),
+            dlltool_files: Vec::new(),
+        })
+        .native_mapping(scope)?
+        .prepare()?
+        .id())
+    };
+    let compiler = tree(ToolchainScope::RustCompiler)?;
+    let exact = tree(ToolchainScope::Default)?;
+    for name in ledger {
+        fs::write(rustlib.join(name), b"changed")?;
+    }
+    let unused = "wasm32-wasip2";
+    fs::create_dir_all(rustlib.join(unused))?;
+    fs::write(rustlib.join(unused).join("libstd.rlib"), b"other target")?;
+    fs::write(
+        rustlib.join(format!("manifest-rust-std-{unused}")),
+        b"installed",
+    )?;
+    assert_eq!(compiler, tree(ToolchainScope::RustCompiler)?);
+    assert_ne!(exact, tree(ToolchainScope::Default)?);
+    fs::write(std.join("libstd.rlib"), b"changed std")?;
+    assert_ne!(compiler, tree(ToolchainScope::RustCompiler)?);
+    Ok(())
 }
 
 #[cfg(feature = "dist-client")]
