@@ -281,6 +281,9 @@ mod toolchain_imp {
 
         /// Record an already-resolved ELF closure without probing individual
         /// libraries a second time (which would lose the executable RUNPATH).
+        ///
+        /// # Errors
+        /// Returns an error if an executable or selected library cannot be captured.
         pub fn add_resolved_executable(
             &mut self,
             executable: &Path,
@@ -296,6 +299,9 @@ mod toolchain_imp {
         /// Publish the exact selected helper name in a private executable
         /// search directory. Names may be used by drivers as fallback
         /// searches, independently of their compiled-in absolute paths.
+        ///
+        /// # Errors
+        /// Returns an error if the alias is invalid, resolution fails, or names conflict.
         pub fn add_native_helper(
             &mut self,
             name: &std::ffi::OsStr,
@@ -323,7 +329,7 @@ mod toolchain_imp {
             });
         }
 
-        pub fn take_native_search(&mut self) -> Option<super::NativeSearchEnvironment> {
+        pub const fn take_native_search(&mut self) -> Option<super::NativeSearchEnvironment> {
             self.native_search.take()
         }
 
