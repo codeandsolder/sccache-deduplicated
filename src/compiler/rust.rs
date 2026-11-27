@@ -72,6 +72,7 @@ use std::time;
 use walkdir::WalkDir;
 
 use crate::errors::{Context, Result, anyhow, bail};
+use anyhow::ensure;
 
 #[cfg(feature = "dist-client")]
 const RLIB_PREFIX: &str = "lib";
