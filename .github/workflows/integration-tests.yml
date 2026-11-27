@@ -31,7 +31,7 @@ jobs:
         uses: ./.github/actions/rust-toolchain
         id: rust
         with:
-          toolchain: "nightly-2026-11-22"
+          toolchain: "nightly-2026-11-23"
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
         with:
@@ -116,7 +116,7 @@ jobs:
         uses: ./.github/actions/rust-toolchain
         id: rust
         with:
-          toolchain: "nightly-2026-11-22"
+          toolchain: "nightly-2026-11-23"
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
         with:
@@ -182,7 +182,7 @@ jobs:
         uses: ./.github/actions/rust-toolchain
         id: rust
         with:
-          toolchain: "nightly-2026-11-22"
+          toolchain: "nightly-2026-11-23"
           target: $TARGET
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
@@ -310,7 +310,7 @@ jobs:
         uses: ./.github/actions/rust-toolchain
         id: rust
         with:
-          toolchain: "nightly-2026-11-22"
+          toolchain: "nightly-2026-11-23"
 
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
@@ -389,7 +389,7 @@ jobs:
         uses: ./.github/actions/rust-toolchain
         id: rust
         with:
-          toolchain: "nightly-2026-11-22"
+          toolchain: "nightly-2026-11-23"
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1a1b52a97b8eef53c7883b7af94dd3a2480b314a # main
         with:
