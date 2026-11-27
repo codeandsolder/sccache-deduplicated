@@ -6,7 +6,7 @@ use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fs,
-    io::{self, BufReader},
+    io::{self, BufReader, IsTerminal, Write},
     num::NonZeroUsize,
     os::unix::ffi::OsStrExt as _,
     path::Path,
@@ -74,6 +74,38 @@ fn publish(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Cargo's compiler templates use structured rustc diagnostics. Render the
+/// diagnostic payload, not the surrounding artifact/unused-extern events.
+fn render_diagnostics(bytes: &[u8]) -> Result<()> {
+    let mut stderr = io::stderr().lock();
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) {
+            match value
+                .get("$message_type")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("diagnostic") => {
+                    if let Some(rendered) =
+                        value.get("rendered").and_then(serde_json::Value::as_str)
+                    {
+                        if stderr.is_terminal() {
+                            stderr.write_all(rendered.as_bytes())?;
+                        } else {
+                            strip_ansi_escapes::Writer::new(&mut stderr)
+                                .write_all(rendered.as_bytes())?;
+                        }
+                        continue;
+                    }
+                }
+                Some("artifact" | "unused-externs" | "future-incompat") => continue,
+                _ => {}
+            }
+        }
+        stderr.write_all(line)?;
+    }
+    Ok(())
+}
+
 fn execute_node(session: &CompileSession<'_>, node: &PlanNode, action: &PlanAction) -> Result<()> {
     node.validate_action(action)?;
     for directory in &node.directories {
@@ -83,8 +115,30 @@ fn execute_node(session: &CompileSession<'_>, node: &PlanNode, action: &PlanActi
         PlanAction::Deferred => anyhow::bail!("unresolved build action"),
         PlanAction::Noop => {}
         PlanAction::Compile { command } => {
-            let code =
-                session.execute(invocation(command), &mut io::stdout(), &mut io::stderr())?;
+            let mut invocation = invocation(command);
+            // The site wrapper opts Cargo invocations into canonical path
+            // identity. Preserve that policy when it is no longer a subprocess.
+            let cargo = invocation
+                .env_vars
+                .iter()
+                .any(|(key, _)| key == "CARGO_MANIFEST_DIR");
+            if cargo {
+                invocation
+                    .env_vars
+                    .retain(|(key, _)| key != "SCCACHE_EXPERIMENTAL_CANONICAL_RUST");
+                invocation
+                    .env_vars
+                    .push(("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()));
+            }
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = session.execute(invocation, &mut stdout, &mut stderr)?;
+            io::stdout().lock().write_all(&stdout)?;
+            if cargo {
+                render_diagnostics(&stderr)?;
+            } else {
+                io::stderr().lock().write_all(&stderr)?;
+            }
             ensure!(code == 0, "compiler exited with status {code}");
         }
         PlanAction::Process {
@@ -107,7 +161,14 @@ fn execute_node(session: &CompileSession<'_>, node: &PlanNode, action: &PlanActi
                 process.stderr(fs::File::create(BuildPlan::path(output))?);
             }
             let status = session.execute_process(&mut process)?;
-            ensure!(status.success(), "process exited with {status}");
+            if !status.success() {
+                let mut diagnostics = io::stderr().lock();
+                for path in [stdout, stderr].into_iter().flatten() {
+                    let mut file = fs::File::open(BuildPlan::path(path))?;
+                    io::copy(&mut file, &mut diagnostics)?;
+                }
+                anyhow::bail!("process exited with {status}");
+            }
         }
         PlanAction::Publish {
             source,
@@ -207,9 +268,8 @@ struct PlannerClient {
 }
 
 impl PlannerClient {
-    fn start(executable: &Path, args: &[OsString]) -> Result<(Self, BuildPlan)> {
-        let mut child = Command::new(executable)
-            .args(args)
+    fn start(command: &mut Command) -> Result<(Self, BuildPlan)> {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -295,9 +355,28 @@ pub(crate) fn execute_planner(
     executable: &Path,
     args: &[OsString],
     max_in_flight: NonZeroUsize,
+    leased_intermediates: bool,
     config: &Config,
 ) -> Result<()> {
-    let (client, plan) = PlannerClient::start(executable, args)?;
+    let mut command = Command::new(executable);
+    command.args(args);
+    if leased_intermediates {
+        #[cfg(all(target_os = "linux", feature = "dist-client"))]
+        return crate::cargo_launcher::with_intermediates(&mut command, |command| {
+            execute_planner_command(command, max_in_flight, config)
+        });
+        #[cfg(not(all(target_os = "linux", feature = "dist-client")))]
+        anyhow::bail!("leased intermediates require Linux native distributed compilation");
+    }
+    execute_planner_command(&mut command, max_in_flight, config)
+}
+
+fn execute_planner_command(
+    command: &mut Command,
+    max_in_flight: NonZeroUsize,
+    config: &Config,
+) -> Result<()> {
+    let (client, plan) = PlannerClient::start(command)?;
     let graph = plan.graph()?;
     let client = Mutex::new(client);
     let session = CompileSession::new(config, true)?;
@@ -308,7 +387,7 @@ pub(crate) fn execute_planner(
     };
     dispatch(graph, max_in_flight, |index| {
         let node = &plan.nodes[index];
-        (|| {
+        (|| -> Result<()> {
             let action = if matches!(node.action, PlanAction::Deferred) {
                 Some(planner()?.prepare(index)?)
             } else {

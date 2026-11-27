@@ -1038,6 +1038,7 @@ pub(crate) struct CompileSession<'a> {
     config: &'a Config,
     runtime: Runtime,
     jobserver: Client,
+    existing_only: bool,
 }
 
 impl<'a> CompileSession<'a> {
@@ -1054,6 +1055,7 @@ impl<'a> CompileSession<'a> {
             config,
             runtime,
             jobserver: Client::new(),
+            existing_only: concurrent,
         })
     }
 
@@ -1084,9 +1086,9 @@ impl<'a> CompileSession<'a> {
             }
         }
 
-        let conn = if self.config.client_side_mode {
+        let conn = if self.existing_only || self.config.client_side_mode {
             connect_to_server(&get_addr())
-                .context("client-side compilation requires an existing daemon")?
+                .context("build session requires an existing managed daemon")?
         } else {
             connect_or_start_server(
                 &get_addr(),
@@ -1187,7 +1189,14 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             executable,
             args,
             max_in_flight,
-        } => crate::build_plan::execute_planner(&executable, &args, max_in_flight, config)?,
+            leased_intermediates,
+        } => crate::build_plan::execute_planner(
+            &executable,
+            &args,
+            max_in_flight,
+            leased_intermediates,
+            config,
+        )?,
         #[cfg(not(unix))]
         Command::ExecutePlanner { .. } => {
             bail!("live build planners currently require POSIX paths")

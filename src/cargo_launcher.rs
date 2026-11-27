@@ -233,6 +233,53 @@ fn exit_code(status: ExitStatus) -> Result<i32> {
         .context("Cargo returned an unknown exit status")
 }
 
+/// Retain all intermediate artifacts in the existing daemon-owned content
+/// store for the duration of a command or a whole native planning session.
+#[cfg(feature = "dist-client")]
+pub(crate) fn with_intermediates<T>(
+    command: &mut Command,
+    execute: impl FnOnce(&mut Command) -> Result<T>,
+) -> Result<T> {
+    // The launcher owns the mount and one connection-owned retention
+    // lease. It is not a compiler or another cache daemon.
+    // Each active FUSE inode has a backing descriptor. Match the
+    // inherited hard limit, rather than the shell's small soft limit.
+    // SAFETY: rlimit is initialized by getrlimit before being read.
+    unsafe {
+        let mut limit = std::mem::zeroed::<libc::rlimit>();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) == -1 {
+            return Err(std::io::Error::last_os_error()).context("query descriptor limit");
+        }
+        limit.rlim_cur = limit.rlim_max;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) == -1 {
+            return Err(std::io::Error::last_os_error()).context("raise descriptor limit");
+        }
+    }
+    let mut scratch = ScratchLease::create(&scratch_base()?)?;
+    let mount = scratch.path.join("intermediates");
+    let backing = scratch.path.join("namespace");
+    let spool = scratch.path.join("spool");
+    for path in [&mount, &backing, &spool] {
+        fs::create_dir(path)?;
+    }
+    let (token, connection) = crate::dist::native::intermediate::open()?;
+    let filesystem = crate::build_runtime::intermediate_fs::mount_intermediates(
+        &mount,
+        &backing,
+        &spool,
+        token,
+        crate::dist::native::intermediate::content(),
+    )
+    .context("mount leased Cargo intermediates")?;
+    scratch.configure(command)?;
+    let result = execute(command);
+    scratch.wait_for_descendants()?;
+    drop(filesystem);
+    drop(connection);
+    drop(scratch);
+    result
+}
+
 fn run(final_only: bool, args: Vec<OsString>) -> Result<i32> {
     let mut command = cargo_command(args)?;
     if !final_only {
@@ -240,44 +287,10 @@ fn run(final_only: bool, args: Vec<OsString>) -> Result<i32> {
     }
     #[cfg(feature = "dist-client")]
     {
-        // The launcher owns the mount and one connection-owned retention
-        // lease. It is not a compiler or another cache daemon.
-        // Each active FUSE inode has a backing descriptor. Match the
-        // inherited hard limit, rather than the shell's small soft limit.
-        // SAFETY: rlimit is initialized by getrlimit before being read.
-        unsafe {
-            let mut limit = std::mem::zeroed::<libc::rlimit>();
-            if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) == -1 {
-                return Err(std::io::Error::last_os_error()).context("query descriptor limit");
-            }
-            limit.rlim_cur = limit.rlim_max;
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) == -1 {
-                return Err(std::io::Error::last_os_error()).context("raise descriptor limit");
-            }
-        }
-        let mut scratch = ScratchLease::create(&scratch_base()?)?;
-        let mount = scratch.path.join("intermediates");
-        let backing = scratch.path.join("namespace");
-        let spool = scratch.path.join("spool");
-        for path in [&mount, &backing, &spool] {
-            fs::create_dir(path)?;
-        }
-        let (token, connection) = crate::dist::native::intermediate::open()?;
-        let filesystem = crate::build_runtime::intermediate_fs::mount_intermediates(
-            &mount,
-            &backing,
-            &spool,
-            token,
-            crate::dist::native::intermediate::content(),
-        )
-        .context("mount leased Cargo intermediates")?;
-        scratch.configure(&mut command)?;
-        let status = command.status().context("execute upstream Cargo")?;
-        scratch.wait_for_descendants()?;
-        drop(filesystem);
-        drop(connection);
-        drop(scratch);
-        exit_code(status)
+        with_intermediates(&mut command, |command| {
+            let status = command.status().context("execute upstream Cargo")?;
+            exit_code(status)
+        })
     }
     #[cfg(not(feature = "dist-client"))]
     anyhow::bail!("Cargo final-only mode requires native distributed compilation")

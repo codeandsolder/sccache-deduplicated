@@ -1,0 +1,15 @@
+[workspace]
+members = ["native-lib", "derive"]
+resolver = "3"
+
+[package]
+name = "native-plan-fixture"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+native-lib = { path = "native-lib" }
+fixture-derive = { path = "derive" }
+
+[profile.dev]
+incremental = false

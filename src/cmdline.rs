@@ -82,6 +82,7 @@ pub enum Command {
         executable: PathBuf,
         args: Vec<OsString>,
         max_in_flight: NonZeroUsize,
+        leased_intermediates: bool,
     },
     /// Run a compiler command.
     Compile {
@@ -106,7 +107,7 @@ fn flag_infer_long(name: &'static str) -> Arg {
 }
 
 const ENABLED_FEATURES_HELP: &str = concat!(
-    "Live build planner: --execute-planner PATH [--max-in-flight N] -- [planner arguments]\n",
+    "Live build planner: --execute-planner PATH [--max-in-flight N] [--leased-intermediates] -- [planner arguments]\n",
     "Linux Cargo launcher: --cargo-final -- [Cargo arguments] (temporary intermediates)\n",
     "                      --cargo-all -- [Cargo arguments] (normal Cargo retention)\n\n",
     "Enabled features:\n",
@@ -331,6 +332,8 @@ struct PlannerArgs {
     execute_planner: PathBuf,
     #[arg(long, default_value = "64")]
     max_in_flight: NonZeroUsize,
+    #[arg(long)]
+    leased_intermediates: bool,
     #[arg(last = true)]
     args: Vec<OsString>,
 }
@@ -342,6 +345,7 @@ fn planner_command(args: &[OsString]) -> Result<Command> {
         executable: parsed.execute_planner,
         args: parsed.args,
         max_in_flight: parsed.max_in_flight,
+        leased_intermediates: parsed.leased_intermediates,
     })
 }
 
@@ -457,7 +461,7 @@ mod tests {
         .map(Into::into);
         let command = planner_command(&args).unwrap();
         assert!(
-            matches!(command, Command::ExecutePlanner { executable, args, max_in_flight } if executable == PathBuf::from("/cargo") && args == ["build", "--release"] && max_in_flight.get() == 17)
+            matches!(command, Command::ExecutePlanner { executable, args, max_in_flight, leased_intermediates: false } if executable == PathBuf::from("/cargo") && args == ["build", "--release"] && max_in_flight.get() == 17)
         );
     }
 }
