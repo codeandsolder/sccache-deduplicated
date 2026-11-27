@@ -82,7 +82,8 @@ impl NativeStore {
         retained: R,
     ) -> Result<TreeLease> {
         let queue = &self.inner.tree_publications;
-        let permit = Arc::clone(&queue.slots).acquire_owned().await?;
+        let resources: Box<dyn Send> =
+            Box::new((retained, Arc::clone(&queue.slots).acquire_owned().await?));
         let (reply, receive) = oneshot::channel();
         let start = {
             let mut state = queue.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -91,7 +92,7 @@ impl NativeStore {
                 staged,
                 completion: Completion {
                     reply,
-                    _resources: Box::new((retained, permit)),
+                    _resources: resources,
                 },
             });
             let start = !state.running;

@@ -1462,6 +1462,7 @@ impl NativeStore {
             for id in &unavailable {
                 release_pin(&mut pins.blobs, id);
             }
+            drop(pins);
             reservation
                 .reserved
                 .retain(|id| unavailable.binary_search(id).is_err());
