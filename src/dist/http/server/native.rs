@@ -380,22 +380,37 @@ where
             }
         });
     }
-    // Result recovery holds the action permit but no compiler slot or thread
-    // while waiting for a source or a shared upload slot.
+    // Independent result recoveries share the same real transfer budget.
+    // The recovery queue accounts for their manifests until they complete.
     {
         let sessions = Arc::downgrade(&sessions);
+        let fetch_peer = Arc::clone(&fetch_peer);
         runtime.spawn(async move {
+            use futures::stream::{FuturesUnordered, StreamExt};
+            let mut active = FuturesUnordered::new();
             while let Some(sessions) = sessions.upgrade() {
                 let fetch = Arc::clone(&fetch_peer);
-                if let Err(error) = sessions
-                    .recover_next_result(
+                tokio::select! {
+                    result = active.next(), if !active.is_empty() => {
+                        match result {
+                            Some(Ok(Err(error))) => warn!("native result recovery failed: {error:#}"),
+                            Some(Err(error)) => warn!("native result recovery task failed: {error:#}"),
+                            _ => {}
+                        }
+                    }
+                    claimed = sessions.start_result_recovery(
                         Duration::from_millis(100),
                         move |blob, store, deadline| fetch(blob, None, store, deadline),
-                    )
-                    .await
-                {
-                    warn!("native result recovery failed: {error:#}");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    ), if active.len() < limits.max_sessions => {
+                        match claimed {
+                            Ok(Some(task)) => active.push(task),
+                            Ok(None) => {}
+                            Err(error) => {
+                                warn!("native result recovery claim failed: {error:#}");
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
                 }
             }
         });
