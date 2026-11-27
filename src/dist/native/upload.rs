@@ -134,6 +134,35 @@ pub(super) fn send(
     }
 }
 
+/// A busy response is an explicit refusal of admission, not an uncertain
+/// completion. Immutable file uploads can replay their exact bytes in this
+/// case. Do not retry connection loss or a failed integrity check here.
+#[cfg(target_os = "linux")]
+pub(super) async fn retry_busy<F, Fut>(timeout: std::time::Duration, mut attempt: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut delay = std::time::Duration::from_millis(25);
+    tokio::time::timeout(timeout, async {
+        loop {
+            match attempt().await {
+                Err(error)
+                    if error.downcast_ref::<wreq::Error>().is_some_and(|error| {
+                        error.status() == Some(http::StatusCode::SERVICE_UNAVAILABLE)
+                    }) =>
+                {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_millis(250));
+                }
+                result => return result,
+            }
+        }
+    })
+    .await
+    .context("native output upload admission deadline exceeded")?
+}
+
 /// Demand-driven immutable file upload. There is no synchronous producer,
 /// no temporary copy, and at most one completion read per body poll.
 #[cfg(all(unix, feature = "native-store"))]

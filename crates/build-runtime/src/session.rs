@@ -126,10 +126,9 @@ impl Transfer {
             !self.staged.contains_key(&blob.id),
             "content already staged"
         );
-        ensure!(
-            self.active.len() < limit,
-            "concurrent upload limit exceeded"
-        );
+        if self.active.len() >= limit {
+            return Err(NativeServiceBusy.into());
+        }
         ensure!(
             self.active.insert(blob.id),
             "content upload already in flight"
