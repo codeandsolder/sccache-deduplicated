@@ -1,5 +1,5 @@
+use crate::Platform;
 use anyhow::{Context, Result, bail, ensure};
-use sccache_rust_build::Platform;
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
@@ -31,7 +31,7 @@ fn output(command: &mut Command) -> Result<String> {
     Ok(String::from_utf8(result.stdout)?.trim_end().to_owned())
 }
 
-pub(super) fn tool(
+pub fn tool(
     name: &str,
     explicit: Option<&Path>,
     toolchain: Option<&str>,

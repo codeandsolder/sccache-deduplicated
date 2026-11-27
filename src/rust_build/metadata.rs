@@ -1,6 +1,7 @@
 //! Package-manager-independent workspace inspection and source formatting.
-use super::{RustBuildArgs, settings};
+use super::RustBuildArgs;
 use anyhow::{Result, ensure};
+use sccache_rust_build::settings;
 use sccache_rust_build::{DependencyKind, Manifest, TargetKind, Workspace};
 use serde_json::{Value, json};
 use std::{

@@ -1,15 +1,12 @@
 //! Translate the resolved unit graph into compiler, build-script and final
 //! publication actions. The common runtime owns readiness and cache admission.
-use super::{
-    Mode, RustBuildArgs,
-    settings::{Settings, Toolchain},
-};
-use anyhow::{Context, Result, bail, ensure};
-use sccache_build::{BuildGraph, BuildPath, EnvironmentChange, PlanAction, PlanCommand, PlanNode};
-use sccache_rust_build::{
+use crate::{
     BuildDomain, DependencyKind, Graph, LinkDirective, LinkScope, Manifest, Profile, ScriptOutput,
     Target, TargetKind, Workspace,
 };
+use crate::{BuildMode as Mode, PlanOptions, Settings, Toolchain};
+use anyhow::{Context, Result, bail, ensure};
+use sccache_build::{BuildGraph, BuildPath, EnvironmentChange, PlanAction, PlanCommand, PlanNode};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
@@ -62,7 +59,7 @@ pub struct Planner<'a> {
     workspace: &'a Workspace,
     settings: &'a Settings,
     toolchain: &'a Toolchain,
-    options: &'a RustBuildArgs,
+    options: &'a PlanOptions,
     intermediate: PathBuf,
     final_root: PathBuf,
     nodes: Vec<Node>,
@@ -124,7 +121,7 @@ impl<'a> Planner<'a> {
         workspace: &'a Workspace,
         settings: &'a Settings,
         toolchain: &'a Toolchain,
-        options: &'a RustBuildArgs,
+        options: &'a PlanOptions,
         intermediate: PathBuf,
         final_root: PathBuf,
     ) -> Result<Self> {
@@ -1182,7 +1179,12 @@ impl<'a> Planner<'a> {
                     .is_some_and(|v| !matches!(v.as_str(), "0" | "false" | "none")))
                 .to_string(),
             ),
-            ("NUM_JOBS", crate::util::num_cpus().to_string()),
+            (
+                "NUM_JOBS",
+                std::thread::available_parallelism()
+                    .map_or(1, std::num::NonZeroUsize::get)
+                    .to_string(),
+            ),
         ] {
             env.insert(name.into(), value.into());
         }

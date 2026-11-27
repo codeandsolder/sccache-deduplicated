@@ -2,17 +2,14 @@
 //! the workspace, holds one artifact lease and submits actual rustc requests.
 //! No external Cargo process, Cargo job queue or Cargo fingerprint database.
 mod metadata;
-mod planner;
-mod settings;
 
-use self::{
-    planner::Planner,
-    settings::{Settings, Toolchain},
-};
 use crate::{build_plan, commands::CompileSession, config::Config};
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, ValueEnum};
-use sccache_rust_build::{Graph, Lockfile, ResolveOptions, Sources, Target, TargetKind, Workspace};
+use sccache_rust_build::{
+    BuildMode, Graph, Lockfile, PlanOptions, Planner, ResolveOptions, Settings, Sources,
+    TargetKind, Toolchain, Workspace,
+};
 use std::{
     collections::BTreeSet,
     ffi::{OsStr, OsString},
@@ -127,49 +124,36 @@ impl RustBuildArgs {
         })
     }
 
-    pub fn selects(&self, target: &Target) -> bool {
-        if self.lib
-            || self.bins
-            || !self.bin.is_empty()
-            || self.examples
-            || !self.example.is_empty()
-            || self.tests
-            || !self.test_targets.is_empty()
-            || self.benches
-            || !self.bench.is_empty()
-        {
-            return match target.kind {
-                TargetKind::Library => self.lib,
-                TargetKind::Binary => self.bins || self.bin.contains(&target.name),
-                TargetKind::Example => self.examples || self.example.contains(&target.name),
-                TargetKind::Test => self.tests || self.test_targets.contains(&target.name),
-                TargetKind::Bench => self.benches || self.bench.contains(&target.name),
-                TargetKind::BuildScript => false,
-            };
-        }
-        if self.mode == Mode::Run {
-            return target.kind == TargetKind::Binary;
-        }
-        if self.mode == Mode::Doc {
-            return target.doc;
-        }
-        if self.mode == Mode::Test && self.doc {
-            return target.kind == TargetKind::Library && target.doctest;
-        }
-        if self.all_targets {
-            return target.kind != TargetKind::BuildScript;
-        }
-        if self.mode == Mode::Test {
-            return target.test
-                && matches!(
-                    target.kind,
-                    TargetKind::Library
-                        | TargetKind::Binary
-                        | TargetKind::Test
-                        | TargetKind::Example
-                );
-        }
-        matches!(target.kind, TargetKind::Library | TargetKind::Binary)
+    fn plan_options(&self) -> Result<PlanOptions> {
+        let mode = match self.mode {
+            Mode::Build => BuildMode::Build,
+            Mode::Check => BuildMode::Check,
+            Mode::Test => BuildMode::Test,
+            Mode::Clippy => BuildMode::Clippy,
+            Mode::Run => BuildMode::Run,
+            Mode::Doc => BuildMode::Doc,
+            _ => anyhow::bail!("command does not produce a build graph"),
+        };
+        Ok(PlanOptions {
+            mode,
+            release: self.release,
+            profile: self.profile.clone(),
+            lib: self.lib,
+            bin: self.bin.clone(),
+            bins: self.bins,
+            all_targets: self.all_targets,
+            example: self.example.clone(),
+            examples: self.examples,
+            test_targets: self.test_targets.clone(),
+            tests: self.tests,
+            bench: self.bench.clone(),
+            benches: self.benches,
+            no_run: self.no_run,
+            doc: self.doc,
+            no_doc: self.no_doc,
+            no_deps: self.no_deps,
+            trailing: self.trailing.clone(),
+        })
     }
 
     fn dev_dependencies(&self) -> bool {
@@ -453,12 +437,13 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
             sources.lock.write(&workspace.root.join("Cargo.lock"))?;
         }
         args.validate_targets(&graph)?;
+        let plan_options = args.plan_options()?;
         let planner = Planner::new(
             &graph,
             &workspace,
             &settings,
             &toolchain,
-            &args,
+            &plan_options,
             intermediate.to_path_buf(),
             final_root,
         )?;

@@ -4347,6 +4347,7 @@ dependencies = [
  "tar",
  "tempfile",
  "toml",
+ "which",
 ]
 
 [[package]]
