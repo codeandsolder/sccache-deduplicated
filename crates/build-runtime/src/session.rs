@@ -2050,7 +2050,7 @@ impl NativeSessions {
         // storage/GC. Lease renewal and close must not wait behind either.
         let reservation = self.store().reserve_blobs(&blobs)?;
         let absent = reservation.missing().to_vec();
-        let previous = {
+        {
             let mut state = Self::lock(&session)?;
             self.authorize_reader(&mut state, reader)?;
             let Phase::Ready(Ready::Tree(delivery)) = &mut state.phase else {
@@ -2061,11 +2061,13 @@ impl NativeSessions {
                 "input delivery changed during prefetch"
             );
             delivery.requested.extend(absent.iter().map(|blob| blob.id));
-            let previous = delivery.reservation.replace(reservation);
+            if let Some(existing) = &mut delivery.reservation {
+                existing.merge_pins(reservation)?;
+            } else {
+                delivery.reservation = Some(reservation);
+            }
             drop(state);
-            previous
-        };
-        drop(previous);
+        }
         self.request_backfills(action, reader, tree, &absent)
     }
 
