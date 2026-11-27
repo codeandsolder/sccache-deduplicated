@@ -529,6 +529,19 @@ struct Pins {
 }
 
 impl Pins {
+    fn pin_result(&mut self, action: ActionKey, blobs: &BTreeMap<ContentId, u64>) -> Result<()> {
+        let count = self
+            .actions
+            .get(&action)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("action pin count overflow")?;
+        self.reserve_content(blobs.keys())?;
+        self.actions.insert(action, count);
+        Ok(())
+    }
+
     fn reserve_content<'a>(
         &mut self,
         ids: impl Iterator<Item = &'a ContentId> + Clone,
@@ -580,6 +593,7 @@ fn release_pin<K: Ord + std::fmt::Debug>(pins: &mut BTreeMap<K, usize>, key: &K)
 }
 
 mod publications;
+mod results;
 
 struct Inner {
     root: PathBuf,
@@ -1633,101 +1647,26 @@ impl NativeStore {
         staged: Vec<StagedBlob>,
         mode: ActionMode,
     ) -> Result<Published> {
-        let action = fingerprint.key()?;
-        let result = manifest.id()?;
-        let blobs = manifest.blobs()?;
-        let staged = self.prepare_staging(&blobs, staged)?;
-        let write = self.inner.db.begin_write()?;
-        let mut publication = Publication::default();
-        let new_action;
-        {
-            let mut actions = write.open_table(ACTIONS)?;
-            let mut results = write.open_table(RESULTS)?;
-            let mut result_actions = write.open_multimap_table(RESULT_ACTIONS)?;
-            let previous = actions
-                .get(&action.0)?
-                .map(|value| encoding().deserialize::<ActionRecord>(value.value()))
-                .transpose()?;
-            new_action = previous.is_none();
-            if let Some(stored) = &previous {
-                ensure!(
-                    stored.fingerprint == *fingerprint,
-                    "conflicting native action fingerprint"
-                );
-                if stored.result == result {
-                    let published = Published {
-                        action,
-                        result,
-                        new_action: false,
-                    };
-                    if self.blobs_present(&blobs)? {
-                        self.inner.lock_pins()?.touch(space::Root::Action(action));
-                        return Ok(published);
-                    }
-                    // A physically incomplete indexed result can be repaired
-                    // in place without changing its references or accounting.
-                    self.attach_blobs(&write, &result.0, &blobs, staged, true, &mut publication)?;
-                    drop(result_actions);
-                    drop(results);
-                    drop(actions);
-                    return self.commit_result(write, publication, published);
-                }
-                // A fresh build may replace an unavailable result; ordinary
-                // reuse must still never overwrite a complete result.
-                let old = results
-                    .get(&stored.result.0)?
-                    .context("missing indexed result")?;
-                let old: ResultManifest = encoding().deserialize(old.value())?;
-                ensure!(
-                    mode == ActionMode::Refresh || !self.blobs_present(&old.blobs()?)?,
-                    "conflicting result for action {action:?}"
-                );
-            }
-            let existing_result = if let Some(stored) = results.get(&result.0)? {
-                let stored: ResultManifest = encoding().deserialize(stored.value())?;
-                ensure!(stored == *manifest, "conflicting native result manifest");
-                true
-            } else {
-                false
-            };
-            self.attach_blobs(
-                &write,
-                &result.0,
-                &blobs,
-                staged,
-                existing_result,
-                &mut publication,
-            )?;
-            if !existing_result {
-                let bytes = encoding().serialize(manifest)?;
-                results.insert(&result.0, bytes.as_slice())?;
-            }
-            let record = ActionRecord {
-                fingerprint: fingerprint.clone(),
-                result,
-            };
-            let bytes = encoding().serialize(&record)?;
-            actions.insert(&action.0, bytes.as_slice())?;
-            result_actions.insert(&result.0, &action.0)?;
-            if let Some(previous) = previous {
-                Self::release_result_reference(
-                    &write,
-                    &mut results,
-                    &mut result_actions,
-                    action,
-                    previous.result,
-                )?;
-            }
+        use std::borrow::Cow;
+        let mut prepared = results::PreparedResult::new(
+            self,
+            Cow::Borrowed(fingerprint),
+            Cow::Borrowed(manifest),
+            staged,
+            mode,
+        )?;
+        let plan = prepared.preflight(self, &self.inner.db.begin_read()?)?;
+        let published = prepared.published(&plan);
+        if !plan.unchanged {
+            let write = self.inner.db.begin_write()?;
+            let mut publication = Publication::default();
+            prepared.attach(self, &write, &mut publication, plan)?;
+            publication.commit(&self.inner, write)?;
         }
-        self.commit_result(
-            write,
-            publication,
-            Published {
-                action,
-                result,
-                new_action,
-            },
-        )
+        self.inner
+            .lock_pins()?
+            .touch(space::Root::Action(published.action));
+        Ok(published)
     }
 
     fn blobs_present(&self, blobs: &BTreeMap<ContentId, u64>) -> Result<bool> {
@@ -1739,22 +1678,6 @@ impl NativeStore {
             }
         }
         Ok(true)
-    }
-
-    fn commit_result(
-        &self,
-        write: WriteTransaction,
-        publication: Publication,
-        published: Published,
-    ) -> Result<Published> {
-        history::forget(&write, published.action)?;
-        // Files and their directory entries are durable before the index
-        // exposes them. Orphans from an interrupted write are harmless.
-        publication.commit(&self.inner, write)?;
-        self.inner
-            .lock_pins()?
-            .touch(space::Root::Action(published.action));
-        Ok(published)
     }
 
     fn prepare_staging(
@@ -1908,17 +1831,9 @@ impl NativeStore {
             "invalid indexed result manifest"
         );
         let blobs = manifest.blobs()?;
-        let count = pins
-            .actions
-            .get(&action)
-            .copied()
-            .unwrap_or(0)
-            .checked_add(1)
-            .context("action pin count overflow")?;
         // A refresh can retire the old result while its delivery lease
         // survives. Pin its content independently of the action mapping.
-        pins.reserve_content(blobs.keys())?;
-        pins.actions.insert(action, count);
+        pins.pin_result(action, &blobs)?;
         drop(pins);
         let lease = ResultLease {
             inner: Arc::clone(&self.inner),
