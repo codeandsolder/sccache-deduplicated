@@ -351,7 +351,7 @@ fn panel_patch(old: &MetricPanel, new: &MetricPanel) -> Option<PanelPatch> {
     if old.title != new.title
         || old.unit != new.unit
         || old.kind != new.kind
-        || old.cache_hits != new.cache_hits
+        || old.group != new.group
     {
         return Some(PanelPatch::Replace(new.clone()));
     }
@@ -497,7 +497,7 @@ mod metrics_tests {
     fn rolling_range_and_late_correction_reconstruct_exact_data() {
         let panel = MetricPanel {
             key: 0,
-            cache_hits: false,
+            group: crate::MetricGroup::Fleet,
             kind: crate::PanelKind::Timeseries,
             title: "Test".into(),
             unit: "s".into(),

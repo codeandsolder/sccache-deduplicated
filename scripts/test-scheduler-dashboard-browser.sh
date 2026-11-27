@@ -86,17 +86,26 @@ await_js 'return document.querySelector("nav button[aria-pressed=true]").textCon
 select_tab() {
     js "const tab=[...document.querySelectorAll('nav button')].find(x=>x.textContent.trim()==='$1'); tab.click(); return true" >/dev/null
 }
+# Updates while the same tab is active retain the chart's actual DOM nodes.
+await_js 'return document.querySelector("main svg path[stroke-linecap]") !== null'
+js 'window.activityChart=document.querySelector("main svg"); window.activityPath=document.querySelector("main svg path[stroke-linecap]"); window.oldPath=activityPath.getAttribute("d"); return true' >/dev/null
+await_js 'return activityPath.getAttribute("d") !== oldPath && document.querySelector("main svg") === activityChart && document.querySelector("main svg path[stroke-linecap]") === activityPath'
 select_tab Jobs
 await_js 'return document.querySelector("#jobs") !== null && document.querySelector("#workers") === null'
 js 'const jobFilter=document.querySelector("#jobs input"); jobFilter.value="rustc"; jobFilter.dispatchEvent(new Event("input",{bubbles:true})); return true' >/dev/null
+js 'const sort=document.querySelectorAll("#jobs select")[1]; sort.value="input"; sort.dispatchEvent(new Event("change",{bubbles:true})); return true' >/dev/null
 select_tab "Cache hits"
 await_js 'return document.querySelector("#admission") !== null && document.querySelector("#jobs") === null'
 select_tab Jobs
-await_js 'return document.querySelector("#jobs input")?.value === "rustc" && document.querySelector("#jobs table") !== null'
+await_js 'return document.querySelector("#jobs input")?.value === "rustc" && document.querySelectorAll("#jobs select")[1]?.value === "input" && document.querySelector("#jobs table") !== null'
 select_tab Topology
 await_js 'return document.querySelector("#topology svg") !== null && document.querySelector("#topology").innerText.includes("1 identities")'
 js 'const e=document.querySelector("#topology select"); e.selectedIndex=1; e.dispatchEvent(new Event("change",{bubbles:true})); return true' >/dev/null
 await_js 'return document.querySelector("#topology article")?.innerText.includes("Scheduler") === true'
+select_tab "Cache storage"
+await_js 'return document.querySelector("#cache-analytics") !== null && document.querySelector("#metrics h2")?.textContent.trim() === "Historical cache storage"'
+select_tab Topology
+await_js 'return document.querySelector("#topology article")?.innerText.includes("Scheduler") === true && document.querySelector("#metrics") === null'
 # Enroll a real authenticated client after hydration; membership must arrive via SSE.
 scheduler_endpoint="$(sed -n 's/.*Scheduler listening for clients on \([^ ]*\).*/\1/p' "$root/scheduler.log" | tail -1)"
 test -n "$scheduler_endpoint"

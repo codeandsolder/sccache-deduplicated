@@ -25,7 +25,7 @@ pub(super) fn CacheAnalytics(
                 }.into_any()
             )}
             <FleetStorage workers=workers/>
-            <p class=styles::muted>"Legacy L0/L1 distributions, per-tier capacity and shared managed-cache heat are in the fleet metrics view. Select an individual client to inspect distributions."</p>
+            <p class=styles::muted>"Historical legacy L0/L1 distributions, per-tier capacity and shared managed-cache heat are below. Select an individual client to inspect distributions."</p>
         </section>
     }
 }

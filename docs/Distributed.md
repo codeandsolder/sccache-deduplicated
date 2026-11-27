@@ -630,7 +630,11 @@ The dashboard opens on Overview. The remaining tabs are Workers, Jobs, CAS,
 Cache hits, Cache storage, Topology, Network and Fleet metrics. Only the active tab is rendered, with filters, pagination and topology selection
 kept outside its view lifetime. Updates retain keyed table cells and fixed column
 widths instead of rebuilding rows. The optional fleet metrics stream disconnects
-when leaving its tabs, avoiding inactive query and rendering load.
+when leaving its tabs, avoiding inactive query and rendering load. Native SSE
+updates invalidate only their affected projections; job updates do not clone
+history or cache telemetry. Overview tiles and keyed chart paths update in place.
+Percentage charts retain a 0–100% baseline; series colors remain stable as
+other series appear or disappear.
 
 ### Live network topology
 
@@ -712,7 +716,10 @@ Worker protocol labels distinguish CAS execution, legacy archive, both, or
 neither; CAS execution describes the transport/execution protocol, not the
 compiler's target architecture. Native job rows include the executable basename,
 Rust crate name or declared output basename, explicit target when present,
-requester identity and total/remaining input bytes and blob counts. The dashboard
+requester identity and total/remaining input bytes and blob counts. The Jobs
+tab supports multi-term search, a phase filter, sorting by age, input backlog,
+worker or phase, and a declared-input availability bar (not network transfer
+progress). Unknown ages and backlog sizes are sorted after known values. The dashboard
 does not retain full command lines, environment variables or authorization data.
 No thousand-job truncation. Expired workers are excluded without
 mutating scheduling state. Native compiler slots are not legacy allocations;
@@ -723,7 +730,8 @@ goodput is not physical link capacity.
 
 The Cache hits tab includes native scheduler admissions independently of the
 fleet metrics backend. Counts are available since scheduler start and for
-observed rolling five- and fifteen-minute windows. The admission hit rate is
+observed rolling one-, five- and fifteen-minute windows. One- and five-minute
+native hit-rate histories are charted directly from the scheduler samples. The admission hit rate is
 hits divided by hits plus reuse-mode compile admissions. Forced refreshes,
 in-flight requests, missing-input responses, busy responses and errors are
 reported separately rather than counted as cache misses. Admissions are not
@@ -738,7 +746,9 @@ Counter increases account for restarts; absent samples remain absent.
 ### Fleet history
 
 If configured, Liberta supplies the existing Grafana dashboard plus cache-tier analytics (50 query
-panels total). Select an exact client or all clients and a range from 15 minutes
+panels total: 20 cache-result, 10 cache-storage and 20 fleet panels).
+Only the selected category is queried and transmitted; the category is part
+of the shared metrics-feed key. Select an exact client or all clients and a range from 15 minutes
 to seven days. Requests use fixed server-side PromQL templates; user labels
 are escaped as literal regular expressions. Linux host-wide panels include monitored Linux hosts rather than claiming all
 are workers. Ingress panels require an explicit Certifex virtual host. Range-dependent resolution is 5–1800 seconds;

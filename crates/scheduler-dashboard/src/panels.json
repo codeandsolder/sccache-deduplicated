@@ -8,7 +8,8 @@
         "expr": "sccache_cache_tier_size_bytes{instance=~\"$client\",resolution=\"raw\"}",
         "legend": "{{instance}} L{{level}} {{backend}} {{kind}}"
       }
-    ]
+    ],
+    "group": "cache_storage"
   },
   {
     "title": "Legacy serialized object sizes (bytes per bucket)",
@@ -20,7 +21,8 @@
         "legend": "{{instance}} L{{level}} {{backend}} {{upper}}"
       }
     ],
-    "requires_client": true
+    "requires_client": true,
+    "group": "cache_storage"
   },
   {
     "title": "Legacy serialized object sizes (objects per bucket)",
@@ -32,7 +34,8 @@
         "legend": "{{instance}} L{{level}} {{backend}} {{upper}}"
       }
     ],
-    "requires_client": true
+    "requires_client": true,
+    "group": "cache_storage"
   },
   {
     "title": "Legacy last-access age (bytes per bucket)",
@@ -44,7 +47,8 @@
         "legend": "{{instance}} L{{level}} {{backend}} {{upper}}"
       }
     ],
-    "requires_client": true
+    "requires_client": true,
+    "group": "cache_storage"
   },
   {
     "title": "Managed decayed heat, milli-hits (bytes per bucket)",
@@ -56,7 +60,8 @@
         "legend": "{{instance}} L{{level}} {{backend}} {{upper}}"
       }
     ],
-    "requires_client": true
+    "requires_client": true,
+    "group": "cache_storage"
   },
   {
     "title": "Managed eviction-adjusted age (bytes per bucket)",
@@ -68,7 +73,8 @@
         "legend": "{{instance}} L{{level}} {{backend}} {{upper}}"
       }
     ],
-    "requires_client": true
+    "requires_client": true,
+    "group": "cache_storage"
   },
   {
     "title": "Managed heat percentile storage share (bounds)",
@@ -80,7 +86,8 @@
         "legend": "{{instance}} L{{level}} {{backend}} p{{percentile}} {{bound}}"
       }
     ],
-    "requires_client": true
+    "requires_client": true,
+    "group": "cache_storage"
   },
   {
     "title": "Legacy analytics snapshot age (seconds)",
@@ -91,7 +98,8 @@
         "expr": "time()-sccache_cache_tier_snapshot_timestamp_seconds{instance=~\"$client\",resolution=\"raw\"}",
         "legend": "{{instance}} L{{level}} {{backend}}"
       }
-    ]
+    ],
+    "group": "cache_storage"
   },
   {
     "title": "Reported cache size by client (shared tiers may repeat)",
@@ -102,7 +110,8 @@
         "expr": "sccache_cache_size_bytes{instance=~\"$client\",resolution=\"raw\"}",
         "legend": "{{instance}} {{kind}}"
       }
-    ]
+    ],
+    "group": "cache_storage"
   },
   {
     "title": "Workers",
@@ -185,7 +194,7 @@
         "legend": "Selected range"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Distributed share (range)",
@@ -234,7 +243,7 @@
         "legend": "{{instance}} {{result}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Distributed compiles by worker",
@@ -257,7 +266,7 @@
         "legend": "{{language}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Non-cacheable reasons",
@@ -273,7 +282,7 @@
         "legend": "crate-type: {{crate_type}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Request disposition",
@@ -285,7 +294,7 @@
         "legend": "{{instance}} {{result}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Average compile time",
@@ -297,7 +306,7 @@
         "legend": "{{instance}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Cache operation latency",
@@ -313,7 +322,7 @@
         "legend": "{{instance}} read hit"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "L0 cache latency",
@@ -329,7 +338,7 @@
         "legend": "{{instance}} {{name}} hit"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Cache-level operations",
@@ -341,7 +350,7 @@
         "legend": "{{instance}} {{name}} {{operation}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Cache errors / unusual events",
@@ -353,7 +362,7 @@
         "legend": "{{instance}} {{event}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Compile & distributed failures",
@@ -435,7 +444,7 @@
         "legend": ""
       }
     ],
-    "cache_hits": true
+    "group": "cache_storage"
   },
   {
     "title": "Basedirs",
@@ -502,7 +511,7 @@
         "legend": "{{compiler_language}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Compiler/language cache requests",
@@ -514,7 +523,7 @@
         "legend": "{{compiler_language}} {{result}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Completed cache results · selected range",
@@ -526,7 +535,7 @@
         "legend": "{{result}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Completed cache hit rate · client history",
@@ -538,7 +547,7 @@
         "legend": "{{instance}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Completed cache hit rate · selected range by client",
@@ -550,7 +559,7 @@
         "legend": "{{instance}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Completed results by client · selected range",
@@ -562,7 +571,7 @@
         "legend": "{{instance}} {{result}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Completed results by compiler · selected range",
@@ -574,7 +583,7 @@
         "legend": "{{compiler_language}} {{result}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Legacy tier lookups · selected range",
@@ -586,7 +595,7 @@
         "legend": "{{instance}} L{{level}} {{name}} {{operation}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Cache bypasses and errors · selected range",
@@ -602,7 +611,7 @@
         "legend": "{{reason}}"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   },
   {
     "title": "Completed cache hit rate · fleet history",
@@ -614,6 +623,6 @@
         "legend": "All selected clients"
       }
     ],
-    "cache_hits": true
+    "group": "cache_hits"
   }
 ]

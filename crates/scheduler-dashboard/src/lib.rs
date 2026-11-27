@@ -318,10 +318,22 @@ pub enum PanelKind {
     Table,
 }
 
+/// Server-selected query category. Only the active tab's panels are queried.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricGroup {
+    #[default]
+    Fleet,
+    CacheHits,
+    CacheStorage,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricPanel {
     pub key: usize,
-    pub cache_hits: bool,
+    pub group: MetricGroup,
     pub kind: PanelKind,
     pub title: String,
     pub unit: String,
@@ -412,6 +424,7 @@ impl TimeRange {
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetricsView {
+    pub group: MetricGroup,
     pub range: TimeRange,
     /// Exact instance label, not a regular expression or arbitrary query.
     pub client: String,

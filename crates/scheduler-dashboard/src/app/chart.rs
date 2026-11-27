@@ -9,7 +9,7 @@ const COLORS: [&str; 10] = [
     "#e78ac3", "#8dd3c7",
 ];
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct Bounds {
     start: f64,
     end: f64,
@@ -17,7 +17,7 @@ struct Bounds {
     max: f64,
 }
 
-fn bounds(series: &[MetricSeries]) -> Option<Bounds> {
+fn bounds(series: &[MetricSeries], unit: &str) -> Option<Bounds> {
     let mut bounds = Bounds {
         start: f64::INFINITY,
         end: f64::NEG_INFINITY,
@@ -38,6 +38,9 @@ fn bounds(series: &[MetricSeries]) -> Option<Bounds> {
     }
     if !observed || !bounds.start.is_finite() {
         return None;
+    }
+    if unit == "percent" {
+        bounds.max = bounds.max.max(100.0);
     }
     if bounds.max <= bounds.min {
         bounds.max = bounds.min + 1.0;
@@ -134,24 +137,109 @@ fn axis_time(time: f64, range: f64) -> String {
         )
 }
 
-pub(super) fn graph(series: Vec<MetricSeries>, unit: &str, step: u64) -> impl IntoView + use<> {
-    let Some(bounds) = bounds(&series) else {
-        return view! {<p class=styles::muted>"No samples"</p>}.into_any();
+fn series_color(key: &str) -> &'static str {
+    // Stable across series arrival/removal and SSR/hydration.
+    let hash = key.bytes().fold(0_u32, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(u32::from(byte))
+    });
+    COLORS[usize::try_from(hash).unwrap_or_default() % COLORS.len()]
+}
+
+#[component]
+pub(super) fn HistoryChart(
+    series: Memo<Vec<MetricSeries>>,
+    unit: Memo<String>,
+    step: Signal<u64>,
+) -> impl IntoView {
+    let indexed = super::keyed_index(series, |series| &series.key);
+    let keys = super::index_keys(indexed);
+    let extent = Memo::new(move |_| series.with(|series| unit.with(|unit| bounds(series, unit))));
+    let axis = move |maximum: bool| {
+        extent.with(|extent| {
+            extent.map_or_else(
+                || "—".into(),
+                |extent| {
+                    unit.with(|unit| {
+                        value_label(if maximum { extent.max } else { extent.min }, unit)
+                    })
+                },
+            )
+        })
     };
-    let range = bounds.end - bounds.start;
+    let time = move |end: bool| {
+        extent.with(|extent| {
+            extent.map_or_else(
+                || "—".into(),
+                |extent| {
+                    axis_time(
+                        if end { extent.end } else { extent.start },
+                        extent.end - extent.start,
+                    )
+                },
+            )
+        })
+    };
     view! {
-        <div class=styles::axis><span>{value_label(bounds.max,unit)}</span><span>{format!("{:.0} min · UTC",range/60.0)}</span></div>
+        <div class=styles::axis><span>{move || axis(true)}</span><span>{move || extent.with(|extent| extent.map_or_else(|| "UTC".into(), |extent| format!("{:.0} min · UTC",(extent.end-extent.start)/60.0)))}</span></div>
         <svg class=styles::chart viewBox="0 0 600 160" role="img" aria-label="Metric history" preserveAspectRatio="none">
             <path d="M10,10 H590 M10,80 H590 M10,150 H590" stroke="currentColor" opacity="0.2" fill="none"/>
-            {series.iter().enumerate().map(|(index,series)| view!{
-                <path d=plot_path(&series.points,bounds,step) stroke=COLORS[index%COLORS.len()] stroke-width="1.5" stroke-linecap="round" vector-effect="non-scaling-stroke" fill="none"><title>{series.label.clone()}</title></path>
-            }).collect_view()}
+            <For each=move || keys.get() key=Clone::clone children=move |key| {
+                let color = series_color(&key);
+                let row = Memo::new(move |_| indexed.with(|series| series.get(&key).cloned()));
+                view!{
+                    <path d=move || extent.with(|extent| row.with(|row| match (extent,row) { (Some(extent),Some(row)) => plot_path(&row.points,*extent,step.get()), _ => String::new() }))
+                        stroke=color stroke-width="1.5" stroke-linecap="round" vector-effect="non-scaling-stroke" fill="none">
+                        <title>{move || row.with(|row| row.as_ref().map_or_else(String::new,|row| row.label.clone()))}</title>
+                    </path>
+                }
+            }/>
         </svg>
-        <div class=styles::axis><span>{value_label(bounds.min,unit)}</span><span>{axis_time(bounds.start,range)}</span><span>{axis_time(bounds.end,range)}</span></div>
-        <div class=styles::legend>{series.into_iter().enumerate().map(|(index,series)| {
-            let last = series.points.last().and_then(|(_,value)| *value);
-            view!{<div><span style:color=COLORS[index%COLORS.len()]>"● "</span>{series.label}<b>{last.map_or_else(|| "—".into(), |value| value_label(value,unit))}</b></div>}
-        }).collect_view()}</div>
+        <div class=styles::axis><span>{move || axis(false)}</span><span>{move || time(false)}</span><span>{move || time(true)}</span></div>
+        <div class=styles::legend>
+            <p class=styles::muted hidden=move || extent.with(Option::is_some)>"No samples"</p>
+            <For each=move || keys.get() key=Clone::clone children=move |key| {
+                let color=series_color(&key);
+                let row=Memo::new(move |_| indexed.with(|series| series.get(&key).cloned()));
+                view!{<div><span style:color=color>"● "</span>{move || row.with(|row| row.as_ref().map_or_else(String::new,|row| row.label.clone()))}<b>{move || row.with(|row| row.as_ref().and_then(|row| row.points.last()).and_then(|(_,value)| *value).map_or_else(|| "—".into(),|value| unit.with(|unit| value_label(value,unit))))}</b></div>}
+            }/>
+        </div>
+    }.into_any()
+}
+
+#[component]
+pub(super) fn MetricCard(
+    panel: Memo<Option<crate::MetricPanel>>,
+    step: Signal<u64>,
+    sampled_at: Memo<Option<u64>>,
+) -> impl IntoView {
+    let kind = Memo::new(move |_| panel.with(|panel| panel.as_ref().map(|panel| panel.kind)));
+    let unit = Memo::new(move |_| {
+        panel.with(|panel| {
+            panel
+                .as_ref()
+                .map_or_else(String::new, |panel| panel.unit.clone())
+        })
+    });
+    let series = Memo::new(move |_| {
+        panel.with(|panel| {
+            panel
+                .as_ref()
+                .map_or_else(Vec::new, |panel| panel.series.clone())
+        })
+    });
+    let error = Memo::new(move |_| {
+        panel.with(|panel| panel.as_ref().and_then(|panel| panel.error.clone()))
+    });
+    view! {
+        <article>
+            <h3>{move || panel.with(|panel| panel.as_ref().map_or_else(String::new,|panel| panel.title.clone()))}</h3>
+            {move || error.get().map(|error| view!{<p class=styles::warning>{error}</p>})}
+            {move || if kind.get()==Some(crate::PanelKind::Timeseries) {
+                view!{<HistoryChart series=series unit=unit step=step/>}.into_any()
+            } else {
+                view!{{move || panel.get().map(|panel| view!{<PanelContent panel=panel step=step.get() sampled_at=sampled_at.get()/>})}}.into_any()
+            }}
+        </article>
     }.into_any()
 }
 
@@ -165,6 +253,22 @@ mod tests {
         assert_eq!(axis_time(f64::NAN, 60.0), "—");
         assert_eq!(axis_time(-1.0, 60.0), "—");
         assert_eq!(axis_time(f64::MAX, 60.0), "—");
+    }
+
+    #[test]
+    fn percentage_axis_keeps_full_scale() {
+        let series = [MetricSeries {
+            key: "hit".into(),
+            label: "Hit".into(),
+            points: vec![(1.0, Some(12.0)), (2.0, Some(23.0))],
+        }];
+        assert!(
+            bounds(&series, "percent")
+                .is_some_and(|extent| (extent.max - 100.0).abs() < f64::EPSILON)
+        );
+        assert!(
+            bounds(&series, "jobs").is_some_and(|extent| (extent.max - 23.0).abs() < f64::EPSILON)
+        );
     }
 
     #[test]
@@ -201,10 +305,8 @@ pub(super) fn PanelContent(
     sampled_at: Option<u64>,
 ) -> impl IntoView {
     use crate::PanelKind;
-    if panel.kind == PanelKind::Timeseries {
-        return graph(panel.series, &panel.unit, step).into_any();
-    }
-    let current_only = panel.cache_hits && panel.kind == PanelKind::Stat;
+    let current_only =
+        panel.group == crate::MetricGroup::CacheHits && panel.kind == PanelKind::Stat;
     let rows = panel
         .series
         .into_iter()

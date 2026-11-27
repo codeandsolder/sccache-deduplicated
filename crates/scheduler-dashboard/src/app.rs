@@ -21,7 +21,7 @@ use leptos::prelude::*;
 use leptos_meta::MetaTags;
 use leptos_meta::{Title, provide_meta_context};
 
-use crate::{DashboardData, MetricsData, MetricsView, TimeRange, styles};
+use crate::{DashboardData, MetricGroup, MetricsData, MetricsView, TimeRange, styles};
 
 mod analytics;
 mod chart;
@@ -54,6 +54,99 @@ async fn snapshot() -> Result<DashboardData, ServerFnError> {
     let state = use_context::<crate::server::DashboardState>()
         .ok_or_else(|| ServerFnError::new("Dashboard unavailable"))?;
     Ok(state.snapshot())
+}
+
+/// Independent invalidation domains for the native SSE projection. A job
+/// update must not copy or rebuild the 900-sample history or cache analytics.
+#[derive(Clone, Copy)]
+enum Projection {
+    Clock,
+    Totals,
+    History,
+    Workers,
+    Jobs,
+    Topology,
+    Telemetry,
+    Error,
+}
+
+const PROJECTION_COUNT: usize = 8;
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn changed_projections(event: &crate::NativeEvent) -> [bool; PROJECTION_COUNT] {
+    use crate::NativeEvent;
+    match event {
+        NativeEvent::Reset(_) => [true; PROJECTION_COUNT],
+        NativeEvent::Patch(patch) => {
+            let snapshot = patch.sampled_at.is_some();
+            let changed =
+                |upserts: usize, removals: usize| snapshot && (upserts != 0 || removals != 0);
+            [
+                snapshot,
+                snapshot && patch.totals.is_some(),
+                patch.sample.is_some(),
+                changed(patch.workers.upsert.len(), patch.workers.remove.len()),
+                changed(patch.jobs.upsert.len(), patch.jobs.remove.len()),
+                changed(patch.hosts.upsert.len(), patch.hosts.remove.len())
+                    || changed(patch.links.upsert.len(), patch.links.remove.len()),
+                patch.telemetry.is_some(),
+                true, // A successful patch also clears a previous error.
+            ]
+        }
+    }
+}
+
+/// Read the SSR resource or the in-place SSE state without cloning the
+/// complete snapshot. Only the changed projection's revision invalidates it.
+#[derive(Clone, Copy)]
+struct DashboardSource {
+    initial: Resource<Result<DashboardData, ServerFnError>>,
+    live: RwSignal<Option<DashboardData>>,
+    epochs: RwSignal<[u64; PROJECTION_COUNT]>,
+}
+
+impl DashboardSource {
+    fn project<T: PartialEq + Send + Sync + 'static>(
+        self,
+        projection: Projection,
+        read: impl Fn(Option<&DashboardData>) -> T + Send + Sync + 'static,
+    ) -> Memo<T> {
+        let version = Memo::new(move |_| self.epochs.with(|epochs| epochs[projection as usize]));
+        Memo::new(move |_| {
+            let _ = version.get();
+            self.live.with_untracked(|live| {
+                if let Some(live) = live {
+                    read(Some(live))
+                } else {
+                    self.initial.with(|initial| {
+                        read(initial.as_ref().and_then(|result| result.as_ref().ok()))
+                    })
+                }
+            })
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn apply(self, event: crate::NativeEvent) -> bool {
+        let changes = changed_projections(&event);
+        let valid = self.live.update_untracked(|data| {
+            if matches!(&event, crate::NativeEvent::Reset(_)) {
+                *data = Some(DashboardData::default());
+            }
+            data.as_mut()
+                .is_some_and(|data| crate::apply_event(data, event))
+        });
+        if valid {
+            self.epochs.update(|epochs| {
+                for (epoch, changed) in epochs.iter_mut().zip(changes) {
+                    if changed {
+                        *epoch = epoch.wrapping_add(1);
+                    }
+                }
+            });
+        }
+        valid
+    }
 }
 
 #[cfg(feature = "ssr")]
@@ -138,8 +231,13 @@ impl Tab {
         (Self::Fleet, "Fleet metrics"),
     ];
 
-    const fn metrics(self) -> bool {
-        matches!(self, Self::CacheHits | Self::Fleet)
+    const fn metric_group(self) -> Option<MetricGroup> {
+        match self {
+            Self::CacheHits => Some(MetricGroup::CacheHits),
+            Self::CacheAnalytics => Some(MetricGroup::CacheStorage),
+            Self::Fleet => Some(MetricGroup::Fleet),
+            _ => None,
+        }
     }
 }
 
@@ -148,8 +246,11 @@ pub fn App() -> impl IntoView {
     provide_meta_context();
     // The SSR resource is fetched once. After hydration the live stream
     // replaces it atomically; neither history nor snapshots are polled.
-    let initial = Resource::new(|| (), |()| snapshot());
-    let live = RwSignal::new(None::<DashboardData>);
+    let data = DashboardSource {
+        initial: Resource::new(|| (), |()| snapshot()),
+        live: RwSignal::new(None),
+        epochs: RwSignal::new([0; PROJECTION_COUNT]),
+    };
     let status = RwSignal::new(ConnectionStatus::Connecting);
     let retry = RwSignal::new(0_u64);
     let tab = RwSignal::new(Tab::Overview);
@@ -157,19 +258,9 @@ pub fn App() -> impl IntoView {
     Effect::new(move |_| {
         let _ = retry.get();
         sse::connect::<crate::NativeEvent>("/api/events", status, retry, move |event| {
-            let mut valid = false;
-            live.update(|data| {
-                if matches!(&event, crate::NativeEvent::Reset(_)) {
-                    *data = Some(DashboardData::default());
-                }
-                if let Some(data) = data {
-                    valid = crate::apply_event(data, event);
-                }
-            });
-            valid
+            data.apply(event)
         });
     });
-    let data = Memo::new(move |_| live.get().or_else(|| initial.get().and_then(Result::ok)));
     view! {
         <Title text="sccache | Scheduler status"/>
         <header class=styles::top>
@@ -199,14 +290,17 @@ fn FleetMetrics(tab: RwSignal<Tab>) -> impl IntoView {
     let clients = RwSignal::new(Vec::<String>::new());
     let status = RwSignal::new(ConnectionStatus::Connecting);
     let retry = RwSignal::new(0_u64);
-    let active = Memo::new(move |_| tab.get().metrics());
+    let group = Memo::new(move |_| tab.get().metric_group());
     #[cfg(target_arch = "wasm32")]
     Effect::new(move |_| {
-        if !active.get() {
+        let Some(group) = group.get() else {
             status.set(ConnectionStatus::Connecting);
             return;
-        }
-        let selected = view.get();
+        };
+        let selected = MetricsView {
+            group,
+            ..view.get()
+        };
         let _ = retry.get();
         data.set(MetricsData {
             view: selected.clone(),
@@ -236,6 +330,7 @@ fn FleetMetrics(tab: RwSignal<Tab>) -> impl IntoView {
         data.with(|data| {
             data.panels
                 .iter()
+                .filter(|panel| Some(panel.group) == group.get())
                 .map(|panel| panel.key)
                 .collect::<Vec<_>>()
         })
@@ -249,10 +344,11 @@ fn FleetMetrics(tab: RwSignal<Tab>) -> impl IntoView {
         })
     });
     let step = Signal::derive(move || data.with(|data| data.view.range.step()));
+    let sampled_at = Memo::new(move |_| data.with(|data| data.sampled_at));
     view! {
-        <Show when=move || active.get()>
+        <Show when=move || group.get().is_some()>
         <section id="metrics">
-            <h2>{move || if tab.get() == Tab::CacheHits {"Cache hit statistics"} else {"Fleet telemetry"}}</h2>
+            <h2>{move || match group.get() { Some(MetricGroup::CacheHits) => "Completed cache results", Some(MetricGroup::CacheStorage) => "Historical cache storage", _ => "Fleet telemetry" }}</h2>
             <p class=styles::muted hidden=move || tab.get() != Tab::CacheHits>
                 "Hit rate = hits / (hits + misses), including native and legacy compiler results. Errors and bypasses are shown separately; tier lookups are not compile requests. Window counts are counter increases (extrapolated at scrape boundaries). No traffic or unavailable telemetry is not a 0% hit rate."
             </p>
@@ -282,19 +378,7 @@ fn FleetMetrics(tab: RwSignal<Tab>) -> impl IntoView {
             <div class=styles::panels>
                 <For each=move || panels.get() key=|key| *key children=move |key| {
                     let panel = Memo::new(move |_| panel_data.with(|panels| panels.get(&key).cloned()));
-                    view! {
-                        <article hidden=move || panel.with(|panel| panel.as_ref().is_none_or(|panel| panel.cache_hits != (tab.get() == Tab::CacheHits)))>
-                        {move || panel.get().map(|panel| {
-                            let title = panel.title.clone();
-                            let error = panel.error.clone();
-                            let sampled_at = data.with(|data| data.sampled_at);
-                            view! {
-                                <h3>{title}</h3>
-                                {error.map(|error| view!{<p class=styles::warning>{error}</p>})}
-                                <chart::PanelContent panel=panel step=step.get() sampled_at=sampled_at/>
-                            }
-                        })}</article>
-                    }
+                    view! { <chart::MetricCard panel=panel step=step sampled_at=sampled_at/> }
                 }/>
             </div>
         </section>
@@ -362,4 +446,29 @@ fn timestamp_formats_utc_without_local_timezone() {
     assert_eq!(timestamp(Some(1_704_067_200)), "2024-01-01 00:00:00 UTC");
     assert_eq!(timestamp(None), "Not yet sampled");
     assert_eq!(timestamp(Some(u64::MAX)), "Not yet sampled");
+}
+
+#[cfg(test)]
+#[test]
+fn native_patch_invalidates_only_affected_projections() {
+    let patch = crate::NativePatch {
+        sampled_at: Some(1),
+        jobs: crate::Rows {
+            upsert: Vec::new(),
+            remove: vec!["1".into()],
+        },
+        ..Default::default()
+    };
+    let changes = changed_projections(&crate::NativeEvent::Patch(Box::new(patch)));
+    assert!(changes[Projection::Clock as usize]);
+    assert!(changes[Projection::Jobs as usize]);
+    assert!(changes[Projection::Error as usize]);
+    assert!(!changes[Projection::History as usize]);
+    assert!(!changes[Projection::Telemetry as usize]);
+    assert!(!changes[Projection::Workers as usize]);
+    assert!(
+        changed_projections(&crate::NativeEvent::Reset(Box::default()))
+            .into_iter()
+            .all(|change| change)
+    );
 }

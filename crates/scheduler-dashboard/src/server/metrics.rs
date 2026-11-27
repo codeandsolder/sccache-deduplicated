@@ -37,7 +37,7 @@ struct PanelDefinition {
     #[serde(default)]
     requires_client: bool,
     #[serde(default)]
-    cache_hits: bool,
+    group: crate::MetricGroup,
 }
 
 #[derive(Clone, Deserialize)]
@@ -466,7 +466,7 @@ async fn read_panel(
 ) -> MetricPanel {
     let mut panel = MetricPanel {
         key,
-        cache_hits: definition.cache_hits,
+        group: definition.group,
         kind: definition.kind,
         title: definition.title,
         unit: definition.unit,
@@ -572,6 +572,7 @@ async fn refresh(source: Arc<Source>, feed: &Feed, view: MetricsView) {
             .clone()
             .into_iter()
             .enumerate()
+            .filter(|(_, definition)| definition.group == view.group)
             .map(|(key, definition)| {
                 let old = old_panels.remove(&key);
                 let full = full || old.as_ref().is_none_or(|panel| panel.error.is_some());
@@ -705,6 +706,23 @@ mod tests {
     fn manifest_is_complete_and_client_cannot_inject_promql() -> Result<()> {
         let panels: Vec<PanelDefinition> = serde_json::from_str(include_str!("../panels.json"))?;
         assert_eq!(panels.len(), 50);
+        assert_eq!(
+            panels
+                .iter()
+                .filter(|panel| panel.group == crate::MetricGroup::CacheStorage)
+                .count(),
+            10
+        );
+        assert!(
+            panels
+                .iter()
+                .any(|panel| panel.group == crate::MetricGroup::CacheHits)
+        );
+        assert!(
+            panels
+                .iter()
+                .any(|panel| panel.group == crate::MetricGroup::Fleet)
+        );
         let view = MetricsView {
             client: "host.*\"} or vector(1) #".into(),
             ..Default::default()
