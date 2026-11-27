@@ -37,7 +37,7 @@ struct Assignment {
 
 enum Terminal {
     Stored,
-    Failed(CapturedExecution),
+    Failed(Box<CapturedExecution>),
     Unavailable,
 }
 
@@ -53,7 +53,7 @@ impl Terminal {
     fn from_result(result: Result<CapturedExecution>) -> Self {
         match result {
             Ok(captured) if captured.successful_result().is_some() => Self::Stored,
-            Ok(captured) => Self::Failed(captured),
+            Ok(captured) => Self::Failed(Box::new(captured)),
             Err(error) => {
                 warn!("Native worker action failed: {error:#}");
                 Self::Unavailable
