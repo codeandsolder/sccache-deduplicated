@@ -2,19 +2,11 @@
 mod fingerprint;
 
 fn main() -> std::io::Result<()> {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest.join("../..").canonicalize()?;
+    // Cargo executes build scripts in the package root. Resolve the actual
+    // checkout at execution time, not a path embedded in a cached executable.
+    let root = std::env::current_dir()?.join("../..").canonicalize()?;
     // Directory watches also catch additions/removals of source files.
-    for path in [
-        "src",
-        "crates",
-        "Cargo.toml",
-        "Cargo.lock",
-        "rust-toolchain.toml",
-        "scripts/build-scheduler-dashboard.sh",
-        "scripts/publish-dashboard-assets.sh",
-        "contrib/codeandsolder/release-protocol.env",
-    ] {
+    for path in fingerprint::INPUTS {
         println!("cargo:rerun-if-changed={}", root.join(path).display());
     }
     let generation = fingerprint::generation(&root)?;

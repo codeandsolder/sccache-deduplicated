@@ -2,10 +2,11 @@
 # Exercise SSR, WASM hydration and SSE against the real scheduler binary.
 set -euo pipefail
 if (( $# != 3 )); then
-    echo "usage: $0 <sccache-dist binary> <dashboard assets directory> <populated fixture binary>" >&2
+    echo "usage: $0 <sccache-dist binary | --fixture-only> <dashboard assets directory> <populated fixture binary>" >&2
     exit 2
 fi
-binary="$(realpath "$1")"
+binary=
+if [[ "$1" != --fixture-only ]]; then binary="$(realpath "$1")"; fi
 assets="$(realpath "$2")"
 fixture="$(realpath "$3")"
 root="$(mktemp -d "$(dirname "$assets")/browser-test.XXXXXXXX")"
@@ -28,6 +29,7 @@ cleanup() {
     rm -rf "$root"
 }
 trap cleanup EXIT
+if [[ -n "$binary" ]]; then
 jq -n --arg assets "$assets" --arg drain "$root/drain" --arg cluster "$root/cluster" '{
     public_addr: "127.0.0.1:0",
     cluster_directory: $cluster,
@@ -39,18 +41,22 @@ jq -n --arg assets "$assets" --arg drain "$root/drain" --arg cluster "$root/clus
 }' > "$root/scheduler.json"
 SCCACHE_NO_DAEMON=1 SCCACHE_LOG=info "$binary" scheduler --config "$root/scheduler.json" > "$root/scheduler.log" 2>&1 &
 scheduler_pid=$!
+fi
 chromedriver --verbose --port=0 --allowed-ips=127.0.0.1 > "$root/driver.log" 2>&1 &
 driver_pid=$!
 dashboard=
 for ((i=0;i<100;i++)); do
-    kill -0 "$scheduler_pid" "$driver_pid"
-    dashboard="$(sed -n 's/.*Scheduler status dashboard listening on \(http:\/\/[^ ]*\).*/\1/p' "$root/scheduler.log" | tail -1)"
+    kill -0 "$driver_pid"
+    if [[ -n "$scheduler_pid" ]]; then
+        kill -0 "$scheduler_pid"
+        dashboard="$(sed -n 's/.*Scheduler status dashboard listening on \(http:\/\/[^ ]*\).*/\1/p' "$root/scheduler.log" | tail -1)"
+    fi
     port="$(sed -n 's/.*started successfully on port \([0-9]*\).*/\1/p' "$root/driver.log" | tail -1)"
-    if [[ -n "$dashboard" && -n "$port" ]]; then driver="http://127.0.0.1:$port"; break; fi
+    if [[ ( -z "$binary" || -n "$dashboard" ) && -n "$port" ]]; then driver="http://127.0.0.1:$port"; break; fi
     sleep .2
 done
 test -n "$driver"
-curl --noproxy '*' -fsS --max-time 10 "$dashboard/" | rg 'Scheduler status' >/dev/null
+if [[ -n "$binary" ]]; then curl --noproxy '*' -fsS --max-time 10 "$dashboard/" | rg 'Scheduler status' >/dev/null; fi
 chrome="$(command -v chromium || command -v google-chrome || command -v google-chrome-stable)"
 caps="$(jq -n --arg chrome "$chrome" --arg profile "$root/chrome" '{
     capabilities: {alwaysMatch: {browserName: "chrome", pageLoadStrategy: "eager", timeouts: {pageLoad: 20000, script: 20000}, "goog:chromeOptions": {
@@ -81,13 +87,15 @@ await_js() {
     js 'return document.body.innerText' >&2
     return 1
 }
+select_tab() {
+    js "const tab=[...document.querySelectorAll('nav button')].find(x=>x.textContent.trim()==='$1'); tab.click(); return true" >/dev/null
+}
+if [[ -n "$binary" ]]; then
 webdriver url "$(jq -n --arg url "$dashboard/" '{url: $url}')" >/dev/null
 await_js 'return document.querySelectorAll("[role=status]").length === 1 && document.querySelector("[role=status]").textContent.trim() === "Live"'
 await_js 'return document.body.innerText.includes("NO WORKERS")'
 await_js 'return document.querySelector("nav button[aria-pressed=true]").textContent.trim() === "Overview" && document.querySelector("#topology") === null'
-select_tab() {
-    js "const tab=[...document.querySelectorAll('nav button')].find(x=>x.textContent.trim()==='$1'); tab.click(); return true" >/dev/null
-}
+
 # Updates while the same tab is active retain the chart's actual DOM nodes.
 await_js 'return document.querySelector("main svg path[stroke-linecap]") !== null'
 js 'window.activityChart=document.querySelector("main svg"); window.activityPath=document.querySelector("main svg path[stroke-linecap]"); window.oldPath=activityPath.getAttribute("d"); return true' >/dev/null
@@ -130,6 +138,7 @@ await_js 'return document.querySelector("main [role=status]").textContent.trim()
 # All updates came through SSE, not repeated snapshot RPCs.
 await_js 'return performance.getEntriesByType("resource").filter(x => x.name.includes("/api/snapshot")).length <= 1'
 echo "Real scheduler browser smoke test passed."
+fi
 
 # Use the production SSR/SSE router and optimized WASM with controlled,
 # populated projections and a real HTTP Prometheus-compatible fixture.

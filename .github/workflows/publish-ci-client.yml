@@ -140,6 +140,8 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends ripgrep
+          rg --version
+          readelf --version
           rustup target add --toolchain "${{ steps.protocol.outputs.rust_toolchain }}" wasm32-unknown-unknown
           release_cargo=(env -u RUSTC -u RUSTDOC cargo +${{ steps.protocol.outputs.rust_toolchain }})
           target_dir="$("${release_cargo[@]}" metadata --locked --no-deps --format-version 1 | jq -r .target_directory)"
@@ -153,15 +155,6 @@ jobs:
           scripts/package-scheduler-dashboard.sh \
             dist/sccache-scheduler-dashboard-linux-x86_64-v2 "$target_dir/scheduler-dashboard/pkg" \
             dist/sccache-scheduler-dashboard-linux-x86_64-v2.tar.gz
-
-      - name: Install native release validation tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ripgrep
-          rg --version
-          readelf --version
 
       - name: Reject binaries requiring a newer GNU libc ABI
         shell: bash

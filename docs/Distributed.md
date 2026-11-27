@@ -676,7 +676,26 @@ On other platforms install the versions of wasm-bindgen-cli and stylance-cli
 specified by Cargo.lock and call the build script with their executable paths
 (or put the matching tools on PATH). The generated package is under the Cargo
 target directory at `scheduler-dashboard/pkg`; install the complete directory
-alongside the corresponding scheduler release. Configure its absolute path:
+alongside the corresponding scheduler release. The asset manifest and
+content-derived generation identity are mandatory. The build requires
+ripgrep, and replacing an existing generated directory requires GNU
+coreutils with atomic `mv --exchange --no-copy` support. Initial publication
+uses a same-directory atomic rename. The old directory is retained until
+the complete new generation is ready.
+
+The native executable and optimized WASM embed the same source identity
+independently; generated JS and CSS carry that identity as well. The
+packager verifies the actual staged binary and full asset set against the
+source checkout. Validate an installed pair before activation:
+
+```sh
+sccache-dist verify-dashboard --assets /opt/sccache/dashboard/pkg
+```
+
+Add `--source /path/to/checkout` to validate the source inputs as well.
+At startup the scheduler verifies and loads all assets into an immutable
+in-memory generation, served under generation-scoped URLs. A filesystem
+replacement cannot mix assets in a running scheduler. Configure its absolute path:
 
 ```toml
 [dashboard]

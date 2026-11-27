@@ -18,7 +18,7 @@ mod fingerprint;
 /// unrelated sidecar. The native asset loader checks this embedded marker.
 #[cfg(all(feature = "hydrate", target_arch = "wasm32"))]
 #[wasm_bindgen::prelude::wasm_bindgen]
-#[must_use]
+#[must_use = "the embedded identity is consumed by generation verification"]
 pub fn dashboard_generation() -> String {
     GENERATION.to_owned()
 }
