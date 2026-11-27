@@ -61,6 +61,22 @@ fn invocation(command: &PlanCommand) -> CompileInvocation<'_> {
     }
 }
 
+pub(crate) fn process_command(command: &PlanCommand, inherit_stdin: bool) -> Command {
+    let invocation = invocation(command);
+    let mut process = Command::new(invocation.exe);
+    process
+        .args(invocation.cmdline)
+        .current_dir(invocation.cwd)
+        .env_clear()
+        .envs(invocation.env_vars)
+        .stdin(if inherit_stdin {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        });
+    process
+}
+
 fn publish(source: &Path, destination: &Path) -> Result<()> {
     // Use a sibling temporary file and atomic rename, so consumers never
     // observe partially installed final artifacts.
@@ -147,18 +163,7 @@ pub(crate) fn execute_node(
             stderr,
             inherit_stdin,
         } => {
-            let invocation = invocation(command);
-            let mut process = Command::new(invocation.exe);
-            process
-                .args(invocation.cmdline)
-                .current_dir(invocation.cwd)
-                .env_clear()
-                .envs(invocation.env_vars)
-                .stdin(if *inherit_stdin {
-                    Stdio::inherit()
-                } else {
-                    Stdio::null()
-                });
+            let mut process = process_command(command, *inherit_stdin);
             if let Some(output) = stdout {
                 process.stdout(fs::File::create(BuildPlan::path(output))?);
             }

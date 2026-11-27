@@ -187,33 +187,34 @@ impl BinaryFunctionMap {
 }
 
 /// Coverage map and structural sentinels for a separately built executable.
+#[derive(Debug, Clone)]
 pub struct ExecutableMap {
     pub path: std::path::PathBuf,
-    pub map: BinaryFunctionMap,
+    pub map: std::sync::Arc<BinaryFunctionMap>,
     pub sentinels: BTreeSet<HitRange>,
 }
 
 /// Build the inverted executable index once, not once per test. Each hit
 /// visits only the executable maps containing that name. Validate all artifact identities
 /// before joining any results: an unmatched rebuilt binary is unsafe too.
-pub struct ExecutableIndex<'a> {
-    maps: &'a [ExecutableMap],
-    by_name: BTreeMap<&'a str, Vec<(usize, &'a [HitRange])>>,
+pub struct ExecutableIndex {
+    maps: Vec<ExecutableMap>,
+    by_name: BTreeMap<String, Vec<usize>>,
 }
 
-impl<'a> ExecutableIndex<'a> {
+impl ExecutableIndex {
     /// Hash mutable binaries once per index; production collection can use
     /// already authorized immutable CAS content identities via with_identity.
-    pub fn new(maps: &'a [ExecutableMap]) -> Result<Self> {
+    pub fn new(maps: &[ExecutableMap]) -> Result<Self> {
         Self::with_identity(maps, crate::content_file)
     }
 
     /// Build and validate the index once for a leased executable inventory.
     pub fn with_identity(
-        maps: &'a [ExecutableMap],
+        maps: &[ExecutableMap],
         mut identity: impl FnMut(&Path) -> Result<BinaryIdentity>,
     ) -> Result<Self> {
-        let mut by_name: BTreeMap<&str, Vec<(usize, &[HitRange])>> = BTreeMap::new();
+        let mut by_name: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (id, executable) in maps.iter().enumerate() {
             if identity(&executable.path)? != executable.map.binary {
                 bail!(
@@ -221,11 +222,24 @@ impl<'a> ExecutableIndex<'a> {
                     executable.path.display()
                 );
             }
-            for (name, ranges) in &executable.map.functions {
-                by_name.entry(name).or_default().push((id, ranges));
+            for name in executable.map.functions.keys() {
+                by_name.entry(name.clone()).or_default().push(id);
             }
         }
-        Ok(Self { maps, by_name })
+        Ok(Self {
+            maps: maps.to_vec(),
+            by_name,
+        })
+    }
+
+    pub fn validate(
+        &self,
+        mut identity: impl FnMut(&Path) -> Result<BinaryIdentity>,
+    ) -> Result<()> {
+        for executable in &self.maps {
+            executable.map.validate(identity(&executable.path)?)?;
+        }
+        Ok(())
     }
 
     /// Shared library names alone are not evidence of an executable launch.
@@ -250,10 +264,11 @@ impl<'a> ExecutableIndex<'a> {
                 harness_evidence |= harness.is_some();
                 continue;
             };
-            for &(id, source_ranges) in owners {
+            for &id in owners {
+                let source_ranges = &self.maps[id].map.functions[*name];
                 ranges.extend(source_ranges.iter().cloned());
                 matched.insert(id);
-                if harness.is_none_or(|h| h.as_slice() != source_ranges) {
+                if harness.is_none_or(|h| h != source_ranges) {
                     launched.insert(id);
                 }
             }
@@ -742,12 +757,12 @@ mod tests {
                 line_end: 6,
             };
             Ok(ExecutableMap {
-                map: BinaryFunctionMap {
+                map: std::sync::Arc::new(BinaryFunctionMap {
                     binary: crate::content_file(&path)?,
                     functions: [(symbol.to_string(), vec![range.clone()])]
                         .into_iter()
                         .collect(),
-                },
+                }),
                 path,
                 sentinels: [HitRange::sentinel(range.file)].into_iter().collect(),
             })
@@ -790,12 +805,12 @@ mod tests {
         };
         let sentinel = HitRange::sentinel(String::from("src/main.rs"));
         let maps = [ExecutableMap {
-            map: BinaryFunctionMap {
+            map: std::sync::Arc::new(BinaryFunctionMap {
                 binary: crate::content_file(&path)?,
                 functions: [("shared".into(), vec![shared.clone()])]
                     .into_iter()
                     .collect(),
-            },
+            }),
             path,
             sentinels: [sentinel.clone()].into_iter().collect(),
         }];
