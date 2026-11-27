@@ -47,16 +47,16 @@ fn space(status: SpaceStatus) -> CacheSpace {
 }
 
 pub(super) fn snapshot(sessions: &NativeSessions, network: &NetworkMeter) -> NativeTelemetry {
-    let stats = sessions.admission_stats();
+    let admissions = sessions.admission_stats();
     let mut snapshot = NativeTelemetry {
         admission: Some(AdmissionCounts {
-            hits: stats.hits,
-            misses: stats.misses,
-            refreshes: stats.refreshes,
-            in_flight: stats.in_flight,
-            missing_inputs: stats.missing_inputs,
-            busy: stats.busy,
-            errors: stats.errors,
+            hits: admissions.hits,
+            misses: admissions.misses,
+            refreshes: admissions.refreshes,
+            in_flight: admissions.in_flight,
+            missing_inputs: admissions.missing_inputs,
+            busy: admissions.busy,
+            errors: admissions.errors,
         }),
         ..Default::default()
     };
