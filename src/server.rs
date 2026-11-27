@@ -941,6 +941,14 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             shared,
         } = self;
         let storage = Arc::clone(&service.storage);
+        #[cfg(all(target_os = "linux", feature = "dist-client"))]
+        let _live_traces = crate::latency_trace::instance()
+            .zip(service.dist_client.native.as_ref())
+            .map(|(instance, client)| {
+                tokio_util::task::AbortOnDropHandle::new(runtime.spawn(
+                    Arc::clone(&service.activities).report_live(Arc::clone(client), instance),
+                ))
+            });
         #[cfg(feature = "direct-metrics")]
         let telemetry_task = crate::telemetry::spawn(runtime.handle(), service.clone());
 

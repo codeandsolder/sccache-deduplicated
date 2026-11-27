@@ -235,6 +235,7 @@ pub use sccache_build::analytics::CacheAnalyticsSample as AnalyticsObservation;
 /// Independent, periodically collected CAS and network observations.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NativeTelemetry {
+    pub live_traces: Option<sccache_build::wire::LiveTraceSnapshot>,
     pub analytics: Option<AnalyticsObservation>,
     pub sampled_at: u64,
     pub cache: Option<Cache>,

@@ -671,6 +671,15 @@ impl NativeCacheClient {
         self.control("admit", &(trace, spec, mode, declared))
     }
 
+    #[cfg(all(target_os = "linux", feature = "dist-client"))]
+    pub(crate) async fn report_live_traces(
+        &self,
+        report: &crate::build_runtime::wire::LiveTraceBatch,
+    ) -> Result<()> {
+        self.control_with_timeout_async("trace_live", report, Duration::from_secs(2))
+            .await
+    }
+
     pub(super) fn poll_input(&self, ticket: Ticket) -> Result<InputPoll> {
         self.control("poll_input", &ticket)
     }

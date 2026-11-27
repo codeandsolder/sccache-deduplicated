@@ -503,6 +503,7 @@ fn native_admission_class((_, operation): &(String, String)) -> AdmissionClass {
         | "package_plan"
         | "package_lookup"
         | "rust_package_lookup"
+        | "trace_live"
         | "begin" => AdmissionClass::Metadata,
         _ => AdmissionClass::Bulk,
     }
@@ -1055,6 +1056,10 @@ fn dispatch(
                     limit,
                 )
             }
+        }
+        "trace_live" if publisher == Publisher::Client => {
+            sessions.report_live_traces(request.id(), metadata(request, limit.min(512 * 1024))?)?;
+            encode(&(), limit)
         }
         "admit" if publisher == Publisher::Client => {
             let (trace, input, mode, declared): (

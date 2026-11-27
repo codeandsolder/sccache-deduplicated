@@ -98,6 +98,62 @@ fn Timeline(detail: TraceDetail) -> impl IntoView {
 }
 
 #[component]
+fn LiveRequests(
+    data: Memo<Option<crate::DashboardData>>,
+    lookup: RwSignal<String>,
+    selected: RwSignal<String>,
+) -> impl IntoView {
+    let report = Memo::new(move |_| {
+        data.with(|data| {
+            data.as_ref()
+                .and_then(|data| data.telemetry.as_ref())
+                .and_then(|telemetry| telemetry.live_traces.clone())
+        })
+    });
+    let rows = Memo::new(move |_| {
+        report.with(|report| {
+            report
+                .as_ref()
+                .map(|report| {
+                    report
+                        .rows
+                        .iter()
+                        .cloned()
+                        .map(|row| (row.request.trace.hex_id(), row))
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                })
+                .unwrap_or_default()
+        })
+    });
+    let keys = Memo::new(move |_| rows.with(|rows| rows.keys().cloned().collect::<Vec<_>>()));
+    view! {
+        <h3>"Active client requests"</h3>
+        <p class=styles::muted>{move || report.with(|report| report.as_ref().map_or_else(|| "No live observation available".into(), |report| format!("{} reported active; {} displayed. Snapshots expire after 10 s.",report.active,report.rows.len())))}</p>
+        <table><thead><tr><th>"Host"</th><th>"Compiler / output"</th><th>"Phase"</th><th>"Phase elapsed"</th><th>"Request elapsed"</th><th>"Worker"</th><th>"Sample age"</th><th>"Trace"</th></tr></thead>
+            <tbody><For each=move || keys.get() key=Clone::clone children=move |id| {
+                let key=id.clone();
+                let row=Memo::new(move |_| rows.with(|rows| rows.get(&key).cloned()));
+                view! {<tr>
+                    <td>{move || row.with(|row| row.as_ref().map(|row|row.instance.clone()))}</td>
+                    <td>{move || row.with(|row| row.as_ref().map(|row|format!("{} / {}",row.request.compiler,row.request.output)))}</td>
+                    <td>{move || row.with(|row| row.as_ref().map(|row|row.request.phase.clone()))}</td>
+                    <td>{move || row.with(|row| row.as_ref().map(|row|format!("{} ms",row.request.phase_age_ms)))}</td>
+                    <td>{move || row.with(|row| row.as_ref().map(|row|format!("{} ms",row.request.elapsed_ms)))}</td>
+                    <td>{move || row.with(|row| row.as_ref().map(|row|row.request.worker.clone()))}</td>
+                    <td>{move || row.with(|row| row.as_ref().map(|row|format!("{} ms",row.observation_age_ms)))}</td>
+                    <td><button on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Inspect"</button>
+                        {move || row.with(|row| row.as_ref().and_then(|row|row.request.producer)).map(|producer| {
+                            let id=producer.hex_id();
+                            view!{<button on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Producer"</button>}
+                        })}
+                    </td>
+                </tr>}
+            }/></tbody>
+        </table>
+    }
+}
+
+#[component]
 pub(super) fn TracePanel(data: Memo<Option<crate::DashboardData>>) -> impl IntoView {
     let filters = RwSignal::new(TraceSearch::default());
     let applied = RwSignal::new(TraceSearch::default());
@@ -121,8 +177,9 @@ pub(super) fn TracePanel(data: Memo<Option<crate::DashboardData>>) -> impl IntoV
     view! {
         <section id="traces">
             <h2>"Request traces"</h2>
+            <LiveRequests data=data lookup=lookup selected=selected/>
             <h3>"Active distributed jobs"</h3>
-            <p class=styles::muted>"Live scheduler state; client-only work is not listed here. Completed spans become available in trace storage."</p>
+            <p class=styles::muted>"Live scheduler state; worker jobs may outlive the client request. Completed spans become available in trace storage."</p>
             <table><thead><tr><th>"Job"</th><th>"Worker"</th><th>"Phase"</th><th>"Phase elapsed"</th><th>"Trace"</th></tr></thead>
                 <tbody>{move || data.get().and_then(|data| data.snapshot).map(|snapshot| snapshot.jobs.into_iter().map(|job| {
                     let trace = job.trace_id;

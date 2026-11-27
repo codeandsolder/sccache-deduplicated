@@ -734,6 +734,79 @@ impl Registry {
         })
     }
 
+    #[cfg(all(target_os = "linux", feature = "dist-client"))]
+    fn live_snapshot(&self, instance: &str) -> crate::build_runtime::wire::LiveTraceBatch {
+        use crate::build_runtime::wire::{LiveTraceBatch, LiveTraceRequest, MAX_LIVE_TRACE_ROWS};
+        fn bounded_label(value: &str) -> String {
+            value
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .scan(0, |bytes, ch| {
+                    *bytes += ch.len_utf8();
+                    (*bytes <= 256).then_some(ch)
+                })
+                .collect()
+        }
+        let mut selected = lock(&self.active).values().cloned().collect::<Vec<_>>();
+        let active = u64::try_from(selected.len()).unwrap_or(u64::MAX);
+        selected.sort_unstable_by_key(|activity| activity.started);
+        selected.truncate(MAX_LIVE_TRACE_ROWS);
+        let requests = selected
+            .iter()
+            .map(|activity| {
+                let state = lock(&activity.state);
+                let now = Instant::now();
+                let producer = state
+                    .remote_history
+                    .as_ref()
+                    .and_then(|history| history.transitions.last())
+                    .filter(|transition| transition.phase == state.phase)
+                    .and_then(|transition| transition.producer)
+                    .or(state.producer);
+                LiveTraceRequest {
+                    trace: TraceContext::request(&activity.id),
+                    compiler: bounded_label(&activity.compiler),
+                    output: bounded_label(state.output.as_deref().unwrap_or_default()),
+                    phase: state.phase.trace_name().into(),
+                    elapsed_ms: millis(now.duration_since(activity.started)),
+                    phase_age_ms: millis(now.duration_since(state.changed)),
+                    worker: bounded_label(state.worker.as_deref().unwrap_or_default()),
+                    job: state.distributed_job,
+                    producer,
+                }
+            })
+            .collect();
+        LiveTraceBatch {
+            generation: self.generation,
+            instance: instance.to_owned(),
+            active,
+            requests,
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "dist-client"))]
+    pub(super) async fn report_live(
+        self: Arc<Self>,
+        client: Arc<crate::compiler::NativeCompilerClient>,
+        instance: &'static str,
+    ) {
+        let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut active = false;
+        loop {
+            ticker.tick().await;
+            let report = self.live_snapshot(instance);
+            if active || report.active != 0 {
+                active = report.active != 0;
+                if let Err(error) = client.report_live_traces(&report).await {
+                    // Retry empty reports too, so completed work is removed promptly.
+                    active = true;
+                    log::debug!("live trace observation unavailable: {error:#}");
+                }
+            }
+        }
+    }
+
     pub(super) fn snapshots(&self) -> Vec<CompileActivity> {
         let active = lock(&self.active).values().cloned().collect::<Vec<_>>();
         active.iter().map(|activity| activity.snapshot()).collect()

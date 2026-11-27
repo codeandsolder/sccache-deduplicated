@@ -158,6 +158,11 @@ pub fn submit(spans: Vec<LatencySpan>) {
     drop(spans);
 }
 
+#[cfg(all(target_os = "linux", feature = "dist-client"))]
+pub(crate) fn instance() -> Option<&'static str> {
+    export::instance()
+}
+
 #[cfg(feature = "http-client")]
 mod export;
 

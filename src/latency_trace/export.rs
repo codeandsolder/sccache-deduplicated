@@ -49,7 +49,9 @@ pub(super) fn configure(config: &TraceConfig) -> Result<()> {
         "trace endpoint must be an HTTP(S) URL without embedded credentials or fragment"
     );
     ensure!(
-        !config.instance.is_empty() && config.instance.len() <= 256,
+        !config.instance.is_empty()
+            && config.instance.len() <= 256
+            && !config.instance.chars().any(char::is_control),
         "invalid trace instance"
     );
     let (sender, receiver) = mpsc::channel(QUEUE);
@@ -67,6 +69,11 @@ pub(super) fn configure(config: &TraceConfig) -> Result<()> {
         .set(Exporter { config, sender })
         .map_err(|_| anyhow::anyhow!("trace exporter initialized concurrently"))?;
     Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "dist-client"))]
+pub(super) fn instance() -> Option<&'static str> {
+    EXPORT.get().map(|export| export.config.instance.as_str())
 }
 
 pub(super) fn enabled() -> bool {

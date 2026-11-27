@@ -46,7 +46,10 @@ fn space(status: SpaceStatus) -> CacheSpace {
 }
 
 pub(super) fn snapshot(sessions: &NativeSessions, network: &NetworkMeter) -> NativeTelemetry {
-    let mut snapshot = NativeTelemetry::default();
+    let mut snapshot = NativeTelemetry {
+        live_traces: sessions.live_traces().ok(),
+        ..Default::default()
+    };
     match sessions.store().stats() {
         Ok(stats) => {
             snapshot.cache = Some(sccache_dashboard::Cache {

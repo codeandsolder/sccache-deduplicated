@@ -45,6 +45,44 @@ impl TraceContext {
     }
 }
 
+/// Maximum request records in a single bounded live report.
+pub const MAX_LIVE_TRACE_ROWS: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveTraceRequest {
+    pub trace: TraceContext,
+    pub compiler: String,
+    pub output: String,
+    pub phase: String,
+    pub elapsed_ms: u64,
+    pub phase_age_ms: u64,
+    pub worker: String,
+    pub job: Option<u64>,
+    pub producer: Option<TraceContext>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveTraceBatch {
+    pub generation: u64,
+    pub instance: String,
+    pub active: u64,
+    pub requests: Vec<LiveTraceRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveTraceRow {
+    pub peer: crate::PeerId,
+    pub instance: String,
+    pub observation_age_ms: u64,
+    pub request: LiveTraceRequest,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveTraceSnapshot {
+    pub active: u64,
+    pub rows: Vec<LiveTraceRow>,
+}
+
 /// A short-lived, unguessable capability. Never log its bytes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
