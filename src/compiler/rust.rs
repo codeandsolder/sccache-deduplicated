@@ -4782,19 +4782,9 @@ impl pkg::InputsPackager for RustInputsPackager {
     // representation of rlibs merely to reduce a per-job archive.
     #[cfg(target_os = "linux")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        // A canonical Cargo output root is a generated-input namespace. Its
-        // physical mtime describes delivery/freshness, not the sandbox input.
-        // Normalize the actual remote inode timestamp, not just the key;
-        // preserve all source-file timestamps and exact permission bits.
-        let generated_roots = self
-            .path_transformer
-            .path_mappings()
-            .filter(|(_, logical)| matches!(logical.as_str(), "/intermediate" | "/target"))
-            .map(|(_, logical)| PathBuf::from(logical))
-            .collect::<std::collections::BTreeSet<_>>();
-        (*self).discover()?.into_native_mapping(|logical| {
-            generated_roots.iter().any(|root| logical.starts_with(root))
-        })
+        // The entire materialized compiler input namespace is content-addressed.
+        // Normalize actual inode timestamps, including sources and opaque macro inputs.
+        (*self).discover()?.into_native_mapping()
     }
 }
 

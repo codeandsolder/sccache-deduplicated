@@ -659,7 +659,7 @@ impl CompilerPlan {
         } else {
             mapped.prepare()?
         };
-        let layout = layout.into_native_mapping(|_| false)?.prepare()?;
+        let layout = layout.into_native_mapping()?.prepare()?;
         let directories = pkg::native_directory_metadata()?;
         let inputs = vec![toolchain, inputs, layout];
         let recipe = TreeRecipe::union(directories, inputs.iter().map(PreparedTree::id));
