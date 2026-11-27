@@ -1045,7 +1045,7 @@ impl NativeCacheClient {
                     }, self.timeout).await?;
                 }
                 let leases = ingress::map_bounded(
-                    chunk.iter().copied(), std::num::NonZeroUsize::new(chunk.len()).expect("nonempty chunk"), |blob| {
+                    chunk.iter().copied(), std::num::NonZeroUsize::new(chunk.len()).context("empty raw input batch")?, |blob| {
                         self.fetch_input_blob(ticket, blob, plans.get(&blob.id), store, transport, check)
                     },
                 ).await?;

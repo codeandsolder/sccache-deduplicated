@@ -336,7 +336,7 @@ impl NativeSessions {
                     failure.get_or_insert(error);
                 }
                 Err(error) => {
-                    failure.get_or_insert(error.into());
+                    failure.get_or_insert_with(|| error.into());
                 }
             }
         }
