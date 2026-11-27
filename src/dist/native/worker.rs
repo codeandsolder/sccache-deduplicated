@@ -278,6 +278,36 @@ mod transport_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn output_slots_are_shared_across_jobs_but_independent_of_downloads() -> Result<()> {
+        let tracker = PackageTransportTracker::new(WorkerTiming {
+            transfer: PackageTransferCost {
+                raw_parallelism: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        })?;
+        let job_a = tracker.clone();
+        let job_b = tracker.clone();
+        let first = job_a.output_slot(&|| Ok(())).await?;
+        let second = job_b.output_slot(&|| Ok(())).await?;
+        assert_eq!(tracker.output_slots.permits.available_permits(), 0);
+        let incoming = tracker.raw_slot(&|| Ok(())).await?;
+        let waiting = tracker.output_slot(&|| Ok(()));
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(first);
+        let third = tokio::time::timeout(Duration::from_secs(1), waiting).await??;
+        assert_eq!(tracker.output_slots.permits.available_permits(), 0);
+        drop((second, third, incoming));
+        assert_eq!(tracker.output_slots.permits.available_permits(), 2);
+        Ok(())
+    }
+
     #[test]
     fn observed_worker_timing_revisions_cover_every_published_service_update() -> Result<()> {
         let tracker = PackageTransportTracker::new(WorkerTiming::default())?;

@@ -157,6 +157,47 @@ fn manifest(bytes: &[u8]) -> ResultManifest {
 }
 
 #[test]
+fn result_upload_saturation_is_retryable_and_does_not_consume_admission() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
+    let NativeAdmission::Compile { ticket } =
+        service.admit(request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("expected compilation")
+    };
+    let mut output = manifest(b"object");
+    let object = output.outputs["obj"].test_file_blob();
+    let stdout = BlobRef {
+        id: ContentId::of(b"stdout"),
+        size: 6,
+    };
+    let stderr = BlobRef {
+        id: ContentId::of(b"stderr"),
+        size: 6,
+    };
+    output.stdout = Some(stdout);
+    output.stderr = Some(stderr);
+    service.begin(ticket, worker, output.clone())?;
+    let first = service.prepare_upload(ticket, worker, object, crate::BlobEncoding::Raw)?;
+    let second = service.prepare_upload(ticket, worker, stdout, crate::BlobEncoding::Raw)?;
+    let refused = service.prepare_upload(ticket, worker, stderr, crate::BlobEncoding::Raw);
+    assert!(matches!(refused, Err(error) if error.is::<NativeServiceBusy>()));
+    service.renew(ticket, worker)?;
+    assert!(service.commit(ticket, worker).is_err());
+    drop(first);
+    upload_encoded(&service, ticket, worker, stderr, b"stderr")?;
+    drop(second);
+    upload_encoded(&service, ticket, worker, stdout, b"stdout")?;
+    upload_encoded(&service, ticket, worker, object, b"object")?;
+    assert_eq!(service.commit(ticket, worker)?, output);
+    Ok(())
+}
+
+#[test]
 fn semantic_reuse_does_not_weaken_execution_verification() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;

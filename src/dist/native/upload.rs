@@ -319,6 +319,63 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn busy_retry_replays_only_explicit_admission_rejections() -> Result<()> {
+        use std::{
+            sync::atomic::{AtomicUsize, Ordering},
+            time::Duration,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let url = format!("http://{}/upload", listener.local_addr()?);
+        let receiver = tokio::spawn(async move {
+            for response in [
+                "503 Service Unavailable",
+                "503 Service Unavailable",
+                "200 OK",
+                "409 Conflict",
+            ] {
+                let (mut stream, _) = listener.accept().await?;
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    header.push(stream.read_u8().await?);
+                    ensure!(header.len() <= 16 * 1024, "oversized request headers");
+                }
+                let mut body = [0; 7];
+                stream.read_exact(&mut body).await?;
+                assert_eq!(&body, b"payload");
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {response}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let client = wreq::Client::builder().no_proxy().build()?;
+        let count = AtomicUsize::new(0);
+        let attempt = || async {
+            count.fetch_add(1, Ordering::Relaxed);
+            client
+                .post(&url)
+                .body("payload")
+                .send()
+                .await?
+                .error_for_status()?;
+            Ok(())
+        };
+        retry_busy(Duration::from_secs(3), attempt).await?;
+        assert_eq!(count.load(Ordering::Relaxed), 3);
+        assert!(retry_busy(Duration::from_secs(3), attempt).await.is_err());
+        assert_eq!(count.load(Ordering::Relaxed), 4);
+        receiver.await??;
+        Ok(())
+    }
+
     #[test]
     fn refused_connection_does_not_read_nonseekable_source() -> Result<()> {
         let socket = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
