@@ -36,12 +36,35 @@ impl BuildGraph {
     /// Returns an error for invalid indices, duplicate edges, cycles or
     /// mismatched costs.
     pub fn new(dependencies: &[Vec<usize>], costs: &[u64]) -> Result<Self> {
+        Self::new_reachable(dependencies, costs, 0..dependencies.len())
+    }
+
+    /// Restrict dispatch to the dependency closure of the requested roots.
+    /// Original node IDs are retained for callers that prepare actions lazily.
+    pub fn new_reachable(
+        dependencies: &[Vec<usize>],
+        costs: &[u64],
+        roots: impl IntoIterator<Item = usize>,
+    ) -> Result<Self> {
         let count = dependencies.len();
         ensure!(costs.len() == count, "missing build node costs");
+        let mut active = vec![false; count];
+        let mut pending = roots.into_iter().collect::<Vec<_>>();
+        while let Some(node) = pending.pop() {
+            ensure!(node < count, "unknown requested build node {node}");
+            if !std::mem::replace(&mut active[node], true) {
+                pending.extend(dependencies[node].iter().copied());
+            }
+        }
+        let active_count = active.iter().filter(|&&value| value).count();
         let mut successors = vec![Vec::new(); count];
         let mut remaining = Vec::with_capacity(count);
         let mut seen = vec![usize::MAX; count];
         for (index, deps) in dependencies.iter().enumerate() {
+            if !active[index] {
+                remaining.push(0);
+                continue;
+            }
             remaining.push(deps.len());
             for &dep in deps {
                 ensure!(dep < count, "node {index} depends on unknown node {dep}");
@@ -57,7 +80,7 @@ impl BuildGraph {
         let mut leaves: Vec<_> = outgoing
             .iter()
             .enumerate()
-            .filter_map(|(i, &degree)| (degree == 0).then_some(i))
+            .filter_map(|(i, &degree)| (active[i] && degree == 0).then_some(i))
             .collect();
         let mut priority = costs.to_vec();
         let mut visited = 0;
@@ -71,18 +94,27 @@ impl BuildGraph {
                 }
             }
         }
-        ensure!(visited == count, "cycle in build graph");
+        ensure!(visited == active_count, "cycle in build graph");
 
         let mut graph = Self {
             successors,
             remaining,
             priority,
-            state: vec![State::Pending; count],
+            state: active
+                .iter()
+                .map(|&active| {
+                    if active {
+                        State::Pending
+                    } else {
+                        State::Complete
+                    }
+                })
+                .collect(),
             ready: BinaryHeap::new(),
-            completed: 0,
+            completed: count - active_count,
         };
         for index in 0..count {
-            if graph.remaining[index] == 0 {
+            if active[index] && graph.remaining[index] == 0 {
                 graph.make_ready(index);
             }
         }
@@ -162,6 +194,20 @@ mod tests {
         assert!(BuildGraph::new(&[vec![1]], &[1]).is_err());
         assert!(BuildGraph::new(&[vec![], vec![0, 0]], &[1, 1]).is_err());
         assert!(BuildGraph::new(&[vec![]], &[]).is_err());
+    }
+
+    #[test]
+    fn selected_closure_excludes_unrelated_actions() -> Result<()> {
+        let deps = [vec![], vec![0], vec![0], vec![1], vec![4]];
+        let mut graph = BuildGraph::new_reachable(&deps, &[1; 5], [3])?;
+        for node in [0, 1, 3] {
+            assert_eq!(graph.take_ready(), Some(node));
+            graph.complete(node)?;
+        }
+        assert_eq!(graph.take_ready(), None);
+        assert!(graph.is_complete());
+        assert!(BuildGraph::new_reachable(&deps, &[1; 5], [4]).is_err());
+        Ok(())
     }
 
     #[test]

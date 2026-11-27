@@ -63,6 +63,8 @@ pub struct Planner<'a> {
     intermediate: PathBuf,
     final_root: PathBuf,
     nodes: Vec<Node>,
+    requested: BTreeSet<usize>,
+    active_count: usize,
     libraries: Vec<Option<usize>>,
     scripts: Vec<Option<usize>>,
     binaries: Vec<BTreeMap<String, (usize, PathBuf)>>,
@@ -134,6 +136,8 @@ impl<'a> Planner<'a> {
             intermediate,
             final_root,
             nodes: Vec::new(),
+            requested: BTreeSet::new(),
+            active_count: 0,
             libraries: vec![None; graph.units.len()],
             scripts: vec![None; graph.units.len()],
             binaries: vec![BTreeMap::new(); graph.units.len()],
@@ -411,9 +415,11 @@ impl<'a> Planner<'a> {
                 bail!("invalid root action")
             };
             if metadata {
+                self.requested.insert(compiled);
                 continue;
             }
             if self.options.mode == Mode::Test && test && !self.options.no_run {
+                self.requested.insert(self.nodes.len());
                 self.nodes.push(Node {
                     action: Action::Run {
                         unit,
@@ -457,7 +463,9 @@ impl<'a> Planner<'a> {
                 if spec.kind == TargetKind::Binary && !test {
                     self.binary_publications[unit].push(publication);
                 }
+                self.requested.insert(publication);
                 if self.options.mode == Mode::Run {
+                    self.requested.insert(self.nodes.len());
                     self.nodes.push(Node {
                         action: Action::Run {
                             unit,
@@ -482,6 +490,7 @@ impl<'a> Planner<'a> {
                             .required_features
                             .is_subset(&self.graph.units[unit].features)
                     {
+                        self.requested.insert(self.nodes.len());
                         self.nodes.push(Node {
                             action: Action::Rustdoc {
                                 unit,
@@ -539,6 +548,7 @@ impl<'a> Planner<'a> {
                     deps.insert(previous);
                 }
                 previous = Some(self.nodes.len());
+                self.requested.insert(self.nodes.len());
                 self.nodes.push(Node {
                     action: Action::Rustdoc {
                         unit,
@@ -636,10 +646,16 @@ impl<'a> Planner<'a> {
             }
             self.nodes[index].deps = deps;
         }
-        // Validate every materialized destination up front, including root
-        // names that collide across selected packages.
+        // Validate destinations only in the actual selected dependency closure.
         let mut paths = BTreeSet::new();
-        for node in &self.nodes {
+        let mut active = BTreeSet::new();
+        let mut pending = self.requested.iter().copied().collect::<Vec<_>>();
+        while let Some(index) = pending.pop() {
+            if !active.insert(index) {
+                continue;
+            }
+            let node = &self.nodes[index];
+            pending.extend(node.deps.iter().copied());
             for path in &node.outputs {
                 ensure!(
                     paths.insert(path),
@@ -648,6 +664,7 @@ impl<'a> Planner<'a> {
                 );
             }
         }
+        self.active_count = active.len();
         self.graph()?;
         Ok(())
     }
@@ -667,11 +684,11 @@ impl<'a> Planner<'a> {
                 _ => 1,
             })
             .collect::<Vec<_>>();
-        BuildGraph::new(&deps, &costs)
+        BuildGraph::new_reachable(&deps, &costs, self.requested.iter().copied())
     }
 
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.active_count
     }
 
     fn script_out(&self, unit: usize) -> Option<&Path> {
