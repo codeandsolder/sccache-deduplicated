@@ -69,7 +69,7 @@ async fn client_loop(
     Ok(())
 }
 
-pub(crate) async fn serve(stream: std::os::unix::net::UnixStream, client: Client) -> Result<()> {
+pub async fn serve(stream: std::os::unix::net::UnixStream, client: Client) -> Result<()> {
     stream.set_nonblocking(true)?;
     let mut stream = UnixStream::from_std(stream)?;
     loop {

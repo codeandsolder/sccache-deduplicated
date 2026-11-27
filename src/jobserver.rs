@@ -194,7 +194,7 @@ impl Client {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) mod remote;
+pub mod remote;
 
 #[cfg(test)]
 mod tests {

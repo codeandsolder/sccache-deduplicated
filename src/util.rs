@@ -455,9 +455,6 @@ pub(crate) async fn hash_path_batch<F>(
 where
     F: FnMut(&Path) -> Result<String> + Send + 'static,
 {
-    if files.is_empty() {
-        return Ok(Vec::new());
-    }
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -469,6 +466,9 @@ where
         }
     }
 
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
     let files = files.to_vec();
     let cancelled = Arc::new(AtomicBool::new(false));
     // Dropping an async caller cannot interrupt an in-progress blocking
