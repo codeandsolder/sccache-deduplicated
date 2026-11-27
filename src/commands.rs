@@ -1199,23 +1199,6 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             "Toolchain packaging not compiled in, please rebuild with the dist-client feature"
         ),
         #[cfg(unix)]
-        Command::ExecutePlanner {
-            executable,
-            args,
-            max_in_flight,
-            leased_intermediates,
-        } => crate::build_plan::execute_planner(
-            &executable,
-            &args,
-            max_in_flight,
-            leased_intermediates,
-            config,
-        )?,
-        #[cfg(not(unix))]
-        Command::ExecutePlanner { .. } => {
-            bail!("live build planners currently require POSIX paths")
-        }
-        #[cfg(unix)]
         Command::ExecutePlan(path, width) => crate::build_plan::execute(&path, width, config)?,
         #[cfg(not(unix))]
         Command::ExecutePlan(_, _) => bail!("native build plans currently require POSIX paths"),
