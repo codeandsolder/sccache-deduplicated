@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Build the runtime once on a provisioned host; distribute the exact image.
+set -euo pipefail
+
+[[ $# == 3 ]] || {
+    echo 'Usage: build-image BASE_LOCAL_TAG TOOLCHAIN_NAME OUTPUT_LOCAL_TAG' >&2
+    exit 64
+}
+base=$1
+toolchain=$2
+output=$3
+[[ $toolchain =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*-unknown-linux-gnu$ ]] || {
+    echo 'Specify the complete Linux Rustup toolchain name' >&2
+    exit 64
+}
+here=$(dirname -- "$(realpath -- "$0")")
+# The installed sysroot is the complete, selected toolchain layer. Do not
+# install components into it while building the image.
+sysroot=$(rustup run "$toolchain" rustc --print sysroot)
+[[ -d $sysroot/bin && -d $sysroot/lib ]] || exit 65
+docker build --pull=false --provenance=false --sbom=false \
+    -t "$base" -f "$here/Dockerfile.base" "$here"
+base_id=$(docker image inspect --format '{{.Id}}' "$base")
+docker build --pull=false --provenance=false --sbom=false \
+    -t "$output" -f "$here/Dockerfile" --build-arg "BASE=$base" \
+    --build-arg "TOOLCHAIN=$toolchain" "$sysroot"
+[[ $(docker image inspect --format '{{.Id}}' "$base") == "$base_id" ]] || {
+    echo 'Base image changed during build' >&2
+    exit 65
+}
+docker image inspect --format '{{.Id}}' "$output"

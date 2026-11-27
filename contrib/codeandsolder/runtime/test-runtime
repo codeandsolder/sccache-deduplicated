@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Real managed cross-host acceptance, not an isolated cache daemon.
+# Use the same absent output path and image on each host.
+set -euo pipefail
+
+[[ $# == 2 && $1 =~ ^sha256:[0-9a-f]{64}$ && ! -e $2 ]] || {
+    echo 'Usage: test-runtime IMAGE_ID ABSENT_OUTPUT_DIRECTORY' >&2
+    exit 64
+}
+image=$1
+here=$(dirname -- "$(realpath -- "$0")")
+mkdir -p "$2"
+root=$(realpath -- "$2")
+mkdir -p "$root/plain/src" "$root/mixed/src" "$root/mixed/mac/src"
+trap 'rm -rf -- "$root/plain/target" "$root/mixed/target" "$root/plain/probe.o" "$root/plain/probe-cxx.o"' EXIT
+
+cd "$root/plain"
+cat > Cargo.toml <<'TOML'
+[package]
+name = "resident-runtime-library"
+version = "0.1.0"
+edition = "2024"
+[profile.dev]
+incremental = false
+TOML
+printf '%s\n' 'pub fn value(x: u64) -> u64 { x.rotate_left(21).wrapping_mul(0x61c8864680b583eb) }' > src/lib.rs
+printf '%s\n' '#include <stdint.h>' 'uint64_t resident_c(uint64_t x) { return x * 31; }' > probe.c
+printf '%s\n' '#include <vector>' 'int resident_cxx(const std::vector<int>& x) { return x.empty() ? 0 : x.front(); }' > probe.cc
+"$here/run" --image "$image" --offline --report-actions -- /bin/bash -ec '
+    sccache /usr/bin/gcc -c probe.c -o probe.o > c.log 2>&1
+    sccache /usr/bin/g++ -c probe.cc -o probe-cxx.o > cxx.log 2>&1
+    sccache --cargo-all -- build --offline -j2 -vv > rust.log 2>&1
+'
+for language in c cxx rust; do
+    printf '%s ' "$language"
+    awk -v mode=reuse -v exact_source=1 -f "$here/../native-action-report.awk" "$language.log"
+done | tee "$root/native-actions.txt"
+sha256sum probe.o probe-cxx.o > "$root/artifacts.sha256"
+find target -name '*.rlib' -type f -print0 | sort -z | xargs -0 -r sha256sum >> "$root/artifacts.sha256"
+[[ $(wc -l < "$root/artifacts.sha256") == 3 ]]
+
+cd "$root/mixed"
+cat > Cargo.toml <<'TOML'
+[package]
+name = "resident-runtime-probe"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+resident-mac = { path = "mac" }
+[profile.dev]
+incremental = false
+TOML
+cat > mac/Cargo.toml <<'TOML'
+[package]
+name = "resident-mac"
+version = "0.1.0"
+edition = "2024"
+[lib]
+proc-macro = true
+TOML
+cat > mac/src/lib.rs <<'RUST'
+extern crate proc_macro;
+#[proc_macro]
+pub fn identity(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }
+RUST
+cat > build.rs <<'RUST'
+use std::{env, path::PathBuf, process::Command};
+fn main() {
+    let dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let object = dir.join("native.o");
+    assert!(Command::new(env::var_os("CC").unwrap_or("/usr/local/libexec/sccache-strict-wrappers/cc".into()))
+        .args(["-c", "native.c", "-o"]).arg(&object).status().unwrap().success());
+    assert!(Command::new("ar").arg("rcs").arg(dir.join("libresident_native.a"))
+        .arg(&object).status().unwrap().success());
+    println!("cargo:rustc-link-search=native={}", dir.display());
+    println!("cargo:rustc-link-lib=static=resident_native");
+    println!("cargo:rerun-if-changed=native.c");
+}
+RUST
+printf '%s\n' 'int native_value(void) { return 42; }' > native.c
+cat > src/main.rs <<'RUST'
+unsafe extern "C" { fn native_value() -> i32; }
+fn answer() -> i32 { resident_mac::identity!(unsafe { native_value() }) }
+fn main() { println!("{}", answer()); }
+#[test]
+fn linked() { assert_eq!(answer(), 42); }
+RUST
+# shellcheck disable=SC2016 # Commands execute in the runtime filesystem.
+"$here/run" --image "$image" --offline --leased-intermediates --report-actions -- /bin/bash -ec '
+    cargo build --offline -j2 -vv
+    test "$(target/debug/resident-runtime-probe)" = 42
+    cargo test --offline -j2 -vv
+    cargo clippy --offline -j2 -- -D warnings
+' > "$root/mixed.log" 2>&1 || { tail -60 "$root/mixed.log"; exit 1; }
+rg 'native_action|Finished|test result' "$root/mixed.log"
+sha256sum target/debug/resident-runtime-probe >> "$root/artifacts.sha256"
+echo "Verified C, C++, Rust, leased mixed Cargo graph, unit test and Clippy: $root"

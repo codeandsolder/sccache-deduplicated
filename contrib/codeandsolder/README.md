@@ -130,6 +130,13 @@ before removing its previous configuration or restoring automatic updates.
 The isolated root regression in `tests/native_dist.rs` is for disposable CI
 only, not for starting test daemons in the managed fleet.
 
+## Immutable build runtime
+
+For common compiler/runtime identities across Linux hosts, use the
+[digest-pinned resident build image](runtime/README.md). Each build session
+uses the existing managed daemon through its authenticated namespace
+interface; no additional cache or resident service is started.
+
 ## Host-native release policy
 
 The portable GitHub release is the source-revision and protocol authority.

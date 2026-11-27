@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# CLI regression independent of a Docker daemon or installed host wrappers.
+set -euo pipefail
+here=$(dirname -- "$(realpath -- "$0")")
+root=$(mktemp -d)
+trap 'rm -rf -- "$root"' EXIT
+cd "$root"
+mkdir cargo-home
+export CARGO_HOME="$root/cargo-home"
+digest="sha256:$(printf '%064d' 0)"
+reject() {
+    local status=0
+    "$here/run" "$@" >"$root/log" 2>&1 || status=$?
+    [[ $status == 64 ]] || { cat "$root/log" >&2; exit 1; }
+}
+reject --image debian:latest -- true
+reject --image "$digest" --bind / -- true
+reject --image "$digest" --bind /usr -- true
+reject --image "$digest" --bind /etc -- true
+reject --image "$digest" --bind /tmp -- true
+reject --image "$digest" --unknown -- true
+reject --image "$digest" --bind
+reject --image "$digest" --
+echo 'runtime CLI rejects mutable images, protected binds and invalid arguments'
