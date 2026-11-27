@@ -956,7 +956,11 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         // connections in separate tasks.
         let server = async move {
             loop {
-                let socket = listener.accept().await?;
+                let socket = match listener.accept().await {
+                    Ok(socket) => socket,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                };
                 trace!("incoming connection");
                 let service = service.clone();
                 #[cfg(target_os = "linux")]
@@ -980,7 +984,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
                     service.bind(socket).await
                 }
                 .map_err(|res| {
-                    error!("Failed to bind socket: {res:#}");
+                    error!("IPC connection failed: {res:#}");
                 });
 
                 // We're not interested if the task panicked; immediately process

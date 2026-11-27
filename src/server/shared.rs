@@ -282,7 +282,10 @@ impl SharedExecutor {
         let waiting = activity::ChildActivity::waiting();
         let _token = self.jobserver.acquire().await?;
         drop(waiting);
-        ensure!(peer::alive(peer.pidfd.as_fd())?, "compile requester exited");
+        ensure!(
+            peer::alive(peer.pidfd.as_fd()).context("check requester pidfd")?,
+            "compile requester exited"
+        );
         let (broker, helper) = UnixStream::pair()?;
         #[cfg(feature = "dist-client")]
         let (digest_broker, digest_helper) = UnixStream::pair()?;
@@ -318,7 +321,8 @@ impl SharedExecutor {
         }
         let mut child = tokio::process::Command::from(command)
             .kill_on_drop(true)
-            .spawn()?;
+            .spawn()
+            .context("launch shared executor")?;
         let pid = i32::try_from(child.id().context("missing executor PID")?)?;
         let mut group = GroupGuard(Some(pid));
         drop(helper);
@@ -349,13 +353,21 @@ impl SharedExecutor {
         input.shutdown().await?;
         drop(input);
         let mut output = child.stdout.take().context("missing executor output")?;
-        let result = read_result(&mut output, &activity).await?;
-        let status = child.wait().await?;
+        let result = read_result(&mut output, &activity)
+            .await
+            .context("receive shared executor result")?;
+        let status = child.wait().await.context("wait for shared executor")?;
         group.0 = None;
         // Wait until the private connection has closed, including pending stats.
-        broker_task.await??;
+        broker_task
+            .await
+            .context("join shared executor IPC broker")?
+            .context("finish shared executor IPC broker")?;
         #[cfg(feature = "dist-client")]
-        digest_task.await??;
+        digest_task
+            .await
+            .context("join shared digest broker")?
+            .context("finish shared digest broker")?;
         ensure!(status.success(), "shared executor exited with {status}");
         Ok(result)
     }

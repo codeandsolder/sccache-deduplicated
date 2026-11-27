@@ -80,11 +80,18 @@ pub(super) fn alive(pidfd: BorrowedFd<'_>) -> io::Result<bool> {
         events: libc::POLLIN,
         revents: 0,
     };
-    // SAFETY: poll references one initialized pollfd for this syscall.
-    match unsafe { libc::poll(&raw mut poll, 1, 0) } {
-        0 => Ok(true),
-        -1 => Err(io::Error::last_os_error()),
-        _ => Ok(false),
+    loop {
+        // SAFETY: poll references one initialized pollfd for this syscall.
+        match unsafe { libc::poll(&raw mut poll, 1, 0) } {
+            0 => return Ok(true),
+            -1 => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            _ => return Ok(false),
+        }
     }
 }
 
