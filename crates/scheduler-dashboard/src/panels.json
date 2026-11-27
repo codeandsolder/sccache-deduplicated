@@ -114,7 +114,7 @@
     "group": "cache_storage"
   },
   {
-    "title": "Workers",
+    "title": "Reported workers (max across clients)",
     "kind": "stat",
     "unit": "short",
     "queries": [
@@ -125,7 +125,7 @@
     ]
   },
   {
-    "title": "Advertised CPUs",
+    "title": "Reported advertised cpus (max across clients)",
     "kind": "stat",
     "unit": "short",
     "queries": [
@@ -136,7 +136,7 @@
     ]
   },
   {
-    "title": "Jobs in progress",
+    "title": "Reported jobs in progress (max across clients)",
     "kind": "stat",
     "unit": "short",
     "queries": [
@@ -147,12 +147,12 @@
     ]
   },
   {
-    "title": "Cluster occupancy",
+    "title": "Reported admission occupancy (max across clients)",
     "kind": "stat",
     "unit": "percent",
     "queries": [
       {
-        "expr": "100*max(sccache_dist_status{resolution=\"raw\",kind=\"in_progress\"})/clamp_min(max(sccache_dist_status{resolution=\"raw\",kind=\"cpus\"}),1)",
+        "expr": "max((100*max by(instance)(sccache_dist_status{resolution=\"raw\",kind=\"in_progress\"})/max by(instance)(sccache_dist_status{resolution=\"raw\",kind=\"max_jobs\"})) and (max by(instance)(sccache_dist_status{resolution=\"raw\",kind=\"max_jobs\"})>0))",
         "legend": ""
       }
     ]
@@ -202,7 +202,7 @@
     "unit": "percent",
     "queries": [
       {
-        "expr": "100*sum(increase(sccache_dist_compiles_total{instance=~\"$client\",resolution=\"raw\"}[$__range]))/clamp_min(sum(increase(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__range])),1)",
+        "expr": "((100*(sum(increase(sccache_dist_compiles_total{instance=~\"$client\",resolution=\"raw\"}[$__range])) or (0*sum(increase(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__range]))))/sum(increase(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__range]))) and (sum(increase(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__range]))>0))",
         "legend": ""
       }
     ]
@@ -302,7 +302,7 @@
     "unit": "s",
     "queries": [
       {
-        "expr": "sum by(instance)(rate(sccache_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"compile\"}[$__rate_interval]))/clamp_min(sum by(instance)(rate(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__rate_interval])),1e-9)",
+        "expr": "((sum by(instance)(rate(sccache_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"compile\"}[$__rate_interval]))/sum by(instance)(rate(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__rate_interval]))) and (sum by(instance)(rate(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__rate_interval]))>0))",
         "legend": "{{instance}}"
       }
     ],
@@ -314,40 +314,40 @@
     "unit": "s",
     "queries": [
       {
-        "expr": "sum by(instance)(rate(sccache_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"cache_write\"}[$__rate_interval]))/clamp_min(sum by(instance)(rate(sccache_cache_events_total{instance=~\"$client\",resolution=\"raw\",event=\"write\"}[$__rate_interval])),1e-9)",
+        "expr": "((sum by(instance)(rate(sccache_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"cache_write\"}[$__rate_interval]))/sum by(instance)(rate(sccache_cache_events_total{instance=~\"$client\",resolution=\"raw\",event=\"write\"}[$__rate_interval]))) and (sum by(instance)(rate(sccache_cache_events_total{instance=~\"$client\",resolution=\"raw\",event=\"write\"}[$__rate_interval]))>0))",
         "legend": "{{instance}} write"
       },
       {
-        "expr": "sum by(instance)(rate(sccache_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"cache_read_hit\"}[$__rate_interval]))/clamp_min(sum by(instance)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__rate_interval])),1e-9)",
+        "expr": "((sum by(instance)(rate(sccache_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"cache_read_hit\"}[$__rate_interval]))/sum by(instance)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__rate_interval]))) and (sum by(instance)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__rate_interval]))>0))",
         "legend": "{{instance}} read hit"
       }
     ],
     "group": "cache_hits"
   },
   {
-    "title": "L0 cache latency",
+    "title": "Legacy cache-tier latency",
     "kind": "timeseries",
     "unit": "s",
     "queries": [
       {
-        "expr": "sum by(instance,name)(rate(sccache_cache_level_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"write\"}[$__rate_interval]))/clamp_min(sum by(instance,name)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\",operation=\"write\"}[$__rate_interval])),1e-9)",
-        "legend": "{{instance}} {{name}} write"
+        "expr": "((sum by(instance,level,name)(rate(sccache_cache_level_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"write\"}[$__rate_interval]))/sum by(instance,level,name)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\",operation=\"write\"}[$__rate_interval]))) and (sum by(instance,level,name)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\",operation=\"write\"}[$__rate_interval]))>0))",
+        "legend": "{{instance}} L{{level}} {{name}} write"
       },
       {
-        "expr": "sum by(instance,name)(rate(sccache_cache_level_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"hit\"}[$__rate_interval]))/clamp_min(sum by(instance,name)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\",operation=\"hit\"}[$__rate_interval])),1e-9)",
-        "legend": "{{instance}} {{name}} hit"
+        "expr": "((sum by(instance,level,name)(rate(sccache_cache_level_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"hit\"}[$__rate_interval]))/sum by(instance,level,name)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\",operation=\"hit\"}[$__rate_interval]))) and (sum by(instance,level,name)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\",operation=\"hit\"}[$__rate_interval]))>0))",
+        "legend": "{{instance}} L{{level}} {{name}} hit"
       }
     ],
     "group": "cache_hits"
   },
   {
-    "title": "Cache-level operations",
+    "title": "Legacy cache-tier operations",
     "kind": "timeseries",
     "unit": "ops",
     "queries": [
       {
-        "expr": "sum by(instance,name,operation)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\"}[$__rate_interval]))",
-        "legend": "{{instance}} {{name}} {{operation}}"
+        "expr": "sum by(instance,level,name,operation)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\"}[$__rate_interval]))",
+        "legend": "{{instance}} L{{level}} {{name}} {{operation}}"
       }
     ],
     "group": "cache_hits"
@@ -429,8 +429,8 @@
     "unit": "bool",
     "queries": [
       {
-        "expr": "max(sccache_preprocessor_cache_mode{instance=~\"$client\",resolution=\"raw\"})",
-        "legend": ""
+        "expr": "max by(instance)(sccache_preprocessor_cache_mode{instance=~\"$client\",resolution=\"raw\"})",
+        "legend": "{{instance}}"
       }
     ]
   },
@@ -440,8 +440,8 @@
     "unit": "short",
     "queries": [
       {
-        "expr": "max(sccache_cache_levels{instance=~\"$client\",resolution=\"raw\"})",
-        "legend": ""
+        "expr": "max by(instance)(sccache_cache_levels{instance=~\"$client\",resolution=\"raw\"})",
+        "legend": "{{instance}}"
       }
     ],
     "group": "cache_storage"
@@ -452,8 +452,8 @@
     "unit": "short",
     "queries": [
       {
-        "expr": "max(sccache_basedirs{instance=~\"$client\",resolution=\"raw\"})",
-        "legend": ""
+        "expr": "max by(instance)(sccache_basedirs{instance=~\"$client\",resolution=\"raw\"})",
+        "legend": "{{instance}}"
       }
     ]
   },
@@ -474,7 +474,7 @@
     "unit": "percent",
     "queries": [
       {
-        "expr": "100*sum by(instance)(rate(cpu_seconds_total{instance=~\".+\",resolution=\"raw\",cpu=\"total\",mode!~\"idle|iowait\"}[$__rate_interval]))/clamp_min(sum by(instance)(rate(cpu_seconds_total{instance=~\".+\",resolution=\"raw\",cpu=\"total\"}[$__rate_interval])),1e-9)",
+        "expr": "((100*sum by(instance)(rate(cpu_seconds_total{instance=~\".+\",resolution=\"raw\",cpu=\"total\",mode!~\"idle|iowait\"}[$__rate_interval]))/sum by(instance)(rate(cpu_seconds_total{instance=~\".+\",resolution=\"raw\",cpu=\"total\"}[$__rate_interval]))) and (sum by(instance)(rate(cpu_seconds_total{instance=~\".+\",resolution=\"raw\",cpu=\"total\"}[$__rate_interval]))>0))",
         "legend": "{{instance}}"
       }
     ]

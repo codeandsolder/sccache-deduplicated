@@ -2,7 +2,10 @@
 use super::display_count;
 use crate::{MetricSeries, styles};
 use leptos::prelude::*;
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 const COLORS: [&str; 10] = [
     "#56b4e9", "#e69f00", "#009e73", "#cc79a7", "#f0e442", "#e76f51", "#88aaff", "#b2df8a",
@@ -17,26 +20,34 @@ struct Bounds {
     max: f64,
 }
 
-fn bounds(series: &[MetricSeries], unit: &str) -> Option<Bounds> {
+fn bounds(series: &[MetricSeries], unit: &str, window: Option<(u64, u64)>) -> Option<Bounds> {
+    let (start, end) = window.map_or((f64::INFINITY, f64::NEG_INFINITY), |(start, end)| {
+        (display_count(start), display_count(end))
+    });
     let mut bounds = Bounds {
-        start: f64::INFINITY,
-        end: f64::NEG_INFINITY,
+        start,
+        end,
         min: 0.0,
         max: 0.0,
     };
-    let mut observed = false;
     for &(time, value) in series.iter().flat_map(|series| &series.points) {
-        if time.is_finite() {
+        if !time.is_finite() {
+            continue;
+        }
+        if window.is_some() {
+            if time < bounds.start || time > bounds.end {
+                continue;
+            }
+        } else {
             bounds.start = bounds.start.min(time);
             bounds.end = bounds.end.max(time);
         }
         if let Some(value) = value.filter(|value| value.is_finite()) {
-            observed = true;
             bounds.min = bounds.min.min(value);
             bounds.max = bounds.max.max(value);
         }
     }
-    if !observed || !bounds.start.is_finite() {
+    if !bounds.start.is_finite() || bounds.end < bounds.start {
         return None;
     }
     if unit == "percent" {
@@ -53,7 +64,9 @@ fn plot_path(points: &[(f64, Option<f64>)], bounds: Bounds, step: u64) -> String
     let mut path = String::new();
     let mut previous = None;
     for &(time, value) in points {
-        if let Some(value) = value.filter(|value| value.is_finite() && time.is_finite()) {
+        if let Some(value) = value.filter(|value| {
+            value.is_finite() && time.is_finite() && time >= bounds.start && time <= bounds.end
+        }) {
             let x =
                 ((time - bounds.start) / (bounds.end - bounds.start).max(1.0)).mul_add(580.0, 10.0);
             let y = ((value - bounds.min) / (bounds.max - bounds.min)).mul_add(-140.0, 150.0);
@@ -137,12 +150,47 @@ fn axis_time(time: f64, range: f64) -> String {
         )
 }
 
-fn series_color(key: &str) -> &'static str {
-    // Stable across series arrival/removal and SSR/hydration.
-    let hash = key.bytes().fold(0_u32, |hash, byte| {
-        hash.wrapping_mul(31).wrapping_add(u32::from(byte))
-    });
-    COLORS[usize::try_from(hash).unwrap_or_default() % COLORS.len()]
+const PATTERNS: [(&str, &str); 5] = [
+    ("none", "━"),
+    ("6 3", "┄"),
+    ("2 3", "┈"),
+    ("8 3 2 3", "┅"),
+    ("10 5", "╍"),
+];
+
+fn reconcile_styles(
+    keys: &[String],
+    previous: Option<BTreeMap<String, usize>>,
+) -> (BTreeMap<String, usize>, bool) {
+    let mut styles = previous.unwrap_or_default();
+    let mut changed = styles.len() != keys.len();
+    let before = styles.len();
+    styles.retain(|key, _| keys.binary_search(key).is_ok());
+    changed |= before != styles.len();
+    let mut used = styles.values().copied().collect::<BTreeSet<_>>();
+    for key in keys {
+        if !styles.contains_key(key) {
+            let index = (0..COLORS.len() * PATTERNS.len())
+                .find(|index| !used.contains(index))
+                .unwrap_or_else(|| {
+                    key.bytes().fold(0_usize, |hash, byte| {
+                        hash.wrapping_mul(31).wrapping_add(usize::from(byte))
+                    }) % (COLORS.len() * PATTERNS.len())
+                });
+            styles.insert(key.clone(), index);
+            used.insert(index);
+            changed = true;
+        }
+    }
+    (styles, changed)
+}
+
+fn current_value(series: &MetricSeries, end: f64) -> Option<f64> {
+    series
+        .points
+        .last()
+        .filter(|(time, _)| time.total_cmp(&end).is_eq())
+        .and_then(|(_, value)| *value)
 }
 
 #[component]
@@ -150,10 +198,22 @@ pub(super) fn HistoryChart(
     series: Memo<Vec<MetricSeries>>,
     unit: Memo<String>,
     step: Signal<u64>,
+    window: Signal<Option<(u64, u64)>>,
 ) -> impl IntoView {
     let indexed = super::keyed_index(series, |series| &series.key);
     let keys = super::index_keys(indexed);
-    let extent = Memo::new(move |_| series.with(|series| unit.with(|unit| bounds(series, unit))));
+    let palette =
+        Memo::new_owning(move |previous| keys.with(|keys| reconcile_styles(keys, previous)));
+    let extent = Memo::new(move |_| {
+        series.with(|series| unit.with(|unit| bounds(series, unit, window.get())))
+    });
+    let observed = Memo::new(move |_| {
+        series.with(|series| {
+            series
+                .iter()
+                .any(|series| series.points.iter().any(|(_, value)| value.is_some()))
+        })
+    });
     let axis = move |maximum: bool| {
         extent.with(|extent| {
             extent.map_or_else(
@@ -184,11 +244,11 @@ pub(super) fn HistoryChart(
         <svg class=styles::chart viewBox="0 0 600 160" role="img" aria-label="Metric history" preserveAspectRatio="none">
             <path d="M10,10 H590 M10,80 H590 M10,150 H590" stroke="currentColor" opacity="0.2" fill="none"/>
             <For each=move || keys.get() key=Clone::clone children=move |key| {
-                let color = series_color(&key);
+                let style = Memo::new({let key=key.clone(); move |_| palette.with(|styles| styles.get(&key).copied().unwrap_or_default())});
                 let row = Memo::new(move |_| indexed.with(|series| series.get(&key).cloned()));
                 view!{
                     <path d=move || extent.with(|extent| row.with(|row| match (extent,row) { (Some(extent),Some(row)) => plot_path(&row.points,*extent,step.get()), _ => String::new() }))
-                        stroke=color stroke-width="1.5" stroke-linecap="round" vector-effect="non-scaling-stroke" fill="none">
+                        stroke=move || COLORS[style.get()%COLORS.len()] stroke-dasharray=move || PATTERNS[(style.get()/COLORS.len())%PATTERNS.len()].0 stroke-width="1.5" stroke-linecap="round" vector-effect="non-scaling-stroke" fill="none">
                         <title>{move || row.with(|row| row.as_ref().map_or_else(String::new,|row| row.label.clone()))}</title>
                     </path>
                 }
@@ -196,11 +256,11 @@ pub(super) fn HistoryChart(
         </svg>
         <div class=styles::axis><span>{move || axis(false)}</span><span>{move || time(false)}</span><span>{move || time(true)}</span></div>
         <div class=styles::legend>
-            <p class=styles::muted hidden=move || extent.with(Option::is_some)>"No samples"</p>
+            <p class=styles::muted hidden=move || observed.get()>"No samples"</p>
             <For each=move || keys.get() key=Clone::clone children=move |key| {
-                let color=series_color(&key);
+                let style = Memo::new({let key=key.clone(); move |_| palette.with(|styles| styles.get(&key).copied().unwrap_or_default())});
                 let row=Memo::new(move |_| indexed.with(|series| series.get(&key).cloned()));
-                view!{<div><span style:color=color>"● "</span>{move || row.with(|row| row.as_ref().map_or_else(String::new,|row| row.label.clone()))}<b>{move || row.with(|row| row.as_ref().and_then(|row| row.points.last()).and_then(|(_,value)| *value).map_or_else(|| "—".into(),|value| unit.with(|unit| value_label(value,unit))))}</b></div>}
+                view!{<div><span style:color=move || COLORS[style.get()%COLORS.len()]>{move || PATTERNS[(style.get()/COLORS.len())%PATTERNS.len()].1}</span>{move || row.with(|row| row.as_ref().map_or_else(String::new,|row| row.label.clone()))}<b>{move || row.with(|row| extent.with(|extent| extent.and_then(|extent| current_value(row.as_ref()?,extent.end)))).map_or_else(|| "—".into(),|value| unit.with(|unit| value_label(value,unit)))}</b></div>}
             }/>
         </div>
     }.into_any()
@@ -211,6 +271,7 @@ pub(super) fn MetricCard(
     panel: Memo<Option<crate::MetricPanel>>,
     step: Signal<u64>,
     sampled_at: Memo<Option<u64>>,
+    window: Signal<Option<(u64, u64)>>,
 ) -> impl IntoView {
     let kind = Memo::new(move |_| panel.with(|panel| panel.as_ref().map(|panel| panel.kind)));
     let unit = Memo::new(move |_| {
@@ -235,9 +296,9 @@ pub(super) fn MetricCard(
             <h3>{move || panel.with(|panel| panel.as_ref().map_or_else(String::new,|panel| panel.title.clone()))}</h3>
             {move || error.get().map(|error| view!{<p class=styles::warning>{error}</p>})}
             {move || if kind.get()==Some(crate::PanelKind::Timeseries) {
-                view!{<HistoryChart series=series unit=unit step=step/>}.into_any()
+                view!{<HistoryChart series=series unit=unit step=step window=window/>}.into_any()
             } else {
-                view!{{move || panel.get().map(|panel| view!{<PanelContent panel=panel step=step.get() sampled_at=sampled_at.get()/>})}}.into_any()
+                kind.get().map(|kind| view!{<PanelContent panel=panel kind=kind unit=unit sampled_at=sampled_at/>}).into_any()
             }}
         </article>
     }.into_any()
@@ -263,11 +324,55 @@ mod tests {
             points: vec![(1.0, Some(12.0)), (2.0, Some(23.0))],
         }];
         assert!(
-            bounds(&series, "percent")
+            bounds(&series, "percent", None)
                 .is_some_and(|extent| (extent.max - 100.0).abs() < f64::EPSILON)
         );
         assert!(
-            bounds(&series, "jobs").is_some_and(|extent| (extent.max - 23.0).abs() < f64::EPSILON)
+            bounds(&series, "jobs", None)
+                .is_some_and(|extent| (extent.max - 23.0).abs() < f64::EPSILON)
+        );
+    }
+
+    #[test]
+    fn selected_axis_and_missing_current_point_are_not_shifted() {
+        let series = MetricSeries {
+            key: "a".into(),
+            label: "a".into(),
+            points: vec![(20.0, Some(12.0))],
+        };
+        let extent = bounds(std::slice::from_ref(&series), "percent", Some((0, 60))).unwrap();
+        assert!(extent.start.total_cmp(&0.0).is_eq());
+        assert!(extent.end.total_cmp(&60.0).is_eq());
+        assert!(current_value(&series, 60.0).is_none());
+        let mut panel = crate::MetricPanel {
+            key: 0,
+            group: crate::MetricGroup::CacheHits,
+            kind: crate::PanelKind::Stat,
+            title: "rate".into(),
+            unit: "percent".into(),
+            series: vec![series],
+            error: None,
+        };
+        assert!(metric_rows(&panel, Some(60)).is_empty());
+        panel.error = Some("failed".into());
+        assert!(metric_rows(&panel, Some(60))[0].stale);
+    }
+
+    #[test]
+    fn chart_styles_survive_roster_changes_without_early_collisions() {
+        let keys = (0..12).map(|key| format!("{key:02}")).collect::<Vec<_>>();
+        let (first, _) = reconcile_styles(&keys, None);
+        assert_eq!(first.values().collect::<BTreeSet<_>>().len(), keys.len());
+        let mut updated = keys[1..].to_vec();
+        updated.push("new".into());
+        let (second, changed) = reconcile_styles(&updated, Some(first.clone()));
+        assert!(changed);
+        for key in &keys[1..] {
+            assert_eq!(first[key], second[key]);
+        }
+        assert_eq!(
+            second.values().collect::<BTreeSet<_>>().len(),
+            updated.len()
         );
     }
 
@@ -296,80 +401,117 @@ mod tests {
     }
 }
 
-/// Grafana's original panels have different semantics: current values,
-/// historical traces, relative work distribution, and version metadata.
-#[component]
-pub(super) fn PanelContent(
-    panel: crate::MetricPanel,
-    step: u64,
-    sampled_at: Option<u64>,
-) -> impl IntoView {
-    use crate::PanelKind;
-    let current_only =
-        panel.group == crate::MetricGroup::CacheHits && panel.kind == PanelKind::Stat;
-    let rows = panel
+/// Current values come from a single evaluation point. Retained values after
+/// query failure remain explicitly stale; the version table is historical.
+#[derive(Clone, PartialEq)]
+struct MetricRow {
+    key: String,
+    label: String,
+    time: f64,
+    value: f64,
+    stale: bool,
+}
+
+fn metric_rows(panel: &crate::MetricPanel, end: Option<u64>) -> Vec<MetricRow> {
+    panel
         .series
-        .into_iter()
+        .iter()
         .filter_map(|series| {
-            let (time, value) = if current_only {
-                let (time, value) = series.points.last()?;
-                (*time, (*value)?)
-            } else {
-                series
-                    .points
-                    .iter()
-                    .rev()
-                    .find_map(|(time, value)| value.map(|value| (*time, value)))?
-            };
-            if current_only
-                && sampled_at
-                    .is_some_and(|end| display_count(end) - time > display_count(step) * 1.5)
-            {
+            let (time, value) = series
+                .points
+                .iter()
+                .rev()
+                .find_map(|(time, value)| value.map(|value| (*time, value)))?;
+            let stale = end.is_none_or(|end| !time.total_cmp(&display_count(end)).is_eq());
+            if panel.kind != crate::PanelKind::Table && panel.error.is_none() && stale {
                 return None;
             }
-            Some((series.label, time, value))
+            Some(MetricRow {
+                key: series.key.clone(),
+                label: series.label.clone(),
+                time,
+                value,
+                stale,
+            })
         })
-        .collect::<Vec<_>>();
-    if rows.is_empty() {
-        return view! {<p class=styles::muted>"No samples"</p>}.into_any();
-    }
-    let stale = move |time: f64| {
-        sampled_at.is_some_and(|end| display_count(end) - time > display_count(step) * 1.5)
+        .collect()
+}
+
+#[component]
+fn PanelContent(
+    panel: Memo<Option<crate::MetricPanel>>,
+    kind: crate::PanelKind,
+    unit: Memo<String>,
+    sampled_at: Memo<Option<u64>>,
+) -> impl IntoView {
+    use crate::PanelKind;
+    let rows = Memo::new(move |_| {
+        panel.with(|panel| {
+            panel
+                .as_ref()
+                .map_or_else(Vec::new, |panel| metric_rows(panel, sampled_at.get()))
+        })
+    });
+    let indexed = super::keyed_index(rows, |row| &row.key);
+    let keys = super::index_keys(indexed);
+    let maximum = Memo::new(move |_| {
+        rows.with(|rows| rows.iter().map(|row| row.value).fold(1.0_f64, f64::max))
+    });
+    let children = move |key| {
+        let row = Memo::new(move |_| indexed.with(|rows| rows.get(&key).cloned()));
+        view! { <MetricValueRow row=row kind=kind unit=unit maximum=maximum/> }
     };
-    match panel.kind {
+    view! {
+        <p class=styles::muted hidden=move || !rows.with(Vec::is_empty)>"No samples"</p>
+        {match kind {
+            PanelKind::Stat => view! { <div class=styles::metricstats><For each=move || keys.get() key=Clone::clone children=children/></div> }.into_any(),
+            PanelKind::Bargauge => view! { <div class=styles::gauges><For each=move || keys.get() key=Clone::clone children=children/></div> }.into_any(),
+            PanelKind::Table => view! { <div class=styles::tablewrap><table><thead><tr><th>"Client / version"</th><th>"Last observed (UTC)"</th></tr></thead><tbody><For each=move || keys.get() key=Clone::clone children=children/></tbody></table></div> }.into_any(),
+            PanelKind::Timeseries => ().into_any(),
+        }}
+    }.into_any()
+}
+
+#[component]
+fn MetricValueRow(
+    row: Memo<Option<MetricRow>>,
+    kind: crate::PanelKind,
+    unit: Memo<String>,
+    maximum: Memo<f64>,
+) -> impl IntoView {
+    use crate::PanelKind;
+    let label = move || {
+        row.with(|row| {
+            row.as_ref()
+                .map_or_else(String::new, |row| row.label.clone())
+        })
+    };
+    let value = move || {
+        row.with(|row| {
+            row.as_ref().map_or_else(
+                || "—".into(),
+                |row| unit.with(|unit| value_label(row.value, unit)),
+            )
+        })
+    };
+    let time = move || {
+        row.with(|row| {
+            row.as_ref()
+                .map_or_else(|| "—".into(), |row| axis_time(row.time, 86_400.0))
+        })
+    };
+    let stale = move || row.with(|row| row.as_ref().is_some_and(|row| row.stale));
+    match kind {
         PanelKind::Stat => view! {
-            <div class=styles::metricstats>
-                {rows.into_iter().map(|(label,time,value)| view!{
-                    <div class=styles::metricstat><small>{label}</small><strong>{value_label(value,&panel.unit)}</strong>
-                        {stale(time).then(||view!{<small class=styles::warning>"Last observed "{axis_time(time,86_400.0)}" UTC"</small>})}
-                    </div>
-                }).collect_view()}
+            <div class=styles::metricstat><small>{label}</small><strong>{value}</strong><small class=styles::warning hidden=move || !stale()>"Last observed "{time}" UTC"</small></div>
+        }.into_any(),
+        PanelKind::Bargauge => view! {
+            <div><div class=styles::subhead><span>{label}</span><b>{value}</b></div>
+                <meter min="0" max=move || maximum.get() prop:value=move || row.with(|row|row.as_ref().map_or(0.0,|row|row.value.max(0.0)))/>
+                <small class=styles::warning hidden=move || !stale()>"Last observed "{time}" UTC"</small>
             </div>
         }.into_any(),
-        PanelKind::Bargauge => {
-            let mut rows = rows;
-            rows.retain(|(_, _, value)| *value > 0.0);
-            rows.sort_unstable_by(|a,b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-            let maximum = rows.iter().map(|(_,_,value)| *value).fold(0.0_f64,f64::max);
-            view! {
-                <div class=styles::gauges>
-                    {rows.into_iter().map(|(label,time,value)| view!{
-                        <div>
-                            <div class=styles::subhead><span>{label}</span><b>{value_label(value,&panel.unit)}</b></div>
-                            <meter min="0" max=maximum.max(1.0) value=value.max(0.0)/>
-                            {stale(time).then(||view!{<small class=styles::warning>"Last observed "{axis_time(time,86_400.0)}" UTC"</small>})}
-                        </div>
-                    }).collect_view()}
-                </div>
-            }.into_any()
-        }
-        PanelKind::Table => view! {
-            <div class=styles::tablewrap>
-                <table><thead><tr><th>"Client / version"</th><th>"Last observed (UTC)"</th></tr></thead><tbody>
-                    {rows.into_iter().map(|(label,time,_)|view!{<tr><td>{label}</td><td class=if stale(time) {styles::warning} else {styles::muted}>{axis_time(time,86_400.0)}</td></tr>}).collect_view()}
-                </tbody></table>
-            </div>
-        }.into_any(),
-        PanelKind::Timeseries => view!{<p class=styles::muted>"No samples"</p>}.into_any(),
+        PanelKind::Table => view! { <tr><td>{label}</td><td class=move || if stale(){styles::warning}else{styles::muted}>{time}</td></tr> }.into_any(),
+        PanelKind::Timeseries => ().into_any(),
     }
 }

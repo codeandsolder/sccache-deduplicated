@@ -132,7 +132,7 @@ fn Overview(totals: Memo<Option<Totals>>, history: Memo<Vec<Sample>>) -> impl In
         </div>
         <section>
             <h2>"Scheduler activity"</h2>
-            <HistoryChart series=activity unit=unit step=step/>
+            <HistoryChart series=activity unit=unit step=step window=Signal::derive(|| None)/>
         </section>
     }.into_any()
 }
@@ -232,7 +232,7 @@ fn AdmissionPanel(
                 }}
             </tbody></table></div>
             <h3>"Rolling native admission hit rate"</h3>
-            <HistoryChart series=series unit=unit step=step/>
+            <HistoryChart series=series unit=unit step=step window=Signal::derive(|| None)/>
         </section>
     }.into_any()
 }

@@ -346,12 +346,18 @@ fn FleetMetrics(tab: RwSignal<Tab>) -> impl IntoView {
     });
     let step = Signal::derive(move || data.with(|data| data.view.range.step()));
     let sampled_at = Memo::new(move |_| data.with(|data| data.sampled_at));
+    let window = Signal::derive(move || {
+        data.with(|data| {
+            data.sampled_at
+                .map(|end| (end.saturating_sub(data.view.range.seconds()), end))
+        })
+    });
     view! {
         <Show when=move || group.get().is_some()>
         <section id="metrics">
             <h2>{move || match group.get() { Some(MetricGroup::CacheHits) => "Completed cache results", Some(MetricGroup::CacheStorage) => "Historical cache storage", _ => "Fleet telemetry" }}</h2>
             <p class=styles::muted hidden=move || tab.get() != Tab::CacheHits>
-                "Hit rate = hits / (hits + misses), including native and legacy compiler results. Errors and bypasses are shown separately; tier lookups are not compile requests. Window counts are counter increases (extrapolated at scrape boundaries). No traffic or unavailable telemetry is not a 0% hit rate."
+                "Hit rate = hits / (hits + misses), including native and legacy compiler results. Forced refreshes, read errors and timeouts may also be counted as misses by the client; event counters are not disjoint from completed outcomes. Tier lookups are not compile requests. Window counts are counter increases (extrapolated at scrape boundaries). No traffic or unavailable telemetry is not a 0% hit rate."
             </p>
             <ConnectionIndicator status=status retry=retry/>
             <div class=styles::controls>
@@ -379,7 +385,7 @@ fn FleetMetrics(tab: RwSignal<Tab>) -> impl IntoView {
             <div class=styles::panels>
                 <For each=move || panels.get() key=|key| *key children=move |key| {
                     let panel = Memo::new(move |_| panel_data.with(|panels| panels.get(&key).cloned()));
-                    view! { <chart::MetricCard panel=panel step=step sampled_at=sampled_at/> }
+                    view! { <chart::MetricCard panel=panel step=step sampled_at=sampled_at window=window/> }
                 }/>
             </div>
         </section>
