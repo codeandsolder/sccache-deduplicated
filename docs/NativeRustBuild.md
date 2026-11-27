@@ -20,6 +20,7 @@ sccache run --bin my-program -- arg1 arg2
 sccache doc --no-deps
 sccache generate-lockfile
 sccache update
+sccache metadata --format-version 1
 sccache metadata --no-deps --format-version 1
 sccache fmt --workspace -- --check
 sccache clean
@@ -37,10 +38,16 @@ the development branch still uses the installed Rust build toolchain.
 * The resolver consumes existing v3/v4 lockfiles or resolves registry,
   path and Git dependencies. An unlocked manifest mismatch may trigger
   atomic lockfile replacement. New registry selections respect the
-  configured 72-hour release-age policy.
+  configured 72-hour release-age policy. Locked acquisition is concurrent
+  (`--source-jobs`, default 16), deduplicated per source identity, and advances
+  as individual dependencies become ready. Unlocked version backtracking
+  uses a mutation journal rather than cloning the graph.
 * The resolved host/target units, feature sets, build scripts, compilation,
   rustdoc, tests and publication form one readiness graph. Build-script
   directives are interpreted only after the producing action completes.
+  Dispatch restricts work to the requested prerequisite closure. Link-time
+  optimization requirements propagate backwards through consumers, so host
+  tooling and ordinary links do not unnecessarily produce LLVM bitcode.
 * Compiler actions use the existing managed compiler session. The local
   frontend does not choose distributed workers. The common dispatch
   runtime bounds outstanding requests, not the cluster's CPU capacity.
@@ -55,6 +62,11 @@ toolchain identities and the captured input closure. Compiler discovery,
 rlib dependency discovery, C/C++ include validation and compiler-helper
 discovery must not accept mtime or ctime as freshness evidence. Immutable
 fs-verity files can reuse a verified digest; mutable files are rehashed.
+Rust key schema 13 binds canonical source paths and extern aliases to their
+contents, and hashes actual installed host/target runtime files rather than
+trusting rustup installation manifests. Git checkouts use a canonical root
+covering all sibling crates. Mutable runtime trees incur repeated hashing
+until an immutable snapshot/lease mechanism can amortize it.
 
 Native compiler sandbox input timestamps are normalized. Metadata checks
 that detect a concurrent modification during capture are race guards, not
@@ -69,7 +81,25 @@ existing scheduler package CAS, via the build lease. Archives are staged
 privately, verified against the lockfile and extracted within that build's
 source staging directory. A pre-existing ecosystem source cache can be
 imported read-only; no second persistent package cache is created. Git
-sources use pinned isolated checkouts.
+sources use pinned isolated checkouts. The resolved metadata command emits
+separate host and target units and stable source-relative paths for leased
+external sources; it does not pretend ephemeral checkout paths remain valid
+once the lease ends.
+
+Alternate registries use the ecosystem index identifier and a named scheduler
+upstream with a relative archive template, for example:
+
+```toml
+[registries.internal]
+index = "sparse+https://registry.example/index/"
+sccache-upstream = "internal"
+sccache-archive-path = "crates/{crate}/{crate}-{version}.crate"
+# Optional existing absolute offline index directory:
+# sccache-index-cache = "/path/to/index"
+```
+
+Configure the corresponding upstream origin on the scheduler. The scheduler
+never accepts a requester-supplied arbitrary archive origin.
 
 This branch requires namespace protocol 9. The scheduler must enable
 original retention and a crates.io upstream:
@@ -102,9 +132,19 @@ source, dependency metadata, a procedural macro, integration-test binary
 publication and a same-length edit with its original mtime restored.
 It uses the already configured sccache for actual compiler requests.
 
-The branch is not yet a validated complete Cargo replacement. Full
-resolved metadata, alternate registries, broader workspace/platform/profile
-semantics, complete CLI compatibility, hermetic build-script result
-caching and coordinated protocol-9 integration require further work.
+The read-only offline planner inspector accepts a source-cache root and
+one or more manifest paths. It constructs and traverses the actual graph
+without executing project builds or changing their files:
+
+```sh
+cargo run --offline --locked -p sccache-rust-build --example inspect -- \
+    /path/to/import-cache /path/to/workspace/Cargo.toml
+```
+
+The branch is not yet a validated complete Cargo replacement. Broader
+workspace/platform/profile semantics, authenticated private registry
+integration, remaining CLI operations, hermetic build-script result caching,
+immutable toolchain snapshot amortization and coordinated protocol-9
+integration require further work.
 Build scripts, rustdoc and test execution are explicit local actions,
 not claimed to be independently cacheable arbitrary processes.
