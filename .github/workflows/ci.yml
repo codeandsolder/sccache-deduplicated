@@ -42,7 +42,7 @@ jobs:
           toolchain: "nightly-2026-11-23"
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@aeb7d43941a8c655e53a3094bf39268a25bff742 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
         with:
           rust-toolchain: ${{ steps.rust.outputs.name }}
 
@@ -55,7 +55,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@aeb7d43941a8c655e53a3094bf39268a25bff742 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
 
   check_features:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
@@ -76,7 +76,7 @@ jobs:
           toolchain: "nightly-2026-11-23"
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@aeb7d43941a8c655e53a3094bf39268a25bff742 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
         with:
           rust-toolchain: ${{ steps.rust.outputs.name }}
 
@@ -89,7 +89,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@aeb7d43941a8c655e53a3094bf39268a25bff742 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
 
 
   host_tools:
@@ -122,6 +122,7 @@ jobs:
           contrib/codeandsolder/test-native-cache-reuse --self-test
           sudo contrib/codeandsolder/fleet/test-activate-host
           shellcheck -x contrib/codeandsolder/runtime/{build-image,run,test-run,test-runtime}
+          shellcheck -x scripts/ci-{prepare-linux-tests,linux-test-shard,build-dist-tests,dist-test-shard}.sh
           contrib/codeandsolder/runtime/test-run
 
   toml_format:
@@ -170,7 +171,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@aeb7d43941a8c655e53a3094bf39268a25bff742 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
         with:
           rust-toolchain: ${{ steps.rust.outputs.name }}
 
@@ -279,75 +280,55 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@aeb7d43941a8c655e53a3094bf39268a25bff742 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
 
-  shared-sccache:
-    name: Linux tests (runner-local sccache)
-    # Single current-Rust Linux lane on every PR and main push.
+  linux-test-shards:
+    name: Linux tests (${{ matrix.shard }})
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@aeb7d43941a8c655e53a3094bf39268a25bff742 # main
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: core
+            suites: |
+              [
+                {"name":"default-unit","cargo":["--locked","--target","x86_64-unknown-linux-gnu","--lib","--bins"],"nextest":["--profile","ci-isolated"]},
+                {"name":"build-runtime","cargo":["--locked","--target","x86_64-unknown-linux-gnu","-p","sccache-build"],"nextest":["--profile","ci-isolated","--run-ignored","all","-E","not test(benchmark_native_zfs_clones_against_reuse) & not test(benchmark_native_zfs_clones_against_fuse_views) & not test(benchmark_cas_metadata_contention) & not test(benchmark_cas_group_commit) & not test(benchmark_cas_mixed_group_commit) & not test(benchmark_package_lookup_contention)"],"doctests":["--locked","--target","x86_64-unknown-linux-gnu","-p","sccache-build"]},
+                {"name":"cluster-identity","cargo":["--locked","--target","x86_64-unknown-linux-gnu","-p","sccache-cluster-identity"],"nextest":["--profile","ci-isolated"],"doctests":["--locked","-p","sccache-cluster-identity"]},
+                {"name":"cpu-target-profile","directory":"tools/cpu-target-profile","cargo":["--locked"],"doctests":["--locked"]}
+              ]
+          - shard: native
+            suites: |
+              [
+                {"name":"scheduler-worker","cargo":["--locked","--target","x86_64-unknown-linux-gnu","--no-default-features","--features=dist-server","--bin","sccache-dist"],"nextest":["--profile","ci-isolated"]},
+                {"name":"native-http-server","continuous":true,"cargo":["--locked","--target","x86_64-unknown-linux-gnu","--no-default-features","--features=dist-client,dist-server","--lib"],"nextest":["--profile","ci-isolated","-E","test(dist::http::server::)"]},
+                {"name":"native-dist","continuous":true,"cargo":["--locked","--target","x86_64-unknown-linux-gnu","--no-default-features","--features=dist-client,dist-server","--test","native_dist"],"nextest":["--profile","ci-isolated","--run-ignored","all","-E","not test(=shared_daemon_credential_isolation)"]}
+              ]
+          - shard: legacy
+            suites: ''
+          - shard: dashboard
+            suites: ''
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@9c14ef2d72423958c56944febc620ec50f01d65a # main
     with:
       isolate-public-sccache-server: true
-      # Bubblewrap 0.11+ supplies private writable overlay mounts.
       runner: ubuntu-26.04
-      prepare-command: |
-        sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends gcc clang bubblewrap ripgrep fuse3
-        # Canonical Rust integration tests execute the bundled compiler through
-        # bwrap, just like the managed Linux hosts.
-        command -v bwrap
-        [[ "$(bwrap --help)" == *--overlay-src* ]]
-        # This disposable test VM must permit nested mount namespaces: the
-        # networkless caller creates its own overlay for Rust's local link.
-        # Ubuntu 26.04's bwrap-userns-restrict profile denies nested namespace
-        # creation independently of the global unprivileged-userns sysctl.
-        # Do not change this policy on managed production hosts.
-        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-        profile=/etc/apparmor.d/bwrap-userns-restrict
-        if [ -f "$profile" ]; then
-          sudo apparmor_parser -R "$profile"
-        fi
-        bwrap --unshare-net --ro-bind / / --proc /proc --dev-bind /dev /dev -- \
-          bwrap --ro-bind / / --dev-bind /dev /dev -- /usr/bin/true
-      command: |
-        # Compile with the canonical CI sccache daemon on its isolated Unix socket.
-        # Run test executables without that socket variable: the sccache system
-        # tests must manage their own independent test daemon.
-        test_runner="$RUNNER_TEMP/sccache-test-runner"
-        printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'unset SCCACHE_SERVER_UDS SCCACHE_SERVER_PORT' 'exec "$@"' > "$test_runner"
-        chmod +x "$test_runner"
-        export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
-        # Default integration binaries share a legacy daemon; cargo test
-        # preserves their serial_test execution semantics.
-        cargo test --locked --target x86_64-unknown-linux-gnu --test '*'
-        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --test native_dist -- --ignored --exact shared_daemon_credential_isolation
-        cargo test --locked --target x86_64-unknown-linux-gnu -p sccache-dashboard --features ssr
-        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=scheduler-dashboard --bin sccache-dist scheduler_status
-        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=scheduler-dashboard --bin sccache-dist status_counts_assignment_rpc_reservations
-        rustup target add wasm32-unknown-unknown
-        env -u RUSTFLAGS cargo check --locked -p sccache-dashboard --no-default-features --features hydrate --target wasm32-unknown-unknown
-        source contrib/codeandsolder/release-protocol.env
-        rustup toolchain install "$rust_toolchain" --profile minimal --target wasm32-unknown-unknown
-        target_dir="$(cargo metadata --locked --no-deps --format-version 1 | jq -r .target_directory)"
-        scripts/install-scheduler-dashboard-tools.sh "$target_dir/dashboard-tools"
-        env -u RUSTFLAGS scripts/build-scheduler-dashboard.sh "$target_dir/dashboard-tools/wasm-bindgen" "$target_dir/dashboard-tools/stylance"
-        cargo build --locked --target x86_64-unknown-linux-gnu --no-default-features --features=scheduler-dashboard --bin sccache-dist
-        cargo build --locked --target x86_64-unknown-linux-gnu -p sccache-dashboard --features ssr --example browser-fixture
-        scripts/test-scheduler-dashboard-package.sh "$target_dir/x86_64-unknown-linux-gnu/debug/sccache-dist" "$target_dir/scheduler-dashboard/pkg"
-        scripts/test-scheduler-dashboard-browser.sh "$target_dir/x86_64-unknown-linux-gnu/debug/sccache-dist" "$target_dir/scheduler-dashboard/pkg" "$target_dir/x86_64-unknown-linux-gnu/debug/examples/browser-fixture"
-      test-suites: |
-        [
-          {"name":"default-unit","cargo":["--locked","--target","x86_64-unknown-linux-gnu","--lib","--bins"],"nextest":["--profile","ci-isolated"]},
-          {"name":"build-runtime","cargo":["--locked","--target","x86_64-unknown-linux-gnu","-p","sccache-build"],"nextest":["--profile","ci-isolated","--run-ignored","all","-E","not test(benchmark_native_zfs_clones_against_reuse) & not test(benchmark_native_zfs_clones_against_fuse_views) & not test(benchmark_cas_metadata_contention) & not test(benchmark_cas_group_commit) & not test(benchmark_cas_mixed_group_commit) & not test(benchmark_package_lookup_contention)"],"doctests":["--locked","--target","x86_64-unknown-linux-gnu","-p","sccache-build"]},
-          {"name":"cluster-identity","cargo":["--locked","--target","x86_64-unknown-linux-gnu","-p","sccache-cluster-identity"],"nextest":["--profile","ci-isolated"],"doctests":["--locked","-p","sccache-cluster-identity"]},
-          {"name":"scheduler-worker","cargo":["--locked","--target","x86_64-unknown-linux-gnu","--no-default-features","--features=dist-server","--bin","sccache-dist"],"nextest":["--profile","ci-isolated"]},
-          {"name":"native-http-server","continuous":true,"cargo":["--locked","--target","x86_64-unknown-linux-gnu","--no-default-features","--features=dist-client,dist-server","--lib"],"nextest":["--profile","ci-isolated","-E","test(dist::http::server::)"]},
-          {"name":"native-dist","continuous":true,"cargo":["--locked","--target","x86_64-unknown-linux-gnu","--no-default-features","--features=dist-client,dist-server","--test","native_dist"],"nextest":["--profile","ci-isolated","--run-ignored","all","-E","not test(=shared_daemon_credential_isolation)"]},
-          {"name":"cpu-target-profile","directory":"tools/cpu-target-profile","cargo":["--locked"],"doctests":["--locked"]}
-        ]
+      prepare-command: bash scripts/ci-prepare-linux-tests.sh
+      command: bash scripts/ci-linux-test-shard.sh '${{ matrix.shard }}'
+      test-suites: ${{ matrix.suites }}
+      sccache-cache-scope: sccache-linux-${{ matrix.shard }}
       rust-toolchain: "nightly-2026-11-23"
       rustflags: "-C target-cpu=x86-64-v2"
+
+  shared-sccache:
+    # Preserve the protected check identity. Every shard must succeed.
+    name: Linux tests (runner-local sccache) / rust
+    runs-on: ubuntu-latest
+    needs: [linux-test-shards]
+    if: ${{ always() }}
+    steps:
+      - name: Require all Linux test shards
+        run: test '${{ needs.linux-test-shards.result }}' = success
 
   windows-rust-response-files:
     name: Windows Rust response-file regression
@@ -365,17 +346,21 @@ jobs:
         with:
           toolchain: "nightly-2026-11-20"
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@aeb7d43941a8c655e53a3094bf39268a25bff742 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
         with:
           rust-toolchain: ${{ steps.rust.outputs.name }}
       - name: Verify long Rust compiler arguments with actual rustc
         run: cargo +${{ steps.rust.outputs.name }} test --locked --no-default-features --test sccache_cargo test_rust_response_file_long_command -- --test-threads 1
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@aeb7d43941a8c655e53a3094bf39268a25bff742 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
 
-  ci-bundle-release-profile:
-    name: CI bundle release profile (publisher toolchain)
+  ci-bundle-release-shards:
+    name: CI bundle release profile (${{ matrix.profile }})
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [base, dashboard]
     # Validate the actual deployment compiler on every PR, independently of
     # the newer routine compiler. The release protocol remains authoritative.
     permissions:
@@ -396,7 +381,7 @@ jobs:
           printf 'channel=%s\n' "$rust_toolchain" >> "$GITHUB_OUTPUT"
       - name: Verify publisher compiler quarantine
         id: compiler
-        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@aeb7d43941a8c655e53a3094bf39268a25bff742 # main
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@9c14ef2d72423958c56944febc620ec50f01d65a # main
         with:
           validation-tier: release
           rust-toolchain: ${{ steps.publisher.outputs.channel }}
@@ -404,15 +389,19 @@ jobs:
         shell: bash
         run: rustup toolchain install ${{ steps.compiler.outputs.channel }} --profile minimal
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@aeb7d43941a8c655e53a3094bf39268a25bff742 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
         with:
           rust-toolchain: ${{ steps.compiler.outputs.channel }}
+          cache-scope: sccache-release-${{ matrix.profile }}
+      - name: Install release verification dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends binutils ripgrep
       - name: Link and verify exact release feature profile
+        if: matrix.profile == 'base'
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends binutils ripgrep
           env -u RUSTC -u RUSTDOC cargo +${{ steps.compiler.outputs.channel }} build --release --locked --no-default-features \
             --features s3,gha,dist-client,dist-server,direct-metrics \
             --bin sccache --bin sccache-dist --message-format=json > "$RUNNER_TEMP/release-binaries.jsonl"
@@ -420,6 +409,7 @@ jobs:
           [[ ${#binaries[@]} == 2 ]]
           bash contrib/codeandsolder/verify-release-native-abi.sh "${binaries[@]}"
       - name: Verify normalized scheduler dependency graph
+        if: matrix.profile == 'dashboard'
         shell: bash
         run: |
           set -euo pipefail
@@ -447,6 +437,7 @@ jobs:
             --edges features -i btls-sys)"
           rg -q 'btls-sys feature "static-cxx-runtime"' <<<"$features"
       - name: Link and verify exact scheduler release feature profile
+        if: matrix.profile == 'dashboard'
         shell: bash
         run: |
           set -euo pipefail
@@ -459,7 +450,16 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@aeb7d43941a8c655e53a3094bf39268a25bff742 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
+
+  ci-bundle-release-profile:
+    name: CI bundle release profile (publisher toolchain)
+    runs-on: ubuntu-latest
+    needs: [ci-bundle-release-shards]
+    if: ${{ always() }}
+    steps:
+      - name: Require both linked release profiles
+        run: test '${{ needs.ci-bundle-release-shards.result }}' = success
 
   build:
     name: build ${{ matrix.binary || 'sccache' }} ${{ matrix.target }}
@@ -482,7 +482,7 @@ jobs:
           target: ${{ matrix.target != 's390x-unknown-linux-musl' && matrix.target || '' }}
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@aeb7d43941a8c655e53a3094bf39268a25bff742 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
         with:
           rust-toolchain: ${{ steps.rust.outputs.name }}
 
@@ -524,7 +524,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@aeb7d43941a8c655e53a3094bf39268a25bff742 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
 
       # Workaround for the lack of substring() function in github actions expressions.
       - name: Id

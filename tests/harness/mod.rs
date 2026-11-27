@@ -205,9 +205,31 @@ pub fn prune_command(mut cmd: Command) -> Command {
     cmd
 }
 
+// A packaged integration-test executable and its subject binaries are
+// relocatable together. Normal Cargo invocations use Cargo's exact paths.
+fn test_binary_path(cargo_path: &str) -> PathBuf {
+    let path = Path::new(cargo_path);
+    env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            let directory = exe.parent()?;
+            let name = path.file_name()?;
+            directory
+                .join("sccache-test-bundle.sha")
+                .is_file()
+                .then(|| directory.join(name))
+        })
+        .unwrap_or_else(|| path.to_owned())
+}
+
+#[must_use = "the returned path identifies the test client"]
+pub fn sccache_path() -> PathBuf {
+    test_binary_path(env!("CARGO_BIN_EXE_sccache"))
+}
+
 #[must_use = "the returned command must be executed to invoke the test client"]
 pub fn sccache_command() -> Command {
-    prune_command(Command::new(env!("CARGO_BIN_EXE_sccache")))
+    prune_command(Command::new(sccache_path()))
 }
 
 #[must_use = "the returned command must be executed to invoke Cargo"]
@@ -217,7 +239,7 @@ pub fn cargo_command() -> Command {
 
 #[cfg(feature = "dist-server")]
 pub fn sccache_dist_path() -> PathBuf {
-    env!("CARGO_BIN_EXE_sccache-dist").into()
+    test_binary_path(env!("CARGO_BIN_EXE_sccache-dist"))
 }
 
 #[must_use = "the returned configuration must be used to configure the test client"]

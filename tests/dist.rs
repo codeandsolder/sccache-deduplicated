@@ -116,9 +116,9 @@ fn basic_compile(tmpdir: &Path, sccache_cfg_path: &Path, sccache_cached_cfg_path
 }
 
 fn rust_compile(tmpdir: &Path, sccache_cfg_path: &Path, sccache_cached_cfg_path: &Path) -> Output {
-    let sccache_path = env!("CARGO_BIN_EXE_sccache");
+    let sccache_path = harness::sccache_path();
     let envs: Vec<(_, &OsStr)> = vec![
-        ("RUSTC_WRAPPER", sccache_path.as_ref()),
+        ("RUSTC_WRAPPER", sccache_path.as_os_str()),
         ("CARGO_TARGET_DIR", "target".as_ref()),
         ("RUST_BACKTRACE", "1".as_ref()),
         ("SCCACHE_LOG", "debug".as_ref()),
@@ -547,7 +547,7 @@ cmp initial.rmeta libprobe.rmeta
         .arg("--chdir")
         .arg(&visible)
         .args(["--", "/bin/sh", "-c", script, "namespace-test"])
-        .arg(env!("CARGO_BIN_EXE_sccache"))
+        .arg(harness::sccache_path())
         .arg(gcc)
         .arg(rustc)
         .env("SCCACHE_CLIENT_SIDE", "1")
@@ -1037,7 +1037,7 @@ fn main() {
     cargo_command()
         .current_dir(&project)
         .args(["run", "--quiet"])
-        .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_sccache"))
+        .env("RUSTC_WRAPPER", harness::sccache_path())
         .env("SCCACHE_CONF", &cfg_path)
         .env("SCCACHE_CACHED_CONF", &cached_cfg)
         .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
@@ -1700,7 +1700,7 @@ fn rust_cargo_split_root_proc_macro(fixture: &RustDistFixture) -> Result<()> {
             .arg(format!("build.build-dir='{}'", intermediate.display()))
             .arg("--target-dir")
             .arg(&target)
-            .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_sccache"))
+            .env("RUSTC_WRAPPER", harness::sccache_path())
             .env("SCCACHE_CONF", cfg_path)
             .env("SCCACHE_CACHED_CONF", cached_cfg)
             .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
@@ -1720,35 +1720,65 @@ fn rust_cargo_split_root_proc_macro(fixture: &RustDistFixture) -> Result<()> {
     Ok(())
 }
 
-// Each case is named in the log so CI timings remain attributable even
-// though the expensive worker/toolchain setup is shared.
+// Keep compatible cases together within a shard, retaining the extracted
+// toolchain, but run independent groups on different CI VMs. Each group owns
+// its worker and client cache; the legacy daemon is serial within each VM.
+#[cfg(unix)]
+type WarmRegression = (&'static str, fn(&RustDistFixture) -> Result<()>);
+
+#[cfg(unix)]
+fn run_warm_regressions(cases: &[WarmRegression]) -> Result<()> {
+    let fixture = RustDistFixture::new(&[])?;
+    for (name, case) in cases {
+        let start = std::time::Instant::now();
+        let result = case(&fixture).with_context(|| format!("distributed regression: {name}"));
+        eprintln!("{name}: {:.2?}", start.elapsed());
+        result?;
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_rust_warm_cargo() -> Result<()> {
+    run_warm_regressions(&[(
+        "cargo split-root proc macro",
+        rust_cargo_split_root_proc_macro,
+    )])
+}
+
 #[test]
 #[cfg(unix)]
 #[cfg_attr(not(feature = "dist-tests"), ignore)]
-fn test_dist_rust_warm_regressions() -> Result<()> {
-    let fixture = RustDistFixture::new(&[])?;
-    fn timed(name: &str, case: impl FnOnce() -> Result<()>) -> Result<()> {
-        let start = std::time::Instant::now();
-        let result = case().with_context(|| format!("distributed regression: {name}"));
-        eprintln!("{name}: {:.2?}", start.elapsed());
-        result
-    }
-    #[cfg(target_os = "linux")]
-    timed("cargo split-root proc macro", || {
-        rust_cargo_split_root_proc_macro(&fixture)
-    })?;
-    timed("Clippy observed paths", || {
-        rust_clippy_observed_paths(&fixture)
-    })?;
-    for (name, relative) in [
-        ("dependency chain absolute", None),
-        ("dependency chain relative nested", Some("out")),
-        ("dependency chain relative sibling", Some("../target")),
-    ] {
-        timed(name, || dist_rust_dependency_chain(&fixture, relative))?;
-    }
-    timed("metadata outputs", || rust_metadata_outputs(&fixture))?;
-    #[cfg(target_os = "linux")]
-    timed("Windows GNU dlltool", || rust_windows_gnu_dlltool(&fixture))?;
-    Ok(())
+fn test_dist_rust_warm_clippy() -> Result<()> {
+    run_warm_regressions(&[("Clippy observed paths", rust_clippy_observed_paths)])
+}
+
+#[test]
+#[cfg(unix)]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_rust_warm_dependencies() -> Result<()> {
+    run_warm_regressions(&[
+        ("dependency chain absolute", |fixture| {
+            dist_rust_dependency_chain(fixture, None)
+        }),
+        ("dependency chain relative nested", |fixture| {
+            dist_rust_dependency_chain(fixture, Some("out"))
+        }),
+        ("dependency chain relative sibling", |fixture| {
+            dist_rust_dependency_chain(fixture, Some("../target"))
+        }),
+    ])
+}
+
+#[test]
+#[cfg(unix)]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_rust_warm_metadata() -> Result<()> {
+    run_warm_regressions(&[
+        ("metadata outputs", rust_metadata_outputs),
+        #[cfg(target_os = "linux")]
+        ("Windows GNU dlltool", rust_windows_gnu_dlltool),
+    ])
 }
