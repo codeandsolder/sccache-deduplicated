@@ -1,4 +1,4 @@
-use crate::{Dependency, DependencyKind, Manifest, Platform, Sources, TargetKind};
+use crate::{DependencyKind, Manifest, Platform, Sources, TargetKind};
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::{

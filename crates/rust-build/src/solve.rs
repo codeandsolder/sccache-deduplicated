@@ -151,11 +151,6 @@ fn rust_version(value: &str) -> Option<Version> {
         .ok()
 }
 
-fn same_class(a: &Version, b: &Version) -> bool {
-    a.major == b.major
-        && (a.major != 0 || (a.minor == b.minor && (a.minor != 0 || a.patch == b.patch)))
-}
-
 #[derive(Clone)]
 struct Chosen {
     candidate: Arc<Candidate>,
@@ -171,13 +166,89 @@ struct Need {
     features: BTreeSet<String>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CompatibilityClass {
+    name: String,
+    source: String,
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+fn compatibility_class(candidate: &Candidate) -> Option<CompatibilityClass> {
+    let source = candidate.lock.source.clone()?;
+    let v = &candidate.lock.version;
+    Some(CompatibilityClass {
+        name: candidate.lock.name.clone(),
+        source,
+        major: v.major,
+        minor: if v.major == 0 { v.minor } else { 0 },
+        patch: if v.major == 0 && v.minor == 0 {
+            v.patch
+        } else {
+            0
+        },
+    })
+}
+
+enum Undo {
+    RestoreChoice(String, Option<Chosen>),
+    RemoveClass(CompatibilityClass),
+    RemoveLinks(String),
+    RestoreEdge(String, usize, Option<String>),
+    RestoreNeed(Need),
+    RemoveNeeds(usize),
+}
+
+#[derive(Default)]
 struct State {
     chosen: BTreeMap<String, Chosen>,
     needs: VecDeque<Need>,
+    classes: BTreeMap<CompatibilityClass, String>,
+    links: BTreeMap<String, String>,
+    undo: Vec<Undo>,
 }
 
 impl State {
+    fn checkpoint(&self) -> usize {
+        self.undo.len()
+    }
+
+    fn pop_need(&mut self) -> Option<Need> {
+        let need = self.needs.pop_front()?;
+        self.undo.push(Undo::RestoreNeed(need.clone()));
+        Some(need)
+    }
+
+    fn rollback(&mut self, checkpoint: usize) {
+        while self.undo.len() > checkpoint {
+            match self.undo.pop().expect("undo entry") {
+                Undo::RestoreChoice(id, Some(choice)) => {
+                    self.chosen.insert(id, choice);
+                }
+                Undo::RestoreChoice(id, None) => {
+                    self.chosen.remove(&id);
+                }
+                Undo::RemoveClass(key) => {
+                    self.classes.remove(&key);
+                }
+                Undo::RemoveLinks(name) => {
+                    self.links.remove(&name);
+                }
+                Undo::RestoreEdge(id, index, previous) => {
+                    let edges = &mut self.chosen.get_mut(&id).expect("parent choice").edges;
+                    if let Some(previous) = previous {
+                        edges.insert(index, previous);
+                    } else {
+                        edges.remove(&index);
+                    }
+                }
+                Undo::RestoreNeed(need) => self.needs.push_front(need),
+                Undo::RemoveNeeds(count) => self.needs.truncate(self.needs.len() - count),
+            }
+        }
+    }
+
     fn activate(
         &mut self,
         candidate: Arc<Candidate>,
@@ -186,19 +257,41 @@ impl State {
     ) -> Result<String> {
         let id = identity(&candidate.lock);
         let fresh = !self.chosen.contains_key(&id);
-        let chosen = self.chosen.entry(id.clone()).or_insert_with(|| Chosen {
-            candidate,
+        let mut chosen = self.chosen.get(&id).cloned().unwrap_or_else(|| Chosen {
+            candidate: Arc::clone(&candidate),
             requested: BTreeSet::new(),
-            root,
+            root: false,
             edges: BTreeMap::new(),
         });
+        ensure!(
+            chosen.candidate.manifest.root == candidate.manifest.root
+                && chosen.candidate.lock.checksum == candidate.lock.checksum,
+            "different source contents share lock identity {id}"
+        );
+        let class = compatibility_class(&candidate);
+        if let Some(class) = &class
+            && let Some(previous) = self.classes.get(class)
+        {
+            ensure!(
+                previous == &id,
+                "semver-compatible versions {previous} and {id} conflict"
+            );
+        }
+        if let Some(links) = &candidate.manifest.package.links
+            && let Some(previous) = self.links.get(links)
+        {
+            ensure!(previous == &id, "native links conflict: {links}");
+        }
         let old_len = chosen.requested.len();
         let was_root = chosen.root;
         chosen.root |= root;
         chosen.requested.extend(requested);
         if fresh || old_len != chosen.requested.len() || was_root != chosen.root {
+            // Validate and prepare before mutating anything. A failed candidate
+            // is therefore cheap and cannot leave a partial activation behind.
             let manifest = &chosen.candidate.manifest;
             let features = feature_request(manifest, &chosen.requested)?;
+            let mut needs = Vec::new();
             for (index, dep) in manifest.dependencies.iter().enumerate() {
                 if dep.kind == DependencyKind::Dev && !chosen.root {
                     continue;
@@ -210,12 +303,26 @@ impl State {
                 if let Some(forwards) = features.forwards.get(&dep.alias) {
                     requested.extend(forwards.iter().cloned());
                 }
-                self.needs.push_back(Need {
+                needs.push(Need {
                     parent: id.clone(),
                     index,
                     features: requested,
                 });
             }
+            if fresh {
+                if let Some(class) = class {
+                    self.classes.insert(class.clone(), id.clone());
+                    self.undo.push(Undo::RemoveClass(class));
+                }
+                if let Some(links) = &candidate.manifest.package.links {
+                    self.links.insert(links.clone(), id.clone());
+                    self.undo.push(Undo::RemoveLinks(links.clone()));
+                }
+            }
+            let previous = self.chosen.insert(id.clone(), chosen);
+            self.undo.push(Undo::RestoreChoice(id.clone(), previous));
+            self.undo.push(Undo::RemoveNeeds(needs.len()));
+            self.needs.extend(needs);
         }
         Ok(id)
     }
@@ -227,34 +334,19 @@ impl State {
         if let Some(existing) = parent.edges.get(&need.index) {
             ensure!(existing == &id, "dependency edge already selected");
         }
-        for (other_id, other) in &self.chosen {
-            if other_id == &id {
-                continue;
-            }
-            let a = &candidate.lock;
-            let b = &other.candidate.lock;
-            ensure!(
-                a.name != b.name || a.source != b.source || !same_class(&a.version, &b.version),
-                "semver-compatible versions {} {} and {} conflict",
-                a.name,
-                a.version,
-                b.version
-            );
-            if let Some(links) = &candidate.manifest.package.links {
-                ensure!(
-                    other.candidate.manifest.package.links.as_ref() != Some(links),
-                    "native links conflict: {links}"
-                );
-            }
-        }
         let mut requested = need.features.clone();
         default_feature(&candidate.manifest, dep.default_features, &mut requested);
         let id = self.activate(candidate, requested, false)?;
-        self.chosen
+        let previous = self
+            .chosen
             .get_mut(&need.parent)
-            .context("missing parent")?
+            .expect("active parent")
             .edges
-            .insert(need.index, id);
+            .insert(need.index, id.clone());
+        if previous.as_ref() != Some(&id) {
+            self.undo
+                .push(Undo::RestoreEdge(need.parent.clone(), need.index, previous));
+        }
         Ok(())
     }
 
@@ -394,14 +486,27 @@ impl Search<'_, '_> {
         let mut result = Vec::new();
         if let Some(bytes) = bytes {
             for record in records(&bytes)? {
-                if !record.name.eq_ignore_ascii_case(name) || record.v > 2 || record.yanked {
+                if !record.name.eq_ignore_ascii_case(name) || record.v > 2 {
                     continue;
                 }
-                if !record
-                    .pubtime
-                    .as_deref()
-                    .and_then(|v| v.parse::<DateTime<Utc>>().ok())
-                    .is_some_and(|time| time <= self.cutoff)
+                let pinned = self.sources.lock().packages.iter().find(|p| {
+                    p.name == record.name
+                        && p.version == record.vers
+                        && p.source.as_deref() == Some(registry.source.as_str())
+                });
+                if let Some(pinned) = pinned {
+                    ensure!(
+                        pinned.checksum.as_deref() == Some(record.cksum.as_str()),
+                        "registry changed checksum for previously locked {} {}",
+                        record.name,
+                        record.vers
+                    );
+                } else if record.yanked
+                    || !record
+                        .pubtime
+                        .as_deref()
+                        .and_then(|v| v.parse::<DateTime<Utc>>().ok())
+                        .is_some_and(|time| time <= self.cutoff)
                 {
                     continue;
                 }
@@ -536,47 +641,50 @@ impl Search<'_, '_> {
             all_features(&candidate.manifest, &mut requested);
             state.activate(candidate, requested, true)?;
         }
-        // Keep alternatives only at genuine decision points. Failed feature
-        // constraints, native links conflicts and semver conflicts all unwind
-        // to an earlier choice; no recursion proportional to graph depth.
-        let mut alternatives = Vec::<(State, Need, std::vec::IntoIter<Arc<Candidate>>)>::new();
-        let mut failure;
+        // A decision stores only a journal position and unexplored versions.
+        // Failed branches undo their own mutations, not a clone of the graph.
+        let mut alternatives = Vec::<(usize, Need, std::vec::IntoIter<Arc<Candidate>>)>::new();
+        let mut failure = String::new();
         loop {
-            let Some(need) = state.needs.pop_front() else {
+            if alternatives.is_empty() {
+                state.undo.clear();
+            }
+            let Some(mut need) = state.pop_need() else {
                 return Ok(state.lock());
             };
-            let candidates = self.candidates(&state, &need)?;
-            let mut valid = candidates.into_iter().filter_map(|candidate| {
-                let mut next = state.clone();
-                next.choose(&need, Arc::clone(&candidate))
-                    .ok()
-                    .map(|()| candidate)
-            });
-            if let Some(first) = valid.next() {
-                let rest = valid.collect::<Vec<_>>();
-                if !rest.is_empty() {
-                    alternatives.push((state.clone(), need.clone(), rest.into_iter()));
-                }
-                state.choose(&need, first)?;
-                continue;
-            }
-            let dep = &state.chosen[&need.parent].candidate.manifest.dependencies[need.index];
-            failure = format!(
-                "{} requires {} {} with features {:?}",
-                need.parent, dep.name, dep.requirement, need.features
-            );
+            let mut candidates = self.candidates(&state, &need)?.into_iter();
             loop {
-                let Some((mut previous, need, mut rest)) = alternatives.pop() else {
-                    bail!("no version solution: {failure}");
-                };
-                if let Some(next) = rest.next() {
-                    if rest.len() > 0 {
-                        alternatives.push((previous.clone(), need.clone(), rest));
+                let checkpoint = state.checkpoint();
+                let mut selected = false;
+                for candidate in candidates.by_ref() {
+                    match state.choose(&need, candidate) {
+                        Ok(()) => {
+                            selected = true;
+                            break;
+                        }
+                        Err(error) => {
+                            failure = format!("{error:#}");
+                            state.rollback(checkpoint);
+                        }
                     }
-                    previous.choose(&need, next)?;
-                    state = previous;
+                }
+                if selected {
+                    if candidates.len() > 0 {
+                        alternatives.push((checkpoint, need, candidates));
+                    }
                     break;
                 }
+                let dep = &state.chosen[&need.parent].candidate.manifest.dependencies[need.index];
+                let requirement = format!(
+                    "{} requires {} {} with features {:?}",
+                    need.parent, dep.name, dep.requirement, need.features
+                );
+                let Some((checkpoint, previous, remaining)) = alternatives.pop() else {
+                    bail!("no version solution: {requirement}; {failure}");
+                };
+                state.rollback(checkpoint);
+                need = previous;
+                candidates = remaining;
             }
         }
     }
