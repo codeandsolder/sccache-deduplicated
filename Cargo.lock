@@ -407,7 +407,7 @@ dependencies = [
 [[package]]
 name = "btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=a4b12ba7391e03470626504fad60d887be790cfb#a4b12ba7391e03470626504fad60d887be790cfb"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=53c46285a85742dc8c3ab48fbb66613da6b4a297#53c46285a85742dc8c3ab48fbb66613da6b4a297"
 dependencies = [
  "bitflags",
  "btls-sys",
@@ -419,10 +419,11 @@ dependencies = [
 [[package]]
 name = "btls-sys"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=a4b12ba7391e03470626504fad60d887be790cfb#a4b12ba7391e03470626504fad60d887be790cfb"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=53c46285a85742dc8c3ab48fbb66613da6b4a297#53c46285a85742dc8c3ab48fbb66613da6b4a297"
 dependencies = [
  "bindgen",
  "cmake",
+ "serde_json",
 ]
 
 [[package]]
@@ -2243,7 +2244,7 @@ dependencies = [
 [[package]]
 name = "jsonwebtoken-btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=a4b12ba7391e03470626504fad60d887be790cfb#a4b12ba7391e03470626504fad60d887be790cfb"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=53c46285a85742dc8c3ab48fbb66613da6b4a297#53c46285a85742dc8c3ab48fbb66613da6b4a297"
 dependencies = [
  "btls",
  "jsonwebtoken",
@@ -2582,13 +2583,13 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 [[package]]
 name = "lurkmoar"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/lurkmoar-rs?rev=0c49fad815ce76bbd63f0e8b79270db30968e289#0c49fad815ce76bbd63f0e8b79270db30968e289"
+source = "git+https://github.com/codeandsolder/lurkmoar-rs?rev=a97f149e673c45c795a8176667f379c1bf215327#a97f149e673c45c795a8176667f379c1bf215327"
 dependencies = [
  "bytes",
  "flate2",
  "tokio",
  "tracing",
- "wreq 0.16.1 (git+https://github.com/codeandsolder/wreq-exp.git?rev=a8385c80ba6a5b035067d3a2e472d37df591faf0)",
+ "wreq",
 ]
 
 [[package]]
@@ -3908,7 +3909,7 @@ dependencies = [
 [[package]]
 name = "reqsign-azure-storage"
 version = "3.3.1"
-source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=47f82a7fc98c591a16a803de9eeeaa527c2779cb#47f82a7fc98c591a16a803de9eeeaa527c2779cb"
+source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=8480e6c3e8fe8b965a8acd7bcb53741079149006#8480e6c3e8fe8b965a8acd7bcb53741079149006"
 dependencies = [
  "anyhow",
  "asyncband 0.8.0",
@@ -3929,7 +3930,7 @@ dependencies = [
 [[package]]
 name = "reqsign-core"
 version = "3.3.3"
-source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=47f82a7fc98c591a16a803de9eeeaa527c2779cb#47f82a7fc98c591a16a803de9eeeaa527c2779cb"
+source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=8480e6c3e8fe8b965a8acd7bcb53741079149006#8480e6c3e8fe8b965a8acd7bcb53741079149006"
 dependencies = [
  "anyhow",
  "asyncband 0.8.0",
@@ -3964,7 +3965,7 @@ dependencies = [
 [[package]]
 name = "reqsign-google"
 version = "3.3.0"
-source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=47f82a7fc98c591a16a803de9eeeaa527c2779cb#47f82a7fc98c591a16a803de9eeeaa527c2779cb"
+source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=8480e6c3e8fe8b965a8acd7bcb53741079149006#8480e6c3e8fe8b965a8acd7bcb53741079149006"
 dependencies = [
  "bytes",
  "form_urlencoded",
@@ -4277,7 +4278,7 @@ dependencies = [
  "walkdir",
  "which",
  "windows-sys 0.61.2",
- "wreq 0.16.1 (git+https://github.com/codeandsolder/wreq-exp.git?rev=16a946b3a9170d6cac4233ef3d1779d0f2fff743)",
+ "wreq",
  "zip",
  "zlib-rs",
  "zstd",
@@ -4332,7 +4333,7 @@ dependencies = [
  "tokio-btls",
  "tower",
  "url",
- "wreq 0.16.1 (git+https://github.com/codeandsolder/wreq-exp.git?rev=16a946b3a9170d6cac4233ef3d1779d0f2fff743)",
+ "wreq",
 ]
 
 [[package]]
@@ -4362,7 +4363,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "web-sys",
- "wreq 0.16.1 (git+https://github.com/codeandsolder/wreq-exp.git?rev=16a946b3a9170d6cac4233ef3d1779d0f2fff743)",
+ "wreq",
 ]
 
 [[package]]
@@ -5279,7 +5280,7 @@ dependencies = [
 [[package]]
 name = "tokio-btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=a4b12ba7391e03470626504fad60d887be790cfb#a4b12ba7391e03470626504fad60d887be790cfb"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=53c46285a85742dc8c3ab48fbb66613da6b4a297#53c46285a85742dc8c3ab48fbb66613da6b4a297"
 dependencies = [
  "btls",
  "btls-sys",
@@ -6043,7 +6044,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "wreq"
 version = "0.16.1"
-source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=16a946b3a9170d6cac4233ef3d1779d0f2fff743#16a946b3a9170d6cac4233ef3d1779d0f2fff743"
+source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=7c0668c3b3e137f233c0aaee132028ab39572dbd#7c0668c3b3e137f233c0aaee132028ab39572dbd"
 dependencies = [
  "base64 0.23.1",
  "btls",
@@ -6071,37 +6072,6 @@ dependencies = [
  "tokio",
  "tokio-btls",
  "tokio-util",
- "tower",
- "url",
- "webpki-root-certs",
- "windows-registry",
-]
-
-[[package]]
-name = "wreq"
-version = "0.16.1"
-source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=a8385c80ba6a5b035067d3a2e472d37df591faf0#a8385c80ba6a5b035067d3a2e472d37df591faf0"
-dependencies = [
- "base64 0.23.1",
- "btls",
- "btls-sys",
- "bytes",
- "futures-util",
- "http",
- "http-body",
- "http-body-util",
- "httparse",
- "ipnet",
- "libc",
- "lru",
- "netty",
- "percent-encoding",
- "pin-project-lite",
- "rustls-native-certs",
- "socket2",
- "system-configuration",
- "tokio",
- "tokio-btls",
  "tower",
  "url",
  "webpki-root-certs",
