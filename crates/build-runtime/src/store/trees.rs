@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io::{Read, Seek},
     sync::{Arc, Condvar, Mutex, PoisonError, Weak},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -24,6 +24,7 @@ pub(super) struct TreeFlights(Mutex<BTreeMap<TreeId, Weak<TreeFlight>>>);
 struct TreeFlight {
     state: Mutex<FlightState>,
     wake: Condvar,
+    async_wake: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -34,9 +35,9 @@ enum FlightState {
     Ready(Arc<TreeLease>),
 }
 
-struct FlightOwner<'a>(&'a TreeFlight);
+struct FlightOwner(Arc<TreeFlight>);
 
-impl Drop for FlightOwner<'_> {
+impl Drop for FlightOwner {
     fn drop(&mut self) {
         let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
         if matches!(*state, FlightState::Fetching) {
@@ -44,6 +45,7 @@ impl Drop for FlightOwner<'_> {
         }
         drop(state);
         self.0.wake.notify_all();
+        self.0.async_wake.notify_waiters();
     }
 }
 
@@ -131,20 +133,7 @@ impl NativeStore {
         if let Some(tree) = self.lookup_tree(id)? {
             return Ok((Arc::new(tree), true));
         }
-        let flight = {
-            let mut flights = self
-                .inner
-                .tree_flights
-                .0
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            flights.retain(|_, flight| flight.strong_count() > 0);
-            flights.get(&id).and_then(Weak::upgrade).unwrap_or_else(|| {
-                let flight = Arc::new(TreeFlight::default());
-                flights.insert(id, Arc::downgrade(&flight));
-                flight
-            })
-        };
+        let flight = self.tree_flight(id);
         loop {
             check()?;
             let mut state = flight.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -153,18 +142,12 @@ impl NativeStore {
                 FlightState::Idle => {
                     *state = FlightState::Fetching;
                     drop(state);
-                    let _owner = FlightOwner(&flight);
+                    let _owner = FlightOwner(Arc::clone(&flight));
                     let (lease, reused) = match self.lookup_tree(id)? {
                         Some(lease) => (lease, true),
                         None => (fetch()?, false),
                     };
-                    ensure!(
-                        lease.id() == id && Arc::ptr_eq(&lease.inner, &self.inner),
-                        "tree acquisition returned unrelated content"
-                    );
-                    let lease = Arc::new(lease);
-                    *flight.state.lock().unwrap_or_else(PoisonError::into_inner) =
-                        FlightState::Ready(Arc::clone(&lease));
+                    let lease = self.complete_flight(id, &flight, lease)?;
                     return Ok((lease, reused));
                 }
                 FlightState::Fetching => {
@@ -174,6 +157,107 @@ impl NativeStore {
                             .wait_timeout(state, Duration::from_millis(100))
                             .unwrap_or_else(PoisonError::into_inner),
                     );
+                }
+            }
+        }
+    }
+
+    fn tree_flight(&self, id: TreeId) -> Arc<TreeFlight> {
+        let mut flights = self
+            .inner
+            .tree_flights
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        flights.retain(|_, flight| flight.strong_count() > 0);
+        flights.get(&id).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let flight = Arc::new(TreeFlight::default());
+            flights.insert(id, Arc::downgrade(&flight));
+            flight
+        })
+    }
+
+    fn complete_flight(
+        &self,
+        id: TreeId,
+        flight: &TreeFlight,
+        lease: TreeLease,
+    ) -> Result<Arc<TreeLease>> {
+        ensure!(
+            lease.id() == id && Arc::ptr_eq(&lease.inner, &self.inner),
+            "tree acquisition returned unrelated content"
+        );
+        let lease = Arc::new(lease);
+        *flight.state.lock().unwrap_or_else(PoisonError::into_inner) =
+            FlightState::Ready(Arc::clone(&lease));
+        Ok(lease)
+    }
+
+    async fn lookup_tree_async(&self, id: TreeId) -> Result<Option<TreeLease>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.lookup_tree(id)).await?
+    }
+
+    /// Share a tree flight with synchronous or asynchronous producers.
+    /// A follower waits for notification, deadline or cancellation, without
+    /// occupying a condition-variable thread. A producer owns the flight
+    /// until its fetch future completes or is dropped.
+    ///
+    /// # Errors
+    /// Returns an error for cancellation, timeout, invalid content or failed acquisition.
+    pub async fn acquire_tree_async<Fut, Cancel>(
+        &self,
+        id: TreeId,
+        deadline: Instant,
+        cancelled: Cancel,
+        fetch: impl FnOnce() -> Fut + Send,
+    ) -> Result<(Arc<TreeLease>, bool)>
+    where
+        Fut: std::future::Future<Output = Result<TreeLease>> + Send,
+        Cancel: std::future::Future<Output = Result<()>> + Send,
+    {
+        ensure!(
+            Instant::now() < deadline,
+            "native tree acquisition deadline exceeded"
+        );
+        if let Some(tree) = self.lookup_tree_async(id).await? {
+            return Ok((Arc::new(tree), true));
+        }
+        let flight = self.tree_flight(id);
+        let mut cancelled = std::pin::pin!(cancelled);
+        loop {
+            ensure!(
+                Instant::now() < deadline,
+                "native tree acquisition deadline exceeded"
+            );
+            let mut notified = std::pin::pin!(flight.async_wake.notified());
+            notified.as_mut().enable();
+            let owner = {
+                let mut state = flight.state.lock().unwrap_or_else(PoisonError::into_inner);
+                match &*state {
+                    FlightState::Ready(lease) => return Ok((Arc::clone(lease), true)),
+                    FlightState::Idle => {
+                        *state = FlightState::Fetching;
+                        drop(state);
+                        Some(FlightOwner(Arc::clone(&flight)))
+                    }
+                    FlightState::Fetching => None,
+                }
+            };
+            if let Some(_owner) = owner {
+                let (lease, reused) = match self.lookup_tree_async(id).await? {
+                    Some(lease) => (lease, true),
+                    None => (fetch().await?, false),
+                };
+                return Ok((self.complete_flight(id, &flight, lease)?, reused));
+            }
+            tokio::select! {
+                result = tokio::time::timeout_at(deadline.into(), notified) => {
+                    result.context("native tree acquisition deadline exceeded")?;
+                }
+                result = &mut cancelled => {
+                    result?;
+                    anyhow::bail!("native tree acquisition cancelled");
                 }
             }
         }
@@ -316,6 +400,7 @@ impl NativeStore {
             }
         }
         write.commit()?;
+        self.inner.publications.send_modify(|()| {});
         drop(staged_reservations);
         self.inner.lock_pins()?.touch(Root::Tree(id));
         Ok(id)

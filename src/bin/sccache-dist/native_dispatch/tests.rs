@@ -84,8 +84,13 @@ struct RecordingRequester {
     states: mpsc::Sender<(JobId, JobState)>,
 }
 
+#[async_trait::async_trait]
 impl ServerOutgoing for RecordingRequester {
-    fn do_update_job_state(&self, id: JobId, state: JobState) -> Result<UpdateJobStateResult> {
+    async fn do_update_job_state(
+        &self,
+        id: JobId,
+        state: JobState,
+    ) -> Result<UpdateJobStateResult> {
         self.states.send((id, state))?;
         Ok(UpdateJobStateResult::Success)
     }
@@ -113,6 +118,56 @@ fn terminal(dispatcher: &NativeDispatcher, id: JobId) -> Result<NativeRunResult>
         );
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[test]
+fn asynchronous_stage_pool_bounds_active_tasks_and_drains_on_close() -> Result<()> {
+    use std::sync::atomic::AtomicUsize;
+    let runtime = sccache::http_client::io_runtime()?;
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let pool = spawn_async_pool(runtime, 3, receiver, {
+        let gate = Arc::clone(&gate);
+        let active = Arc::clone(&active);
+        let completed = Arc::clone(&completed);
+        move |id| {
+            let gate = Arc::clone(&gate);
+            let active = Arc::clone(&active);
+            let completed = Arc::clone(&completed);
+            let started = started.clone();
+            async move {
+                active.fetch_add(1, Ordering::AcqRel);
+                if started.send(id).is_ok()
+                    && let Ok(permit) = gate.acquire().await
+                {
+                    permit.forget();
+                    completed.fetch_add(1, Ordering::AcqRel);
+                }
+                active.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    });
+    runtime.block_on(async {
+        for id in 0..8 {
+            sender.send(id).await?;
+        }
+        drop(sender);
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(5), observed.recv())
+                .await?
+                .context("stage task did not start")?;
+        }
+        assert_eq!(active.load(Ordering::Acquire), 3);
+        assert!(observed.try_recv().is_err());
+        gate.add_permits(8);
+        tokio::time::timeout(Duration::from_secs(5), pool).await??;
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(completed.load(Ordering::Acquire), 8);
+        Ok::<_, anyhow::Error>(())
+    })
 }
 
 #[test]

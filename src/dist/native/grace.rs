@@ -10,7 +10,7 @@ use anyhow::{Context, Result, ensure};
 
 use crate::build_runtime::{
     ActionFingerprint, ActionMode, CapturedExecution, ContentId, NativeStore, ResultLease,
-    ResultManifest, StageBudget,
+    StageBudget,
 };
 
 type Contents = BTreeMap<ContentId, u64>;
@@ -125,31 +125,44 @@ pub(super) struct GraceReservation {
 }
 
 impl GraceReservation {
-    pub(super) fn retain(
+    pub(super) async fn retain(
         self,
-        store: &NativeStore,
-        budget: &mut StageBudget,
-        fingerprint: &ActionFingerprint,
-        manifest: &ResultManifest,
-        captured: &CapturedExecution,
-        wait: (Duration, &dyn Fn() -> Result<()>),
-    ) -> Result<Option<RetainedOutput>> {
+        store: NativeStore,
+        mut budget: StageBudget,
+        fingerprint: ActionFingerprint,
+        captured: CapturedExecution,
+        wait: (Duration, &super::LeaseCheck<'_>),
+    ) -> Result<(CapturedExecution, Option<RetainedOutput>)> {
+        let manifest = captured
+            .successful_result()
+            .context("failed execution cannot be retained")?;
         if manifest.outputs.is_empty() {
-            return Ok(None);
+            return Ok((captured, None));
         }
         let publication = self.promote();
-        let existing = store.reserve_upload(manifest)?;
-        let warm = existing.missing().is_empty();
-        let mut staged = Vec::new();
-        for &blob in existing.missing() {
-            staged.push(budget.stage_expected(blob, captured.open_blob(blob.id)?)?);
-        }
-        let lease = store.publish_pinned(fingerprint, manifest, staged, ActionMode::Refresh)?;
-        let (deadline, waited) = publication.commit(lease, wait)?;
-        Ok(Some(RetainedOutput {
-            deadline,
-            warm: warm && !waited,
-        }))
+        let (captured, lease, warm) = tokio::task::spawn_blocking(move || {
+            let manifest = captured
+                .successful_result()
+                .context("failed execution cannot be retained")?;
+            let existing = store.reserve_upload(manifest)?;
+            let warm = existing.missing().is_empty();
+            let mut staged = Vec::new();
+            for &blob in existing.missing() {
+                staged.push(budget.stage_expected(blob, captured.open_blob(blob.id)?)?);
+            }
+            let lease =
+                store.publish_pinned(&fingerprint, manifest, staged, ActionMode::Refresh)?;
+            Ok::<_, anyhow::Error>((captured, lease, warm))
+        })
+        .await??;
+        let (deadline, waited) = publication.commit(lease, wait).await?;
+        Ok((
+            captured,
+            Some(RetainedOutput {
+                deadline,
+                warm: warm && !waited,
+            }),
+        ))
     }
 
     /// Exact publishers supersede forecasts. No publisher can deadlock
@@ -175,10 +188,10 @@ struct Publication {
 }
 
 impl Publication {
-    fn commit(
+    async fn commit(
         mut self,
         lease: ResultLease,
-        wait: (Duration, &dyn Fn() -> Result<()>),
+        wait: (Duration, &super::LeaseCheck<'_>),
     ) -> Result<(Instant, bool)> {
         let contents = lease.manifest().blobs()?;
         let total = contents.values().try_fold(0_u64, |sum, &size| {
@@ -192,55 +205,58 @@ impl Publication {
         let started = Instant::now();
         loop {
             check()?;
-            let mut state = self
-                .pool
-                .state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            state.reap(Instant::now());
-            let mut additional = 0_u64;
-            for (&id, &size) in &contents {
-                if let Some(&(previous, count)) = state.refs.get(&id) {
-                    ensure!(
-                        previous == size && count < usize::MAX,
-                        "invalid grace content accounting"
-                    );
-                } else {
-                    additional = additional
-                        .checked_add(size)
-                        .context("grace bytes overflow")?;
-                }
-            }
-            // The published result lease pins its content while it waits.
-            // Charge only the exact unique union, not outstanding forecasts.
-            if additional <= self.pool.max_bytes - state.bytes {
-                let expires = Instant::now()
-                    .checked_add(self.pool.duration)
-                    .context("grace deadline overflow")?;
+            {
+                let mut state = self
+                    .pool
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                state.reap(Instant::now());
+                let mut additional = 0_u64;
                 for (&id, &size) in &contents {
-                    state.refs.entry(id).or_insert((size, 0)).1 += 1;
+                    if let Some(&(previous, count)) = state.refs.get(&id) {
+                        ensure!(
+                            previous == size && count < usize::MAX,
+                            "invalid grace content accounting"
+                        );
+                    } else {
+                        additional = additional
+                            .checked_add(size)
+                            .context("grace bytes overflow")?;
+                    }
                 }
-                state.bytes += additional;
-                state.results.push_back(ProtectedResult {
-                    expires,
-                    contents,
-                    _lease: lease,
-                });
+                // The published result lease pins its content while it waits.
+                // Charge only the exact unique union, not outstanding forecasts.
+                if additional <= self.pool.max_bytes - state.bytes {
+                    let expires = Instant::now()
+                        .checked_add(self.pool.duration)
+                        .context("grace deadline overflow")?;
+                    for (&id, &size) in &contents {
+                        state.refs.entry(id).or_insert((size, 0)).1 += 1;
+                    }
+                    state.bytes += additional;
+                    state.results.push_back(ProtectedResult {
+                        expires,
+                        contents,
+                        _lease: lease,
+                    });
+                    drop(state);
+                    return Ok((expires, self.waiting));
+                }
+                if !self.waiting {
+                    state.waiting_publishers += 1;
+                    self.waiting = true;
+                }
                 drop(state);
-                return Ok((expires, self.waiting));
             }
-            if !self.waiting {
-                state.waiting_publishers += 1;
-                self.waiting = true;
-            }
-            drop(state);
             ensure!(
                 started.elapsed() < timeout,
                 "native artifact grace publication timed out"
             );
-            std::thread::sleep(
+            tokio::time::sleep(
                 Duration::from_millis(100).min(timeout.saturating_sub(started.elapsed())),
-            );
+            )
+            .await;
         }
     }
 }
@@ -272,10 +288,10 @@ impl Drop for GraceReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build_runtime::{Artifact, BlobRef, Eviction};
+    use crate::build_runtime::{Artifact, BlobRef, Eviction, ResultManifest};
 
-    #[test]
-    fn shared_artifacts_charge_once_and_expiry_releases_eviction_pin() -> Result<()> {
+    #[tokio::test]
+    async fn shared_artifacts_charge_once_and_expiry_releases_eviction_pin() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let store = NativeStore::open(directory.path())?;
         let pool = ArtifactGrace::new(Duration::from_secs(300), 8)?;
@@ -305,13 +321,17 @@ mod tests {
         )?;
         first
             .promote()
-            .commit(lease, (Duration::ZERO, &|| Ok(())))?;
+            .commit(lease, (Duration::ZERO, &|| Ok(())))
+            .await?;
         let second = pool.reserve(4)?.context("second grace reservation")?;
         assert!(pool.reserve(1)?.is_none());
-        second.promote().commit(
-            store.publish_pinned(&b, &manifest, Vec::new(), ActionMode::Reuse)?,
-            (Duration::ZERO, &|| Ok(())),
-        )?;
+        second
+            .promote()
+            .commit(
+                store.publish_pinned(&b, &manifest, Vec::new(), ActionMode::Reuse)?,
+                (Duration::ZERO, &|| Ok(())),
+            )
+            .await?;
         let cancelled = pool
             .reserve(4)?
             .context("deduplicated content should be charged once")?;
@@ -353,8 +373,9 @@ mod tests {
         )
     }
 
-    #[test]
-    fn native_grace_exact_publishers_supersede_forecasts_without_early_eviction() -> Result<()> {
+    #[tokio::test]
+    async fn native_grace_exact_publishers_supersede_forecasts_without_early_eviction() -> Result<()>
+    {
         let directory = tempfile::tempdir()?;
         let store = NativeStore::open(directory.path())?;
         let pool = ArtifactGrace::new(Duration::from_secs(300), 8)?;
@@ -365,7 +386,9 @@ mod tests {
         // A surprisingly large result supersedes the remaining forecasts.
         let first = first.promote();
         assert!(pool.reserve(3)?.is_some());
-        first.commit(result(&store, b"123456")?, (Duration::ZERO, &|| Ok(())))?;
+        first
+            .commit(result(&store, b"123456")?, (Duration::ZERO, &|| Ok(())))
+            .await?;
         {
             let state = pool.state.lock().unwrap();
             assert_eq!(state.bytes, 6);
@@ -373,12 +396,15 @@ mod tests {
         }
         assert!(pool.reserve(1)?.is_none());
         let second = second.promote();
-        second.commit(result(&store, b"78")?, (Duration::ZERO, &|| Ok(())))?;
+        second
+            .commit(result(&store, b"78")?, (Duration::ZERO, &|| Ok(())))
+            .await?;
         // A duplicate manifest consumes no extra grace bytes, even when
         // the entire pool is occupied and the forecast underestimated.
         third
             .promote()
-            .commit(result(&store, b"123456")?, (Duration::ZERO, &|| Ok(())))?;
+            .commit(result(&store, b"123456")?, (Duration::ZERO, &|| Ok(())))
+            .await?;
         {
             let state = pool.state.lock().unwrap();
             assert_eq!(state.bytes, 8);
@@ -390,8 +416,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn native_grace_waiting_publication_is_cancellable_and_does_not_release_retained_bytes()
+    #[tokio::test]
+    async fn native_grace_waiting_publication_is_cancellable_and_does_not_release_retained_bytes()
     -> Result<()> {
         let directory = tempfile::tempdir()?;
         let store = NativeStore::open(directory.path())?;
@@ -400,22 +426,25 @@ mod tests {
         let second = pool.reserve(4)?.context("second forecast")?;
         first
             .promote()
-            .commit(result(&store, b"123456")?, (Duration::ZERO, &|| Ok(())))?;
-        let check_count = std::cell::Cell::new(0);
-        let failed = second.promote().commit(
-            result(&store, b"abcde")?,
-            (Duration::from_secs(2), &|| {
-                let count = check_count.get();
-                check_count.set(count + 1);
-                if count != 0 {
-                    assert!(pool.reserve(0)?.is_none());
-                }
-                ensure!(count == 0, "cancelled publication");
-                Ok(())
-            }),
-        );
+            .commit(result(&store, b"123456")?, (Duration::ZERO, &|| Ok(())))
+            .await?;
+        let check_count = std::sync::atomic::AtomicUsize::new(0);
+        let failed = second
+            .promote()
+            .commit(
+                result(&store, b"abcde")?,
+                (Duration::from_secs(2), &|| {
+                    let count = check_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if count != 0 {
+                        assert!(pool.reserve(0)?.is_none());
+                    }
+                    ensure!(count == 0, "cancelled publication");
+                    Ok(())
+                }),
+            )
+            .await;
         assert!(failed.is_err());
-        assert_eq!(check_count.get(), 2);
+        assert_eq!(check_count.load(std::sync::atomic::Ordering::Relaxed), 2);
         let mut state = pool.state.lock().unwrap();
         assert_eq!(state.bytes, 6);
         assert_eq!(state.pending, 0);

@@ -361,6 +361,135 @@ pub fn encode_raw(mut reader: impl Read, target: &mut File, bound: Option<u64>) 
     })
 }
 
+fn write_encoded_chunk(file: &mut impl Write, bytes: &[u8]) -> Result<()> {
+    let encoded = zstd::bulk::compress(bytes, 1)?;
+    let (physical, raw) = if encoded.len() < bytes.len() {
+        (encoded.as_slice(), false)
+    } else {
+        (bytes, true)
+    };
+    let stored = u32::try_from(physical.len())?;
+    file.write_all(&(stored | if raw { RAW_CHUNK } else { 0 }).to_le_bytes())?;
+    file.write_all(&u32::try_from(bytes.len())?.to_le_bytes())?;
+    file.write_all(physical)?;
+    Ok(())
+}
+
+fn transport_header(size: u64) -> Result<[u8; 32]> {
+    let mut header = [0_u8; 32];
+    header[..16].copy_from_slice(&MAGIC);
+    header[16..24].copy_from_slice(&size.to_le_bytes());
+    header[24..28].copy_from_slice(&u32::try_from(CHUNK)?.to_le_bytes());
+    header[28..].copy_from_slice(&u32::try_from(size.div_ceil(CHUNK as u64))?.to_le_bytes());
+    Ok(header)
+}
+
+/// Demand-driven canonical wire compression of an already verified raw file.
+/// The logical size is known before the first byte, so no temporary archive
+/// or seek-back operation is necessary.
+pub struct BlobWireEncoder {
+    remaining: u64,
+}
+
+impl BlobWireEncoder {
+    /// Start a stream and return its final canonical header.
+    ///
+    /// # Errors
+    /// Returns an error if the stream exceeds the format's chunk count.
+    pub fn new(size: u64) -> Result<(Self, [u8; 32])> {
+        Ok((Self { remaining: size }, transport_header(size)?))
+    }
+
+    /// Exact number of input bytes required for the next frame. Zero means EOF.
+    #[must_use = "determines the exact size of the next input frame"]
+    pub fn next_frame_size(&self) -> usize {
+        usize::try_from(self.remaining)
+            .unwrap_or(usize::MAX)
+            .min(CHUNK)
+    }
+
+    /// Encode a single independent frame, with no filesystem or network I/O.
+    ///
+    /// # Errors
+    /// Returns an error for a noncanonical input length or codec failure.
+    pub fn frame(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
+        ensure!(
+            !bytes.is_empty() && bytes.len() == self.next_frame_size(),
+            "noncanonical CAS frame length"
+        );
+        let mut encoded = Vec::with_capacity(bytes.len().saturating_add(8));
+        write_encoded_chunk(&mut encoded, bytes)?;
+        self.remaining -= u64::try_from(bytes.len())?;
+        Ok(encoded)
+    }
+}
+
+fn write_encoded_header(file: &File, size: u64, chunks: u32) -> Result<()> {
+    write_at(file, &size.to_le_bytes(), 16)?;
+    write_at(file, &u32::try_from(CHUNK)?.to_le_bytes(), 24)?;
+    write_at(file, &chunks.to_le_bytes(), 28)?;
+    Ok(())
+}
+
+fn validate_transport_header(header: &[u8; 32], expected: BlobRef) -> Result<u32> {
+    ensure!(
+        header[..16] == MAGIC,
+        "native content stream is not the compressed CAS format"
+    );
+    let size = u64::from_le_bytes(header[16..24].try_into()?);
+    let chunk = u32::from_le_bytes(header[24..28].try_into()?);
+    let count = u32::from_le_bytes(header[28..].try_into()?);
+    ensure!(
+        size == expected.size
+            && chunk as usize == CHUNK
+            && u64::from(count) == size.div_ceil(CHUNK as u64),
+        "invalid native content stream declaration"
+    );
+    Ok(count)
+}
+
+#[derive(Clone, Copy)]
+struct ChunkWidths {
+    stored: usize,
+    plain: usize,
+    raw: bool,
+}
+
+fn validate_transport_widths(widths: [u8; 8], remaining: u64) -> Result<ChunkWidths> {
+    let word = u32::from_le_bytes(widths[..4].try_into()?);
+    let stored = usize::try_from(word & !RAW_CHUNK)?;
+    let plain = usize::try_from(u32::from_le_bytes(widths[4..].try_into()?))?;
+    let raw = word & RAW_CHUNK != 0;
+    ensure!(
+        plain == usize::try_from(remaining.min(CHUNK as u64))?,
+        "noncanonical transported CAS chunk position"
+    );
+    ensure!(
+        stored > 0
+            && stored <= zstd::zstd_safe::compress_bound(CHUNK)
+            && plain > 0
+            && plain <= CHUNK
+            && (!raw || stored == plain),
+        "native CAS chunk exceeds bounds"
+    );
+    Ok(ChunkWidths { stored, plain, raw })
+}
+
+fn decode_transport_chunk(data: &[u8], widths: ChunkWidths) -> Result<std::borrow::Cow<'_, [u8]>> {
+    let bytes = if widths.raw {
+        std::borrow::Cow::Borrowed(data)
+    } else {
+        std::borrow::Cow::Owned(zstd::bulk::decompress(data, widths.plain)?)
+    };
+    ensure!(bytes.len() == widths.plain, "invalid native decoded chunk");
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+mod ingest;
+#[cfg(unix)]
+pub use ingest::BlobIngest;
+
 /// Write one immutable compressed representation while hashing its logical
 /// content. This is one compression pass with bounded buffering.
 ///
@@ -393,22 +522,10 @@ pub fn encode(mut reader: impl Read, file: &mut File, bound: Option<u64>) -> Res
             ensure!(size <= limit, "CAS input exceeds declared size");
         }
         hash.update(&buffer[..used]);
-        let encoded = zstd::bulk::compress(&buffer[..used], 1)?;
-        let (physical, raw) = if encoded.len() < used {
-            (encoded.as_slice(), false)
-        } else {
-            (&buffer[..used], true)
-        };
-        let stored = u32::try_from(physical.len())?;
-        file.write_all(&(stored | if raw { RAW_CHUNK } else { 0 }).to_le_bytes())?;
-        file.write_all(&u32::try_from(used)?.to_le_bytes())?;
-        file.write_all(physical)?;
+        write_encoded_chunk(file, &buffer[..used])?;
         chunks = chunks.checked_add(1).context("too many CAS chunks")?;
     }
-    file.write_all(&[])?;
-    write_at(file, &size.to_le_bytes(), 16)?;
-    write_at(file, &u32::try_from(CHUNK)?.to_le_bytes(), 24)?;
-    write_at(file, &chunks.to_le_bytes(), 28)?;
+    write_encoded_header(file, size, chunks)?;
     Ok(BlobRef {
         id: ContentId(*hash.finalize().as_bytes()),
         size,
@@ -478,63 +595,26 @@ fn transfer_zstd_chunks(
     mut plaintext: impl Write,
     expected: BlobRef,
 ) -> Result<()> {
-    let mut marker = [0_u8; 16];
-    reader.read_exact(&mut marker)?;
-    ensure!(
-        marker == MAGIC,
-        "native content stream is not the compressed CAS format"
-    );
-    physical.write_all(&marker)?;
-    let mut header = [0_u8; 16];
+    let mut header = [0_u8; 32];
     reader.read_exact(&mut header)?;
+    let count = validate_transport_header(&header, expected)?;
     physical.write_all(&header)?;
-    let size = u64::from_le_bytes(header[..8].try_into()?);
-    let chunk = u32::from_le_bytes(header[8..12].try_into()?);
-    let count = u32::from_le_bytes(header[12..].try_into()?);
-    ensure!(
-        size == expected.size
-            && chunk as usize == CHUNK
-            && u64::from(count) == size.div_ceil(CHUNK as u64),
-        "invalid native content stream declaration"
-    );
+    let size = expected.size;
     let mut decoded = 0_u64;
     let mut hash = blake3::Hasher::new();
     for _ in 0..count {
         let mut widths = [0_u8; 8];
         reader.read_exact(&mut widths)?;
-        let word = u32::from_le_bytes(widths[..4].try_into()?);
-        let stored = usize::try_from(word & !RAW_CHUNK)?;
-        let plain = usize::try_from(u32::from_le_bytes(widths[4..].try_into()?))?;
         let remaining = size
             .checked_sub(decoded)
             .context("CAS transfer chunk position overflow")?;
-        ensure!(
-            plain == usize::try_from(remaining.min(CHUNK as u64))?,
-            "noncanonical transported CAS chunk position"
-        );
-        ensure!(
-            stored > 0
-                && stored <= zstd::zstd_safe::compress_bound(CHUNK)
-                && plain > 0
-                && plain <= CHUNK
-                && (word & RAW_CHUNK == 0 || stored == plain),
-            "native CAS chunk exceeds bounds"
-        );
+        let parsed = validate_transport_widths(widths, remaining)?;
         decoded = decoded
-            .checked_add(u64::try_from(plain)?)
+            .checked_add(u64::try_from(parsed.plain)?)
             .context("decoded length overflow")?;
-        ensure!(
-            decoded <= size,
-            "native CAS decoded length exceeds declaration"
-        );
-        let mut data = vec![0; stored];
+        let mut data = vec![0; parsed.stored];
         reader.read_exact(&mut data)?;
-        let bytes = if word & RAW_CHUNK == 0 {
-            zstd::bulk::decompress(&data, plain)?
-        } else {
-            data.clone()
-        };
-        ensure!(bytes.len() == plain, "invalid native decoded chunk");
+        let bytes = decode_transport_chunk(&data, parsed)?;
         hash.update(&bytes);
         plaintext.write_all(&bytes)?;
         physical.write_all(&widths)?;

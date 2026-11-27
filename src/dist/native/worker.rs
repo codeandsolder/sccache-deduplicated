@@ -3,11 +3,9 @@
 //! scheduler. There is no legacy archive creation or client-side reupload.
 
 use std::{
-    cell::Cell,
-    io::{self, Read},
     num::NonZeroUsize,
     sync::{
-        Arc, Condvar, Mutex, PoisonError,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -16,12 +14,12 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 use super::{
-    LeaseCheck, NativeCacheClient, PackagePlanRequest, map_packages, retryable_transport_error,
+    LeaseCheck, NativeCacheClient, PackagePlanRequest, ingress, retryable_transport_error,
 };
 use crate::build_runtime::{
     ArchiveLength, BlobRef, CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeServiceBusy,
-    NativeStore, PackageArchive, PackageImportLimits, PackageTransferCost, StageBudget, TreeId,
-    TreeLease, VerifiedPackage, execute,
+    NativeStore, PackageArchive, PackageImportLimits, PackagePreparation, PackageTransferCost,
+    StageBudget, TreeId, TreeLease, VerifiedPackage, execute,
     wire::{ActionObservation, ActionRequest, Ticket, WorkerTiming},
 };
 
@@ -37,19 +35,7 @@ pub struct PackageTransportTracker {
 
 struct RawDownloadSlots {
     limit: NonZeroUsize,
-    active: Mutex<usize>,
-    wake: Condvar,
-}
-
-pub(super) struct RawDownloadPermit<'a>(&'a RawDownloadSlots);
-
-impl Drop for RawDownloadPermit<'_> {
-    fn drop(&mut self) {
-        let mut active = self.0.active.lock().unwrap_or_else(PoisonError::into_inner);
-        *active -= 1;
-        drop(active);
-        self.0.wake.notify_one();
-    }
+    permits: tokio::sync::Semaphore,
 }
 
 impl PackageTransportTracker {
@@ -65,8 +51,7 @@ impl PackageTransportTracker {
             timing: Arc::new(Mutex::new(initial)),
             slots: Arc::new(RawDownloadSlots {
                 limit,
-                active: Mutex::new(0),
-                wake: Condvar::new(),
+                permits: tokio::sync::Semaphore::new(limit.get()),
             }),
         })
     }
@@ -81,27 +66,17 @@ impl PackageTransportTracker {
     /// waiting. A slot is released on every return path, including failures.
     /// # Errors
     /// Returns an error if cancellation or lease renewal failed.
-    pub(super) fn raw_slot(&self, check: &LeaseCheck<'_>) -> Result<RawDownloadPermit<'_>> {
+    pub(super) async fn raw_slot(
+        &self,
+        check: &LeaseCheck<'_>,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        let mut acquire = std::pin::pin!(self.slots.permits.acquire());
         loop {
             check()?;
-            let (mut active, _) = self
-                .slots
-                .wake
-                .wait_timeout_while(
-                    self.slots
-                        .active
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner),
-                    Duration::from_millis(50),
-                    |in_use| *in_use >= self.slots.limit.get(),
-                )
-                .unwrap_or_else(PoisonError::into_inner);
-            if *active < self.slots.limit.get() {
-                *active += 1;
-                drop(active);
-                return Ok(RawDownloadPermit(&self.slots));
+            tokio::select! {
+                permit = &mut acquire => return Ok(permit?),
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
             }
-            drop(active);
         }
     }
 
@@ -247,12 +222,9 @@ mod transport_tests {
         BlobRef, ContentId, PackageCompression, PackageIdentity, PackageSource, TreeId,
     };
 
-    #[test]
-    fn slots_bound_parallel_downloads_and_restore_admission_on_drop() -> Result<()> {
-        use std::sync::{
-            Barrier,
-            atomic::{AtomicUsize, Ordering},
-        };
+    #[tokio::test]
+    async fn slots_bound_parallel_downloads_and_restore_admission_on_drop() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let tracker = PackageTransportTracker::new(WorkerTiming {
             transfer: PackageTransferCost {
                 raw_parallelism: 2,
@@ -260,41 +232,26 @@ mod transport_tests {
             },
             ..Default::default()
         })?;
-        let barrier = Barrier::new(8);
         let running = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
-        std::thread::scope(|scope| -> Result<()> {
-            let threads = (0..8)
-                .map(|_| {
-                    let tracker = tracker.clone();
-                    let barrier = &barrier;
-                    let running = &running;
-                    let peak = &peak;
-                    scope.spawn(move || -> Result<()> {
-                        barrier.wait();
-                        let _permit = tracker.raw_slot(&|| Ok(()))?;
-                        let count = running.fetch_add(1, Ordering::SeqCst) + 1;
-                        peak.fetch_max(count, Ordering::SeqCst);
-                        std::thread::sleep(Duration::from_millis(30));
-                        running.fetch_sub(1, Ordering::SeqCst);
-                        Ok(())
-                    })
-                })
-                .collect::<Vec<_>>();
-            for thread in threads {
-                thread
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("raw limiter worker panicked"))??;
-            }
-            Ok(())
-        })?;
+        futures::future::try_join_all((0..8).map(|_| async {
+            let _permit = tracker.raw_slot(&|| Ok(())).await?;
+            let count = running.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(count, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            running.fetch_sub(1, Ordering::SeqCst);
+            Ok::<_, anyhow::Error>(())
+        }))
+        .await?;
         assert_eq!(peak.load(Ordering::SeqCst), 2);
         assert_eq!(running.load(Ordering::SeqCst), 0);
         assert!(
             tracker
                 .raw_slot(&|| anyhow::bail!("expired session"))
+                .await
                 .is_err()
         );
+        assert_eq!(tracker.slots.permits.available_permits(), 2);
         let initial = tracker.estimate().raw_request_nanoseconds;
         tracker.observe_raw(8192, Duration::from_millis(35));
         assert!(tracker.estimate().raw_request_nanoseconds > initial);
@@ -377,25 +334,8 @@ mod transport_tests {
     }
 }
 
-// Measure the actual archive transfer independently of its subsequent decoder.
-struct TimedDownload<'a, R> {
-    reader: R,
-    start: Instant,
-    elapsed: &'a Cell<Option<Duration>>,
-}
-
-impl<R: Read> Read for TimedDownload<'_, R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let count = self.reader.read(buffer)?;
-        if count == 0 && !buffer.is_empty() && self.elapsed.get().is_none() {
-            self.elapsed.set(Some(self.start.elapsed()));
-        }
-        Ok(count)
-    }
-}
-
 impl NativeCacheClient {
-    pub(super) fn reconstruct_packages(
+    pub(super) async fn reconstruct_packages(
         &self,
         ticket: Ticket,
         missing: &[BlobRef],
@@ -404,15 +344,18 @@ impl NativeCacheClient {
         transport: &PackageTransportTracker,
         check: &LeaseCheck<'_>,
     ) -> Result<Vec<VerifiedPackage>> {
-        let plan = self.control(
-            "package_plan",
-            &PackagePlanRequest {
-                ticket,
-                missing: missing.to_vec(),
-                max_archive_bytes: limits.max_archive_bytes,
-                cost: transport.estimate(),
-            },
-        );
+        let plan = self
+            .control_with_timeout_async(
+                "package_plan",
+                &PackagePlanRequest {
+                    ticket,
+                    missing: missing.to_vec(),
+                    max_archive_bytes: limits.max_archive_bytes,
+                    cost: transport.estimate(),
+                },
+                self.timeout,
+            )
+            .await;
         let offers: Vec<PackageArchive> = match plan {
             Ok(offers) => offers,
             Err(error) => {
@@ -422,9 +365,12 @@ impl NativeCacheClient {
         };
         let jobs = NonZeroUsize::new(limits.max_concurrent_imports)
             .context("zero package acquisition concurrency")?;
-        let packages = map_packages(&offers, jobs, |offer| {
+        let packages = ingress::map_bounded(offers, jobs, |offer| async move {
             check()?;
-            match self.reconstruct_package(ticket, *offer, store, limits, transport, check) {
+            match self
+                .reconstruct_package(ticket, offer, store, limits, transport, check)
+                .await
+            {
                 Ok(package) => Ok(Some(package)),
                 Err(error) => {
                     check()?;
@@ -434,11 +380,12 @@ impl NativeCacheClient {
                     Ok(None)
                 }
             }
-        })?;
+        })
+        .await?;
         Ok(packages.into_iter().flatten().collect())
     }
 
-    fn reconstruct_package(
+    async fn reconstruct_package(
         &self,
         ticket: Ticket,
         offer: PackageArchive,
@@ -454,40 +401,48 @@ impl NativeCacheClient {
             "invalid native original archive offer"
         );
         let start = Instant::now();
-        let executable = std::env::current_exe()?;
         loop {
             check()?;
             let attempted = Instant::now();
-            let downloaded = Cell::new(None);
-            let (package, reused) = match store.acquire_package(
-                offer.source.identity,
-                ArchiveLength::Exact(offer.source.size),
-                limits,
-                &executable,
-                || {
-                    let start = Instant::now();
-                    Ok(TimedDownload {
-                        reader: {
-                            let (response, encoding) =
-                                self.download_response(ticket, offer.blob)?;
-                            ensure!(
-                                encoding == crate::build_runtime::BlobEncoding::Raw,
-                                "package must be original bytes"
-                            );
-                            response
-                        },
-                        start,
-                        elapsed: &downloaded,
-                    })
-                },
-            ) {
-                Ok(package) => package,
+            let prepared = {
+                let store = store.clone();
+                tokio::task::spawn_blocking(move || {
+                    store.prepare_package(
+                        offer.source.identity,
+                        ArchiveLength::Exact(offer.source.size),
+                        limits,
+                        || Ok(()),
+                    )
+                })
+                .await?
+            };
+            let (package, downloaded) = match prepared {
+                Ok(PackagePreparation::Cached(package)) => (package, None),
+                Ok(PackagePreparation::Import(upload)) => {
+                    let transfer = Instant::now();
+                    let (mut response, encoding) = self
+                        .try_download_response_async(ticket, offer.blob, self.timeout)
+                        .await?
+                        .context("native original package unavailable")?;
+                    ensure!(
+                        encoding == crate::build_runtime::BlobEncoding::Raw,
+                        "package must be original bytes"
+                    );
+                    let (package, finished) = ingress::receive_package(
+                        upload,
+                        &mut response,
+                        None,
+                        ArchiveLength::Exact(offer.source.size),
+                    )
+                    .await?;
+                    (package, Some(finished.duration_since(transfer)))
+                }
                 Err(error) if error.is::<NativeServiceBusy>() => {
                     ensure!(
                         start.elapsed() < self.timeout,
                         "native worker package reservation deadline exceeded"
                     );
-                    std::thread::sleep(Duration::from_millis(100));
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -496,10 +451,8 @@ impl NativeCacheClient {
                 package.source() == offer.source && package.tree().id() == offer.tree,
                 "reconstructed original package identity mismatch"
             );
-            if !reused {
-                if let Some(download) = downloaded.get() {
-                    transport.observe_archive(offer, attempted.elapsed(), download);
-                }
+            if let Some(download) = downloaded {
+                transport.observe_archive(offer, attempted.elapsed(), download);
                 debug!(
                     "native package transfer estimate after import: {:?}",
                     transport.estimate()
@@ -517,15 +470,19 @@ impl NativeCacheClient {
     /// Acquire and pin an admitted worker action before it enters the compiler queue.
     /// # Errors
     /// Returns an error if the lease, execution contract or staging fails.
-    pub fn prepare_on_worker(
+    pub async fn prepare_on_worker<A, F>(
         &self,
         ticket: Ticket,
         spec: &ExecutionSpec,
         store: &NativeStore,
         policy: &ExecutionPolicy,
         delivery: WorkerDelivery<'_>,
-        preparation: WorkerPreparation<'_>,
-    ) -> Result<PreparedWorker> {
+        preparation: WorkerPreparation<'_, A>,
+    ) -> Result<PreparedWorker>
+    where
+        A: FnOnce() -> F + Send,
+        F: std::future::Future<Output = Result<()>> + Send,
+    {
         let started = Instant::now();
         let lease = WorkerLease::start(
             self.clone(),
@@ -534,38 +491,116 @@ impl NativeCacheClient {
             policy.timeout,
             delivery.renewal_interval,
             preparation.cancelled,
-        )?;
-        lease.check()?;
-        (preparation.on_authorized)()?;
-        lease.check()?;
-        let mut prepared = self.prepare_execution(
-            ExecutionContext {
-                ticket,
-                spec,
+        )
+        .await?;
+        let result = async {
+            lease.check()?;
+            (preparation.on_authorized)().await?;
+            lease.check()?;
+            let request = spec.action_request()?;
+            ensure!(
+                spec.platform == policy.platform,
+                "native executor platform mismatch"
+            );
+            let check = &|| lease.check();
+            let WorkerStorage {
+                output,
+                cached,
+                mut warm,
+            } = prepare_worker_storage(
                 store,
                 policy,
-            },
-            delivery.artifact_grace.map(|grace| {
-                (
-                    grace,
-                    preparation
-                        .estimated_result_bytes
-                        .unwrap_or(policy.max_result_bytes)
-                        .clamp(1, policy.max_result_bytes),
-                )
-            }),
-            |id, check, on_tree| self.fetch_tree(ticket, id, store, delivery, check, on_tree),
-            &|| lease.check(),
-            preparation.on_tree,
-        )?;
-        if prepared.warm_staging.is_some() {
-            prepared.warm_staging = Some(started.elapsed());
+                delivery.artifact_grace,
+                &request,
+                preparation.estimated_result_bytes,
+                check,
+            )
+            .await?;
+            let mut inputs = Vec::new();
+            let on_tree = preparation.on_tree;
+            for (id, cached) in cached {
+                check()?;
+                let (tree, hit) = if let Some(tree) = cached {
+                    (Arc::new(tree), true)
+                } else if delivery.artifact_grace.is_none() {
+                    warm = false;
+                    // Shared-store acquisition depends on the scheduler's own
+                    // producer flights; wait without taking their ownership.
+                    (
+                        Arc::new(
+                            Box::pin(self.fetch_tree(ticket, id, store, delivery, check, on_tree))
+                                .await?,
+                        ),
+                        false,
+                    )
+                } else {
+                    warm = false;
+                    let deadline = Instant::now()
+                        .checked_add(policy.timeout)
+                        .context("input staging deadline overflow")?;
+                    let cancelled = async {
+                        loop {
+                            check()?;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    };
+                    Box::pin(store.acquire_tree_async(id, deadline, cancelled, || {
+                        self.fetch_tree(ticket, id, store, delivery, check, on_tree)
+                    }))
+                    .await?
+                };
+                trace_tree_access(id, &tree, hit)?;
+                on_tree(&tree);
+                inputs.push(tree);
+            }
+            warm &= self
+                .announce_worker_inputs(ticket, policy.timeout, check)
+                .await?;
+            Ok(PreparedExecution {
+                request,
+                _inputs: inputs,
+                output,
+                warm_staging: warm.then(|| started.elapsed()),
+            })
         }
-        Ok(PreparedWorker {
-            lease,
-            prepared,
-            spec: spec.clone(),
-        })
+        .await;
+        match result {
+            Ok(prepared) => Ok(PreparedWorker {
+                lease,
+                prepared,
+                spec: spec.clone(),
+            }),
+            Err(error) => {
+                lease.fail().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn announce_worker_inputs(
+        &self,
+        ticket: Ticket,
+        timeout: Duration,
+        check: &LeaseCheck<'_>,
+    ) -> Result<bool> {
+        let mut warm = true;
+        let announced = Instant::now();
+        loop {
+            check()?;
+            match self
+                .control_with_timeout_async::<_, ()>("inputs_staged", &ticket, self.timeout)
+                .await
+            {
+                Ok(()) => return Ok(warm),
+                Err(error)
+                    if retryable_transport_error(&error) && announced.elapsed() < timeout =>
+                {
+                    warm = false;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     #[cfg(feature = "dist-client")]
@@ -594,7 +629,13 @@ impl NativeCacheClient {
                 &mut |_| {},
             )?;
             let captured = compile(context, control.queue, control.transport, check, || {})?;
-            self.publish_execution(context, prepared, captured, control.transport, check)
+            crate::http_client::io_runtime()?.block_on(self.publish_execution(
+                context,
+                prepared,
+                captured,
+                control.transport,
+                check,
+            ))
         });
         if result.is_err() {
             let _ = self.fail(ticket);
@@ -602,6 +643,7 @@ impl NativeCacheClient {
         result
     }
 
+    #[cfg(feature = "dist-client")]
     fn prepare_execution(
         &self,
         context: ExecutionContext<'_>,
@@ -621,12 +663,7 @@ impl NativeCacheClient {
         if let Some((grace, _)) = grace {
             grace.reap();
         }
-        if let Some(report) = store.maintain_space()? {
-            ensure!(
-                report.minimum_satisfied,
-                "native executor store lacks allocatable space: {report:?}"
-            );
-        }
+        maintain_executor_space(store)?;
         let request = spec.action_request()?;
         ensure!(
             spec.platform == policy.platform,
@@ -661,24 +698,7 @@ impl NativeCacheClient {
                 warm = false;
                 store.acquire_tree(*id, check, || fetch(*id, check, on_tree))?
             };
-            if log::log_enabled!(target: "native_cas_replay", log::Level::Trace) {
-                let blobs = tree
-                    .manifest()
-                    .blobs()?
-                    .into_iter()
-                    .map(|(id, size)| BlobRef { id, size })
-                    .collect::<Vec<_>>();
-                log::trace!(
-                target: "native_cas_replay",
-                "{}",
-                serde_json::json!({
-                    "kind": "tree_access",
-                    "tree": id,
-                    "hit": hit,
-                    "blobs": blobs,
-                })
-                );
-            }
+            trace_tree_access(*id, &tree, hit)?;
             on_tree(&tree);
             inputs.push(tree);
         }
@@ -707,7 +727,7 @@ impl NativeCacheClient {
         })
     }
 
-    fn publish_execution(
+    async fn publish_execution(
         &self,
         context: ExecutionContext<'_>,
         mut prepared: PreparedExecution,
@@ -718,61 +738,78 @@ impl NativeCacheClient {
         let ExecutionContext { ticket, store, .. } = context;
         let MeasuredExecution { captured, duration } = measured;
         check()?;
-        if let Some(manifest) = captured.successful_result() {
-            let publication_started = Instant::now();
-            prepared.request.validate_result(manifest)?;
-            let blobs = manifest.blobs()?;
-            let retained = if let Some((grace, mut budget)) = prepared.output.take() {
-                grace.retain(
-                    store,
-                    &mut budget,
-                    &prepared.request.action_fingerprint()?,
-                    manifest,
-                    &captured,
+        let Some(manifest) = captured.successful_result().cloned() else {
+            self.control_with_timeout_async::<_, ()>("fail", &ticket, self.timeout)
+                .await?;
+            return Ok(captured);
+        };
+        let publication_started = Instant::now();
+        prepared.request.validate_result(&manifest)?;
+        let blobs = manifest.blobs()?;
+        let (captured, retained) = if let Some((grace, budget)) = prepared.output.take() {
+            grace
+                .retain(
+                    store.clone(),
+                    budget,
+                    prepared.request.action_fingerprint()?,
+                    captured,
                     (context.policy.timeout, check),
-                )?
-            } else {
-                None
-            };
-            let missing = self.begin(ticket, manifest.clone())?.missing;
-            let publication_setup = retained
-                .as_ref()
-                .is_none_or(|output| output.warm)
-                .then(|| publication_started.elapsed());
-            // The scheduler recorded its anchor before sending the begin
-            // response. Its clock need not be synchronized with ours.
-            let retained_after_begin = retained.map_or(Duration::ZERO, |output| {
-                output.deadline.saturating_duration_since(Instant::now())
-            });
-            let bytes = missing
-                .iter()
-                .map(|blob| blob.size)
-                .fold(0_u64, u64::saturating_add);
-            let requests = u64::try_from(missing.len())?;
-            let started = Instant::now();
-            for missing in missing {
-                check()?;
-                ensure!(
-                    blobs.get(&missing.id) == Some(&missing.size),
-                    "scheduler requested undeclared output"
-                );
-                self.upload_stored_file(
+                )
+                .await?
+        } else {
+            (captured, None)
+        };
+        let begin: crate::build_runtime::wire::BeginResult = self
+            .control_with_timeout_async(
+                "begin",
+                &super::ManifestRequest {
                     ticket,
-                    missing,
-                    captured.physical_encoding(),
-                    captured.open_file(missing.id)?,
-                )?;
-            }
-            let upload_duration = started.elapsed();
-            let worker_timing = transport.map(|transport| {
-                transport.observe_result(bytes, requests, upload_duration);
-                transport.snapshot()
-            });
+                    manifest: manifest.clone(),
+                },
+                self.timeout,
+            )
+            .await?;
+        let missing = begin.missing;
+        let publication_setup = retained
+            .as_ref()
+            .is_none_or(|output| output.warm)
+            .then(|| publication_started.elapsed());
+        let retained_after_begin = retained.map_or(Duration::ZERO, |output| {
+            output.deadline.saturating_duration_since(Instant::now())
+        });
+        let bytes = missing
+            .iter()
+            .map(|blob| blob.size)
+            .fold(0_u64, u64::saturating_add);
+        let requests = u64::try_from(missing.len())?;
+        let started = Instant::now();
+        for missing in missing {
+            check()?;
             ensure!(
-                self.commit(
+                blobs.get(&missing.id) == Some(&missing.size),
+                "scheduler requested undeclared output"
+            );
+            self.upload_stored_file_async(
+                ticket,
+                missing,
+                captured.physical_encoding(),
+                captured.open_file(missing.id)?,
+            )
+            .await?;
+        }
+        let upload_duration = started.elapsed();
+        let worker_timing = transport.map(|transport| {
+            transport.observe_result(bytes, requests, upload_duration);
+            transport.snapshot()
+        });
+        let committed: crate::build_runtime::ResultManifest = self
+            .control_with_timeout_async(
+                "commit",
+                &super::CommitRequest {
                     ticket,
-                    retained_after_begin,
-                    Some(ActionObservation {
+                    retained_after_begin_millis: u64::try_from(retained_after_begin.as_millis())
+                        .unwrap_or(u64::MAX),
+                    observation: Some(ActionObservation {
                         worker_timing,
                         warm_staging_nanoseconds: prepared
                             .warm_staging
@@ -786,15 +823,113 @@ impl NativeCacheClient {
                         upload_requests: requests,
                         upload_nanoseconds: u64::try_from(upload_duration.as_nanos())
                             .unwrap_or(u64::MAX),
-                    })
-                )? == *manifest,
-                "native publication manifest mismatch"
-            );
-        } else {
-            self.fail(ticket)?;
-        }
+                    }),
+                },
+                self.timeout,
+            )
+            .await?;
+        ensure!(
+            committed == manifest,
+            "native publication manifest mismatch"
+        );
         Ok(captured)
     }
+}
+
+struct WorkerStorage {
+    output: Option<(super::grace::GraceReservation, StageBudget)>,
+    cached: Vec<(TreeId, Option<TreeLease>)>,
+    warm: bool,
+}
+
+/// Pin the already-resident closure in the same blocking task as output-space
+/// admission. No network operation holds the blocking pool or an index lock.
+async fn prepare_worker_storage(
+    store: &NativeStore,
+    policy: &ExecutionPolicy,
+    grace: Option<&super::ArtifactGrace>,
+    request: &ActionRequest,
+    estimated_result_bytes: Option<u64>,
+    check: &LeaseCheck<'_>,
+) -> Result<WorkerStorage> {
+    let predicted = estimated_result_bytes
+        .unwrap_or(policy.max_result_bytes)
+        .clamp(1, policy.max_result_bytes);
+    let mut warm = true;
+    let reservation = if let Some(grace) = grace {
+        let mut reservation = {
+            let store = store.clone();
+            let grace = grace.clone();
+            tokio::task::spawn_blocking(move || {
+                grace.reap();
+                maintain_executor_space(&store)?;
+                grace.reserve(predicted)
+            })
+            .await??
+        };
+        let started = Instant::now();
+        warm = reservation.is_some();
+        while reservation.is_none() {
+            check()?;
+            ensure!(
+                started.elapsed() < policy.timeout,
+                "native artifact grace admission timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            check()?;
+            let grace = grace.clone();
+            reservation = tokio::task::spawn_blocking(move || grace.reserve(predicted)).await??;
+        }
+        reservation
+    } else {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || maintain_executor_space(&store)).await??;
+        None
+    };
+    check()?;
+    let store = store.clone();
+    let limit = policy.max_result_bytes;
+    let trees = request.input_trees.clone();
+    tokio::task::spawn_blocking(move || {
+        let output = reservation
+            .map(|reservation| Ok::<_, anyhow::Error>((reservation, store.reserve_staging(limit)?)))
+            .transpose()?;
+        let cached = trees
+            .into_iter()
+            .map(|id| Ok((id, store.lookup_tree(id)?)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(WorkerStorage {
+            output,
+            cached,
+            warm,
+        })
+    })
+    .await?
+}
+
+fn maintain_executor_space(store: &NativeStore) -> Result<()> {
+    if let Some(report) = store.maintain_space()? {
+        ensure!(
+            report.minimum_satisfied,
+            "native executor store lacks allocatable space: {report:?}"
+        );
+    }
+    Ok(())
+}
+
+fn trace_tree_access(id: TreeId, tree: &TreeLease, hit: bool) -> Result<()> {
+    if log::log_enabled!(target: "native_cas_replay", log::Level::Trace) {
+        let blobs = tree
+            .manifest()
+            .blobs()?
+            .into_iter()
+            .map(|(id, size)| BlobRef { id, size })
+            .collect::<Vec<_>>();
+        log::trace!(target: "native_cas_replay", "{}", serde_json::json!({
+            "kind": "tree_access", "tree": id, "hit": hit, "blobs": blobs,
+        }));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -853,7 +988,7 @@ struct WorkerLease {
 }
 
 impl WorkerLease {
-    fn start(
+    async fn start(
         client: NativeCacheClient,
         ticket: Ticket,
         spec: &ExecutionSpec,
@@ -870,7 +1005,7 @@ impl WorkerLease {
         // Verification is the delegation barrier: the scheduler cannot
         // authorize this worker until its assignment RPC has returned and
         // the session has installed the delegated publisher.
-        let result = (|| {
+        let result = async {
             let started = Instant::now();
             let mut delay = Duration::from_millis(10);
             loop {
@@ -883,11 +1018,22 @@ impl WorkerLease {
                     !remaining.is_zero(),
                     "native assignment authorization timed out"
                 );
-                match lease.client.verify_execution(ticket, spec.clone()) {
+                match lease
+                    .client
+                    .control_with_timeout_async::<_, ()>(
+                        "verify",
+                        &super::ExecutionRequest {
+                            ticket,
+                            spec: spec.clone(),
+                        },
+                        remaining,
+                    )
+                    .await
+                {
                     Ok(()) => break,
                     Err(error) if retryable_transport_error(&error) => {
                         debug!("retrying native assignment authorization: {error:#}");
-                        std::thread::sleep(delay.min(remaining));
+                        tokio::time::sleep(delay.min(remaining)).await;
                         delay = (delay * 2).min(Duration::from_millis(200));
                     }
                     Err(error) => return Err(error),
@@ -896,14 +1042,18 @@ impl WorkerLease {
             let renewals = super::renewal::Renewals::start(lease.client.clone(), interval)?;
             renewals.add(ticket)?;
             Ok(renewals)
-        })();
+        }
+        .await;
         match result {
             Ok(renewals) => {
                 lease.renewals = Some(renewals);
                 Ok(lease)
             }
             Err(error) => {
-                let _ = lease.client.fail(ticket);
+                let _ = lease
+                    .client
+                    .control_with_timeout_async::<_, ()>("fail", &ticket, lease.client.timeout)
+                    .await;
                 Err(error)
             }
         }
@@ -920,11 +1070,21 @@ impl WorkerLease {
             .check()
     }
 
-    fn finish(mut self) {
+    async fn finish(mut self) {
         if let Some(renewals) = self.renewals.take()
-            && let Err(error) = renewals.finish()
+            && let Err(error) = renewals.finish_async().await
         {
             debug!("Native worker lease ended after terminal publication: {error:#}");
+        }
+    }
+
+    async fn fail(mut self) {
+        if let Some(renewals) = self.renewals.take() {
+            drop(renewals);
+            let _ = self
+                .client
+                .control_with_timeout_async::<_, ()>("fail", &self.ticket, self.client.timeout)
+                .await;
         }
     }
 }
@@ -933,17 +1093,25 @@ impl Drop for WorkerLease {
     fn drop(&mut self) {
         if let Some(renewals) = self.renewals.take() {
             drop(renewals);
-            let _ = self.client.fail(self.ticket);
+            let client = self.client.clone();
+            let ticket = self.ticket;
+            if let Ok(runtime) = crate::http_client::io_runtime() {
+                runtime.spawn(async move {
+                    let _ = client
+                        .control_with_timeout_async::<_, ()>("fail", &ticket, client.timeout)
+                        .await;
+                });
+            }
         }
     }
 }
 
 /// Cancellation and verified-tree progress for worker-side preparation.
-pub struct WorkerPreparation<'a> {
+pub struct WorkerPreparation<'a, A> {
     pub estimated_result_bytes: Option<u64>,
     pub cancelled: Arc<AtomicBool>,
-    pub on_tree: &'a mut dyn FnMut(&TreeLease),
-    pub on_authorized: &'a dyn Fn() -> Result<()>,
+    pub on_tree: &'a mut (dyn FnMut(&TreeLease) + Send),
+    pub on_authorized: A,
 }
 
 /// A ready action owns its verified input closure and output reservation.
@@ -993,7 +1161,7 @@ impl CompletedWorker {
     /// Publish retained outputs and finish the scheduler lease.
     /// # Errors
     /// Returns an error for failed publication, verification or cancellation.
-    pub fn publish(
+    pub async fn publish(
         self,
         store: &NativeStore,
         policy: &ExecutionPolicy,
@@ -1010,14 +1178,26 @@ impl CompletedWorker {
             store,
             policy,
         };
-        let captured = lease.client.publish_execution(
-            context,
-            prepared,
-            self.captured?,
-            Some(transport),
-            &|| lease.check(),
-        )?;
-        lease.finish();
-        Ok(captured)
+        let result = match self.captured {
+            Ok(captured) => {
+                lease
+                    .client
+                    .publish_execution(context, prepared, captured, Some(transport), &|| {
+                        lease.check()
+                    })
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(captured) => {
+                lease.finish().await;
+                Ok(captured)
+            }
+            Err(error) => {
+                lease.fail().await;
+                Err(error)
+            }
+        }
     }
 }

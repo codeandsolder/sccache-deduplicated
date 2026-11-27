@@ -2,7 +2,11 @@ use sccache_cluster_identity::{
     ClusterCa, EnrollmentAuthority, Identity, PeerConfig, PeerCredentials, Registry, Role,
     TlsCredentials,
 };
-use std::{collections::BTreeMap, io::Cursor, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    io::{Cursor, Seek},
+    sync::Mutex,
+};
 
 use super::*;
 use crate::{
@@ -180,55 +184,84 @@ fn with_native_service(
             let network = Arc::clone(&network);
             let observations = Arc::clone(&observations);
             let sources = Arc::clone(&sources);
-            native_router(move |request, role, operation| {
-                respond(
-                    request,
-                    role,
-                    operation,
-                    NativeServices {
-                        sessions: &sessions,
-                        packages: None,
-                        network: &network,
-                        source_plan: &|blob, _, _| {
-                            Ok(sources
-                                .lock()
-                                .unwrap()
-                                .get(&blob.id)
-                                .cloned()
-                                .unwrap_or_default())
+            let schedule_sessions = Arc::clone(&sessions);
+            let schedule_network = Arc::clone(&network);
+            let upload_sessions = Arc::clone(&sessions);
+            let upload_network = Arc::clone(&network);
+            native_router(
+                move |request, role, operation| {
+                    respond(
+                        request,
+                        role,
+                        operation,
+                        NativeServices {
+                            sessions: &sessions,
+                            packages: None,
+                            network: &network,
+                            source_plan: &|blob, _, _| {
+                                Ok(sources
+                                    .lock()
+                                    .unwrap()
+                                    .get(&blob.id)
+                                    .cloned()
+                                    .unwrap_or_default())
+                            },
+                            observe_result: &|server, job, event| {
+                                let result = match event {
+                                    crate::dist::NativeLifecycleEvent::Delivered(_) => return,
+                                    crate::dist::NativeLifecycleEvent::InputsStaged => {
+                                        Observation::Staged
+                                    }
+                                    crate::dist::NativeLifecycleEvent::Negotiated => {
+                                        Observation::Negotiated
+                                    }
+                                    crate::dist::NativeLifecycleEvent::Committed {
+                                        manifest,
+                                        retained_after_begin,
+                                        ..
+                                    } => Observation::Committed(
+                                        manifest.clone(),
+                                        retained_after_begin,
+                                    ),
+                                };
+                                observations.lock().unwrap().push((server, job, result));
+                            },
                         },
-                        observe_result: &|server, job, event| {
-                            let result = match event {
-                                crate::dist::NativeLifecycleEvent::Delivered(_) => return,
-                                crate::dist::NativeLifecycleEvent::InputsStaged => {
-                                    Observation::Staged
-                                }
-                                crate::dist::NativeLifecycleEvent::Negotiated => {
-                                    Observation::Negotiated
-                                }
-                                crate::dist::NativeLifecycleEvent::Committed {
-                                    manifest,
-                                    retained_after_begin,
-                                    ..
-                                } => Observation::Committed(manifest.clone(), retained_after_begin),
-                            };
-                            observations.lock().unwrap().push((server, job, result));
-                        },
-                    },
-                    &move |_, _, _| {
-                        Ok(ScheduleReply::Assigned(WorkerAllocation {
-                            peer: worker,
-                            routes: sccache_peer_identity::RouteSet::new(
-                                "127.0.0.1:10501".parse().unwrap(),
-                                [],
-                            ),
-                            job: 42,
-                            auth: "allocation-proof".into(),
-                        }))
-                    },
-                    1024 * 1024,
-                )
-            })
+                        1024 * 1024,
+                    )
+                },
+                move |request| {
+                    schedule_response(
+                        request,
+                        Arc::clone(&schedule_sessions),
+                        Arc::clone(&schedule_network),
+                        Arc::new(move |_, _, _| async move {
+                            Ok(ScheduleReply::Assigned(WorkerAllocation {
+                                peer: worker,
+                                routes: sccache_peer_identity::RouteSet::new(
+                                    "127.0.0.1:10501".parse().unwrap(),
+                                    [],
+                                ),
+                                job: 42,
+                                auth: "allocation-proof".into(),
+                            }))
+                        }),
+                        1024 * 1024,
+                    )
+                },
+                move |request, role, operation| {
+                    upload_response(
+                        request,
+                        role,
+                        operation,
+                        Arc::clone(&upload_sessions),
+                        Arc::clone(&upload_network),
+                        1024 * 1024,
+                    )
+                },
+                None,
+                1024 * 1024,
+            )
         },
     )?;
     let url = url::Url::parse(&format!("https://{}/", server.local_addr()?))?;
@@ -341,6 +374,8 @@ fn verify_peer_delivery(
                     "/api/v3/distserver/native_blob",
                     super::super::cluster_http::route(
                         MethodFilter::POST,
+                        AdmissionClass::Bulk,
+                        |_| Some(40),
                         move |_: &(), request| {
                             serve_peer_blob(request, &*authorizer, |requested| {
                                 if requested != blob {
@@ -448,6 +483,137 @@ fn verify_peer_delivery(
         .map_err(|_| anyhow::anyhow!("peer delivery test listener panicked"))??;
     endpoint.sources.lock().unwrap().remove(&blob.id);
     outcome
+}
+
+#[test]
+fn stalled_bulk_uploads_leave_lease_and_dispatch_lanes_available() -> Result<()> {
+    use crate::build_runtime::{TreeEntry, TreePath};
+    use bytes::Bytes;
+    use futures::{StreamExt, stream};
+
+    with_native_service(|endpoint, _, network, _| {
+        let client = make_client(endpoint, "client-token")?;
+        let worker = make_client(endpoint, "worker-token")?.for_worker(JobId(42));
+        let metadata = TreeMetadata {
+            mode: 0o755,
+            modified: TreeTimestamp {
+                seconds: 1,
+                nanoseconds: 0,
+            },
+        };
+        let root = TreeManifest {
+            root: metadata,
+            entries: BTreeMap::new(),
+        };
+        let offer = client.offer_tree(&root)?;
+        client.commit_tree(offer.ticket)?;
+        let spec = action(&root)?;
+        let NativeAdmission::Compile { ticket } = client.admit(
+            &spec,
+            crate::build_runtime::ActionMode::Reuse,
+            &BTreeMap::new(),
+        )?
+        else {
+            anyhow::bail!("expected compilation");
+        };
+
+        let (http, base) = endpoint.raw(&endpoint.client)?;
+        let upload_url = base.join("/api/v5/native/client/upload")?;
+        let runtime = crate::http_client::io_runtime()?;
+        let mut uploads = Vec::new();
+        const PAYLOAD: usize = 256 * 1024;
+        for byte in 0_u8..4 {
+            let bytes = vec![byte; PAYLOAD];
+            let blob = BlobRef {
+                id: ContentId::of(&bytes),
+                size: PAYLOAD as u64,
+            };
+            let tree = TreeManifest {
+                root: metadata,
+                entries: BTreeMap::from([(
+                    TreePath::new(b"input".to_vec())?,
+                    TreeEntry::File { blob, metadata },
+                )]),
+            };
+            let offer = client.offer_tree(&tree)?;
+            assert_eq!(offer.missing, vec![blob]);
+            let header = codec().serialize(&UploadHeader {
+                ticket: offer.ticket,
+                blob,
+                encoding: BlobEncoding::Raw as u8,
+            })?;
+            let (resume, paused) = tokio::sync::oneshot::channel::<()>();
+            let stream = stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(header)) })
+                .chain(stream::once(async move {
+                    paused.await.map_err(std::io::Error::other)?;
+                    Ok(Bytes::from(bytes))
+                }));
+            let request = http
+                .post(upload_url.as_str())
+                .header("Content-Type", "application/octet-stream")
+                .body(wreq::Body::wrap_stream(stream))
+                .timeout(Duration::from_secs(20));
+            uploads.push((
+                resume,
+                runtime.spawn(async move { request.send().await }),
+                offer.ticket,
+                tree.id()?,
+            ));
+        }
+
+        // The transfer meters are installed only after the authenticated
+        // upload header has been parsed and its staging reservation acquired.
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let remaining: u64 = network
+                        .snapshot()
+                        .receive
+                        .peers
+                        .values()
+                        .map(|peer| peer.active_remaining_bytes)
+                        .sum();
+                    if remaining >= 4 * PAYLOAD as u64 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+        })?;
+
+        let rejected = runtime.block_on(
+            http.post(upload_url.as_str())
+                .header("Content-Type", "application/octet-stream")
+                .body(Vec::new())
+                .timeout(Duration::from_secs(3))
+                .send(),
+        )?;
+        assert_eq!(rejected.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(client.status(ticket)?, NativeStatus::Compiling);
+        client.renew(ticket)?;
+        assert!(matches!(
+            client.schedule(ticket, spec)?,
+            ScheduleReply::Assigned(_)
+        ));
+        worker.renew(ticket)?;
+
+        // Resume each valid upload, and verify all four reservations can publish.
+        let tasks = uploads
+            .into_iter()
+            .map(|(resume, task, ticket, id)| {
+                resume
+                    .send(())
+                    .map_err(|()| anyhow::anyhow!("upload stopped before resume"))?;
+                Ok((task, ticket, id))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (task, ticket, id) in tasks {
+            runtime.block_on(task)??.error_for_status()?;
+            assert_eq!(client.commit_tree(ticket)?, id);
+        }
+        Ok(())
+    })
 }
 
 #[test]
@@ -858,7 +1024,7 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
             artifact_grace: Some(&artifact_grace),
         };
         let busy = execution_queue.acquire(|| Ok(()))?;
-        let prepared = worker.prepare_on_worker(
+        let prepared = crate::http_client::io_runtime()?.block_on(worker.prepare_on_worker(
             ticket,
             &spec,
             &worker_store,
@@ -868,16 +1034,20 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
                 estimated_result_bytes: None,
                 cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 on_tree: &mut |_| {},
-                on_authorized: &|| Ok(()),
+                on_authorized: || std::future::ready(Ok(())),
             },
-        )?;
+        ))?;
         assert_eq!(execution_queue.active(), 1);
         drop(busy);
         let completed = prepared.execute(&worker_store, &policy, delivery, || {
             assert_eq!(execution_queue.active(), 1)
         });
         assert_eq!(execution_queue.active(), 0);
-        let result = completed.publish(&worker_store, &policy, &transport)?;
+        let result = crate::http_client::io_runtime()?.block_on(completed.publish(
+            &worker_store,
+            &policy,
+            &transport,
+        ))?;
         let manifest = result
             .successful_result()
             .context("native execution failed")?;
@@ -933,6 +1103,13 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
 #[tokio::test]
 async fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> Result<()> {
     use std::io::{Seek as _, Write as _};
+    let request = Request::fake_http_from(
+        "127.0.0.1:1".parse()?,
+        "POST",
+        "/test",
+        Vec::new(),
+        Vec::new(),
+    );
     let compressible = vec![b'Z'; 256 * 1024];
     let noise: Vec<u8> = (0..8192_u64)
         .flat_map(|i| *blake3::hash(&i.to_le_bytes()).as_bytes())
@@ -945,13 +1122,15 @@ async fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> 
         let mut raw = tempfile::tempfile()?;
         raw.write_all(&original)?;
         raw.rewind()?;
-        let response = physical_blob_response(raw, BlobEncoding::Raw)?;
+        let response = physical_blob_response(&request, raw, BlobEncoding::Raw)?;
         assert_eq!(response.headers()["X-Sccache-CAS-Encoding"], "zstd-chunks");
-        let size = response.headers()[http::header::CONTENT_LENGTH]
-            .to_str()?
-            .parse::<u64>()?;
+        assert!(
+            !response
+                .headers()
+                .contains_key(http::header::CONTENT_LENGTH)
+        );
         let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024).await?;
-        assert_eq!(u64::try_from(bytes.len())?, size);
+        let size = u64::try_from(bytes.len())?;
         let stream = std::io::Cursor::new(bytes);
         let mut encoded = tempfile::tempfile()?;
         let mut decoded = Vec::new();
@@ -964,7 +1143,7 @@ async fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> 
         )?;
         assert_eq!(decoded, original);
         encoded.rewind()?;
-        let response = physical_blob_response(encoded, BlobEncoding::ZstdChunks)?;
+        let response = physical_blob_response(&request, encoded, BlobEncoding::ZstdChunks)?;
         let reused_size = response.headers()[http::header::CONTENT_LENGTH]
             .to_str()?
             .parse::<u64>()?;

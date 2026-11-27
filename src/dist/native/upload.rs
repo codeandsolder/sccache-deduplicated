@@ -43,6 +43,15 @@ async fn reply(
             Err(error) => Some((Err(error), None)),
         }
     });
+    reply_stream(request, length, limit, stream).await
+}
+
+async fn reply_stream(
+    request: wreq::RequestBuilder,
+    length: u64,
+    limit: u64,
+    stream: impl futures::Stream<Item = io::Result<Bytes>> + Send + 'static,
+) -> Result<Reply> {
     let response = request
         .header(http::header::CONTENT_LENGTH, length)
         .body(wreq::Body::wrap_stream(stream))
@@ -125,10 +134,161 @@ pub(super) fn send(
     }
 }
 
+/// Demand-driven immutable file upload. There is no synchronous producer,
+/// no temporary copy, and at most one completion read per body poll.
+#[cfg(all(unix, feature = "native-store"))]
+pub(super) async fn send_file(
+    request: wreq::RequestBuilder,
+    header: Bytes,
+    file: std::sync::Arc<std::fs::File>,
+    size: u64,
+    limit: u64,
+    activity: Option<crate::dist::cluster_routes::interface::Activity>,
+) -> Result<Attempt> {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
+    let length = size
+        .checked_add(header.len() as u64)
+        .context("native upload length overflow")?;
+    let consumed = Arc::new(AtomicU64::new(0));
+    let local_error = Arc::new(Mutex::new(None));
+    let count = Arc::clone(&consumed);
+    let errors = Arc::clone(&local_error);
+    let stream = futures::stream::try_unfold(
+        (Some(header), file, 0_u64, activity),
+        move |(header, file, offset, mut activity)| {
+            let count = Arc::clone(&count);
+            let errors = Arc::clone(&errors);
+            async move {
+                let (bytes, next) = if let Some(header) = header {
+                    (header, offset)
+                } else if offset < size {
+                    let width = usize::try_from((size - offset).min(CHUNK as u64))
+                        .map_err(io::Error::other)?;
+                    match crate::build_runtime::read_file_at(Arc::clone(&file), offset, width, ())
+                        .await
+                    {
+                        Ok((bytes, ())) => (Bytes::from(bytes), offset + width as u64),
+                        Err(error) => {
+                            let description = format!("{error:#}");
+                            *errors
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                            return Err(io::Error::other(description));
+                        }
+                    }
+                } else {
+                    return Ok(None);
+                };
+                count.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                if let Some(activity) = &mut activity {
+                    activity.bytes(bytes.len() as u64);
+                }
+                Ok(Some((bytes, (None, file, next, activity))))
+            }
+        },
+    );
+    let result = reply_stream(request, length, limit, stream).await;
+    let local_error = local_error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    Ok(Attempt {
+        result: local_error.map_or(result, Err),
+        consumed: consumed.load(Ordering::Relaxed),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, TcpListener};
+
+    #[cfg(all(unix, feature = "native-store"))]
+    #[tokio::test]
+    async fn refused_connection_does_not_read_immutable_file() -> Result<()> {
+        let socket = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let address = socket.local_addr()?;
+        drop(socket);
+        let request = wreq::Client::builder()
+            .no_proxy()
+            .build()?
+            .post(format!("http://{address}/upload"))
+            .timeout(std::time::Duration::from_secs(2));
+        // A declared but absent payload would return a local truncation
+        // error if the stream were read before a connection exists.
+        let file = std::sync::Arc::new(tempfile::tempfile()?);
+        let attempt = send_file(
+            request,
+            Bytes::from_static(b"metadata"),
+            file,
+            1 << 20,
+            1024,
+            None,
+        )
+        .await?;
+        assert!(attempt.result.is_err());
+        assert_eq!(attempt.consumed, 0);
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "native-store"))]
+    #[tokio::test]
+    async fn immutable_file_body_reads_exact_positional_range() -> Result<()> {
+        use std::{
+            io::{Seek, SeekFrom, Write},
+            sync::Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let bytes = (0..(3 * CHUNK + 17))
+            .map(|index| u8::try_from(index % 251).unwrap_or_default())
+            .collect::<Vec<_>>();
+        let mut file = tempfile::tempfile()?;
+        file.write_all(&bytes)?;
+        file.seek(SeekFrom::Start(123))?;
+        let file = Arc::new(file);
+        let expected = [b"metadata".as_slice(), &bytes].concat();
+        let size = bytes.len() as u64;
+        let length = expected.len();
+        let receiver = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(stream.read_u8().await?);
+                ensure!(headers.len() <= 16 * 1024, "oversized request headers");
+            }
+            let mut actual = vec![0; length];
+            stream.read_exact(&mut actual).await?;
+            assert_eq!(actual, expected);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let request = wreq::Client::builder()
+            .no_proxy()
+            .build()?
+            .post(format!("http://{address}/upload"))
+            .timeout(std::time::Duration::from_secs(5));
+        let attempt = send_file(
+            request,
+            Bytes::from_static(b"metadata"),
+            Arc::clone(&file),
+            size,
+            1024,
+            None,
+        )
+        .await?;
+        assert_eq!(attempt.result?.bytes, b"OK");
+        assert_eq!(attempt.consumed, length as u64);
+        receiver.await??;
+        assert_eq!((&*file).stream_position()?, 123);
+        Ok(())
+    }
 
     #[test]
     fn refused_connection_does_not_read_nonseekable_source() -> Result<()> {

@@ -13,7 +13,7 @@ mod network;
 pub use network::{
     ConcurrentCapacity, Direction, DirectionSnapshot, MeteredReader, NetworkCheckpoint,
     NetworkMeter, NetworkPath, NetworkSnapshot, Peer, PeerCapacity, ResultTransferEstimate,
-    SharedCapacity, TransferDemand, transfer_seconds,
+    SharedCapacity, TransferDemand, TransferMeter, transfer_seconds,
 };
 mod package;
 mod placement_class;
@@ -44,9 +44,14 @@ pub use tree::{TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTime
 mod blob_codec;
 #[cfg(feature = "store")]
 pub use blob_codec::{
-    BlobEncoding, BlobReader, encode as encode_native_blob, encode_raw as encode_native_raw_blob,
-    transfer as transfer_native_blob,
+    BlobEncoding, BlobReader, BlobWireEncoder, encode as encode_native_blob,
+    encode_raw as encode_native_raw_blob, transfer as transfer_native_blob,
 };
+
+#[cfg(all(unix, feature = "async-io"))]
+mod disk;
+#[cfg(all(unix, feature = "async-io"))]
+pub use disk::{initialize_async_disk, read_file_at};
 
 #[cfg(all(unix, feature = "store"))]
 mod coordinator;
@@ -54,8 +59,9 @@ mod coordinator;
 mod session;
 #[cfg(all(unix, feature = "store"))]
 pub use session::{
-    DeliveryReceipt, ManifestStatus, NativeContentPending, NativeInputRejected, NativeServiceBusy,
-    NativeSessions, PeerInputClaim, RecoveryStatus, SessionLimits, SessionStatus, TicketStatus,
+    DeliveryReceipt, ManifestStatus, NativeContentPending, NativeDownload, NativeInputRejected,
+    NativeServiceBusy, NativeSessions, NativeUpload, PeerInputClaim, RecoveryStatus,
+    SchedulePreparation, ScheduleReservation, SessionLimits, SessionStatus, TicketStatus,
 };
 #[cfg(all(unix, feature = "store"))]
 mod store;
@@ -64,9 +70,10 @@ pub use coordinator::{Admission, BuildCoordinator, CompilePermit};
 #[cfg(all(unix, feature = "store"))]
 pub use store::{
     CacheAnalyticsSampler, CacheStats, ComponentAudit, Eviction, GarbageCollected,
-    NativeIndexAudit, NativeStore, PackageArchiveLease, PackageDecoder, PackageImportLimits,
-    PackagePolicy, PackageSlot, Published, ResultLease, SchemaInventory, SpaceReport, SpaceStatus,
-    StageBudget, StagedBlob, TreeLease, UploadReservation, VerifiedPackage, decode_package_process,
+    NativeIndexAudit, NativeStore, PackageArchiveLease, PackageDecoder, PackageImport,
+    PackageImportLimits, PackagePolicy, PackagePreparation, PackageSlot, PhysicalStager, Published,
+    ResultLease, SchemaInventory, SpaceReport, SpaceStatus, StageBudget, StagedBlob, TreeLease,
+    UploadReservation, VerifiedPackage, decode_package_process,
 };
 
 #[cfg(all(target_os = "linux", feature = "store"))]
