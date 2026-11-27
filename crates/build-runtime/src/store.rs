@@ -624,6 +624,20 @@ where
     P: ReadableTable<&'static [u8; 32], u64>,
     E: ReadableTable<&'static [u8; 32], u8>,
 {
+    fn open_available(&self, inner: &Inner, blob: BlobRef) -> Result<Option<(File, BlobEncoding)>> {
+        let live = self.live.get(&blob.id.0)?.map(|entry| entry.value());
+        let size = if live.is_some() {
+            live
+        } else {
+            self.pending.get(&blob.id.0)?.map(|entry| entry.value())
+        };
+        let Some(size) = size else {
+            return Ok(None);
+        };
+        ensure!(size == blob.size, "inconsistent indexed blob length");
+        inner.open_checked_blob(self.layouts, blob.id, blob.size)
+    }
+
     fn inspect(
         &self,
         inner: &Inner,
@@ -2221,6 +2235,10 @@ impl ResultLease {
     #[must_use = "the manifest identifies the leased result"]
     pub const fn manifest(&self) -> &ResultManifest {
         &self.manifest
+    }
+
+    pub(crate) const fn blobs(&self) -> &BTreeMap<ContentId, u64> {
+        &self.blobs
     }
 
     pub(crate) fn blob_size(&self, id: ContentId) -> Result<u64> {

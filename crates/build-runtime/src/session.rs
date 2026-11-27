@@ -1713,10 +1713,7 @@ impl NativeSessions {
             .map(|allocation| allocation.worker.peer);
         let (producer, pinned) = match &state.phase {
             Phase::Ready(Ready::Result(lease)) => {
-                ensure!(
-                    declared(&lease.manifest().blobs()?),
-                    "undeclared result source"
-                );
+                ensure!(declared(lease.blobs()), "undeclared result source");
                 (producer, true)
             }
             Phase::Ready(Ready::Tree(delivery)) => match &delivery.source {
@@ -1744,10 +1741,7 @@ impl NativeSessions {
         let availability = if pinned {
             vec![true; blobs.len()]
         } else {
-            blobs
-                .iter()
-                .map(|&blob| Ok(self.store().open_available_physical(blob)?.is_some()))
-                .collect::<Result<Vec<_>>>()?
+            self.store().available_blobs(blobs)?
         };
         Ok((producer, availability))
     }
@@ -1843,18 +1837,21 @@ impl NativeSessions {
         missing: Vec<BlobRef>,
     ) -> Result<()> {
         let session = self.get(ticket)?;
-        let mut state = Self::lock(&session)?;
-        self.authorize_reader(&mut state, reader)?;
-        let Phase::Ready(Ready::Tree(delivery)) = &mut state.phase else {
-            bail!("input prefetch requires a tree delivery");
-        };
-        let TreeSource::Action {
-            ticket: action,
-            id: tree,
-            input,
-        } = &delivery.source
-        else {
-            bail!("input prefetch requires an assigned action");
+        let (action, tree, input) = {
+            let mut state = Self::lock(&session)?;
+            self.authorize_reader(&mut state, reader)?;
+            let Phase::Ready(Ready::Tree(delivery)) = &state.phase else {
+                bail!("input prefetch requires a tree delivery");
+            };
+            let TreeSource::Action {
+                ticket: action,
+                id: tree,
+                input,
+            } = &delivery.source
+            else {
+                bail!("input prefetch requires an assigned action");
+            };
+            (*action, *tree, Arc::clone(input))
         };
         let mut blobs = BTreeMap::new();
         for blob in missing {
@@ -1864,13 +1861,24 @@ impl NativeSessions {
                 "undeclared or duplicate input prefetch"
             );
         }
-        let action = *action;
-        let tree = *tree;
+        // Physical validation and pending-content reservation may wait for
+        // storage/GC. Lease renewal and close must not wait behind either.
         let reservation = self.store().reserve_blobs(&blobs)?;
         let absent = reservation.missing().to_vec();
-        delivery.requested.extend(absent.iter().map(|blob| blob.id));
-        delivery.reservation = Some(reservation);
-        drop(state);
+        let previous = {
+            let mut state = Self::lock(&session)?;
+            self.authorize_reader(&mut state, reader)?;
+            let Phase::Ready(Ready::Tree(delivery)) = &mut state.phase else {
+                bail!("input delivery closed during prefetch");
+            };
+            ensure!(
+                matches!(&delivery.source, TreeSource::Action { ticket, id, .. } if *ticket == action && *id == tree),
+                "input delivery changed during prefetch"
+            );
+            delivery.requested.extend(absent.iter().map(|blob| blob.id));
+            delivery.reservation.replace(reservation)
+        };
+        drop(previous);
         self.request_backfills(action, reader, tree, &absent)
     }
 

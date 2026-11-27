@@ -71,16 +71,34 @@ impl NativeStore {
         let read = self.inner.db.begin_read()?;
         let live = read.open_table(super::BLOBS)?;
         let pending = read.open_table(super::PENDING_DELETIONS)?;
-        let size = match live.get(&blob.id.0)? {
-            Some(size) => size.value(),
-            None => match pending.get(&blob.id.0)? {
-                Some(size) => size.value(),
-                None => return Ok(None),
-            },
-        };
-        ensure!(size == blob.size, "inconsistent indexed blob length");
         let layouts = read.open_table(super::BLOB_LAYOUTS)?;
-        self.inner.open_checked_blob(&layouts, blob.id, blob.size)
+        super::BlobIndex {
+            live: &live,
+            pending: &pending,
+            layouts: &layouts,
+        }
+        .open_available(&self.inner, blob)
+    }
+
+    /// Check a batch of physical content references against a single index
+    /// snapshot, preserving the caller's order. No delivery pin is acquired.
+    ///
+    /// # Errors
+    /// Returns an error for inconsistent lengths or storage failures.
+    pub(crate) fn available_blobs(&self, blobs: &[BlobRef]) -> Result<Vec<bool>> {
+        let read = self.inner.db.begin_read()?;
+        let live = read.open_table(super::BLOBS)?;
+        let pending = read.open_table(super::PENDING_DELETIONS)?;
+        let layouts = read.open_table(super::BLOB_LAYOUTS)?;
+        let index = super::BlobIndex {
+            live: &live,
+            pending: &pending,
+            layouts: &layouts,
+        };
+        blobs
+            .iter()
+            .map(|&blob| Ok(index.open_available(&self.inner, blob)?.is_some()))
+            .collect()
     }
 
     /// A canonical single-blob retention root. Uses the ordinary CAS and eviction

@@ -829,6 +829,51 @@ fn lookups_do_not_wait_on_publication_lock() -> Result<()> {
 }
 
 #[test]
+fn batched_availability_preserves_order_and_pending_content() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let live = store.stage(&b"live"[..])?;
+    let pending = store.stage(&b"pending"[..])?;
+    let live_ref = live.reference();
+    let pending_ref = pending.reference();
+    store.publish(
+        &action("live"),
+        &result(live_ref),
+        vec![live],
+        ActionMode::Reuse,
+    )?;
+    let retired = store.publish(
+        &action("pending"),
+        &result(pending_ref),
+        vec![pending],
+        ActionMode::Reuse,
+    )?;
+    store.evict(retired.action)?;
+    let missing = BlobRef {
+        id: ContentId::of(b"missing"),
+        size: 7,
+    };
+    assert_eq!(
+        store.available_blobs(&[missing, pending_ref, live_ref, pending_ref])?,
+        vec![false, true, true, true]
+    );
+    assert!(
+        store
+            .available_blobs(&[BlobRef {
+                id: live_ref.id,
+                size: live_ref.size + 1
+            }])
+            .is_err()
+    );
+    store.collect_garbage(8)?;
+    assert_eq!(
+        store.available_blobs(&[pending_ref, live_ref])?,
+        vec![false, true]
+    );
+    Ok(())
+}
+
+#[test]
 fn live_reservations_do_not_wait_for_publication_but_pending_content_is_protected() -> Result<()> {
     use std::{sync::mpsc, time::Duration};
     let dir = tempfile::tempdir()?;
