@@ -17,7 +17,7 @@ permissions:
 jobs:
   distributed:
     name: Distributed runtime regression
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@343303848026ed142e48a6a82e7a889080b99b26 # Last reusable workflow without provider-only OIDC permission
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@4c7fc62a9f9ec37aaa7c155d263cd5025e446a53 # main
     with:
       runner: ubuntu-26.04
       rust-toolchain: "nightly-2026-11-23"

@@ -234,6 +234,19 @@ impl Drop for CancelDeadline {
     }
 }
 
+/// Start the decoder with an otherwise empty environment. The profiling
+/// destination is set by the invoking process (never an archive or client
+/// request); forwarding it lets instrumented decoder builds retain their
+/// counters without forwarding any of the daemon's other environment.
+fn decoder_command(executable: &Path, profile: Option<std::ffi::OsString>) -> Command {
+    let mut command = Command::new(executable);
+    command.env_clear();
+    if let Some(profile) = profile {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    command
+}
+
 fn decode_isolated(
     executable: &Path,
     reader: File,
@@ -247,8 +260,7 @@ fn decode_isolated(
         memory_bytes > 0 && !timeout.is_zero(),
         "invalid package decoder resource limits"
     );
-    let mut child = Command::new(executable)
-        .env_clear()
+    let mut child = decoder_command(executable, std::env::var_os("LLVM_PROFILE_FILE"))
         .arg("native-decode-package")
         .args(["--compression", compression.name()])
         .arg("--max-tar-bytes")
@@ -357,4 +369,24 @@ pub fn decode_package_process(
     write_frame(&mut output, None)?;
     output.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoder_inherits_only_the_explicit_coverage_destination() -> Result<()> {
+        let profile = "/tmp/decoder-test-%p-%m%c.profraw";
+        let output = decoder_command(Path::new("/usr/bin/env"), Some(profile.into())).output()?;
+        ensure!(output.status.success(), "environment probe failed");
+        assert_eq!(
+            String::from_utf8(output.stdout)?,
+            format!("LLVM_PROFILE_FILE={profile}\n")
+        );
+        let output = decoder_command(Path::new("/usr/bin/env"), None).output()?;
+        ensure!(output.status.success(), "empty environment probe failed");
+        assert!(output.stdout.is_empty());
+        Ok(())
+    }
 }

@@ -2198,6 +2198,12 @@ impl LocalService {
             .env("SCCACHE_CACHED_CONF", &self.cached_config)
             .env("SCCACHE_NO_AUTO_START_SERVER", "1")
             .env("SCCACHE_LOG", "sccache=debug");
+        // Keep the explicitly isolated test environment, but let an
+        // instrumented client (including one launched through bwrap) write
+        // coverage into this test's profile bundle.
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
         command
     }
 
