@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use bincode::Options;
 use redb::{ReadTransaction, ReadableDatabase, ReadableTable};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{Semaphore, oneshot};
 
 use super::{
     super::{Attachment, BLOB_LAYOUTS, BLOBS, BlobIndex, PENDING_DELETIONS},
@@ -56,8 +56,9 @@ struct Request {
 
 struct Completion {
     reply: oneshot::Sender<Result<TreeLease>>,
-    _retained: Box<dyn Send>,
-    _permit: OwnedSemaphorePermit,
+    // The request owns its admission and caller-supplied resources as one
+    // lifetime. Neither is a mutex guard or can be released before commit.
+    _resources: Box<dyn Send>,
 }
 
 impl Completion {
@@ -90,8 +91,7 @@ impl NativeStore {
                 staged,
                 completion: Completion {
                     reply,
-                    _retained: Box::new(retained),
-                    _permit: permit,
+                    _resources: Box::new((retained, permit)),
                 },
             });
             let start = !state.running;
