@@ -1112,6 +1112,18 @@ impl NativeSessions {
         request: ActionRequest,
         publisher: Publisher,
         mode: ActionMode,
+        declared: BTreeMap<TreeId, TreeManifest>,
+    ) -> Result<NativeAdmission> {
+        let result = self.admit_inner(request, publisher, mode, declared);
+        self.admission_counters.record(mode, &result);
+        result
+    }
+
+    fn admit_inner(
+        &self,
+        request: ActionRequest,
+        publisher: Publisher,
+        mode: ActionMode,
         mut declared: BTreeMap<TreeId, TreeManifest>,
     ) -> Result<NativeAdmission> {
         self.reap()?;
