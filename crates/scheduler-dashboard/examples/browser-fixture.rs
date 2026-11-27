@@ -127,7 +127,7 @@ fn host(id: &str, name: &str, role: HostRole, address: &str, phase: u64) -> Netw
 }
 
 fn snapshot(phase: u64) -> Snapshot {
-    let jobs = (0..3)
+    let jobs = (0..if phase == 8 { 12 } else { 3 })
         .filter(|index| *index != 0 || phase < 4)
         .map(|index| job(index, phase))
         .collect::<Vec<_>>();
@@ -216,17 +216,30 @@ fn snapshot(phase: u64) -> Snapshot {
 }
 
 fn telemetry(phase: u64) -> NativeTelemetry {
-    NativeTelemetry {
-        live_traces: Some(LiveTraceSnapshot {
-            active: 1,
-            rows: vec![LiveTraceRow {
+    let rows = if phase == 9 {
+        Vec::new()
+    } else {
+        let count = if phase == 8 { 48 } else { 1 };
+        (0..count)
+            .map(|index| LiveTraceRow {
                 peer: PeerId::from_digest([0x55; 32]),
                 instance: "fixture-client".into(),
                 observation_age_ms: 20,
                 request: LiveTraceRequest {
-                    trace: REQUEST,
+                    trace: if index == 0 {
+                        REQUEST
+                    } else {
+                        TraceContext {
+                            trace_id: [index + 0x33; 16],
+                            span_id: [index + 0x33; 8],
+                        }
+                    },
                     compiler: "rustc".into(),
-                    output: "fixture-traced-crate".into(),
+                    output: if index == 0 {
+                        "fixture-traced-crate".into()
+                    } else {
+                        format!("fixture-live-crate-{index}")
+                    },
                     phase: if phase.is_multiple_of(2) {
                         "hash_inputs".into()
                     } else {
@@ -238,7 +251,13 @@ fn telemetry(phase: u64) -> NativeTelemetry {
                     job: None,
                     producer: Some(PRODUCER),
                 },
-            }],
+            })
+            .collect::<Vec<_>>()
+    };
+    NativeTelemetry {
+        live_traces: Some(LiveTraceSnapshot {
+            active: u64::try_from(rows.len()).unwrap_or_default(),
+            rows,
         }),
         admission: Some(AdmissionCounts {
             hits: 80 + phase * 4,
@@ -474,7 +493,18 @@ fn trace_query(body: Bytes) -> Ready<(StatusCode, String)> {
     } else if query.contains(r#""resource_attr:service.version":="#) && !query.contains(REVISION) {
         Vec::new()
     } else {
-        vec![trace_root(REQUEST)]
+        std::iter::once(trace_root(REQUEST))
+            .chain((1_u8..60).map(|index| {
+                let mut row = trace_root(TraceContext {
+                    trace_id: [index + 0x66; 16],
+                    span_id: [index + 0x66; 8],
+                });
+                row["span_id"] = json!(format!("{:016x}", index));
+                row["span_attr:sccache.output"] = json!(format!("fixture-completed-{index}"));
+                row["duration"] = json!((90_000_000 - u64::from(index) * 1_000_000).to_string());
+                row
+            }))
+            .collect()
     };
     let mut body = rows
         .into_iter()
