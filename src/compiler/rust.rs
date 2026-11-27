@@ -347,7 +347,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"10";
+const CACHE_VERSION: &[u8] = b"11";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -971,6 +971,21 @@ fn hash_rust_input_group(digest: &mut Digest, domain: &[u8], hashes: &[String]) 
         let bytes = hash.as_bytes();
         digest.update(&(bytes.len() as u128).to_le_bytes());
         digest.update(bytes);
+    }
+}
+
+/// Bind each extern name (including rustc modifiers) to the digest of
+/// its selected artifact. An unordered collection of file digests cannot
+/// distinguish renaming two otherwise identical dependency graphs.
+fn hash_rust_extern_bindings(digest: &mut Digest, bindings: &mut [(&str, &str)]) {
+    // Preserve ordering within repeated names; rustc may see several
+    // candidates for the same extern.
+    bindings.sort_by(|left, right| left.0.cmp(right.0));
+    digest.delimiter(b"rust-extern-bindings-v1");
+    digest.update(&(bindings.len() as u128).to_le_bytes());
+    for (name, content) in bindings {
+        digest.delimiter(name.as_bytes());
+        digest.delimiter(content.as_bytes());
     }
 }
 
@@ -3176,6 +3191,23 @@ where
             )
         });
 
+        // Associate names with the original content hashes before canonical
+        // sorting changes their ordering. The physical paths are only lookup
+        // keys; neither their spelling nor their timestamps enter the binding.
+        let extern_by_path: HashMap<_, _> = abs_externs.iter().zip(&extern_hashes).collect();
+        let mut extern_bindings = Vec::new();
+        for argument in &self.parsed_args.arguments {
+            if let Some(Extern(ArgExtern { name, path })) = argument.get_data() {
+                let content = extern_by_path
+                    .get(&cwd.join(path))
+                    .context("missing content digest for explicit Rust extern")?;
+                extern_bindings.push((name.as_str(), (*content).as_str()));
+            }
+        }
+        let mut binding_digest = Digest::new();
+        hash_rust_extern_bindings(&mut binding_digest, &mut extern_bindings);
+        let binding_digest = binding_digest.finish();
+
         let source_hashes =
             hashes_in_canonical_path_order(&source_files, source_hashes, canonical_paths.as_ref());
         let extern_hashes =
@@ -3320,6 +3352,7 @@ where
         // 7. The digest of the content of the target json file specified via `--target` (if any).
         hash_rust_input_group(&mut m, b"rust-sources-v1", &source_hashes);
         hash_rust_input_group(&mut m, b"rust-externs-v1", &extern_hashes);
+        m.delimiter(binding_digest.as_bytes());
         hash_rust_input_group(&mut m, b"rust-staticlibs-v1", &staticlib_hashes);
         hash_rust_input_group(&mut m, b"rust-target-json-v1", &target_json_hash);
         // 8. Environment variables: Hash all environment variables listed in the rustc dep-info
@@ -7103,6 +7136,9 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             &[empty_digest.clone(), empty_digest.clone()],
         );
         hash_rust_input_group(&mut m, b"rust-externs-v1", &[empty_digest]);
+        let mut binding_digest = Digest::new();
+        hash_rust_extern_bindings(&mut binding_digest, &mut []);
+        m.delimiter(binding_digest.finish().as_bytes());
         hash_rust_input_group(&mut m, b"rust-staticlibs-v1", &[libbaz_a_digest]);
         hash_rust_input_group(&mut m, b"rust-target-json-v1", &[]);
         // Env vars
@@ -7119,6 +7155,18 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let mut out = res.compilation.outputs().map(|k| k.key).collect::<Vec<_>>();
         out.sort();
         assert_eq!(out, vec!["foo.a", "foo.rlib", "foo.rmeta"]);
+    }
+
+    #[test]
+    fn rust_extern_binding_hash_distinguishes_swapped_aliases() {
+        let hash = |mut bindings: [(&str, &str); 2]| {
+            let mut digest = Digest::new();
+            hash_rust_extern_bindings(&mut digest, &mut bindings);
+            digest.finish()
+        };
+        let original = hash([("a", "digest1"), ("b", "digest2")]);
+        assert_eq!(original, hash([("b", "digest2"), ("a", "digest1")]));
+        assert_ne!(original, hash([("a", "digest2"), ("b", "digest1")]));
     }
 
     #[test]
