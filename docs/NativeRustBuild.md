@@ -66,8 +66,8 @@ fs-verity files and genuine read-only ZFS snapshot files can reuse a verified
 digest; mutable files are rehashed. Snapshot recognition uses descriptor-based
 kernel mount metadata, including the unique mount ID and snapshot source.
 Ordinary read-only mounts and unsupported kernels do not qualify.
-Rust key schema 13 binds canonical source paths and extern aliases to their
-contents, and hashes actual installed host/target runtime files rather than
+Rust key schema 14 binds canonical source paths, extern aliases and
+installation-relative compiler input names to their contents, and hashes actual installed host/target runtime files rather than
 trusting rustup installation manifests. Git checkouts use a canonical root
 covering all sibling crates. Select a pinned installation with
 `--toolchain-root` or `[build] toolchain-root` in project configuration.

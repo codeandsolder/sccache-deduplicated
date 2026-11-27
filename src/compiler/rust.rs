@@ -347,7 +347,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"13";
+const CACHE_VERSION: &[u8] = b"14";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -1441,28 +1441,28 @@ fn rust_discovery_files(
     dist_archive: Option<PathBuf>,
 ) -> Result<Vec<PathBuf>> {
     let libs_path = sysroot.join(LIBS_DIR);
-    let mut libs = fs::read_dir(&libs_path)
-        .with_context(|| {
-            format!(
-                "Failed to list rustc sysroot: `{}`",
-                crate::util::debug_display(&libs_path)
-            )
-        })?
-        .filter_map(|e| {
-            e.ok().and_then(|e| {
-                e.file_type().ok().and_then(|t| {
-                    let p = e.path();
-                    if (t.is_file() || t.is_symlink() && p.is_file())
-                        && p.extension().is_some_and(|e| e == DLL_EXTENSION)
-                    {
-                        Some(p)
-                    } else {
-                        None
-                    }
-                })
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut libs = Vec::new();
+    let entries = fs::read_dir(&libs_path).with_context(|| {
+        format!(
+            "Failed to list rustc sysroot: `{}`",
+            crate::util::debug_display(&libs_path)
+        )
+    })?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let filename = entry.file_name();
+        let shared_library = path.extension().is_some_and(|ext| ext == DLL_EXTENSION)
+            || (cfg!(target_os = "linux")
+                && filename.as_encoded_bytes().windows(4).any(|w| w == b".so."));
+        if shared_library {
+            // Fail on inaccessible or dangling shared-library entries rather
+            // than silently shrinking the compiler's input closure.
+            if fs::metadata(&path)?.is_file() {
+                libs.push(path);
+            }
+        }
+    }
     libs.push(executable.to_owned());
     if let Some(path) = dist_archive {
         trace!(
@@ -1473,6 +1473,76 @@ fn rust_discovery_files(
     }
     libs.sort();
     Ok(libs)
+}
+
+/// Bind the content of each compiler input to its installation-relative name.
+/// Two installations with identical names and bytes remain interchangeable;
+/// renaming a loader input is not equivalent to changing only its location.
+fn bind_rust_discovery_digests(
+    sysroot: &Path,
+    files: &[PathBuf],
+    hashes: &[String],
+) -> Result<Vec<String>> {
+    ensure!(
+        files.len() == hashes.len(),
+        "compiler discovery digest count mismatch"
+    );
+    let mut bound = Vec::with_capacity(files.len());
+    for (path, hash) in files.iter().zip(hashes) {
+        let mut digest = Digest::new();
+        digest.delimiter(b"rust-compiler-input-v1");
+        let relative = match path.strip_prefix(sysroot) {
+            Ok(relative) => {
+                digest.delimiter(b"sysroot");
+                relative
+            }
+            Err(_) => {
+                digest.delimiter(b"external");
+                path.as_path()
+            }
+        };
+        let name = relative.as_os_str().as_encoded_bytes();
+        digest.update(&(name.len() as u128).to_le_bytes());
+        digest.update(name);
+        digest.delimiter(hash.as_bytes());
+        bound.push(digest.finish());
+    }
+    bound.sort_unstable();
+    Ok(bound)
+}
+
+#[cfg(test)]
+#[test]
+fn rust_discovery_digest_binds_names_but_not_sysroot_location() -> Result<()> {
+    let first = PathBuf::from("installation-one");
+    let second = PathBuf::from("installation-two");
+    let paths = [first.join("lib/libcompiler.so"), first.join("bin/rustc")];
+    let hashes = [
+        "compiler-library".to_owned(),
+        "compiler-executable".to_owned(),
+    ];
+    let identity = bind_rust_discovery_digests(&first, &paths, &hashes)?;
+    assert_eq!(
+        identity,
+        bind_rust_discovery_digests(
+            &second,
+            &[second.join("lib/libcompiler.so"), second.join("bin/rustc")],
+            &hashes
+        )?
+    );
+    assert_ne!(
+        identity,
+        bind_rust_discovery_digests(
+            &first,
+            &[first.join("lib/librenamed.so"), first.join("bin/rustc")],
+            &hashes
+        )?
+    );
+    assert_ne!(
+        identity,
+        bind_rust_discovery_digests(&first, &paths, &[hashes[1].clone(), hashes[0].clone()])?
+    );
+    Ok(())
 }
 
 impl Rust {
@@ -1517,7 +1587,8 @@ impl Rust {
                 None
             }
         };
-        let digests = discovery.hash_toolchain_files(&libs, &pool).await?;
+        let hashes = discovery.hash_toolchain_files(&libs, &pool).await?;
+        let digests = bind_rust_discovery_digests(&sysroot, &libs, &hashes)?;
         Ok(Self {
             executable,
             host,
@@ -1602,7 +1673,8 @@ where
         Box::pin(async move {
             let files =
                 rust_discovery_files(&self.sysroot, &self.executable, self.dist_archive.clone())?;
-            let digests = discovery.hash_toolchain_files(&files, pool).await?;
+            let hashes = discovery.hash_toolchain_files(&files, pool).await?;
+            let digests = bind_rust_discovery_digests(&self.sysroot, &files, &hashes)?;
             Ok(digests == self.compiler_shlibs_digests)
         })
     }
