@@ -1,24 +1,8 @@
 name: Distributed runtime regression
 
 on:
+  # Required status check: never skip a pull request by changed paths.
   pull_request:
-    paths:
-      - Cargo.toml
-      - Cargo.lock
-      - rust-toolchain.toml
-      - src/dist/**
-      - crates/build-runtime/**
-      - tests/native_dist.rs
-      - src/compiler/rust.rs
-      - src/compiler/rust_dlltool.rs
-      - src/compiler/dynamic_dependencies.rs
-      - src/compiler/compiler.rs
-      - src/compiler/canonical_paths.rs
-      - tests/dist.rs
-      - tests/dist/**
-      - tests/harness/**
-      - src/bin/sccache-dist/**
-      - .github/workflows/dist-jwt-regression.yml
   push:
     # Every main SHA must have a distributed-runtime result for fleet promotion.
     branches: [main]
