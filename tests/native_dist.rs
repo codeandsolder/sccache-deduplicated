@@ -454,10 +454,14 @@ fn shared_daemon_credential_isolation() -> Result<()> {
     let script =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("contrib/codeandsolder/test-shared-daemon");
     let binary = env!("CARGO_BIN_EXE_sccache");
+    let wrapper = b"#!/bin/sh\nexec \"$(dirname -- \"$0\")/sccache\" /usr/bin/gcc \"$@\"\n";
+    let digest = blake3::hash(wrapper).to_hex().to_string();
     let local = Command::new("sudo")
         .args(["-n", "bash"])
         .arg(&script)
         .arg(binary)
+        .arg("")
+        .arg(&digest)
         .status()?;
     ensure!(
         local.success(),
@@ -491,6 +495,7 @@ fn shared_daemon_credential_isolation() -> Result<()> {
         .arg(script)
         .arg(binary)
         .arg(path)
+        .arg(&digest)
         .status()?;
     ensure!(
         distributed.success(),

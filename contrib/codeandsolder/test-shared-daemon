@@ -6,6 +6,8 @@ umask 022
 
 binary=${1:?sccache test binary required}
 dist=${2:-}
+wrapper_digest=${3:?recursive wrapper digest required}
+[[ "$wrapper_digest" =~ ^[0-9a-f]{64}$ ]]
 uid=${SUDO_UID:?run this regression with sudo from a non-root account}
 gid=${SUDO_GID:?run this regression with sudo from a non-root account}
 [[ $EUID == 0 && $uid != 0 ]]
@@ -28,6 +30,15 @@ trap cleanup EXIT
 chmod 755 "$root"
 install -o root -g root -m 755 "$binary" "$root/sccache"
 install -d -m 700 "$root/root-private" "$root/cache"
+# This recursive launcher is intentionally identical to a strict host
+# compiler wrapper: if the executor runs it, it will submit to itself.
+cat > "$root/strict-cc" <<'WRAPPER'
+#!/bin/sh
+exec "$(dirname -- "$0")/sccache" /usr/bin/gcc "$@"
+WRAPPER
+chmod 0755 "$root/strict-cc"
+ln -s strict-cc "$root/cc"
+ln -s cc "$root/host-cc"
 install -d -o "$uid" -g "$gid" -m 700 "$root/user-private"
 touch "$root/client.toml"
 chmod 644 "$root/client.toml"
@@ -38,8 +49,9 @@ else
     cp "$dist" "$root/distribution.json"
 fi
 jq -n --arg dir "$root/cache" --argjson uid "$uid" --argjson gid "$gid" \
+    --arg alias "$root/strict-cc" --arg digest "$wrapper_digest" \
     --slurpfile dist "$root/distribution.json" \
-    '{cache: {disk: {dir: $dir, size: 104857600}}, shared_daemon: {socket_gid: $gid, allowed_uids: [$uid]}, dist: ($dist[0] + {cache_dir: ($dir + "/toolchains")})}' \
+    '{cache: {disk: {dir: $dir, size: 104857600}}, shared_daemon: {socket_gid: $gid, allowed_uids: [$uid]}, compiler_aliases: {($alias): {compiler: "/usr/bin/gcc", blake3: $digest}}, dist: ($dist[0] + {cache_dir: ($dir + "/toolchains")})}' \
     > "$root/server.json"
 chmod 600 "$root/server.json" "$root/distribution.json"
 env -i PATH=/usr/bin:/bin HOME="$root/root-private" SCCACHE_CONF="$root/server.json" \
@@ -100,6 +112,34 @@ rm probe.o
 user_client /usr/bin/gcc -c probe.c -o probe.o
 [[ $(stat -c '%u:%g' probe.o) == "$uid:$gid" ]]
 [[ $(sha256sum probe.o | cut -d' ' -f1) == "$reference" ]]
+
+# Exercise both direct and indirect aliases concurrently from a genuine
+# credential-dropping shared executor. Same compiler, source and artifact
+# identity must hit rather than recursively call the same daemon.
+before=$(stats | jq '.stats.cache_hits.counts | [.[]] | add // 0')
+rm probe.o
+user_client "$root/host-cc" -c probe.c -o probe.o &
+a=$!
+client "$root/cc" -c probe.c -o alias.o &
+b=$!
+wait "$a"
+wait "$b"
+[[ $(stat -c '%u:%g' probe.o) == "$uid:$gid" ]]
+[[ $(stat -c '%u' alias.o) == 0 ]]
+[[ $(sha256sum probe.o | cut -d' ' -f1) == "$reference" ]]
+[[ $(sha256sum alias.o | cut -d' ' -f1) == "$reference" ]]
+after=$(stats | jq '.stats.cache_hits.counts | [.[]] | add // 0')
+(( after == before + 2 ))
+rm alias.o
+# A changed launcher is not silently resolved by any spelling.
+cp "$root/strict-cc" "$root/strict-cc.original"
+printf '# altered\n' >> "$root/strict-cc"
+if user_client "$root/host-cc" -c probe.c -o tampered.o; then
+    echo "modified compiler alias accepted" >&2
+    exit 1
+fi
+[[ ! -e tampered.o ]]
+mv "$root/strict-cc.original" "$root/strict-cc"
 
 # Different masks must produce distinct entries, including on the remote
 # worker. A hit must preserve the exact restrictive output mode.

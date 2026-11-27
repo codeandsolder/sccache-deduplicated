@@ -1007,10 +1007,36 @@ impl CompilerAliases {
         Ok(())
     }
 
+    /// Find a configured launcher, including alternate symlink spellings.
+    ///
+    /// Preserve the requested path of ordinary executables: multicall
+    /// compilers can select their language or mode from argv[0].
+    fn launcher(&self, executable: &Path) -> Result<Option<&CompilerAlias>> {
+        if let Some(alias) = self.0.get(executable) {
+            return Ok(Some(alias));
+        }
+        if self.0.is_empty() {
+            return Ok(None);
+        }
+        let Ok(canonical) = executable.canonicalize() else {
+            return Ok(None);
+        };
+        let mut matched = self.0.get(&canonical);
+        for (path, alias) in &self.0 {
+            if path != &canonical && path.canonicalize().ok().as_ref() == Some(&canonical) {
+                if matched.is_some_and(|existing| existing != alias) {
+                    bail!("Conflicting compiler aliases for {}", executable.display());
+                }
+                matched = Some(alias);
+            }
+        }
+        Ok(matched)
+    }
+
     /// Resolve a trusted launcher before compiler detection and key generation.
     /// A changed launcher is a configuration error, not an alias match.
     pub(crate) fn resolve(&self, executable: PathBuf) -> Result<PathBuf> {
-        let Some(alias) = self.0.get(&executable) else {
+        let Some(alias) = self.launcher(&executable)? else {
             return Ok(executable);
         };
         let contents = fs::read(&executable)?;
@@ -1018,6 +1044,14 @@ impl CompilerAliases {
         if blake3::hash(&contents) != expected {
             bail!(
                 "Compiler alias digest mismatch for {}; update the alias configuration or remove it",
+                executable.display()
+            );
+        }
+        // Reject indirect launcher chains too, even if a configured real
+        // compiler path was subsequently replaced by a symlink.
+        if self.launcher(&alias.compiler)?.is_some() {
+            bail!(
+                "Compiler alias must name a real compiler, not another alias: {}",
                 executable.display()
             );
         }
@@ -1057,6 +1091,53 @@ fn compiler_alias_configuration_and_identity() -> Result<()> {
     assert_eq!(file.compiler_aliases.resolve(unrelated.clone())?, unrelated);
     fs::write(&launcher, b"#!/bin/sh\nexit 0\n")?;
     assert!(file.compiler_aliases.resolve(launcher).is_err());
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn compiler_alias_symlink_identity_and_indirect_chains() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let wrapper = root.join("wrapper");
+    let public = root.join("cc");
+    let nested = root.join("host-cc");
+    let compiler = root.join("real-cc");
+    let compiler_link = root.join("real-c++");
+    let script = b"#!/bin/sh\nexec compiler \"$@\"\n";
+    fs::write(&wrapper, script)?;
+    fs::write(&compiler, b"real compiler")?;
+    symlink("wrapper", &public)?;
+    symlink("cc", &nested)?;
+    symlink("real-cc", &compiler_link)?;
+    let mut aliases = CompilerAliases(HashMap::from([(
+        wrapper.clone(),
+        CompilerAlias {
+            compiler: compiler_link.clone(),
+            blake3: blake3::hash(script).to_hex().to_string(),
+        },
+    )]));
+    assert_eq!(aliases.resolve(nested.clone())?, compiler_link);
+    // Do not change argv[0] of unrelated symlinked compilers.
+    assert_eq!(aliases.resolve(compiler_link.clone())?, compiler_link);
+    fs::write(&wrapper, b"modified")?;
+    assert!(aliases.resolve(public.clone()).is_err());
+    fs::write(&wrapper, script)?;
+    fs::remove_file(&compiler_link)?;
+    symlink("cc", &compiler_link)?;
+    assert!(aliases.resolve(nested.clone()).is_err());
+    fs::remove_file(&compiler_link)?;
+    symlink("real-cc", &compiler_link)?;
+    aliases.0.insert(
+        public,
+        CompilerAlias {
+            compiler,
+            blake3: blake3::hash(script).to_hex().to_string(),
+        },
+    );
+    assert!(aliases.resolve(nested).is_err());
     Ok(())
 }
 
