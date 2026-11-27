@@ -111,6 +111,9 @@ impl InstallationCatalog {
                 report.differing_files += 1;
                 continue;
             }
+            // Measure before hashing: enabling verity concurrently must not bind
+            // a new immutable identity to bytes read before it was enabled.
+            let identity = verity_identity(&file);
             let reused = lookup(&previous, &resolved, &file, &stat)? == Some(blob);
             if reused {
                 report.reused_files += 1;
@@ -121,10 +124,7 @@ impl InstallationCatalog {
             }
             // The catalog records the expected content of all verified files.
             // Only fs-verity identities permit subsequent reuse without reads.
-            let record = AttestedFile {
-                identity: verity_identity(&file),
-                blob,
-            };
+            let record = AttestedFile { identity, blob };
             let path = resolved.into_os_string().into_vec();
             if let Some(previous) = catalog.files.insert(path, record) {
                 ensure!(previous == record, "installation changed while verifying");

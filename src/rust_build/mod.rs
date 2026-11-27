@@ -213,6 +213,10 @@ fn execute(args: RustBuildArgs) -> Result<i32> {
         if !args.offline {
             sources.download = Some(&download);
         }
+        if sources.lock.version.is_none() {
+            sources.lock = sources.resolve_lock(&toolchain.version)?;
+            sources.lock.write(&workspace.root.join("Cargo.lock"))?;
+        }
         let graph = Graph::resolve(
             &mut sources,
             ResolveOptions {

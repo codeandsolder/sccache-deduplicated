@@ -46,13 +46,16 @@ pub struct ResolveOptions {
 }
 
 #[derive(Default)]
-struct FeatureRequest {
-    names: BTreeSet<String>,
-    optional: BTreeSet<String>,
-    forwards: BTreeMap<String, BTreeSet<String>>,
+pub(crate) struct FeatureRequest {
+    pub(crate) names: BTreeSet<String>,
+    pub(crate) optional: BTreeSet<String>,
+    pub(crate) forwards: BTreeMap<String, BTreeSet<String>>,
 }
 
-fn feature_request(package: &Manifest, requested: &BTreeSet<String>) -> Result<FeatureRequest> {
+pub(crate) fn feature_request(
+    package: &Manifest,
+    requested: &BTreeSet<String>,
+) -> Result<FeatureRequest> {
     let optional: BTreeSet<_> = package
         .dependencies
         .iter()
@@ -125,13 +128,13 @@ fn feature_request(package: &Manifest, requested: &BTreeSet<String>) -> Result<F
     Ok(state)
 }
 
-fn default_feature(manifest: &Manifest, enabled: bool, names: &mut BTreeSet<String>) {
+pub(crate) fn default_feature(manifest: &Manifest, enabled: bool, names: &mut BTreeSet<String>) {
     if enabled && manifest.features.contains_key("default") {
         names.insert("default".to_owned());
     }
 }
 
-fn all_features(manifest: &Manifest, names: &mut BTreeSet<String>) {
+pub(crate) fn all_features(manifest: &Manifest, names: &mut BTreeSet<String>) {
     names.extend(manifest.features.keys().cloned());
     let hidden: BTreeSet<_> = manifest
         .features

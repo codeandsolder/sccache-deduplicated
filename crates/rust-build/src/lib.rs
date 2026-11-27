@@ -6,6 +6,7 @@ mod platform;
 mod profile;
 mod resolve;
 mod script;
+mod solve;
 mod source;
 pub use profile::Profile;
 pub use script::{LinkDirective, LinkScope, ScriptOutput};
