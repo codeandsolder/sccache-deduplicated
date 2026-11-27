@@ -2,18 +2,18 @@ use std::{
     collections::BTreeMap,
     fs::File,
     io::{Read, Seek},
-    sync::{Arc, Condvar, Mutex, PoisonError, Weak},
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
 use bincode::Options;
-use redb::{ReadableDatabase, ReadableTable};
+use redb::{ReadTransaction, ReadableDatabase, ReadableTable};
 
 use super::packages::PackageRecord;
 use super::{
-    BLOB_PACKAGES, Eviction, Inner, LeasedReader, NativeStore, PACKAGES, Publication, StagedBlob,
-    TREE_PACKAGES, TREES, USAGE, UploadReservation, encoding, release_pin, space::Root,
+    BLOB_PACKAGES, Eviction, Inner, LeasedReader, NativeStore, PACKAGES, Pins, Publication,
+    StagedBlob, TREE_PACKAGES, TREES, USAGE, UploadReservation, encoding, release_pin, space::Root,
 };
 use crate::{BlobRef, ContentId, PackageSource, TreeId, TreeManifest, TreeRecipe};
 
@@ -539,8 +539,19 @@ impl NativeStore {
     /// # Errors
     /// Returns an error for invalid metadata, missing content or storage failure.
     pub fn lookup_tree(&self, id: TreeId) -> Result<Option<TreeLease>> {
-        let mut pins = self.inner.lock_pins()?;
+        let pins = self.inner.lock_pins()?;
         let read = self.inner.db.begin_read()?;
+        self.lookup_tree_in(id, &read, pins)
+    }
+
+    // Package identity and its tree must be resolved from one index
+    // snapshot while eviction cannot remove the root.
+    pub(super) fn lookup_tree_in(
+        &self,
+        id: TreeId,
+        read: &ReadTransaction,
+        mut pins: MutexGuard<'_, Pins>,
+    ) -> Result<Option<TreeLease>> {
         let trees = read.open_table(TREES)?;
         let Some(record) = trees.get(&id.0)? else {
             return Ok(None);

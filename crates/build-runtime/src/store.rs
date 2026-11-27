@@ -550,7 +550,7 @@ pub struct CacheStats {
 }
 
 /// Work completed by a bounded garbage collection pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GarbageCollected {
     pub blobs: u64,
     pub logical_bytes: u64,
@@ -599,24 +599,20 @@ impl Pins {
 }
 
 // A single batched transaction serves both periodic checkpoints and orderly
-// shutdown, without any database activity on the lookup critical path.
-fn persist_usage(db: &Database, pins: &mut Pins) -> Result<()> {
-    if pins.dirty_usage.is_empty() {
+// shutdown, without holding the shared pin lock across a database write.
+fn persist_usage(db: &Database, records: &[(space::Root, space::UsageRecord)]) -> Result<()> {
+    if records.is_empty() {
         return Ok(());
     }
     let write = db.begin_write()?;
     {
         let mut usage = write.open_table(USAGE)?;
-        for root in &pins.dirty_usage {
-            if let Some(record) = pins.usage.get(root) {
-                let bytes = encoding().serialize(record)?;
-                usage.insert(&root.key(), bytes.as_slice())?;
-            }
+        for (root, record) in records {
+            let bytes = encoding().serialize(record)?;
+            usage.insert(&root.key(), bytes.as_slice())?;
         }
     }
     write.commit()?;
-    pins.dirty_usage.clear();
-    pins.last_usage_checkpoint = Some(Instant::now());
     Ok(())
 }
 
@@ -970,7 +966,7 @@ impl Drop for Inner {
             .pins
             .get_mut()
             .map_err(|_| anyhow!("native usage mutex poisoned at shutdown"))
-            .and_then(|pins| persist_usage(&self.db, pins));
+            .and_then(|pins| persist_usage(&self.db, &pins.usage_snapshot()));
         if let Err(error) = result {
             log::error!("could not persist native usage on shutdown: {error:#}");
         }
@@ -2051,6 +2047,19 @@ impl NativeStore {
     /// Returns an error for database failures; per-file failures remain queued
     /// and are reported in the collection result.
     pub fn collect_garbage(&self, limit: usize) -> Result<GarbageCollected> {
+        // A read snapshot with no queued deletions needs no exclusion from
+        // concurrent publication. Later deletions belong to the next pass.
+        if limit == 0
+            || self
+                .inner
+                .db
+                .begin_read()?
+                .open_table(PENDING_DELETIONS)?
+                .len()?
+                == 0
+        {
+            return Ok(GarbageCollected::default());
+        }
         let _mutation = self.inner.lock_mutations()?;
         let pins = self.inner.lock_pins()?;
         let read = self.inner.db.begin_read()?;

@@ -351,30 +351,46 @@ impl NativeStore {
         identity: PackageIdentity,
         policy: PackagePolicy,
     ) -> Result<Option<VerifiedPackage>> {
-        let _mutation = self.inner.lock_mutations()?;
         let key = package_key(identity, policy)?;
-        let id = {
-            let read = self.inner.db.begin_read()?;
-            let table = read.open_table(PACKAGES)?;
-            table
-                .get(&key.0)?
-                .map(|entry| encoding().deserialize::<PackageRecord>(entry.value()))
-                .transpose()?
-        };
-        let Some(record) = id else {
+        self.lookup_indexed_package(key, |record| {
+            ensure!(
+                record.source.identity == identity,
+                "inconsistent package identity"
+            );
+            Ok(true)
+        })
+        .map(|found| {
+            found.map(|(record, tree)| VerifiedPackage {
+                source: record.source,
+                tree,
+            })
+        })
+    }
+
+    fn lookup_indexed_package(
+        &self,
+        key: ContentId,
+        accept: impl FnOnce(&PackageRecord) -> Result<bool>,
+    ) -> Result<Option<(PackageRecord, TreeLease)>> {
+        // Eviction removes the package mapping and its tree under the pin
+        // mutex. Pin that same snapshot's tree before releasing the mutex;
+        // manifest decoding and physical validation need no mutation lock.
+        let pins = self.inner.lock_pins()?;
+        let read = self.inner.db.begin_read()?;
+        let table = read.open_table(PACKAGES)?;
+        let Some(record) = table.get(&key.0)? else {
             return Ok(None);
         };
-        ensure!(
-            record.source.identity == identity,
-            "inconsistent package identity"
-        );
-        let tree = self
-            .lookup_tree(record.tree)?
-            .context("indexed package tree missing")?;
-        Ok(Some(VerifiedPackage {
-            source: record.source,
-            tree,
-        }))
+        let record: PackageRecord = encoding().deserialize(record.value())?;
+        if !accept(&record)? {
+            return Ok(None);
+        }
+        let id = record.tree;
+        Ok(Some((
+            record,
+            self.lookup_tree_in(id, &read, pins)?
+                .context("indexed package tree missing")?,
+        )))
     }
 
     /// Verify the compressed package against its upstream SHA-256 and length,
@@ -880,6 +896,94 @@ mod tests {
         header.set_cksum();
         builder.append_link(&mut header, "component/bin/alias", "component/bin/compiler")?;
         Ok(builder.into_inner()?)
+    }
+
+    #[test]
+    #[ignore = "controlled warm package and space admission benchmark"]
+    fn benchmark_package_lookup_contention() -> Result<()> {
+        use std::{sync::Barrier, time::Instant};
+        let directory = tempfile::tempdir()?;
+        let store = NativeStore::open_managed(
+            directory.path(),
+            crate::SpacePolicy {
+                min_available_bytes: 4096,
+                target_available_bytes: 8192,
+                max_resident_bytes: 1 << 30,
+                target_resident_bytes: 1 << 29,
+                max_evictions_per_pass: 16,
+                gc_batch: 256,
+            },
+        )?;
+        let mut archive = tar::Builder::new(Vec::new());
+        for index in 0..512_u32 {
+            let bytes = index.to_le_bytes().repeat(256);
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            archive.append_data(
+                &mut header,
+                format!("component/file-{index:04}"),
+                &bytes[..],
+            )?;
+        }
+        let bytes = archive.into_inner()?;
+        let source = source(&bytes, PackageCompression::Tar);
+        let policy = PackagePolicy {
+            max_entries: 1024,
+            max_expanded_bytes: 1 << 20,
+            max_tar_bytes: 2 << 20,
+            max_metadata_bytes: 1 << 20,
+            ..policy()
+        };
+        drop(store.import_package(
+            source.identity,
+            ArchiveLength::Exact(source.size),
+            policy,
+            &bytes[..],
+            PackageDecoder::InProcess,
+        )?);
+        store.checkpoint_usage()?;
+        for width in [1, 8] {
+            let barrier = Barrier::new(width);
+            let elapsed = std::thread::scope(|scope| -> Result<_> {
+                let jobs = (0..width)
+                    .map(|_| {
+                        scope.spawn(|| -> Result<_> {
+                            barrier.wait();
+                            let started = Instant::now();
+                            for _ in 0..16 {
+                                let lease = store
+                                    .lookup_package(source.identity, policy)?
+                                    .context("missing warm package")?;
+                                ensure!(lease.source() == source, "package identity changed");
+                                ensure!(
+                                    store
+                                        .maintain_space()?
+                                        .context("missing space policy")?
+                                        .minimum_satisfied,
+                                    "space pressure in fixture"
+                                );
+                                std::hint::black_box(lease);
+                            }
+                            Ok(started.elapsed())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                jobs.into_iter()
+                    .map(|job| {
+                        job.join()
+                            .map_err(|_| anyhow!("package benchmark panicked"))?
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            let elapsed = elapsed.iter().max().context("missing benchmark sample")?;
+            println!(
+                "PACKAGE_ADMISSION threads={width} iterations=16 files=512 wall_ms={:.3}",
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
