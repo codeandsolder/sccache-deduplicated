@@ -231,7 +231,7 @@ pub struct StagedBlob {
 /// A captured compiler output in its final physical representation.
 /// Publication cannot consume the staged blob until its bytes are durable.
 #[cfg(target_os = "linux")]
-pub(crate) struct CapturedStage {
+pub struct CapturedStage {
     stage: StagedBlob,
     file: Arc<File>,
 }
