@@ -10,11 +10,13 @@ pub use settings::{Settings, Toolchain};
 mod manifest;
 mod platform;
 mod profile;
+mod registry;
 mod resolve;
 mod script;
 mod solve;
 mod source;
 pub use profile::Profile;
+pub use registry::{IndexNotFound, Registries, Registry};
 pub use script::{LinkDirective, LinkScope, ScriptOutput};
 
 pub use fingerprint::{content_file, content_tree};

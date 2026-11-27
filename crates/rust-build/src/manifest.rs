@@ -305,7 +305,7 @@ impl Workspace {
     }
 }
 
-fn dependency(
+pub(crate) fn dependency(
     alias: &str,
     value: &Value,
     kind: DependencyKind,

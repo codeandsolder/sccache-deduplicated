@@ -77,8 +77,8 @@ impl IntermediateContent for Content {
 pub fn package(
     session: Ticket,
     identity: crate::build_runtime::PackageIdentity,
-    name: &str,
-    version: &str,
+    upstream: &str,
+    path: &str,
     offline: bool,
     destination: &mut File,
 ) -> Result<bool> {
@@ -87,8 +87,8 @@ pub fn package(
         connection.transfer(TransferRequest::IntermediatePackage {
             session,
             identity,
-            name: name.into(),
-            version: version.into(),
+            upstream: upstream.into(),
+            path: path.into(),
             offline,
         })?
     else {

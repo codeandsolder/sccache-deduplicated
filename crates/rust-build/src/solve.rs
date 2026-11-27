@@ -2,7 +2,8 @@
 //! reversible: later constraints can change earlier choices rather than silently
 //! selecting incompatible duplicate versions in one semver compatibility class.
 use crate::{
-    Dependency, DependencyKind, LockedPackage, Lockfile, Manifest, Package, Sources,
+    Dependency, DependencyKind, IndexNotFound, LockedPackage, Lockfile, Manifest, Package,
+    Registry, Sources,
     resolve::{all_features, default_feature, feature_request},
     source::{identity, load_discovered, validate_dependency},
 };
@@ -17,8 +18,6 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-
-const REGISTRY: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
 #[derive(Clone, Debug)]
 struct Candidate {
@@ -67,7 +66,7 @@ struct IndexRecord {
 }
 
 impl IndexRecord {
-    fn candidate(self) -> Result<Candidate> {
+    fn candidate(self, source: &str) -> Result<Candidate> {
         let mut features = self.features;
         for (name, more) in self.features2 {
             features.entry(name).or_default().extend(more);
@@ -89,7 +88,7 @@ impl IndexRecord {
                     path: None,
                     git: None,
                     git_reference: None,
-                    registry: d.registry,
+                    registry: d.registry.or_else(|| Some(source.to_owned())),
                     optional: d.optional,
                     default_features: d.default_features,
                     features: d.features,
@@ -101,7 +100,7 @@ impl IndexRecord {
         let lock = LockedPackage {
             name: self.name.clone(),
             version: self.vers.clone(),
-            source: Some(REGISTRY.to_owned()),
+            source: Some(source.to_owned()),
             checksum: Some(self.cksum),
             dependencies: Vec::new(),
         };
@@ -123,23 +122,6 @@ impl IndexRecord {
             lock,
         })
     }
-}
-
-fn index_path(name: &str) -> Result<String> {
-    ensure!(
-        !name.is_empty()
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-        "invalid registry package name {name}"
-    );
-    let name = name.to_ascii_lowercase();
-    Ok(match name.len() {
-        1 => format!("1/{name}"),
-        2 => format!("2/{name}"),
-        3 => format!("3/{}/{name}", &name[..1]),
-        _ => format!("{}/{}/{name}", &name[..2], &name[2..4]),
-    })
 }
 
 fn records(bytes: &[u8]) -> Result<Vec<IndexRecord>> {
@@ -310,7 +292,7 @@ struct Search<'a, 'b> {
     sources: &'a mut Sources<'b>,
     cutoff: DateTime<Utc>,
     rustc: Version,
-    registry: BTreeMap<String, Vec<Arc<Candidate>>>,
+    registry: BTreeMap<(String, String), Vec<Arc<Candidate>>>,
     paths: BTreeMap<(PathBuf, Option<String>), Arc<Candidate>>,
     git: BTreeMap<(String, Option<(String, String)>, String), Vec<Arc<Candidate>>>,
 }
@@ -339,75 +321,103 @@ impl Search<'_, '_> {
         Ok(candidate)
     }
 
-    fn index(&mut self, name: &str) -> Result<Vec<Arc<Candidate>>> {
-        if let Some(candidates) = self.registry.get(name) {
+    fn index(&mut self, registry: &Registry, name: &str) -> Result<Vec<Arc<Candidate>>> {
+        let key = (registry.source.clone(), name.to_owned());
+        if let Some(candidates) = self.registry.get(&key) {
             return Ok(candidates.clone());
         }
-        let relative = index_path(name)?;
         let bytes = if let Some(download) = self.sources.download {
-            let mut file = tempfile::tempfile_in(&self.sources.scratch)?;
-            download(&format!("https://index.crates.io/{relative}"), &mut file)?;
-            file.seek(SeekFrom::Start(0))?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
-            bytes
+            if let Some(url) = registry.sparse_url(name)? {
+                let mut file = tempfile::tempfile_in(&self.sources.scratch)?;
+                match download(&url, &mut file) {
+                    Ok(()) => {
+                        file.seek(SeekFrom::Start(0))?;
+                        let mut bytes = Vec::new();
+                        file.read_to_end(&mut bytes)?;
+                        Some(bytes)
+                    }
+                    Err(error) if error.is::<IndexNotFound>() => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                // A Git index is pinned once per resolution invocation; all
+                // subsequent object reads refer to that exact snapshot.
+                let repo = self
+                    .sources
+                    .scratch
+                    .join("registry-index")
+                    .join(blake3::hash(registry.source.as_bytes()).to_hex().as_str());
+                if !repo.exists() {
+                    fs::create_dir_all(repo.parent().context("missing registry index parent")?)?;
+                    let status = std::process::Command::new("git")
+                        .args(["clone", "--bare", "--depth=1", "--filter=blob:none", "--"])
+                        .arg(
+                            registry
+                                .index
+                                .strip_prefix("registry+")
+                                .unwrap_or(&registry.index),
+                        )
+                        .arg(&repo)
+                        .status()?;
+                    ensure!(
+                        status.success(),
+                        "cannot acquire registry index {}",
+                        registry.source
+                    );
+                }
+                let relative = crate::registry::index_path(name)?;
+                let object = format!("HEAD:{relative}");
+                let output = std::process::Command::new("git")
+                    .arg("--git-dir")
+                    .arg(&repo)
+                    .args(["show", &object])
+                    .output()?;
+                if output.status.success() {
+                    Some(output.stdout)
+                } else {
+                    // Distinguish an absent entry from a failed object fetch.
+                    let tree = std::process::Command::new("git")
+                        .arg("--git-dir")
+                        .arg(&repo)
+                        .args(["ls-tree", "HEAD", "--", &relative])
+                        .output()?;
+                    ensure!(
+                        tree.status.success() && tree.stdout.is_empty(),
+                        "failed to read registry index object {object}"
+                    );
+                    None
+                }
+            }
         } else {
-            let import = self
-                .sources
-                .import_root
-                .as_ref()
-                .context("no offline index configured")?;
-            // Only import the crates.io index, never a similarly named crate
-            // from an arbitrary alternative registry.
-            let index = import.join("registry/index");
-            let mut candidates = Vec::new();
-            for entry in fs::read_dir(index)? {
-                let entry = entry?;
-                if !entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("index.crates.io-")
+            registry.offline_entry(self.sources.import_root.as_deref(), name)?
+        };
+        let mut result = Vec::new();
+        if let Some(bytes) = bytes {
+            for record in records(&bytes)? {
+                if !record.name.eq_ignore_ascii_case(name) || record.v > 2 || record.yanked {
+                    continue;
+                }
+                if !record
+                    .pubtime
+                    .as_deref()
+                    .and_then(|v| v.parse::<DateTime<Utc>>().ok())
+                    .is_some_and(|time| time <= self.cutoff)
                 {
                     continue;
                 }
-                let path = entry.path().join(".cache").join(&relative);
-                if path.is_file() {
-                    candidates.push(path);
+                if record
+                    .rust_version
+                    .as_deref()
+                    .and_then(rust_version)
+                    .is_some_and(|v| v > self.rustc)
+                {
+                    continue;
                 }
+                result.push(Arc::new(record.candidate(&registry.source)?));
             }
-            ensure!(
-                candidates.len() == 1,
-                "missing or ambiguous offline crates.io index entry for {name}"
-            );
-            fs::read(&candidates[0])?
-        };
-        let mut result = Vec::new();
-        for record in records(&bytes)? {
-            if record.name != name || record.v > 2 || record.yanked {
-                continue;
-            }
-            // Release policy is based on registry-published time, not file
-            // timestamps. Existing locked versions are not re-selected here.
-            if !record
-                .pubtime
-                .as_deref()
-                .and_then(|v| v.parse::<DateTime<Utc>>().ok())
-                .is_some_and(|time| time <= self.cutoff)
-            {
-                continue;
-            }
-            if record
-                .rust_version
-                .as_deref()
-                .and_then(rust_version)
-                .is_some_and(|v| v > self.rustc)
-            {
-                continue;
-            }
-            result.push(Arc::new(record.candidate()?));
         }
         result.sort_by(|a, b| b.lock.version.cmp(&a.lock.version));
-        self.registry.insert(name.to_owned(), result.clone());
+        self.registry.insert(key, result.clone());
         Ok(result)
     }
 
@@ -466,55 +476,33 @@ impl Search<'_, '_> {
             validate_dependency(&candidate.manifest, dep)?;
             return Ok(vec![candidate]);
         }
-        if dep.git.is_some() {
-            return self.git_candidates(dep);
-        }
-        ensure!(
-            dep.registry.as_deref().is_none_or(|v| matches!(
-                v,
-                "crates-io" | "https://github.com/rust-lang/crates.io-index"
-            )),
-            "unsupported unlocked registry for {}",
-            dep.alias
-        );
-        let mut candidates = self.index(&dep.name)?;
-        if let Some(patches) = self
-            .sources
-            .workspace
-            .document
-            .get("patch")
-            .and_then(toml::Value::as_table)
-            .and_then(|t| t.get("crates-io"))
-            .and_then(toml::Value::as_table)
-            .cloned()
-        {
-            for (name, patch) in &patches {
-                let Some(spec) = patch.as_table() else {
-                    continue;
-                };
-                if spec
-                    .get("package")
-                    .and_then(toml::Value::as_str)
-                    .unwrap_or(name)
-                    != dep.name
+        let mut candidates = if dep.git.is_some() {
+            self.git_candidates(dep)?
+        } else {
+            let registry = self
+                .sources
+                .registries
+                .get(dep.registry.as_deref())?
+                .clone();
+            self.index(&registry, &dep.name)?
+        };
+        for patch in self.sources.patches(dep)? {
+            let patches = if let Some(path) = &patch.path {
+                vec![self.path(path, None)?]
+            } else if patch.git.is_some() {
+                self.git_candidates(&patch)?
+            } else {
+                let registry = self
+                    .sources
+                    .registries
+                    .get(patch.registry.as_deref())?
+                    .clone();
+                self.index(&registry, &patch.name)?
+            };
+            for candidate in patches {
+                if patch.requirement.matches(&candidate.lock.version)
+                    && candidate.lock.name == dep.name
                 {
-                    continue;
-                }
-                let patches = if let Some(path) = spec.get("path").and_then(toml::Value::as_str) {
-                    vec![self.path(&self.sources.workspace.root.join(path), None)?]
-                } else if let Some(url) = spec.get("git").and_then(toml::Value::as_str) {
-                    let mut patched = dep.clone();
-                    patched.git = Some(url.to_owned());
-                    patched.git_reference = ["rev", "tag", "branch"].into_iter().find_map(|key| {
-                        spec.get(key)
-                            .and_then(toml::Value::as_str)
-                            .map(|value| (key.to_owned(), value.to_owned()))
-                    });
-                    self.git_candidates(&patched)?
-                } else {
-                    bail!("unsupported patch for {}", dep.name);
-                };
-                for candidate in patches {
                     candidates.retain(|other| other.lock.version != candidate.lock.version);
                     candidates.push(candidate);
                 }
@@ -635,7 +623,7 @@ mod tests {
     fn index(root: &Path, name: &str, entries: &[serde_json::Value]) -> Result<()> {
         let path = root
             .join("registry/index/index.crates.io-fixture/.cache")
-            .join(index_path(name)?);
+            .join(crate::registry::index_path(name)?);
         fs::create_dir_all(path.parent().context("missing index parent")?)?;
         let mut bytes = vec![3, 2, 0, 0, 0];
         bytes.extend_from_slice(b"etag: fixture\0");
@@ -745,6 +733,53 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([Version::new(1, 0, 0), Version::new(2, 0, 0)])
         );
+        Ok(())
+    }
+    #[test]
+    fn equal_versions_in_distinct_registries_have_distinct_lock_identities() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("workspace");
+        package(
+            &root,
+            "app",
+            "[dependencies]\npublic = { package = \"a\", version = \"1\" }\nprivate = { package = \"a\", version = \"1\", registry = \"private\" }\n",
+        )?;
+        let import = temp.path().join("import");
+        let entry = release("a", "1.0.0", json!([]), json!({}));
+        index(&import, "a", std::slice::from_ref(&entry))?;
+        let alternate = temp.path().join("alternate");
+        let file = alternate.join(crate::registry::index_path("a")?);
+        fs::create_dir_all(file.parent().context("missing index parent")?)?;
+        fs::write(file, serde_json::to_vec(&entry)?)?;
+        let settings: toml::Table = toml::from_str(&format!(
+            "[registries.private]\nindex=\"sparse+https://registry.example/index/\"\nsccache-index-cache={:?}\n",
+            alternate.to_string_lossy()
+        ))?;
+        let workspace = Workspace::discover(&root.join("Cargo.toml"))?;
+        let scratch = temp.path().join("scratch");
+        fs::create_dir_all(&scratch)?;
+        let mut sources = Sources::new(&workspace, Lockfile::default(), Some(import), scratch);
+        sources.registries = crate::Registries::from_settings(&settings)?;
+        let lock = sources.resolve_lock("release: 1.100.0-nightly")?;
+        let identities = lock
+            .packages
+            .iter()
+            .filter(|package| package.name == "a")
+            .filter_map(|package| package.source.as_deref())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            identities,
+            BTreeSet::from([
+                crate::registry::CRATES_IO,
+                "sparse+https://registry.example/index/"
+            ])
+        );
+        let root_package = lock
+            .packages
+            .iter()
+            .find(|p| p.name == "app")
+            .context("missing app lock")?;
+        assert_eq!(root_package.dependencies.len(), 2);
         Ok(())
     }
 }

@@ -69,16 +69,16 @@ impl NativeResultSession {
     pub fn original_package(
         &self,
         identity: crate::build_runtime::PackageIdentity,
-        name: String,
-        version: String,
+        upstream: String,
+        path: String,
         offline: bool,
     ) -> Result<Option<File>> {
         self.check()?;
         let locator = super::PackageLocator {
             identity,
             expected_size: None,
-            upstream: "crates".into(),
-            path: format!("crates/{name}/{name}-{version}.crate"),
+            upstream,
+            path,
         };
         self.client.original_package(&locator, offline)
     }

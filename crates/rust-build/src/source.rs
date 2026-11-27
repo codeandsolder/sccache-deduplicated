@@ -10,7 +10,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use crate::{Dependency, Manifest, Workspace};
+use crate::{Dependency, Manifest, Registries, Registry, Workspace};
 
 /// The manifest graph no longer agrees with its lockfile. Distinguish this
 /// from source acquisition and compiler errors; only this error permits
@@ -97,7 +97,8 @@ pub struct Sources<'a> {
     pub scratch: PathBuf,
     /// Stream a verified registry archive to the provided staging file.
     pub download: Option<&'a dyn Fn(&str, &mut fs::File) -> Result<()>>,
-    pub archive: Option<&'a dyn Fn(&LockedPackage, &mut fs::File) -> Result<bool>>,
+    pub archive: Option<&'a dyn Fn(&LockedPackage, &Registry, &mut fs::File) -> Result<bool>>,
+    pub registries: Registries,
     materialized: BTreeMap<String, PathBuf>,
 }
 
@@ -141,6 +142,7 @@ impl<'a> Sources<'a> {
             scratch,
             download: None,
             archive: None,
+            registries: Registries::default(),
             materialized: BTreeMap::new(),
         }
     }
@@ -198,25 +200,19 @@ impl<'a> Sources<'a> {
                 parent.package.name, dep.alias
             ))
         })?;
-        let candidates: Vec<_> = self
-            .lock
-            .packages
-            .iter()
-            .filter(|p| {
-                p.name == dep.name
-                    && dep.requirement.matches(&p.version)
-                    && parent_lock
-                        .dependencies
-                        .iter()
-                        .any(|edge| locked_edge(edge, p))
-                    && dep.git.as_ref().is_none_or(|_| {
-                        p.source
-                            .as_deref()
-                            .is_some_and(|source| matches_git_source(dep, source))
-                    })
-            })
-            .cloned()
-            .collect();
+        let mut candidates = Vec::new();
+        for package in &self.lock.packages {
+            if package.name == dep.name
+                && dep.requirement.matches(&package.version)
+                && parent_lock
+                    .dependencies
+                    .iter()
+                    .any(|edge| locked_edge(edge, package))
+                && self.matches_source(dep, package)?
+            {
+                candidates.push(package.clone());
+            }
+        }
         if candidates.len() != 1 {
             return Err(LockMismatch(format!(
                 "edge {} -> {} has {} candidates",
@@ -232,7 +228,7 @@ impl<'a> Sources<'a> {
                 self.registry(locked)?
             }
             Some(source) if source.starts_with("git+") => self.git(locked)?,
-            None => self.patched_path(locked)?,
+            None => self.patched_path(dep, locked)?,
             Some(source) => bail!("unsupported locked source {source}"),
         };
         let manifest = if self.workspace.members.contains(&root) {
@@ -248,45 +244,121 @@ impl<'a> Sources<'a> {
         Ok((manifest, locked.source.clone()))
     }
 
-    fn patched_path(&self, package: &LockedPackage) -> Result<PathBuf> {
-        let mut candidates = BTreeSet::new();
-        if let Some(patches) = self
+    pub(crate) fn patches(&self, dep: &Dependency) -> Result<Vec<Dependency>> {
+        let Some(patches) = self
             .workspace
             .document
             .get("patch")
             .and_then(toml::Value::as_table)
-        {
-            for table in patches.values().filter_map(toml::Value::as_table) {
-                for (alias, spec) in table {
-                    if let Some(spec) = spec.as_table() {
-                        if spec
-                            .get("package")
-                            .and_then(toml::Value::as_str)
-                            .unwrap_or(alias)
-                            == package.name
-                            && let Some(path) = spec.get("path").and_then(toml::Value::as_str)
-                        {
-                            candidates.insert(self.workspace.root.join(path).canonicalize()?);
-                        }
-                    }
+        else {
+            return Ok(Vec::new());
+        };
+        let mut result = Vec::new();
+        let registry = if dep.git.is_none() {
+            Some(self.registries.get(dep.registry.as_deref())?)
+        } else {
+            None
+        };
+        for (source, values) in patches {
+            let matches = if let Some(git) = dep.git.as_deref() {
+                source.trim_end_matches('/') == git.trim_end_matches('/')
+            } else if let Some(registry) = registry {
+                self.registries
+                    .get(Some(source))
+                    .is_ok_and(|other| other.source == registry.source)
+            } else {
+                false
+            };
+            if !matches {
+                continue;
+            }
+            let values = values.as_table().context("patch source must be a table")?;
+            for (alias, value) in values {
+                let patch = crate::manifest::dependency(
+                    alias,
+                    value,
+                    dep.kind,
+                    dep.platform.as_deref(),
+                    &self.workspace.root,
+                    Some(self.workspace),
+                )?;
+                if patch.name == dep.name {
+                    result.push(patch);
                 }
             }
         }
-        candidates.extend(self.workspace.members.iter().cloned());
-        let mut found = Vec::new();
-        for path in candidates {
-            let manifest = self.workspace.package(&path)?;
-            if manifest.package.name == package.name && manifest.package.version == package.version
+        Ok(result)
+    }
+
+    fn matches_source(&self, dep: &Dependency, package: &LockedPackage) -> Result<bool> {
+        let original = if dep.git.is_some() {
+            package
+                .source
+                .as_deref()
+                .is_some_and(|source| matches_git_source(dep, source))
+        } else {
+            let registry = self.registries.get(dep.registry.as_deref())?;
+            package
+                .source
+                .as_deref()
+                .is_some_and(|source| self.registries.matches(registry, source))
+        };
+        if original {
+            return Ok(true);
+        }
+        for patch in self.patches(dep)? {
+            if !patch.requirement.matches(&package.version) {
+                continue;
+            }
+            if patch.path.is_some() && package.source.is_none() {
+                return Ok(true);
+            }
+            if patch.git.is_some()
+                && package
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| matches_git_source(&patch, source))
             {
-                found.push(path);
+                return Ok(true);
+            }
+            if patch.registry.is_some() {
+                let registry = self.registries.get(patch.registry.as_deref())?;
+                if package
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| self.registries.matches(registry, source))
+                {
+                    return Ok(true);
+                }
             }
         }
-        ensure!(
-            found.len() == 1,
-            "cannot uniquely locate path patch {}",
-            identity(package)
-        );
-        Ok(found.remove(0))
+        Ok(false)
+    }
+
+    fn patched_path(&self, dep: &Dependency, package: &LockedPackage) -> Result<PathBuf> {
+        let mut found = BTreeSet::new();
+        for patch in self.patches(dep)? {
+            if !patch.requirement.matches(&package.version) {
+                continue;
+            }
+            if let Some(path) = patch.path {
+                let path = path.canonicalize()?;
+                let manifest = self.workspace.package(&path)?;
+                if manifest.package.name == package.name
+                    && manifest.package.version == package.version
+                {
+                    found.insert(path);
+                }
+            }
+        }
+        if found.len() != 1 {
+            return Err(LockMismatch(format!(
+                "cannot locate unique declared path patch {}",
+                identity(package)
+            ))
+            .into());
+        }
+        found.pop_first().context("missing path patch")
     }
 
     fn registry(&mut self, package: &LockedPackage) -> Result<PathBuf> {
@@ -298,6 +370,7 @@ impl<'a> Sources<'a> {
             .source
             .as_deref()
             .context("missing registry source")?;
+        let registry = self.registries.get(Some(source))?.clone();
         let checksum = package
             .checksum
             .as_ref()
@@ -340,7 +413,7 @@ impl<'a> Sources<'a> {
         if !found && let Some(archive) = self.archive {
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
-            found = archive(package, &mut file)?;
+            found = archive(package, &registry, &mut file)?;
             if found {
                 ensure!(
                     verify(&mut file, checksum)?,
@@ -356,18 +429,10 @@ impl<'a> Sources<'a> {
             let download = self
                 .download
                 .context("locked crate archive not available offline")?;
-            ensure!(
-                matches!(
-                    source,
-                    "registry+https://github.com/rust-lang/crates.io-index"
-                        | "sparse+https://index.crates.io/"
-                ),
-                "download configuration missing for {source}"
-            );
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
             download(
-                &format!("https://static.crates.io/crates/{name}/{filename}"),
+                &registry.archive_url(name, &package.version.to_string(), checksum)?,
                 &mut file,
             )?;
             ensure!(

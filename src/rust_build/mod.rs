@@ -227,13 +227,18 @@ impl RustBuildArgs {
 
 fn download(url: &str, file: &mut fs::File) -> Result<()> {
     let response = crate::http_client::io_runtime()?.block_on(async {
-        crate::http_client::new_http_client_builder()
-            .build()?
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()
+        Ok::<_, anyhow::Error>(
+            crate::http_client::new_http_client_builder()
+                .build()?
+                .get(url)
+                .send()
+                .await?,
+        )
     })?;
+    if response.status() == http::StatusCode::NOT_FOUND {
+        return Err(sccache_rust_build::IndexNotFound.into());
+    }
+    let response = response.error_for_status()?;
     let mut reader = crate::http_client::ResponseReader::new(response)?;
     io::copy(&mut reader, file)?;
     Ok(())
@@ -272,6 +277,7 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
         .or_else(|| std::env::var_os("CARGO_HOME").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".cargo")));
     let settings = Settings::load(&cwd, import.as_deref())?;
+    let registries = sccache_rust_build::Registries::from_settings(&settings.document)?;
     let selected = args.selected(&workspace)?;
     let default_target = workspace.root.join("target");
     let target_root = args
@@ -332,6 +338,7 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
             Lockfile::load(&workspace.root.join("Cargo.lock"))?
         };
         let mut sources = Sources::new(&workspace, lock, import, scratch.path().to_path_buf());
+        sources.registries = registries;
         if !args.offline {
             sources.download = Some(&download);
         }
@@ -369,34 +376,30 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
     crate::build_lease::with_build_intermediates(|lease, intermediate, token| {
         let sources_root = lease.root().join("sources");
         fs::create_dir_all(&sources_root)?;
-        let archive = |package: &sccache_rust_build::LockedPackage, file: &mut fs::File| {
-            ensure!(
-                matches!(
-                    package.source.as_deref(),
-                    Some(
-                        "registry+https://github.com/rust-lang/crates.io-index"
-                            | "sparse+https://index.crates.io/"
-                    )
-                ),
-                "shared archive acquisition requires a configured registry"
-            );
+        let archive = |package: &sccache_rust_build::LockedPackage,
+                       registry: &sccache_rust_build::Registry,
+                       file: &mut fs::File| {
+            let checksum = package
+                .checksum
+                .as_deref()
+                .context("missing package checksum")?;
             let identity = crate::build_runtime::PackageIdentity::from_sha256_hex(
-                package
-                    .checksum
-                    .as_deref()
-                    .context("missing package checksum")?,
+                checksum,
                 crate::build_runtime::PackageCompression::Gzip,
             )?;
+            let path =
+                registry.archive_path(&package.name, &package.version.to_string(), checksum)?;
             crate::dist::native::intermediate::package(
                 token,
                 identity,
-                &package.name,
-                &package.version.to_string(),
+                &registry.upstream,
+                &path,
                 args.offline,
                 file,
             )
         };
         let mut sources = Sources::new(&workspace, lock, import, sources_root);
+        sources.registries = registries;
         sources.archive = Some(&archive);
         if !args.offline {
             sources.download = Some(&download);

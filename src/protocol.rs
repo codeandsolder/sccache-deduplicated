@@ -146,8 +146,8 @@ pub enum TransferRequest {
     IntermediatePackage {
         session: crate::build_runtime::wire::Ticket,
         identity: crate::build_runtime::PackageIdentity,
-        name: String,
-        version: String,
+        upstream: String,
+        path: String,
         offline: bool,
     },
 }

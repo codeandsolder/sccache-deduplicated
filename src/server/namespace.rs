@@ -270,8 +270,8 @@ impl TransferSession {
             TransferRequest::IntermediatePackage {
                 session,
                 identity,
-                name,
-                version,
+                upstream,
+                path,
                 offline,
             } => {
                 ensure!(
@@ -280,7 +280,7 @@ impl TransferSession {
                 );
                 let group = client.intermediate(uid, session)?;
                 let file = tokio::task::spawn_blocking(move || {
-                    group.original_package(identity, name, version, offline)
+                    group.original_package(identity, upstream, path, offline)
                 })
                 .await??;
                 let Some(file) = file else {
