@@ -12,20 +12,22 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ExitStatus, Stdio},
     sync::Arc,
-    thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
 use rustix::{
+    event::{PollFd, PollFlags, poll},
     fs::{Mode, OFlags, ResolveFlags, Stat, openat2},
     io::Errno,
+    process::{Pid, PidfdFlags, pidfd_open},
+    time::Timespec,
 };
 
 use crate::{
     Artifact, BlobEncoding, BlobRef, BuildPath, ContentId, ExecutionSpec, MountedTree, NativeStore,
-    OutputKind, ResultManifest, StageBudget, StagedBlob, TreeEntry, TreeLease, TreeManifest,
-    TreePath,
+    OutputKind, ResultManifest, StageBudget, StagedBlob, TreeEntry, TreeId, TreeLease,
+    TreeManifest, TreePath,
     sandbox::{MountAccess, SandboxInvocation, SandboxPath, SandboxPlan},
     store::CapturedStage,
 };
@@ -50,13 +52,28 @@ pub struct ExecutionPolicy {
 /// files opened before releasing the private build directory.
 pub struct CapturedExecution {
     status: ExitStatus,
+    timings: ExecutionTimings,
     manifest: ResultManifest,
     files: BTreeMap<ContentId, Arc<File>>,
     staged: BTreeMap<ContentId, CapturedStage>,
     encoding: BlobEncoding,
 }
 
+/// Wall-clock phase durations of a native action. Process time includes
+/// namespace setup and child execution; it is not pure compiler CPU time.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExecutionTimings {
+    pub preparation: Duration,
+    pub process: Duration,
+    pub capture: Duration,
+}
+
 impl CapturedExecution {
+    #[must_use = "the timings report execution phase durations"]
+    pub const fn timings(&self) -> ExecutionTimings {
+        self.timings
+    }
+
     #[must_use = "the status distinguishes successful from failed execution"]
     pub const fn status(&self) -> ExitStatus {
         self.status
@@ -355,7 +372,7 @@ fn output_parent(path: &BuildPath) -> Result<BuildPath> {
 
 fn writable_locations(
     spec: &ExecutionSpec,
-    leases: &BTreeMap<BuildPath, TreeLease>,
+    leases: &BTreeMap<BuildPath, Arc<TreeLease>>,
 ) -> Result<BTreeSet<BuildPath>> {
     let tmp = BuildPath::new(b"/tmp".to_vec())?;
     let mut writable = BTreeSet::from([tmp]);
@@ -441,7 +458,7 @@ fn mount_input_views(
     spec: &ExecutionSpec,
     store: &NativeStore,
     scratch: &Path,
-    leases: BTreeMap<BuildPath, TreeLease>,
+    leases: BTreeMap<BuildPath, Arc<TreeLease>>,
     writable: &BTreeSet<BuildPath>,
 ) -> Result<BTreeMap<BuildPath, MountedTree>> {
     let protected_system = [
@@ -506,21 +523,28 @@ fn bind_file_overlays(
 }
 
 impl PreparedBuild {
-    fn prepare(spec: &ExecutionSpec, store: &NativeStore, scratch: &Path) -> Result<Self> {
+    fn prepare(
+        spec: &ExecutionSpec,
+        store: &NativeStore,
+        scratch: &Path,
+        inputs: &[Arc<TreeLease>],
+    ) -> Result<Self> {
+        let inputs = admitted_inputs(spec, store, inputs)?;
         let root_point = BuildPath::new(b"/".to_vec())?;
-        let mut leases: BTreeMap<BuildPath, TreeLease> = spec
+        let mut leases: BTreeMap<BuildPath, Arc<TreeLease>> = spec
             .mounts
             .iter()
-            .map(|(path, &id)| {
+            .map(|(path, id)| {
                 Ok((
                     path.clone(),
-                    store
-                        .lookup_tree(id)?
-                        .context("native input tree unavailable")?,
+                    Arc::clone(inputs.get(id).context("native input tree unavailable")?),
                 ))
             })
             .collect::<Result<_>>()?;
-        leases.insert(root_point.clone(), store.lease_recipe(&spec.root.recipe)?);
+        leases.insert(
+            root_point.clone(),
+            store.resident_recipe(&spec.root, &inputs)?,
+        );
         let root = leases.get(&root_point).context("native root unavailable")?;
         spec.root.verify(root.id())?;
         // Never mount through a symlink or a nonexistent parent in the root.
@@ -620,15 +644,79 @@ impl RunningChild {
         mut progress: impl FnMut() -> Result<()>,
     ) -> Result<ExitStatus> {
         let start = Instant::now();
+        // The unreaped child PID cannot be recycled. pidfd readiness wakes
+        // immediately on exit instead of occupying a compiler slot for the
+        // remainder of a 50 ms polling interval.
+        let pidfd = pidfd_open(Pid::from_child(&self.0), PidfdFlags::empty())?;
         loop {
             if let Some(status) = self.0.try_wait()? {
                 return Ok(status);
             }
             ensure!(start.elapsed() < timeout, "native execution timed out");
             progress()?;
-            thread::sleep(Duration::from_millis(50).min(timeout.saturating_sub(start.elapsed())));
+            let remaining = timeout.saturating_sub(start.elapsed());
+            ensure!(!remaining.is_zero(), "native execution timed out");
+            let interval = Timespec::try_from(remaining.min(Duration::from_millis(50)))?;
+            let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
+            match poll(&mut fds, Some(&interval)) {
+                Ok(_) | Err(Errno::INTR) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
     }
+}
+
+fn admitted_inputs(
+    spec: &ExecutionSpec,
+    store: &NativeStore,
+    inputs: &[Arc<TreeLease>],
+) -> Result<BTreeMap<TreeId, Arc<TreeLease>>> {
+    let required: BTreeSet<_> = spec
+        .root
+        .recipe
+        .layers
+        .iter()
+        .map(|layer| layer.tree)
+        .chain(spec.mounts.values().copied())
+        .collect();
+    let mut admitted = BTreeMap::new();
+    for lease in inputs {
+        ensure!(
+            lease.belongs_to(store) && lease.is_indexed(),
+            "native input lease is not an indexed tree from this store"
+        );
+        ensure!(
+            required.contains(&lease.id()),
+            "unexpected native input lease"
+        );
+        admitted
+            .entry(lease.id())
+            .or_insert_with(|| Arc::clone(lease));
+    }
+    ensure!(
+        admitted.len() == required.len(),
+        "native input closure incomplete"
+    );
+    Ok(admitted)
+}
+
+/// Acquire all declared input leases for direct execution. Distributed
+/// workers pass their already admitted leases to execution instead.
+/// # Errors
+/// Returns an error for an invalid specification or missing input tree.
+pub fn acquire_execution_inputs(
+    spec: &ExecutionSpec,
+    store: &NativeStore,
+) -> Result<Vec<Arc<TreeLease>>> {
+    spec.action_request()?
+        .input_trees
+        .into_iter()
+        .map(|id| {
+            store
+                .lookup_resident_tree(id)?
+                .context("native input tree unavailable")
+        })
+        .collect()
 }
 
 /// Execute one immutable declared build on a worker.
@@ -646,8 +734,9 @@ pub fn execute(
     spec: &ExecutionSpec,
     store: &NativeStore,
     policy: &ExecutionPolicy,
+    inputs: &[Arc<TreeLease>],
     budget: Option<StageBudget>,
-    progress: impl FnMut() -> Result<()>,
+    mut progress: impl FnMut() -> Result<()>,
 ) -> Result<CapturedExecution> {
     spec.validate()?;
     ensure!(
@@ -664,11 +753,20 @@ pub fn execute(
         !policy.timeout.is_zero() && policy.max_result_bytes > 0,
         "invalid execution limits"
     );
-    let build = PreparedBuild::prepare(spec, store, &policy.scratch)?;
+    let started = Instant::now();
+    progress()?;
+    let build = PreparedBuild::prepare(spec, store, &policy.scratch, inputs)?;
     let invocation = SandboxInvocation::from_spec(&spec.command)?;
     let stdout = tempfile::tempfile_in(&policy.scratch)?;
     let stderr = tempfile::tempfile_in(&policy.scratch)?;
-    let status = RunningChild(
+    progress()?;
+    let preparation = started.elapsed();
+    ensure!(
+        preparation < policy.timeout,
+        "native execution preparation timed out"
+    );
+    let running = Instant::now();
+    let mut child = RunningChild(
         build
             .plan
             .command(&policy.bubblewrap, &invocation)?
@@ -676,8 +774,13 @@ pub fn execute(
             .stdout(stdout.try_clone()?)
             .stderr(stderr.try_clone()?)
             .spawn()?,
-    )
-    .wait(policy.timeout, progress)?;
+    );
+    let status = child.wait(
+        policy.timeout.saturating_sub(started.elapsed()),
+        &mut progress,
+    )?;
+    let process = running.elapsed();
+    progress()?;
     let mut capture = Capture {
         files: BTreeMap::new(),
         staged: BTreeMap::new(),
@@ -693,8 +796,20 @@ pub fn execute(
     } else {
         BTreeMap::new()
     };
+    let timings = ExecutionTimings {
+        preparation,
+        process,
+        capture: running.elapsed().saturating_sub(process),
+    };
+    log::debug!(
+        "native execution phases: preparation={:?} process={:?} capture={:?}",
+        timings.preparation,
+        timings.process,
+        timings.capture
+    );
     Ok(CapturedExecution {
         status,
+        timings,
         manifest: ResultManifest {
             outputs,
             stdout,

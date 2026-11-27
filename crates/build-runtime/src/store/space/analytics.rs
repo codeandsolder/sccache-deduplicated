@@ -119,61 +119,6 @@ impl NativeStore {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{ActionFingerprint, ActionMode, Artifact, ResultManifest};
-    use anyhow::Context;
-    use std::io::Cursor;
-
-    #[test]
-    fn shared_result_is_counted_once_with_all_action_touches() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let store = NativeStore::open(temp.path())?;
-        let stage = store.stage(Cursor::new(b"same"))?;
-        let manifest = ResultManifest {
-            outputs: BTreeMap::from([(
-                "out".into(),
-                Artifact::File {
-                    blob: stage.reference(),
-                    mode: None,
-                },
-            )]),
-            stdout: None,
-            stderr: None,
-        };
-        let fingerprint = |name: &[u8]| ActionFingerprint {
-            schema: "analytics".into(),
-            components: BTreeMap::from([("name".into(), ContentId::of(name))]),
-        };
-        let first = store.publish(
-            &fingerprint(b"a"),
-            &manifest,
-            vec![stage],
-            ActionMode::Reuse,
-        )?;
-        store.publish(&fingerprint(b"b"), &manifest, vec![], ActionMode::Reuse)?;
-        let _lease = store.lookup(first.action)?.context("missing result")?;
-        let report = store.cache_distribution()?;
-        assert_eq!(report.total.objects, 1);
-        assert_eq!(report.total.logical_bytes, 4);
-        assert_eq!(report.referenced_bytes, 8);
-        assert_eq!(report.total.touches, 3);
-        assert_eq!(report.total.byte_touches, 12);
-        assert_eq!(report.total.measured_objects, 1);
-        assert_eq!(
-            report.eviction.pinned_roots + report.eviction.zero_logical_roots,
-            2
-        );
-        assert!(report.eviction.logical.is_empty());
-        drop(_lease);
-        let report = store.cache_distribution()?;
-        assert_eq!(report.eviction.pinned_roots, 0);
-        assert_eq!(report.eviction.zero_logical_roots, 2);
-        Ok(())
-    }
-}
-
 /// Keeps an expensive analytics scan off scheduler and worker heartbeat paths.
 pub struct CacheAnalyticsSampler {
     receiver: std::sync::mpsc::Receiver<crate::analytics::CacheAnalyticsSample>,
@@ -240,5 +185,60 @@ impl NativeStore {
                 }
             })?;
         Ok(CacheAnalyticsSampler { receiver, stop })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ActionFingerprint, ActionMode, Artifact, ResultManifest};
+    use anyhow::Context;
+    use std::io::Cursor;
+
+    #[test]
+    fn shared_result_is_counted_once_with_all_action_touches() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = NativeStore::open(temp.path())?;
+        let stage = store.stage(Cursor::new(b"same"))?;
+        let manifest = ResultManifest {
+            outputs: BTreeMap::from([(
+                "out".into(),
+                Artifact::File {
+                    blob: stage.reference(),
+                    mode: None,
+                },
+            )]),
+            stdout: None,
+            stderr: None,
+        };
+        let fingerprint = |name: &[u8]| ActionFingerprint {
+            schema: "analytics".into(),
+            components: BTreeMap::from([("name".into(), ContentId::of(name))]),
+        };
+        let first = store.publish(
+            &fingerprint(b"a"),
+            &manifest,
+            vec![stage],
+            ActionMode::Reuse,
+        )?;
+        store.publish(&fingerprint(b"b"), &manifest, vec![], ActionMode::Reuse)?;
+        let _lease = store.lookup(first.action)?.context("missing result")?;
+        let report = store.cache_distribution()?;
+        assert_eq!(report.total.objects, 1);
+        assert_eq!(report.total.logical_bytes, 4);
+        assert_eq!(report.referenced_bytes, 8);
+        assert_eq!(report.total.touches, 3);
+        assert_eq!(report.total.byte_touches, 12);
+        assert_eq!(report.total.measured_objects, 1);
+        assert_eq!(
+            report.eviction.pinned_roots + report.eviction.zero_logical_roots,
+            2
+        );
+        assert!(report.eviction.logical.is_empty());
+        drop(_lease);
+        let report = store.cache_distribution()?;
+        assert_eq!(report.eviction.pinned_roots, 0);
+        assert_eq!(report.eviction.zero_logical_roots, 2);
+        Ok(())
     }
 }

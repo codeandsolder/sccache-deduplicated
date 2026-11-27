@@ -79,6 +79,30 @@ impl TreeRecipe {
     /// Returns an error for unavailable packages, invalid paths or conflicting
     /// entries, including incompatible hardlink topology.
     pub fn compose(&self, packages: &BTreeMap<TreeId, &TreeManifest>) -> Result<TreeManifest> {
+        let mut verified = std::collections::BTreeSet::new();
+        for layer in &self.layers {
+            if verified.insert(layer.tree) {
+                let package = packages
+                    .get(&layer.tree)
+                    .context("recipe package unavailable")?;
+                ensure!(
+                    package.id()? == layer.tree,
+                    "recipe package digest mismatch"
+                );
+            }
+        }
+        let manifest = self.compose_verified(packages)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    // Only leases issued by the store may enter this path: their manifest
+    // identity and content closure were already verified at acquisition.
+    // The caller must validate the composed manifest before accepting it.
+    pub(crate) fn compose_verified(
+        &self,
+        packages: &BTreeMap<TreeId, &TreeManifest>,
+    ) -> Result<TreeManifest> {
         self.validate()?;
         let mut manifest = TreeManifest {
             root: self.directories,
@@ -88,13 +112,8 @@ impl TreeRecipe {
             let package = packages
                 .get(&layer.tree)
                 .context("recipe package unavailable")?;
-            ensure!(
-                package.id()? == layer.tree,
-                "recipe package digest mismatch"
-            );
             self.compose_layer(layer, package, &mut manifest)?;
         }
-        manifest.validate()?;
         Ok(manifest)
     }
 
@@ -104,6 +123,16 @@ impl TreeRecipe {
         package: &TreeManifest,
         output: &mut TreeManifest,
     ) -> Result<()> {
+        if layer.source.is_none() && layer.destination.is_none() {
+            for (path, entry) in &package.entries {
+                let entry = match entry {
+                    TreeEntry::Directory(_) => TreeEntry::Directory(output.root),
+                    other => other.clone(),
+                };
+                insert(&mut output.entries, path.clone(), entry)?;
+            }
+            return Ok(());
+        }
         if let Some(source) = &layer.source {
             ensure!(
                 matches!(package.entries.get(source), Some(TreeEntry::Directory(_))),

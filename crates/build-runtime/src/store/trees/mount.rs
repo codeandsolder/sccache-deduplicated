@@ -50,7 +50,7 @@ struct OpenHandles {
 }
 
 struct VirtualFs {
-    lease: TreeLease,
+    lease: Arc<TreeLease>,
     nodes: Vec<Node>,
     handles: Mutex<OpenHandles>,
     uid: u32,
@@ -58,7 +58,7 @@ struct VirtualFs {
 }
 
 impl VirtualFs {
-    fn new(lease: TreeLease) -> Result<Self> {
+    fn new(lease: Arc<TreeLease>) -> Result<Self> {
         let root = lease.manifest().root;
         let mut nodes = vec![Node {
             kind: Kind::Directory(BTreeMap::new()),
@@ -390,22 +390,21 @@ impl Filesystem for VirtualFs {
 /// filesystems expose indexed compressed objects through a read-only FUSE mount.
 pub enum ReadOnlyView {
     Fuse {
-        manifest: TreeManifest,
+        lease: Arc<TreeLease>,
         unmount: SessionUnmounter,
         thread: Option<JoinHandle<io::Result<()>>>,
         _directory: TempDir,
         mountpoint: PathBuf,
     },
     Zfs {
-        lease: TreeLease,
+        lease: Arc<TreeLease>,
         materialized: MaterializedTree,
     },
 }
 
 impl ReadOnlyView {
-    pub(crate) fn mount_fuse(lease: TreeLease, parent: &Path) -> Result<Self> {
-        let manifest = lease.manifest().clone();
-        let filesystem = VirtualFs::new(lease)?;
+    pub(crate) fn mount_fuse(lease: Arc<TreeLease>, parent: &Path) -> Result<Self> {
+        let filesystem = VirtualFs::new(Arc::clone(&lease))?;
         let directory = tempfile::Builder::new()
             .prefix("build-fuse-")
             .tempdir_in(parent)?;
@@ -421,7 +420,7 @@ impl ReadOnlyView {
         let unmount = session.unmount_callable();
         let thread = thread::spawn(move || session.run());
         Ok(Self::Fuse {
-            manifest,
+            lease,
             unmount,
             thread: Some(thread),
             _directory: directory,
@@ -429,7 +428,7 @@ impl ReadOnlyView {
         })
     }
 
-    pub(crate) fn materialize_zfs(lease: TreeLease, parent: &Path) -> Result<Self> {
+    pub(crate) fn materialize_zfs(lease: Arc<TreeLease>, parent: &Path) -> Result<Self> {
         // Clone each immutable CAS tree only on its first use. Subsequent
         // actions share this view and expose it only through read-only binds.
         let materialized = lease.materialize(parent)?;
@@ -439,10 +438,13 @@ impl ReadOnlyView {
         })
     }
 
-    pub(crate) const fn manifest(&self) -> &TreeManifest {
+    pub(crate) fn manifest(&self) -> &TreeManifest {
+        self.lease().manifest()
+    }
+
+    pub(crate) const fn lease(&self) -> &Arc<TreeLease> {
         match self {
-            Self::Fuse { manifest, .. } => manifest,
-            Self::Zfs { lease, .. } => lease.manifest(),
+            Self::Fuse { lease, .. } | Self::Zfs { lease, .. } => lease,
         }
     }
 
@@ -511,25 +513,39 @@ impl Drop for ReadOnlyView {
 pub struct MountedTree {
     view: Arc<ReadOnlyView>,
     private_zfs: Option<MaterializedTree>,
-    directory: TempDir,
+    scratch_parent: PathBuf,
+    directory: Option<TempDir>,
     writable: BTreeMap<PathBuf, PathBuf>,
     scratch_directories: Vec<PathBuf>,
     overlays: Option<OverlayFiles>,
 }
 
 impl MountedTree {
-    pub(crate) fn from_view(view: Arc<ReadOnlyView>, parent: &Path) -> Result<Self> {
-        let directory = tempfile::Builder::new()
-            .prefix("build-mutable-")
-            .tempdir_in(parent)?;
-        Ok(Self {
+    pub(crate) fn from_view(view: Arc<ReadOnlyView>, parent: &Path) -> Self {
+        Self {
             view,
             private_zfs: None,
-            directory,
+            scratch_parent: parent.to_owned(),
+            directory: None,
             writable: BTreeMap::new(),
             scratch_directories: Vec::new(),
             overlays: None,
-        })
+        }
+    }
+
+    fn mutable_directory(&mut self) -> Result<&Path> {
+        if self.directory.is_none() {
+            self.directory = Some(
+                tempfile::Builder::new()
+                    .prefix("build-mutable-")
+                    .tempdir_in(&self.scratch_parent)?,
+            );
+        }
+        Ok(self
+            .directory
+            .as_ref()
+            .context("missing private scratch directory")?
+            .path())
     }
 
     #[must_use = "the sandbox must bind the root of the pinned immutable view"]
@@ -583,7 +599,8 @@ impl MountedTree {
             .chain(std::iter::once(relative.to_owned()))
             .collect::<Vec<_>>();
         if self.private_zfs.is_none() && self.view.crosses_hardlink_boundary(&regions) {
-            let mut private = self.view.private_zfs_view(self.directory.path())?;
+            let parent = self.mutable_directory()?.to_owned();
+            let mut private = self.view.private_zfs_view(&parent)?;
             for existing in self.writable.keys() {
                 private.mark_writable(existing);
             }
@@ -604,10 +621,8 @@ impl MountedTree {
             return Ok(());
         }
 
-        let scratch = self
-            .directory
-            .path()
-            .join(format!("mutable-{}", self.writable.len()));
+        let index = self.writable.len();
+        let scratch = self.mutable_directory()?.join(format!("mutable-{index}"));
         // Track partial scratch trees too, so failures cannot leave mode-000
         // directories behind after cleanup.
         self.scratch_directories.push(scratch.clone());
@@ -707,7 +722,10 @@ impl TreeLease {
     /// # Errors
     /// Returns an error when the mount, manifest or filesystem is unavailable.
     pub fn mount_readonly(self, parent: &Path) -> Result<MountedTree> {
-        MountedTree::from_view(Arc::new(ReadOnlyView::mount_fuse(self, parent)?), parent)
+        Ok(MountedTree::from_view(
+            Arc::new(ReadOnlyView::mount_fuse(Arc::new(self), parent)?),
+            parent,
+        ))
     }
 }
 

@@ -174,6 +174,27 @@ atomically. Successful worker HTTPS responses contain no output bytes.
 Failed processes return diagnostics and exit status without committing a
 successful action.
 
+Each worker owns one resident native runtime within its existing CAS instance.
+Assignment, admission and execution share verified indexed tree leases;
+warm input lookup does not reread the manifest or rescan its blobs while
+the lease is alive. Assignment reserves only blobs not covered by complete
+resident tree leases, avoiding redundant per-blob index and filesystem probes. Composed recipes memoize their verified identity and
+retain constituent leases. A bounded LRU of 16 immutable filesystem views
+preserves the filesystem backing across actions, while weak per-identity
+memo entries do not independently pin storage. Eviction retires idle views
+of the requested tree, including views composed from that tree. Concurrent
+preparations of one identity share construction; unrelated identities do
+not serialize filesystem work under a global cache mutex.
+
+Each action still launches a fresh Bubblewrap namespace and allocates only
+its required private writable scratch. There is no separate runtime cache,
+Docker daemon, or mutable sandbox state shared between compiler jobs.
+Linux pidfd readiness detects child exit immediately;
+a bounded 50 ms interval is retained for lease renewal and cancellation
+checks, not for detecting normal completion. Execution phase diagnostics
+report preparation, child process wall time (including namespace startup),
+and capture separately.
+
 The platform contract is an administrator-supplied compatibility declaration,
 not automatic hardware attestation. Equal contracts must imply compatible
 observable hardware, kernel, sandbox and execution behavior; the compiler

@@ -1168,10 +1168,10 @@ mod tests {
             (&SourceDigestCache::default(), None),
         )?;
         let store = NativeStore::open(&cwd.join("native-store"))?;
-        let _leases = plan
+        let leases = plan
             .inputs
             .iter()
-            .map(|tree| tree.import(&store))
+            .map(|tree| tree.import(&store).map(std::sync::Arc::new))
             .collect::<Result<Vec<_>>>()?;
         let result = execute(
             &plan.spec,
@@ -1183,6 +1183,7 @@ mod tests {
                 timeout: Duration::from_secs(60),
                 max_result_bytes: 64 * 1024 * 1024,
             },
+            &leases,
             None,
             || Ok(()),
         )?;

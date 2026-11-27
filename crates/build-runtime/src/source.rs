@@ -96,27 +96,6 @@ pub fn unchanged(before: &Stat, after: &Stat) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rustix::fs::fstat;
-
-    #[test]
-    fn metadata_cache_rejects_fresh_and_future_timestamps() -> Result<()> {
-        let file = tempfile::tempfile()?;
-        let recent = fstat(&file)?;
-        assert!(!version_is_mature(&recent));
-        let mut mature = recent;
-        mature.st_ctime -= 10;
-        mature.st_mtime -= 10;
-        assert!(version_is_mature(&mature));
-        let mut future = mature;
-        future.st_ctime += 30;
-        assert!(!version_is_mature(&future));
-        Ok(())
-    }
-}
-
 /// Snapshot a quiescent directory through its descriptor. File handling is
 /// delegated to the caller; directory topology, symlinks, hardlinks, and
 /// mutation checks have a single implementation.
@@ -221,5 +200,26 @@ impl<F: FnMut(&TreePath, File, &Stat) -> Result<BlobRef>> Capture<F> {
             blob: reference,
             metadata: metadata(stat)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustix::fs::fstat;
+
+    #[test]
+    fn metadata_cache_rejects_fresh_and_future_timestamps() -> Result<()> {
+        let file = tempfile::tempfile()?;
+        let recent = fstat(&file)?;
+        assert!(!version_is_mature(&recent));
+        let mut mature = recent;
+        mature.st_ctime -= 10;
+        mature.st_mtime -= 10;
+        assert!(version_is_mature(&mature));
+        let mut future = mature;
+        future.st_ctime += 30;
+        assert!(!version_is_mature(&future));
+        Ok(())
     }
 }
