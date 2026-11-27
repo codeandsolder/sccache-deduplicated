@@ -1,7 +1,7 @@
 //! Scheduler tables use stable identities and independently memoized sections.
 use super::{
-    DashboardSource, Stat, Tab, age, age_since, bytes, chart::HistoryChart, display_count, rate,
-    timestamp,
+    DashboardSource, Projection, Stat, Tab, age, age_since, bytes, chart::HistoryChart,
+    display_count, rate, timestamp,
 };
 use crate::{
     AdmissionCounts, CacheSpace, Job, MetricSeries, NativeService, NativeTelemetry, Sample, Totals,
