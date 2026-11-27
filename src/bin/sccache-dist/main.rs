@@ -1289,6 +1289,15 @@ struct CandidateSet {
     predictions: BTreeMap<ServerId, placement::PlacementEstimate>,
 }
 
+impl CandidateSet {
+    const fn no_capacity(&self, servers: usize) -> NoCapacity {
+        NoCapacity {
+            servers,
+            saturated_native: self.saturated_native,
+        }
+    }
+}
+
 fn collect_candidates(
     servers: &mut HashMap<ServerId, ServerDetails>,
     native: Option<&NativeAssignment>,
@@ -1472,18 +1481,14 @@ impl Scheduler {
             &candidates,
             now,
         );
+        let Some(server_id) = selected else {
+            return Ok(Err(candidates.no_capacity(servers.len())));
+        };
         let CandidateSet {
-            saturated_native,
             healthy,
             predictions,
             ..
         } = candidates;
-        let Some(server_id) = selected else {
-            return Ok(Err(NoCapacity {
-                servers: servers.len(),
-                saturated_native,
-            }));
-        };
         let server_details = servers.get_mut(&server_id).ok_or_else(|| {
             anyhow::anyhow!("selected worker disappeared while scheduler lock held")
         })?;
