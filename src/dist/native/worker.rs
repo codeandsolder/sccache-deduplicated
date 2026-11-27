@@ -17,9 +17,9 @@ use super::{
     LeaseCheck, NativeCacheClient, PackagePlanRequest, ingress, retryable_transport_error,
 };
 use crate::build_runtime::{
-    ArchiveLength, BlobRef, CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeStore,
-    PackageArchive, PackageImportLimits, PackagePreparation, PackageTransferCost, StageBudget,
-    TreeId, TreeLease, VerifiedPackage, execute,
+    ArchiveLength, BlobRef, CapturedExecution, ExecutionPhase, ExecutionPolicy, ExecutionSpec,
+    NativeStore, PackageArchive, PackageImportLimits, PackagePreparation, PackageTransferCost,
+    StageBudget, TreeId, TreeLease, VerifiedPackage, execute,
     wire::{ActionObservation, ActionRequest, Ticket, WorkerTiming},
 };
 
@@ -691,7 +691,7 @@ impl NativeCacheClient {
                 &prepared.inputs,
                 budget,
                 check,
-                || {},
+                |_| {},
             )?;
             crate::http_client::io_runtime()?.block_on(self.publish_execution(
                 context,
@@ -1067,10 +1067,9 @@ fn compile(
     inputs: &[Arc<TreeLease>],
     budget: Option<StageBudget>,
     check: &LeaseCheck<'_>,
-    on_start: impl FnOnce(),
+    on_phase: impl FnMut(ExecutionPhase),
 ) -> Result<MeasuredExecution> {
     let _permit = queue.map(|queue| queue.acquire(check)).transpose()?;
-    on_start();
     let started = Instant::now();
     let captured = execute(
         context.spec,
@@ -1079,6 +1078,7 @@ fn compile(
         inputs,
         budget,
         check,
+        on_phase,
     )?;
     let duration = started.elapsed();
     if captured.successful_result().is_some()
@@ -1240,7 +1240,7 @@ impl PreparedWorker {
         store: &NativeStore,
         policy: &ExecutionPolicy,
         delivery: WorkerDelivery<'_>,
-        on_start: impl FnOnce(),
+        on_phase: impl FnMut(ExecutionPhase),
     ) -> CompletedWorker {
         let budget = self.prepared.take_budget();
         let context = ExecutionContext {
@@ -1256,7 +1256,7 @@ impl PreparedWorker {
             &self.prepared.inputs,
             budget,
             &|| self.lease.check(),
-            on_start,
+            on_phase,
         );
         CompletedWorker {
             worker: self,

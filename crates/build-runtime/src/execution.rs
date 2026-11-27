@@ -45,6 +45,14 @@ pub struct ExecutionPolicy {
     pub max_result_bytes: u64,
 }
 
+/// Actual execution boundaries, including failures before output capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionPhase {
+    Preparation,
+    Process,
+    Capture,
+}
+
 /// An isolated process's captured output and diagnostics.
 ///
 /// Failed processes retain diagnostics for delivery but cannot produce a
@@ -737,7 +745,9 @@ pub fn execute(
     inputs: &[Arc<TreeLease>],
     budget: Option<StageBudget>,
     mut progress: impl FnMut() -> Result<()>,
+    mut phase: impl FnMut(ExecutionPhase),
 ) -> Result<CapturedExecution> {
+    phase(ExecutionPhase::Preparation);
     spec.validate()?;
     ensure!(
         budget
@@ -766,6 +776,7 @@ pub fn execute(
         "native execution preparation timed out"
     );
     let running = Instant::now();
+    phase(ExecutionPhase::Process);
     let mut child = RunningChild(
         build
             .plan
@@ -780,6 +791,7 @@ pub fn execute(
         &mut progress,
     )?;
     let process = running.elapsed();
+    phase(ExecutionPhase::Capture);
     progress()?;
     let mut capture = Capture {
         files: BTreeMap::new(),

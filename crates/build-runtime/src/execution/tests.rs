@@ -14,7 +14,7 @@ fn execute_test(
     progress: impl FnMut() -> Result<()>,
 ) -> Result<CapturedExecution> {
     let inputs = acquire_execution_inputs(spec, store)?;
-    execute(spec, store, policy, &inputs, budget, progress)
+    execute(spec, store, policy, &inputs, budget, progress, |_| {})
 }
 
 fn metadata(mode: u32) -> TreeMetadata {
@@ -709,7 +709,7 @@ fn resident_execution_isolates_concurrent_writable_state() -> Result<()> {
                     let script = format!("test ! -e /tmp/marker && test ! -e /out/nested/object || exit 9; printf '{index}' > /tmp/marker; printf '{index}' > /out/nested/object");
                     spec.command.arguments[1] = script.into_bytes();
                     barrier.wait();
-                    let captured = execute(&spec, store, policy, inputs, None, || Ok(()))?;
+                    let captured = execute(&spec, store, policy, inputs, None, || Ok(()), |_| {})?;
                     let result = captured.successful_result().context("isolated job failed")?;
                     let mut output = Vec::new();
                     captured.open_blob(result.outputs["object"].test_file_blob().id)?.read_to_end(&mut output)?;

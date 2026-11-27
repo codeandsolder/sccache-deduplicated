@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use sccache::{
     build_runtime::{
-        CapturedExecution, ResidentInputs, TreeLease,
+        CapturedExecution, ExecutionPhase, ResidentInputs, TreeLease,
         wire::{NativeJobPhase, NativeRunRequest, NativeRunResult},
     },
     dist::{
@@ -104,7 +104,7 @@ fn trace_phase(phase: NativeJobPhase) -> &'static str {
         NativeJobPhase::Queued => "staging_queue",
         NativeJobPhase::Staging => "stage_inputs",
         NativeJobPhase::Ready => "compiler_queue",
-        NativeJobPhase::Executing => "execute",
+        NativeJobPhase::Executing => "prepare_sandbox",
         NativeJobPhase::AwaitingPublication => "publication_queue",
         NativeJobPhase::Publishing => "publish_outputs",
         NativeJobPhase::Terminal => "terminal",
@@ -179,6 +179,27 @@ impl Shared {
             if phase.inputs_ready() {
                 entry.remaining = RemainingInputs::default();
             }
+        }
+    }
+
+    fn execution_phase(&self, job: JobId, phase: ExecutionPhase) {
+        let name = match phase {
+            ExecutionPhase::Preparation => {
+                self.phase(job, NativeJobPhase::Executing);
+                return;
+            }
+            ExecutionPhase::Process => "compiler_process",
+            ExecutionPhase::Capture => "capture_outputs",
+        };
+        let mut reservations = self
+            .reservations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(trace) = reservations
+            .get_mut(&job)
+            .and_then(|entry| entry.trace.as_mut())
+        {
+            trace.phase(name);
         }
     }
 
@@ -314,8 +335,8 @@ impl Shared {
 
     fn compile(&self, ready: Ready, publishing: &tokio::sync::mpsc::Sender<Publishing>) {
         let Ready { job, prepared } = ready;
-        let completed = self.worker.execute(prepared, &self.queue, || {
-            self.phase(job.id, NativeJobPhase::Executing);
+        let completed = self.worker.execute(prepared, &self.queue, |phase| {
+            self.execution_phase(job.id, phase);
         });
         self.phase(job.id, NativeJobPhase::AwaitingPublication);
         if let Err(error) = publishing.try_send(Publishing { job, completed }) {

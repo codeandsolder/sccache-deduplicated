@@ -5,7 +5,7 @@ has a unique trace identity independent of its cache action key. The daemon
 records monotonic phase transitions and jobserver/child intervals. Namespace
 executors report their bounded history on completion as well as on heartbeats.
 The native scheduler and worker propagate the same trace context across
-assignment, staging, compiler queue, execution and publication.
+assignment, staging, compiler queue, sandbox preparation, compiler process, output capture and publication. Coalesced waiters link to the current producer via OTLP span links. Result recovery without a compiler owner is reported as an unlinked wait.
 
 ## Configuration
 
@@ -50,9 +50,13 @@ The timeline aligns spans by wall-clock start times and uses monotonic duration
 measurements within each host. Cross-host clock disagreement can make spans
 appear outside the root; the UI flags that instead of changing measurements.
 Overlapping spans are not additive. The fleet table reports p50/p95/p99 and
-cumulative elapsed time by phase, service, host and version. Active distributed
-jobs come from the scheduler's live snapshot, not VictoriaTraces ingestion;
-client-only active requests remain available via `sccache --show-active-compiles`.
+cumulative elapsed time by phase, service, host and version. Live native client requests and distributed jobs come from the scheduler, not
+VictoriaTraces ingestion. Active clients send a compact snapshot every two
+seconds through the existing authenticated native service. Snapshots expire
+after ten seconds and empty reports clear prior observations. The reporter
+selects at most 256 requests and the scheduler retains at most 128 reporters,
+displaying up to 2048 longest requests while reporting the total. Non-native
+clients can still inspect live requests locally via `sccache --show-active-compiles`.
 
 ## Rollout
 
