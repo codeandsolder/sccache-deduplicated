@@ -83,7 +83,7 @@ async fn concurrent_tree_publications_commit_together_and_isolate_invalid_reques
     assert_eq!(
         store
             .inner
-            .tree_publications
+            .publication_queue
             .committed_batches
             .load(Ordering::Relaxed),
         1
@@ -97,7 +97,7 @@ async fn concurrent_tree_publications_commit_together_and_isolate_invalid_reques
     assert_eq!(
         store
             .inner
-            .tree_publications
+            .publication_queue
             .committed_batches
             .load(Ordering::Relaxed),
         1
@@ -185,7 +185,7 @@ async fn benchmark_cas_group_commit() -> Result<()> {
         let commits = if grouped {
             store
                 .inner
-                .tree_publications
+                .publication_queue
                 .committed_batches
                 .load(Ordering::Relaxed)
         } else {

@@ -141,7 +141,7 @@ impl<'a> PreparedResult<'a> {
         store: &NativeStore,
         write: &WriteTransaction,
         publication: &mut Publication,
-        plan: ResultPlan,
+        plan: &ResultPlan,
     ) -> Result<()> {
         let mut actions = write.open_table(ACTIONS)?;
         let mut results = write.open_table(RESULTS)?;
@@ -179,7 +179,7 @@ impl<'a> PreparedResult<'a> {
             };
             actions.insert(&self.action.0, encoding().serialize(&record)?.as_slice())?;
             result_actions.insert(&self.result.0, &self.action.0)?;
-            if let Some(previous) = plan.previous {
+            if let Some(previous) = &plan.previous {
                 NativeStore::release_result_reference(
                     write,
                     &mut results,

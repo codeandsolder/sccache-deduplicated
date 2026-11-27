@@ -447,6 +447,156 @@ fn aliases_and_shared_artifacts_reclaim_only_last_reference() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn mixed_result_and_tree_publications_share_one_durable_transaction() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let first = store.stage(&b"shared result"[..])?;
+    let duplicate = store.stage(&b"shared result"[..])?;
+    let tree_blob = store.stage(&b"shared result"[..])?;
+    let other = store.stage(&b"conflicting result"[..])?;
+    let blob = first.reference();
+    let manifest = result(blob);
+    let tree = NativeStore::blob_retention_manifest(blob)?;
+    let bad = result(BlobRef {
+        id: ContentId::of(b"missing"),
+        size: 7,
+    });
+    let (a, tree_lease, invalid, alias, conflict) = tokio::join!(
+        store.publish_pinned_async(
+            action("a"),
+            manifest.clone(),
+            vec![first],
+            ActionMode::Reuse,
+            ()
+        ),
+        store.publish_tree_pinned_async(tree.clone(), vec![tree_blob], ()),
+        store.publish_pinned_async(action("invalid"), bad, Vec::new(), ActionMode::Reuse, ()),
+        store.publish_pinned_async(
+            action("alias"),
+            manifest.clone(),
+            vec![duplicate],
+            ActionMode::Reuse,
+            ()
+        ),
+        store.publish_pinned_async(
+            action("a"),
+            result(other.reference()),
+            vec![other],
+            ActionMode::Reuse,
+            ()
+        ),
+    );
+    let (a, tree_lease, alias) = (a?, tree_lease?, alias?);
+    assert!(invalid.is_err());
+    assert!(conflict.is_err());
+    assert_eq!(a.manifest(), &manifest);
+    assert_eq!(alias.manifest(), &manifest);
+    assert_eq!(tree_lease.manifest(), &tree);
+    assert_eq!(
+        store
+            .inner
+            .publication_queue
+            .committed_batches
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(store.stats()?.blobs, 1);
+    assert_eq!(store.stats()?.actions, 2);
+    assert_eq!(store.stats()?.results, 1);
+    assert_eq!(store.evict(action("a").key()?)?, Eviction::Pinned);
+    Ok(())
+}
+
+#[tokio::test]
+async fn result_batch_resurrects_alias_retired_by_earlier_refresh() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let original = store.stage(&b"original result"[..])?;
+    let old_blob = original.reference();
+    let old = result(old_blob);
+    let original_lease =
+        store.publish_pinned(&action("old"), &old, vec![original], ActionMode::Reuse)?;
+    let replacement = store.stage(&b"replacement result"[..])?;
+    let replacement_manifest = result(replacement.reference());
+    let (refreshed, new_alias) = tokio::join!(
+        store.publish_pinned_async(
+            action("old"),
+            replacement_manifest.clone(),
+            vec![replacement],
+            ActionMode::Refresh,
+            ()
+        ),
+        store.publish_pinned_async(
+            action("new"),
+            old.clone(),
+            Vec::new(),
+            ActionMode::Reuse,
+            ()
+        ),
+    );
+    let (refreshed, new_alias) = (refreshed?, new_alias?);
+    assert_eq!(refreshed.manifest(), &replacement_manifest);
+    assert_eq!(new_alias.manifest(), &old);
+    assert_eq!(original_lease.manifest(), &old);
+    assert_eq!(store.stats()?.pending_gc_blobs, 0);
+    assert_eq!(
+        store
+            .inner
+            .publication_queue
+            .committed_batches
+            .load(Ordering::Relaxed),
+        1
+    );
+    let mut bytes = Vec::new();
+    original_lease
+        .open_blob(old_blob.id)?
+        .read_to_end(&mut bytes)?;
+    assert_eq!(bytes, b"original result");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_result_publication_still_commits_and_releases_admission() -> Result<()> {
+    use std::{
+        future::{Future, poll_fn},
+        task::Poll,
+        time::Duration,
+    };
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let staged = store.stage(&b"cancelled waiter result"[..])?;
+    let blob = staged.reference();
+    let fingerprint = action("cancelled");
+    let key = fingerprint.key()?;
+    let published = store.inner.publications.register([blob.id])?;
+    let mut future = Box::pin(store.publish_pinned_async(
+        fingerprint,
+        result(blob),
+        vec![staged],
+        ActionMode::Reuse,
+        (),
+    ));
+    poll_fn(|cx| {
+        assert!(future.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(future);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), published.next()).await?,
+        BTreeSet::from([blob.id])
+    );
+    assert_eq!(
+        store
+            .lookup(key)?
+            .context("cancelled publication lost result")?
+            .manifest(),
+        &result(blob)
+    );
+    Ok(())
+}
+
 #[test]
 fn publication_is_idempotent_and_conflicts_are_rejected() -> Result<()> {
     let dir = tempfile::tempdir()?;

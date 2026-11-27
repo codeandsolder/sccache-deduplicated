@@ -592,6 +592,7 @@ fn release_pin<K: Ord + std::fmt::Debug>(pins: &mut BTreeMap<K, usize>, key: &K)
     }
 }
 
+mod commit_queue;
 mod publications;
 mod results;
 
@@ -607,7 +608,7 @@ struct Inner {
     pins: Mutex<Pins>,
     package_imports: Mutex<BTreeSet<crate::PackageIdentity>>,
     tree_flights: trees::TreeFlights,
-    tree_publications: trees::TreePublicationQueue,
+    publication_queue: commit_queue::PublicationQueue,
     publications: publications::PublicationWaits,
     space_policy: Option<SpacePolicy>,
     space: Mutex<space::SpaceState>,
@@ -1205,7 +1206,7 @@ impl NativeStore {
             pins: Mutex::new(pins),
             package_imports: Mutex::new(BTreeSet::new()),
             tree_flights: trees::TreeFlights::default(),
-            tree_publications: trees::TreePublicationQueue::default(),
+            publication_queue: commit_queue::PublicationQueue::default(),
             publications: publications::PublicationWaits::default(),
             space_policy,
             space: Mutex::default(),
@@ -1660,7 +1661,7 @@ impl NativeStore {
         if !plan.unchanged {
             let write = self.inner.db.begin_write()?;
             let mut publication = Publication::default();
-            prepared.attach(self, &write, &mut publication, plan)?;
+            prepared.attach(self, &write, &mut publication, &plan)?;
             publication.commit(&self.inner, write)?;
         }
         self.inner
