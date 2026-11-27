@@ -88,6 +88,7 @@ impl RecoveryQueue {
         {
             return Ok(Some(permit));
         }
+        permit.clear_trace()?;
         state.queued_bytes += bytes;
         state.jobs.push_back(RecoveryJob {
             permit,

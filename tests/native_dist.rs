@@ -1546,7 +1546,12 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         )]),
     };
     assert_eq!(
-        client.admit(&spec, ActionMode::Reuse, &std::collections::BTreeMap::new())?,
+        client.admit(
+            None,
+            &spec,
+            ActionMode::Reuse,
+            &std::collections::BTreeMap::new()
+        )?,
         NativeAdmission::MissingInputs {
             trees: [root_tree.id(), source_tree.id()].into_iter().collect()
         },
@@ -1561,8 +1566,12 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         |_| -> Result<File> { anyhow::bail!("preseeded original must not upload its payload") },
         Duration::from_secs(1),
     )?;
-    let NativeAdmission::Compile { ticket } =
-        client.admit(&spec, ActionMode::Reuse, &std::collections::BTreeMap::new())?
+    let NativeAdmission::Compile { ticket } = client.admit(
+        None,
+        &spec,
+        ActionMode::Reuse,
+        &std::collections::BTreeMap::new(),
+    )?
     else {
         anyhow::bail!("expected native miss");
     };
@@ -1599,7 +1608,12 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let NativeAdmission::Hit {
         ticket: hit,
         manifest: cached,
-    } = client.admit(&spec, ActionMode::Reuse, &std::collections::BTreeMap::new())?
+    } = client.admit(
+        None,
+        &spec,
+        ActionMode::Reuse,
+        &std::collections::BTreeMap::new(),
+    )?
     else {
         anyhow::bail!("expected cache hit");
     };
@@ -1614,6 +1628,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         ticket: flattened_hit,
         manifest: cached,
     } = client.admit(
+        None,
         &flattened,
         ActionMode::Reuse,
         &std::collections::BTreeMap::new(),
@@ -1629,6 +1644,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         ticket: reordered_hit,
         manifest: cached,
     } = client.admit(
+        None,
         &reordered,
         ActionMode::Reuse,
         &std::collections::BTreeMap::new(),
@@ -1646,6 +1662,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     assert!(
         client
             .admit(
+                None,
                 &forged,
                 ActionMode::Reuse,
                 &std::collections::BTreeMap::new()
@@ -1817,6 +1834,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         .arguments
         .push(b"--invalid-native-test-flag".to_vec());
     let NativeAdmission::Compile { ticket } = client.admit(
+        None,
         &invalid,
         ActionMode::Reuse,
         &std::collections::BTreeMap::new(),

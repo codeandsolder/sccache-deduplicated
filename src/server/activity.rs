@@ -54,9 +54,10 @@ impl CompileLimits {
 
     pub(super) const fn budget(self, phase: Phase) -> Duration {
         Duration::from_secs(match phase {
-            Phase::HashInputs | Phase::RunDistributed | Phase::LocalCompile => {
-                self.execution_timeout_secs
-            }
+            Phase::HashInputs
+            | Phase::RunDistributed
+            | Phase::LocalCompile
+            | Phase::WaitForProducer => self.execution_timeout_secs,
             _ => self.phase_timeout_secs,
         })
     }
@@ -70,6 +71,7 @@ pub enum Phase {
     ResolveDistribution,
     HashInputs,
     CacheLookup,
+    WaitForProducer,
     RestoreOutputs,
     PlanCompile,
     IdentifyToolchain,
@@ -102,6 +104,7 @@ impl Phase {
             Self::ResolveDistribution => "resolve_distribution",
             Self::HashInputs => "hash_inputs",
             Self::CacheLookup => "cache_lookup",
+            Self::WaitForProducer => "wait_for_producer",
             Self::RestoreOutputs => "restore_outputs",
             Self::PlanCompile => "plan_compile",
             Self::IdentifyToolchain => "identify_toolchain",
@@ -156,6 +159,7 @@ impl TraceOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct Transition {
     phase: Phase,
+    producer: Option<TraceContext>,
     offset: u64,
 }
 
@@ -201,6 +205,7 @@ impl TraceHistory {
             elapsed: 0,
             transitions: vec![Transition {
                 phase: Phase::DetectCompiler,
+                producer: None,
                 offset: 0,
             }],
             intervals: Vec::new(),
@@ -211,9 +216,13 @@ impl TraceHistory {
         }
     }
 
-    fn transition(&mut self, phase: Phase, offset: u64) {
+    fn transition(&mut self, phase: Phase, producer: Option<TraceContext>, offset: u64) {
         if self.transitions.len() < MAX_TRACE_INTERVALS {
-            self.transitions.push(Transition { phase, offset });
+            self.transitions.push(Transition {
+                phase,
+                producer,
+                offset,
+            });
         } else {
             self.omitted_transitions = self.omitted_transitions.saturating_add(1);
         }
@@ -234,6 +243,11 @@ impl TraceHistory {
                 .transitions
                 .first()
                 .is_some_and(|first| first.offset == 0)
+            && self.transitions.iter().all(|transition| {
+                transition.producer.is_none_or(|producer| {
+                    transition.phase == Phase::WaitForProducer && producer.valid()
+                })
+            })
             && self
                 .transitions
                 .windows(2)
@@ -271,13 +285,15 @@ impl TraceHistory {
             if index + 1 == self.transitions.len() && self.omitted_transitions != 0 {
                 break;
             }
-            spans.push(LatencySpan::child(
+            let mut span = LatencySpan::child(
                 parent,
                 "sccache-client",
                 transition.phase.trace_name(),
                 from,
                 until,
-            ));
+            );
+            span.links.extend(transition.producer);
+            spans.push(span);
         }
         for interval in &self.intervals {
             let from = self.start.saturating_add(interval.start).clamp(start, end);
@@ -322,6 +338,7 @@ struct State {
     observed: Option<Instant>,
     output: Option<String>,
     phase: Phase,
+    producer: Option<TraceContext>,
     changed: Instant,
     waiting_for_jobserver: usize,
     compiler_children: usize,
@@ -372,6 +389,7 @@ impl Activity {
                 observed: None,
                 output: None,
                 phase: Phase::DetectCompiler,
+                producer: None,
                 changed: now,
                 waiting_for_jobserver: 0,
                 compiler_children: 0,
@@ -384,13 +402,18 @@ impl Activity {
     }
 
     pub(super) fn phase(&self, phase: Phase) {
+        self.phase_with_producer(phase, None);
+    }
+
+    fn phase_with_producer(&self, phase: Phase, producer: Option<TraceContext>) {
         let mut state = lock(&self.state);
-        if state.phase != phase {
+        if state.phase != phase || state.producer != producer {
             state.phase = phase;
+            state.producer = producer;
             state.sequence = state.sequence.saturating_add(1);
             state.changed = Instant::now();
             let offset = nanos(state.changed.duration_since(self.started));
-            state.history.transition(phase, offset);
+            state.history.transition(phase, producer, offset);
         }
     }
 
@@ -459,6 +482,15 @@ impl Activity {
         let age = Duration::from_millis(sample.phase_age_ms).min(now.duration_since(self.started));
         let changed = now - age;
         let mut state = lock(&self.state);
+        if let Some(previous) = &state.remote_history {
+            ensure!(
+                sample.trace.start == previous.start
+                    && sample.trace.elapsed >= previous.elapsed
+                    && sample.trace.transitions.starts_with(&previous.transitions)
+                    && sample.trace.intervals.starts_with(&previous.intervals),
+                "inconsistent remote trace history"
+            );
+        }
         match sample.phase_sequence.cmp(&state.sequence) {
             std::cmp::Ordering::Less => anyhow::bail!("out-of-order namespace compile observation"),
             std::cmp::Ordering::Equal => {
@@ -473,15 +505,6 @@ impl Activity {
                 state.phase = sample.phase;
                 state.changed = changed;
             }
-        }
-        if let Some(previous) = &state.remote_history {
-            ensure!(
-                sample.trace.start == previous.start
-                    && sample.trace.elapsed >= previous.elapsed
-                    && sample.trace.transitions.starts_with(&previous.transitions)
-                    && sample.trace.intervals.starts_with(&previous.intervals),
-                "inconsistent remote trace history"
-            );
         }
         state.observed = Some(now);
         state.output = sample.output;
@@ -578,6 +601,7 @@ impl Activity {
         let mut spans = vec![LatencySpan {
             context,
             parent: None,
+            links: Vec::new(),
             service: "sccache-client",
             name: "compile",
             start,
@@ -711,10 +735,8 @@ impl Registry {
     }
 
     pub(super) fn snapshots(&self) -> Vec<CompileActivity> {
-        lock(&self.active)
-            .values()
-            .map(|activity| activity.snapshot())
-            .collect()
+        let active = lock(&self.active).values().cloned().collect::<Vec<_>>();
+        active.iter().map(|activity| activity.snapshot()).collect()
     }
 }
 
@@ -787,6 +809,15 @@ pub(super) fn finished(result: &CompileFinished) {
     let _ = CURRENT.try_with(|current| {
         if let Some(activity) = current {
             activity.finished(result);
+        }
+    });
+}
+
+#[cfg(feature = "dist-client")]
+pub fn wait_for_producer(producer: Option<TraceContext>) {
+    let _ = CURRENT.try_with(|current| {
+        if let Some(activity) = current {
+            activity.phase_with_producer(Phase::WaitForProducer, producer);
         }
     });
 }
@@ -884,6 +915,44 @@ pub fn job(id: u64, worker: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_spans_link_the_actual_producer_across_retries() {
+        let identity = CompileIdentity {
+            client_pid: 7,
+            exe: "rustc".into(),
+            cwd: "/build".into(),
+        };
+        let activity = Activity::new("waiting".into(), &identity, CompileOwner::Namespace);
+        let first = TraceContext::request("producer-1");
+        let second = TraceContext::request("producer-2");
+        activity.phase(Phase::CacheLookup);
+        activity.phase_with_producer(Phase::WaitForProducer, Some(first));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        activity.phase_with_producer(Phase::WaitForProducer, Some(first));
+        tokio::time::advance(Duration::from_secs(3)).await;
+        activity.phase_with_producer(Phase::WaitForProducer, Some(second));
+        tokio::time::advance(Duration::from_secs(7)).await;
+        activity.phase(Phase::RestoreOutputs);
+        let history = activity.snapshot().trace;
+        let mut spans = Vec::new();
+        let start = history.start;
+        history.append_spans(
+            TraceContext::request("waiting"),
+            start,
+            start + history.elapsed,
+            &mut spans,
+        );
+        let waiting = spans
+            .iter()
+            .filter(|span| span.name == "wait_for_producer")
+            .collect::<Vec<_>>();
+        assert_eq!(waiting.len(), 2);
+        assert_eq!(waiting[0].links, vec![first]);
+        assert_eq!(waiting[0].end - waiting[0].start, 5_000_000_000);
+        assert_eq!(waiting[1].links, vec![second]);
+        assert_eq!(waiting[1].end - waiting[1].start, 7_000_000_000);
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test(start_paused = true)]

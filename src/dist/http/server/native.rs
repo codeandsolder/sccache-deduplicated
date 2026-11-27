@@ -1057,13 +1057,18 @@ fn dispatch(
             }
         }
         "admit" if publisher == Publisher::Client => {
-            let (input, mode, declared): (
+            let (trace, input, mode, declared): (
+                Option<crate::latency_trace::TraceContext>,
                 ExecutionSpec,
                 ActionMode,
                 BTreeMap<TreeId, TreeManifest>,
             ) = metadata(request, limit)?;
+            ensure!(
+                trace.is_none_or(crate::latency_trace::TraceContext::valid),
+                "invalid admission trace context"
+            );
             encode(
-                &sessions.admit(input.action_request()?, publisher, mode, declared)?,
+                &sessions.admit(trace, input.action_request()?, publisher, mode, declared)?,
                 limit,
             )
         }

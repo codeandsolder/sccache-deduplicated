@@ -110,9 +110,14 @@ impl NativeNamespacePolicy {
 struct RemoteInputs<'a> {
     stream: &'a mut DaemonStream,
     limit: u64,
+    trace: Option<crate::latency_trace::TraceContext>,
 }
 
 impl InputProvider for RemoteInputs<'_> {
+    fn trace_context(&self) -> Option<crate::latency_trace::TraceContext> {
+        self.trace
+    }
+
     fn progress(&mut self, progress: NativeProgress) -> Result<()> {
         send(self.stream, &Event::Progress(progress), self.limit)
     }
@@ -156,12 +161,17 @@ fn serve_inner(
     registry: &super::result_session::Registry,
     uid: u32,
 ) -> Result<()> {
-    let (spec, mode, selected, retained): (
+    let (trace, spec, mode, selected, retained): (
+        Option<crate::latency_trace::TraceContext>,
         ExecutionSpec,
         ActionMode,
         BTreeSet<String>,
         BTreeSet<crate::build_runtime::wire::Ticket>,
     ) = receive(stream, policy.max_metadata_bytes)?;
+    ensure!(
+        trace.is_none_or(crate::latency_trace::TraceContext::valid),
+        "invalid namespace trace context"
+    );
     ensure!(
         selected.iter().all(|name| spec.outputs.contains_key(name)),
         "undeclared selected result output"
@@ -178,6 +188,7 @@ fn serve_inner(
     let mut inputs = RemoteInputs {
         stream,
         limit: policy.max_metadata_bytes,
+        trace,
     };
     match client.acquire_action(&spec, &mut inputs, &build_policy, local, &selected)? {
         Outcome::Failed { source, failure } => {
@@ -300,7 +311,13 @@ fn run_inner(
     let selected = destinations.eager.keys().cloned().collect::<BTreeSet<_>>();
     send(
         stream,
-        &(spec, mode, selected, destinations.sessions()),
+        &(
+            crate::server::activity::trace_context(),
+            spec,
+            mode,
+            selected,
+            destinations.sessions(),
+        ),
         limit,
     )?;
     let mut advertised = BTreeMap::<TreeId, BTreeMap<ContentId, u64>>::new();

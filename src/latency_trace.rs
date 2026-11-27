@@ -11,47 +11,14 @@ pub struct TraceConfig {
     pub instance: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TraceContext {
-    pub trace_id: [u8; 16],
-    pub span_id: [u8; 8],
-}
+pub use crate::build_runtime::wire::TraceContext;
 
-impl TraceContext {
-    #[must_use = "the context identifies the client request, not the action"]
-    pub fn request(id: &str) -> Self {
-        let digest = blake3::hash(id.as_bytes());
-        let mut trace_id = [0; 16];
-        let mut span_id = [0; 8];
-        trace_id.copy_from_slice(&digest.as_bytes()[..16]);
-        span_id.copy_from_slice(&digest.as_bytes()[16..24]);
-        Self { trace_id, span_id }
+fn child_context(parent: TraceContext) -> TraceContext {
+    let mut span_id: [u8; 8] = rand::random();
+    if span_id == [0; 8] {
+        span_id[0] = 1;
     }
-
-    #[must_use = "a child retains the trace ID but must have a distinct span ID"]
-    pub fn child(self) -> Self {
-        let mut span_id: [u8; 8] = rand::random();
-        if span_id == [0; 8] {
-            span_id[0] = 1;
-        }
-        Self { span_id, ..self }
-    }
-
-    #[must_use = "the hexadecimal identifier selects a trace in the dashboard"]
-    pub fn hex_id(self) -> String {
-        use std::fmt::Write as _;
-        self.trace_id
-            .iter()
-            .fold(String::with_capacity(32), |mut output, byte| {
-                let _ = write!(output, "{byte:02x}");
-                output
-            })
-    }
-
-    #[must_use = "the IDs must be nonzero before accepting remote context"]
-    pub fn valid(self) -> bool {
-        self.trace_id != [0; 16] && self.span_id != [0; 8]
-    }
+    TraceContext { span_id, ..parent }
 }
 
 #[must_use = "the timestamp is used to align host-local monotonic durations"]
@@ -72,6 +39,7 @@ pub fn nanos(duration: Duration) -> u64 {
 pub struct LatencySpan {
     pub context: TraceContext,
     pub parent: Option<TraceContext>,
+    pub links: Vec<TraceContext>,
     pub service: &'static str,
     pub name: &'static str,
     pub start: u64,
@@ -90,8 +58,9 @@ impl LatencySpan {
         end: u64,
     ) -> Self {
         Self {
-            context: parent.child(),
+            context: child_context(parent),
             parent: Some(parent),
+            links: Vec::new(),
             service,
             name,
             start,
@@ -117,7 +86,7 @@ impl SpanGuard {
     #[must_use = "keep the guard alive for the operation being measured"]
     pub fn new(parent: TraceContext, service: &'static str, name: &'static str) -> Self {
         Self {
-            context: parent.child(),
+            context: child_context(parent),
             parent,
             service,
             name,
@@ -142,6 +111,7 @@ impl Drop for SpanGuard {
         submit(vec![LatencySpan {
             context: self.context,
             parent: Some(self.parent),
+            links: Vec::new(),
             service: self.service,
             name: self.name,
             start: self.start,
@@ -272,7 +242,7 @@ mod tests {
         assert_ne!(first.trace_id, second.trace_id);
         assert!(first.valid());
         assert_eq!(first, TraceContext::request("request1"));
-        let child = first.child();
+        let child = child_context(first);
         assert_eq!(first.trace_id, child.trace_id);
         assert_ne!(first.span_id, child.span_id);
     }

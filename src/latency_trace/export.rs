@@ -7,7 +7,7 @@ use opentelemetry_proto::tonic::{
     collector::trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse},
     common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value::Value},
     resource::v1::Resource,
-    trace::v1::{ResourceSpans, ScopeSpans, Span, Status, status::StatusCode},
+    trace::v1::{ResourceSpans, ScopeSpans, Span, Status, span::Link, status::StatusCode},
 };
 use prost::Message as _;
 use std::{
@@ -101,6 +101,15 @@ fn request(spans: Vec<LatencySpan>, instance: &str) -> ExportTraceServiceRequest
             parent_span_id: span
                 .parent
                 .map_or_else(Vec::new, |parent| parent.span_id.to_vec()),
+            links: span
+                .links
+                .into_iter()
+                .map(|link| Link {
+                    trace_id: link.trace_id.to_vec(),
+                    span_id: link.span_id.to_vec(),
+                    ..Default::default()
+                })
+                .collect(),
             name: span.name.into(),
             kind: if span.parent.is_none() { 2 } else { 1 },
             start_time_unix_nano: span.start,
@@ -215,7 +224,9 @@ mod tests {
     #[test]
     fn protobuf_preserves_causal_ids_and_timestamps() -> Result<()> {
         let root = TraceContext::request("test");
-        let span = LatencySpan::child(root, "sccache-client", "hash_inputs", 10, 20);
+        let mut span = LatencySpan::child(root, "sccache-client", "hash_inputs", 10, 20);
+        let producer = TraceContext::request("producer");
+        span.links.push(producer);
         let id = span.context;
         let message = ExportTraceServiceRequest::decode(
             request(vec![span], "test-host").encode_to_vec().as_slice(),
@@ -226,6 +237,9 @@ mod tests {
         assert_eq!(span.span_id, id.span_id);
         assert_eq!(span.start_time_unix_nano, 10);
         assert_eq!(span.end_time_unix_nano, 20);
+        assert_eq!(span.links.len(), 1);
+        assert_eq!(span.links[0].trace_id, producer.trace_id);
+        assert_eq!(span.links[0].span_id, producer.span_id);
         Ok(())
     }
 }

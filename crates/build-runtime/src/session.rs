@@ -1073,6 +1073,7 @@ impl NativeSessions {
     /// or storage failure.
     pub fn admit(
         &self,
+        trace: Option<crate::wire::TraceContext>,
         request: ActionRequest,
         publisher: Publisher,
         mode: ActionMode,
@@ -1080,8 +1081,8 @@ impl NativeSessions {
     ) -> Result<NativeAdmission> {
         self.reap()?;
         let fingerprint = request.action_fingerprint()?;
-        match self.coordinator.admit(fingerprint, mode)? {
-            Admission::InFlight => Ok(NativeAdmission::InFlight),
+        match self.coordinator.admit(trace, fingerprint, mode)? {
+            Admission::InFlight(producer) => Ok(NativeAdmission::InFlight { producer }),
             Admission::Cached(lease) => {
                 self.recovery
                     .release_ready(request.action_fingerprint()?.key()?)?;
@@ -1109,7 +1110,7 @@ impl NativeSessions {
                         self.limits.idle_timeout,
                     )?
                     else {
-                        return Ok(NativeAdmission::InFlight);
+                        return Ok(NativeAdmission::InFlight { producer: None });
                     };
                     permit
                 } else {

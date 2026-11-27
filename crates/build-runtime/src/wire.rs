@@ -10,6 +10,41 @@ use crate::{
     TreeManifest, identity::typed_digest,
 };
 
+/// Correlation only; never included in an action fingerprint or execution spec.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TraceContext {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+}
+
+impl TraceContext {
+    #[must_use = "the context identifies the client request, not the action"]
+    pub fn request(id: &str) -> Self {
+        let digest = blake3::hash(id.as_bytes());
+        let mut trace_id = [0; 16];
+        let mut span_id = [0; 8];
+        trace_id.copy_from_slice(&digest.as_bytes()[..16]);
+        span_id.copy_from_slice(&digest.as_bytes()[16..24]);
+        Self { trace_id, span_id }
+    }
+
+    #[must_use = "the hexadecimal identifier selects a trace in the dashboard"]
+    pub fn hex_id(self) -> String {
+        use std::fmt::Write as _;
+        self.trace_id
+            .iter()
+            .fold(String::with_capacity(32), |mut output, byte| {
+                let _ = write!(output, "{byte:02x}");
+                output
+            })
+    }
+
+    #[must_use = "the IDs must be nonzero before accepting remote context"]
+    pub fn valid(self) -> bool {
+        self.trace_id != [0; 16] && self.span_id != [0; 8]
+    }
+}
+
 /// A short-lived, unguessable capability. Never log its bytes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -140,7 +175,9 @@ pub enum NativeAdmission {
         ticket: Ticket,
         manifest: ResultManifest,
     },
-    InFlight,
+    InFlight {
+        producer: Option<TraceContext>,
+    },
     MissingInputs {
         trees: BTreeSet<TreeId>,
     },

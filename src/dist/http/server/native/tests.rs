@@ -509,6 +509,7 @@ fn stalled_bulk_uploads_leave_lease_and_dispatch_lanes_available() -> Result<()>
         client.commit_tree(offer.ticket)?;
         let spec = action(&root)?;
         let NativeAdmission::Compile { ticket } = client.admit(
+            None,
             &spec,
             crate::build_runtime::ActionMode::Reuse,
             &BTreeMap::new(),
@@ -640,7 +641,10 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
 
         assert!(unauthorized.is_err());
 
+        let producer = crate::latency_trace::TraceContext::request("http-producer");
+        let waiter = crate::latency_trace::TraceContext::request("http-waiter");
         let NativeAdmission::Compile { ticket } = client.admit(
+            Some(producer),
             &spec,
             crate::build_runtime::ActionMode::Reuse,
             &BTreeMap::new(),
@@ -650,11 +654,14 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         };
         assert_eq!(
             client.admit(
+                Some(waiter),
                 &spec,
                 crate::build_runtime::ActionMode::Reuse,
                 &BTreeMap::new()
             )?,
-            NativeAdmission::InFlight
+            NativeAdmission::InFlight {
+                producer: Some(producer)
+            }
         );
         let mut wrong_spec = spec.clone();
         wrong_spec.command.arguments.push(b"changed".to_vec());
@@ -834,6 +841,7 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
             ticket: hit,
             manifest,
         } = client.admit(
+            None,
             &spec,
             crate::build_runtime::ActionMode::Reuse,
             &BTreeMap::new(),
@@ -869,6 +877,7 @@ fn admit_empty_action(
     client.commit_tree(offered.ticket)?;
     let spec = action(&root)?;
     let NativeAdmission::Compile { ticket } = client.admit(
+        None,
         &spec,
         crate::build_runtime::ActionMode::Reuse,
         &BTreeMap::new(),
@@ -1060,6 +1069,7 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
             .insert(BuildPath::new(b"/src".to_vec())?, source.id());
         spec.command.arguments = vec![b"-c".to_vec(), b"IFS= read -r data < /src/input; printf '%s' \"$data\" > /out/obj; printf diagnostic >&2; printf stdout".to_vec()];
         let NativeAdmission::Compile { ticket } = client.admit(
+            None,
             &spec,
             crate::build_runtime::ActionMode::Reuse,
             &BTreeMap::new(),
@@ -1164,6 +1174,7 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
             ticket: hit,
             manifest: cached,
         } = client.admit(
+            None,
             &spec,
             crate::build_runtime::ActionMode::Reuse,
             &BTreeMap::new(),
@@ -1288,8 +1299,12 @@ fn lazy_admission_prefetch_and_origin_backfill_over_http() -> Result<()> {
         };
         let id = root.id()?;
         let spec = action(&root)?;
-        let NativeAdmission::Compile { ticket } =
-            client.admit(&spec, ActionMode::Reuse, &BTreeMap::from([(id, root)]))?
+        let NativeAdmission::Compile { ticket } = client.admit(
+            None,
+            &spec,
+            ActionMode::Reuse,
+            &BTreeMap::from([(id, root)]),
+        )?
         else {
             anyhow::bail!("metadata-only admission failed");
         };

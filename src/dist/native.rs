@@ -663,11 +663,12 @@ impl NativeCacheClient {
     /// Returns an error on invalid metadata, authentication or transport failure.
     pub fn admit(
         &self,
+        trace: Option<crate::latency_trace::TraceContext>,
         spec: &ExecutionSpec,
         mode: ActionMode,
         declared: &BTreeMap<TreeId, TreeManifest>,
     ) -> Result<NativeAdmission> {
-        self.control("admit", &(spec, mode, declared))
+        self.control("admit", &(trace, spec, mode, declared))
     }
 
     pub(super) fn poll_input(&self, ticket: Ticket) -> Result<InputPoll> {
@@ -716,11 +717,17 @@ impl NativeCacheClient {
     /// Returns an error for an invalid or expired action.
     pub fn schedule(&self, ticket: Ticket, spec: ExecutionSpec) -> Result<ScheduleReply> {
         let selected = spec.outputs.keys().cloned().collect();
-        self.schedule_selected(ticket, spec, selected)
+        self.schedule_selected(
+            crate::server::activity::trace_context(),
+            ticket,
+            spec,
+            selected,
+        )
     }
 
     fn schedule_selected(
         &self,
+        trace: Option<crate::latency_trace::TraceContext>,
         ticket: Ticket,
         spec: ExecutionSpec,
         selected: std::collections::BTreeSet<String>,
@@ -737,7 +744,7 @@ impl NativeCacheClient {
             "schedule",
             &ScheduleRequest {
                 ticket,
-                trace: crate::server::activity::trace_context(),
+                trace,
                 spec,
                 receiver,
                 selected,
