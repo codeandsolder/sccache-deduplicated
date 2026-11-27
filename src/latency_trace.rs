@@ -71,6 +71,19 @@ impl LatencySpan {
             error: false,
         }
     }
+    /// A mutually exclusive phase of its host-local parent operation.
+    #[must_use = "submit the phase with its parent"]
+    pub fn phase(
+        parent: TraceContext,
+        service: &'static str,
+        name: &'static str,
+        start: u64,
+        end: u64,
+    ) -> Self {
+        let mut span = Self::child(parent, service, name, start, end);
+        span.attributes.push(("sccache.span_kind", "phase".into()));
+        span
+    }
 }
 
 /// A host-local duration uses the monotonic clock even when NTP adjusts UTC.
@@ -213,7 +226,7 @@ impl PhaseTrace {
     }
 
     fn close_phase(&mut self, now: u64) {
-        self.spans.push(LatencySpan::child(
+        self.spans.push(LatencySpan::phase(
             self.root.context,
             self.root.service,
             self.phase,

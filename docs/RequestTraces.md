@@ -68,11 +68,19 @@ loopback and the private Tailscale address.
 ## Dashboard
 
 Open Traces for recent or slow completed requests, filtering by exact
-host/compiler/output/outcome. Select an individual request or paste its trace ID.
+host/revision/compiler/output/outcome. Select an individual request or paste its trace ID.
 The timeline aligns spans by wall-clock start times and uses monotonic duration
 measurements within each host. Cross-host clock disagreement can make spans
 appear outside the root; the UI flags that instead of changing measurements.
-Overlapping spans are not additive. The fleet table reports p50/p95/p99 and
+Overlapping spans are not additive. The detail view shows the request's
+exact source revision, action key and outcome. Ranked latency attribution
+partitions each client request and each worker job independently from
+explicit host-local phase spans. Repeated overlapping spans for the same
+phase count once; conflicting phases are reported as ambiguous overlap;
+unrecorded gaps and instrumenter omissions remain visible. Parallel
+diagnostic intervals and other hosts are excluded from this accounting.
+A producer link opens its separate trace. The browser regression exercises
+live row identity, trace selection, producer navigation and revision search. The fleet table reports p50/p95/p99 and
 cumulative elapsed time by phase, service, host and exact source revision.
 The binary embeds the full Git SHA at build time (including commit-expanded
 Git archives); dirty compilation inputs carry a `-dirty-<SHA256>` fingerprint, archives with

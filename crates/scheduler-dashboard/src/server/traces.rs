@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Semaphore;
 
 use crate::traces::{
-    PhaseAggregate, TraceDetail, TraceOverview, TraceSearch, TraceSpan, TraceSummary,
+    PhaseAggregate, SpanKind, TraceDetail, TraceOverview, TraceSearch, TraceSpan, TraceSummary,
 };
 
 const LIMIT: usize = 100;
@@ -16,7 +16,7 @@ const MAX_RESPONSE: usize = 8 * 1024 * 1024;
 // Retry delivery preserves all of these fields byte-for-byte. Deduplicate
 // before limits, sorting or aggregates so transport retries cannot bias p99.
 const ROOT_FIELDS: &str = r#"trace_id,span_id,duration,start_time_unix_nano,"resource_attr:host.name","resource_attr:service.version","span_attr:sccache.compiler","span_attr:sccache.output","span_attr:sccache.outcome","span_attr:sccache.worker","span_attr:sccache.action_key""#;
-const SPAN_FIELDS: &str = r#"span_id,parent_span_id,name,start_time_unix_nano,duration,status_code,"resource_attr:service.name","resource_attr:host.name","resource_attr:service.version","span_attr:sccache.producer_trace_id""#;
+const SPAN_FIELDS: &str = r#"trace_id,span_id,parent_span_id,name,start_time_unix_nano,duration,status_code,"resource_attr:service.name","resource_attr:host.name","resource_attr:service.version","span_attr:sccache.producer_trace_id","span_attr:sccache.span_kind","span_attr:sccache.omitted_intervals","span_attr:sccache.compiler","span_attr:sccache.output","span_attr:sccache.outcome","span_attr:sccache.worker","span_attr:sccache.action_key""#;
 const AGGREGATE_FIELDS: &str = r#"trace_id,span_id,name,duration,"resource_attr:service.name","resource_attr:host.name","resource_attr:service.version""#;
 
 #[derive(Clone)]
@@ -70,10 +70,26 @@ impl TraceService {
         let mut rows = self.source()?.rows(&query, SPAN_LIMIT + 1).await?;
         let truncated = rows.len() > SPAN_LIMIT;
         rows.truncate(SPAN_LIMIT);
+        let root = rows.iter().find(|row| {
+            row.get("name").is_some_and(|name| name == "compile")
+                && row
+                    .get("resource_attr:service.name")
+                    .is_some_and(|service| service == "sccache-client")
+                && row.get("parent_span_id").is_none_or(String::is_empty)
+        });
+        let request = root.cloned().map(summary).transpose()?;
+        let omitted_intervals = root
+            .and_then(|row| row.get("span_attr:sccache.omitted_intervals"))
+            .filter(|value| !value.is_empty())
+            .map(|value| value.parse::<u64>())
+            .transpose()?
+            .unwrap_or_default();
         let spans = rows.into_iter().map(span).collect::<Result<Vec<_>>>()?;
         ensure!(!spans.is_empty(), "trace not found or not yet visible");
         Ok(TraceDetail {
             id,
+            request,
+            omitted_intervals,
             spans,
             truncated,
         })
@@ -141,6 +157,7 @@ fn search_queries(search: &TraceSearch) -> Result<(String, String)> {
     );
     for (field, value) in [
         ("resource_attr:host.name", &search.host),
+        ("resource_attr:service.version", &search.revision),
         ("span_attr:sccache.compiler", &search.compiler),
         ("span_attr:sccache.output", &search.output),
         ("span_attr:sccache.outcome", &search.outcome),
@@ -217,6 +234,11 @@ fn span(mut row: Row) -> Result<TraceSpan> {
         id,
         parent,
         name: take(&mut row, "name"),
+        kind: match take(&mut row, "span_attr:sccache.span_kind").as_str() {
+            "phase" => SpanKind::Phase,
+            "interval" => SpanKind::Interval,
+            _ => SpanKind::Other,
+        },
         service: take(&mut row, "resource_attr:service.name"),
         host: take(&mut row, "resource_attr:host.name"),
         revision: take(&mut row, "resource_attr:service.version"),

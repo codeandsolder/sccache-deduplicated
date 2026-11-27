@@ -2,7 +2,10 @@ use leptos::prelude::*;
 
 use crate::{
     styles,
-    traces::{TraceDetail, TraceOverview, TraceSearch, TraceSpan},
+    traces::{
+        PhaseBreakdown, SpanKind, TraceDetail, TraceOverview, TraceSearch, TraceSpan,
+        phase_breakdowns,
+    },
 };
 
 #[server(endpoint = "trace_search")]
@@ -69,19 +72,52 @@ fn span_row(
         ms(offset),
         span.revision
     );
+    let kind = match span.kind {
+        SpanKind::Phase => "Phase",
+        SpanKind::Interval => "Overlapping interval",
+        SpanKind::Other => "Operation",
+    };
     view! {
         <tr>
             <td>{span.host}" / "{span.name}
-                {span.producer.map(|id| view!{<button on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Producer"</button>})}
+                {span.producer.map(|id| view!{<a href="#trace-detail" on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Producer"</a>})}
             </td>
+            <td>{kind}</td>
             <td>{ms(span.duration_ns)}</td>
-            <td style="width:55%;min-width:160px">
+            <td style="width:45%;min-width:160px">
                 <svg viewBox="0 0 100000 8" preserveAspectRatio="none" style="width:100%;height:20px">
                     <title>{title}</title>
                     <rect x=x.to_string() y="0" width=width.max(1).to_string() height="8" fill=fill/>
                 </svg>
             </td>
         </tr>
+    }
+}
+
+fn attribution_row(name: String, elapsed_ns: u64, total_ns: u64) -> impl IntoView {
+    let permille = u128::from(elapsed_ns) * 1000 / u128::from(total_ns.max(1));
+    let share = format!("{}.{:01}%", permille / 10, permille % 10);
+    view! {
+        <tr><td>{name}</td><td>{ms(elapsed_ns)}</td><td>{share}</td>
+            <td><meter min="0" max=total_ns.max(1).to_string() value=elapsed_ns.to_string() style="width:100%"/></td>
+        </tr>
+    }
+}
+
+fn breakdown_view(part: PhaseBreakdown) -> impl IntoView {
+    let total = part.elapsed_ns;
+    view! {
+        <article class="trace-breakdown">
+            <h4>{part.host}" / "{part.operation}" · "{ms(total)}</h4>
+            {part.clipped.then(|| view!{<p class=styles::warning>"Phase timestamps extend outside the parent operation. Accounting is clipped to its measured interval."</p>})}
+            <table><thead><tr><th>"Phase"</th><th>"Exclusive elapsed"</th><th>"Share"</th><th>"Time share"</th></tr></thead>
+                <tbody>
+                    {part.phases.into_iter().map(|phase| attribution_row(phase.name, phase.elapsed_ns, total)).collect_view()}
+                    { (part.ambiguous_ns != 0).then(|| attribution_row("Ambiguous overlap".into(), part.ambiguous_ns, total)) }
+                    { (part.unobserved_ns != 0).then(|| attribution_row("Unobserved".into(), part.unobserved_ns, total)) }
+                </tbody>
+            </table>
+        </article>
     }
 }
 
@@ -115,14 +151,24 @@ fn Timeline(
     let skew = root.is_some_and(|span| {
         start < span.start_ns || end > span.start_ns.saturating_add(span.duration_ns)
     });
+    let breakdowns = phase_breakdowns(&detail);
     view! {
         <article>
             <h3>"Request "{detail.id}</h3>
             <p>"Client elapsed: "{root_duration}" · observed envelope: "{ms(extent)}</p>
+            {detail.request.map(|request| view!{
+                <p>{request.host}" · "{request.compiler}" / "{request.output}" · "{request.outcome}" · worker "{request.worker}</p>
+                <p>"Revision: "<code>{request.revision}</code>" · Action key: "<code>{request.action}</code></p>
+            })}
+            { (detail.omitted_intervals != 0).then(|| view!{<p class=styles::warning>{detail.omitted_intervals}" recorded intervals omitted by the instrumenter."</p>}) }
+            <h3>"Latency attribution"</h3>
+            <p class=styles::muted>"Each client or worker operation has its own wall-time partition. Overlapping diagnostic spans and remote clocks are not added to it."</p>
+            {breakdowns.into_iter().map(breakdown_view).collect_view()}
+            <h3>"Span timeline"</h3>
             <p class=styles::muted>"Blue: client · purple: scheduler · green: worker · red: error. Spans overlap; do not sum their durations."</p>
             {detail.truncated.then(|| view!{<p class=styles::warning>"Span limit reached."</p>})}
             {skew.then(|| view!{<p class=styles::warning>"Spans extend outside the client interval: clock skew or asynchronous completion."</p>})}
-            <table><thead><tr><th>"Host / phase"</th><th>"Elapsed"</th><th>"Timeline"</th></tr></thead>
+            <table class="trace-waterfall"><thead><tr><th>"Host / phase"</th><th>"Kind"</th><th>"Elapsed"</th><th>"Timeline"</th></tr></thead>
                 <tbody>{detail.spans.into_iter().map(|span| span_row(span,start,extent,selected,lookup)).collect_view()}</tbody>
             </table>
         </article>
@@ -167,10 +213,10 @@ fn LiveRequests(
                     <td>{move || row.with(|row| row.as_ref().map(|row|format!("{} ms",row.request.elapsed_ms)))}</td>
                     <td>{move || row.with(|row| row.as_ref().map(|row|row.request.worker.clone()))}</td>
                     <td>{move || row.with(|row| row.as_ref().map(|row|format!("{} ms",row.observation_age_ms)))}</td>
-                    <td><button on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Inspect"</button>
+                    <td><a href="#trace-detail" on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Inspect"</a>
                         {move || row.with(|row| row.as_ref().and_then(|row|row.request.producer)).map(|producer| {
                             let id=producer.hex_id();
-                            view!{<button on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Producer"</button>}
+                            view!{<a href="#trace-detail" on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Producer"</a>}
                         })}
                     </td>
                 </tr>}
@@ -220,7 +266,7 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
                         <td>{move || row.with(|job| job.as_ref().map(|job| job.worker.clone()))}</td>
                         <td>{move || row.with(|job| job.as_ref().map(|job| job.native_phase.clone().unwrap_or_else(|| job.state.clone())))}</td>
                         <td>{move || row.with(|job| job.as_ref().and_then(|job| job.native_phase_observed_ns).map_or_else(|| "—".into(), ms))}</td>
-                        <td>{move || row.with(|job| job.as_ref().and_then(|job| job.trace_id.clone())).map(|id| view!{<button on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Inspect"</button>})}</td>
+                        <td>{move || row.with(|job| job.as_ref().and_then(|job| job.trace_id.clone())).map(|id| view!{<a href="#trace-detail" on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Inspect"</a>})}</td>
                     </tr>}
                 }/></tbody>
             </table>
@@ -229,6 +275,7 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
                     <option value="300">"5 minutes"</option><option value="3600" selected=true>"1 hour"</option><option value="86400">"1 day"</option><option value="604800">"7 days"</option>
                 </select></label>
                 <label>"Host"<input on:input=move |ev| filters.update(|f| f.host=event_target_value(&ev))/></label>
+                <label>"Revision (full SHA)"<input on:input=move |ev| filters.update(|f| f.revision=event_target_value(&ev))/></label>
                 <label>"Compiler"<input on:input=move |ev| filters.update(|f| f.compiler=event_target_value(&ev))/></label>
                 <label>"Output"<input on:input=move |ev| filters.update(|f| f.output=event_target_value(&ev))/></label>
                 <label>"Outcome"<input on:input=move |ev| filters.update(|f| f.outcome=event_target_value(&ev))/></label>
@@ -237,6 +284,15 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
             </div>
             <div class=styles::controls><label>"Trace ID"<input prop:value=move || lookup.get() on:input=move |ev| lookup.set(event_target_value(&ev))/></label>
                 <button on:click=move |_| selected.set(lookup.get())>"Open"</button>
+            </div>
+            <div id="trace-detail">
+            <Suspense fallback=|| view!{<p>"Loading timeline…"</p>}>
+                {move || detail.get().map(|result| match result {
+                    Ok(Some(detail)) => view!{<Timeline detail=detail selected=selected lookup=lookup/>}.into_any(),
+                    Ok(None) => ().into_any(),
+                    Err(error) => view!{<p class=styles::warning>{error.to_string()}</p>}.into_any(),
+                })}
+            </Suspense>
             </div>
             <Suspense fallback=|| view!{<p>"Loading traces…"</p>}>
                 {move || overview.get().map(|result| match result {
@@ -247,7 +303,7 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
                             <tbody>{data.traces.into_iter().map(|row| {
                                 let id=row.id.clone();
                                 view!{<tr><td>{row.host}</td><td title=row.revision.clone()>{revision_label(&row.revision)}</td><td>{row.compiler}</td><td>{row.output}</td><td>{row.outcome}</td><td>{ms(row.duration_ns)}</td><td>{row.worker}</td>
-                                    <td><button on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Inspect"</button></td></tr>}
+                                    <td><a href="#trace-detail" on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Inspect"</a></td></tr>}
                             }).collect_view()}</tbody>
                         </table>
                         <h3>"Fleet-wide phase latency"</h3>
@@ -261,13 +317,7 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
                     }.into_any(),
                 })}
             </Suspense>
-            <Suspense fallback=|| view!{<p>"Loading timeline…"</p>}>
-                {move || detail.get().map(|result| match result {
-                    Ok(Some(detail)) => view!{<Timeline detail=detail selected=selected lookup=lookup/>}.into_any(),
-                    Ok(None) => ().into_any(),
-                    Err(error) => view!{<p class=styles::warning>{error.to_string()}</p>}.into_any(),
-                })}
-            </Suspense>
+
         </section>
     }
 }

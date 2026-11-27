@@ -285,7 +285,7 @@ impl TraceHistory {
             if index + 1 == self.transitions.len() && self.omitted_transitions != 0 {
                 break;
             }
-            let mut span = LatencySpan::child(
+            let mut span = LatencySpan::phase(
                 parent,
                 "sccache-client",
                 transition.phase.trace_name(),
@@ -302,13 +302,11 @@ impl TraceHistory {
         for interval in &self.intervals {
             let from = self.start.saturating_add(interval.start).clamp(start, end);
             let until = self.start.saturating_add(interval.end).clamp(from, end);
-            spans.push(LatencySpan::child(
-                parent,
-                "sccache-client",
-                interval.kind.name(),
-                from,
-                until,
-            ));
+            let mut span =
+                LatencySpan::child(parent, "sccache-client", interval.kind.name(), from, until);
+            span.attributes
+                .push(("sccache.span_kind", "interval".into()));
+            spans.push(span);
         }
     }
 }
@@ -633,7 +631,7 @@ fn append_request_spans(
             .saturating_add(remote.elapsed)
             .clamp(child_start, end);
         if child_start > start {
-            spans.push(LatencySpan::child(
+            spans.push(LatencySpan::phase(
                 context,
                 "sccache-client",
                 "executor_startup",
@@ -651,7 +649,7 @@ fn append_request_spans(
         {
             let after = start.saturating_add(transition.offset).min(end);
             if after > child_end {
-                spans.push(LatencySpan::child(
+                spans.push(LatencySpan::phase(
                     context,
                     "sccache-client",
                     "executor_return",
@@ -662,7 +660,7 @@ fn append_request_spans(
             history.append_spans(context, after, end, spans);
             spans.retain(|span| span.parent.is_none() || span.end > span.start);
         } else if end > child_end {
-            spans.push(LatencySpan::child(
+            spans.push(LatencySpan::phase(
                 context,
                 "sccache-client",
                 "executor_return",

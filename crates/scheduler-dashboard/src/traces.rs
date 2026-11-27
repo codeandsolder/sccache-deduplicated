@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub struct TraceSearch {
     pub lookback_secs: u32,
     pub host: String,
+    pub revision: String,
     pub compiler: String,
     pub output: String,
     pub outcome: String,
@@ -17,6 +18,7 @@ impl Default for TraceSearch {
         Self {
             lookback_secs: 3600,
             host: String::new(),
+            revision: String::new(),
             compiler: String::new(),
             output: String::new(),
             outcome: String::new(),
@@ -39,6 +41,13 @@ pub struct TraceSummary {
     pub action: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SpanKind {
+    Phase,
+    Interval,
+    Other,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TraceSpan {
     pub id: String,
@@ -47,6 +56,7 @@ pub struct TraceSpan {
     pub host: String,
     pub revision: String,
     pub name: String,
+    pub kind: SpanKind,
     pub start_ns: u64,
     pub duration_ns: u64,
     pub error: bool,
@@ -56,6 +66,8 @@ pub struct TraceSpan {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TraceDetail {
     pub id: String,
+    pub request: Option<TraceSummary>,
+    pub omitted_intervals: u64,
     pub spans: Vec<TraceSpan>,
     pub truncated: bool,
 }
@@ -78,3 +90,6 @@ pub struct TraceOverview {
     pub traces: Vec<TraceSummary>,
     pub phases: Vec<PhaseAggregate>,
 }
+
+mod attribution;
+pub use attribution::{PhaseBreakdown, PhaseDuration, phase_breakdowns};
