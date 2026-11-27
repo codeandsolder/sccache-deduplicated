@@ -756,6 +756,7 @@ fn pidfd_wait_reaps_completed_and_cancelled_children() -> Result<()> {
 
 #[test]
 fn capture_without_resident_headroom_still_has_verified_delivery_bytes() -> Result<()> {
+    use std::io::Write as _;
     let dir = tempfile::tempdir()?;
     let store = NativeStore::open_managed(
         &dir.path().join("store"),
