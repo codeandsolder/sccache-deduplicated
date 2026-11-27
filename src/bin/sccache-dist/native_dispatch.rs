@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use sccache::{
     build_runtime::{
-        CapturedExecution, TreeLease,
+        CapturedExecution, ResidentInputs, TreeLease,
         wire::{NativeJobPhase, NativeRunRequest, NativeRunResult},
     },
     dist::{
@@ -26,13 +26,13 @@ use sccache::{
     },
 };
 
-use super::{NativeInputPins, NativeWorker};
+use super::NativeWorker;
 
 const RESULT_RETENTION: Duration = Duration::from_mins(5);
 
 struct Assignment {
     spec: NativeAssignment,
-    pins: NativeInputPins,
+    pins: ResidentInputs,
 }
 
 enum Terminal {
@@ -222,7 +222,7 @@ impl Shared {
 
     async fn stage(&self, staging: Staging, ready: &SyncSender<Ready>) {
         let Staging { job, assignment } = staging;
-        let missing = assignment.pins.blobs.missing();
+        let missing = assignment.pins.missing();
         let mut remaining = RemainingInputs::from_missing(missing);
         let mut missing: BTreeMap<_, _> = missing.iter().map(|blob| (blob.id, blob.size)).collect();
         let mut on_tree = |tree: &TreeLease| {
@@ -453,12 +453,12 @@ impl NativeDispatcher {
     pub(super) fn assign(
         &self,
         id: JobId,
-        spec: NativeAssignment,
+        mut spec: NativeAssignment,
         requester: Arc<dyn ServerOutgoing>,
     ) -> Result<()> {
         spec.spec.validate()?;
-        let pins = self.shared.worker.pin_resident_inputs(&spec)?;
-        let remaining = RemainingInputs::from_missing(pins.blobs.missing());
+        let pins = self.shared.worker.pin_resident_inputs(&mut spec)?;
+        let remaining = RemainingInputs::from_missing(pins.missing());
         let mut reservations = self
             .shared
             .reservations

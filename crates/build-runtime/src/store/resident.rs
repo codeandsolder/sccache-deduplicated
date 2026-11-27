@@ -11,11 +11,56 @@ use std::{
 use anyhow::{Context, Result, anyhow, ensure};
 
 use super::{
-    NativeStore,
+    NativeStore, UploadReservation,
     space::Root,
     trees::{MountedTree, ReadOnlyView, TreeLease, plan_overlays},
 };
-use crate::{ContentId, ExecutionRoot, TreeId};
+use crate::{BlobRef, ContentId, ExecutionRoot, TreeId};
+
+/// The complete resident portion of an admitted input closure. Complete
+/// trees protect all their blobs; the remaining partial closure has its
+/// own reservation until the worker has acquired the missing trees.
+pub struct ResidentInputs {
+    _trees: Vec<Arc<TreeLease>>,
+    blobs: UploadReservation,
+}
+
+impl ResidentInputs {
+    #[must_use = "missing inputs must be acquired before execution"]
+    pub fn missing(&self) -> &[BlobRef] {
+        self.blobs.missing()
+    }
+}
+
+impl NativeStore {
+    /// Pin complete resident trees and reserve only the input blobs not
+    /// already covered by those leases. No redundant disk probe or
+    /// per-blob pin is needed for a verified immutable tree.
+    /// # Errors
+    /// Returns an error for inconsistent lengths or store failure.
+    pub fn reserve_resident_inputs(
+        &self,
+        trees: impl IntoIterator<Item = TreeId>,
+        mut uncovered: BTreeMap<ContentId, u64>,
+    ) -> Result<ResidentInputs> {
+        let mut leases = Vec::new();
+        for id in trees {
+            if let Some(tree) = self.lookup_resident_tree(id)? {
+                for (id, &size) in tree.blobs() {
+                    if let Some(expected) = uncovered.remove(id) {
+                        ensure!(size == expected, "inconsistent admitted content length");
+                    }
+                }
+                leases.push(tree);
+            }
+        }
+        let blobs = self.reserve_blobs(&uncovered)?;
+        Ok(ResidentInputs {
+            _trees: leases,
+            blobs,
+        })
+    }
+}
 
 const MAX_CACHED_TREE_MOUNTS: usize = 16;
 const MEMO_SWEEP_THRESHOLD: usize = 64;
@@ -369,6 +414,40 @@ mod tests {
         drop(second);
         assert!(matches!(store.evict_tree(id)?, Eviction::Removed { .. }));
         assert!(store.lookup_resident_tree(id)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_reserves_only_blobs_not_covered_by_complete_trees() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("source");
+        fs::create_dir(&source)?;
+        let bytes = b"resident input";
+        fs::write(source.join("input"), bytes)?;
+        let store = NativeStore::open(&directory.path().join("store"))?;
+        let lease = store.capture_tree(&source)?;
+        let id = lease.id();
+        let blob = ContentId::of(bytes);
+        let missing = ContentId::of(b"missing");
+        let length = u64::try_from(bytes.len())?;
+        let inputs = BTreeMap::from([(blob, length), (missing, 7)]);
+        let pins = store.reserve_resident_inputs([id], inputs)?;
+        assert_eq!(
+            pins.missing(),
+            &[BlobRef {
+                id: missing,
+                size: 7
+            }]
+        );
+        assert!(
+            store
+                .reserve_resident_inputs([id], BTreeMap::from([(blob, length + 1)]))
+                .is_err()
+        );
+        drop(lease);
+        assert_eq!(store.evict_tree(id)?, Eviction::Pinned);
+        drop(pins);
+        assert!(matches!(store.evict_tree(id)?, Eviction::Removed { .. }));
         Ok(())
     }
 

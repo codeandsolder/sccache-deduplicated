@@ -1070,6 +1070,8 @@ impl<R: Read> Read for ReservingReader<'_, R> {
 
 #[cfg(target_os = "linux")]
 mod resident;
+#[cfg(target_os = "linux")]
+pub use resident::ResidentInputs;
 
 /// Single-owner, durable action index and content-addressed file storage.
 /// Blocking storage operations belong on an I/O executor rather than the
@@ -1509,6 +1511,13 @@ impl NativeStore {
     /// # Errors
     /// Returns an error for inconsistent lengths or storage failure.
     pub fn reserve_blobs(&self, blobs: &BTreeMap<ContentId, u64>) -> Result<UploadReservation> {
+        if blobs.is_empty() {
+            return Ok(UploadReservation {
+                inner: Arc::clone(&self.inner),
+                reserved: Vec::new(),
+                missing: Vec::new(),
+            });
+        }
         // Live references can be pinned under the same lock used by GC's
         // candidate selection. Only pending-only references require exclusion
         // of a collector that may already have selected their files.
@@ -2268,6 +2277,9 @@ impl UploadReservation {
 
 impl Drop for UploadReservation {
     fn drop(&mut self) {
+        if self.reserved.is_empty() {
+            return;
+        }
         match self.inner.lock_pins() {
             Ok(mut pins) => {
                 for id in &self.reserved {

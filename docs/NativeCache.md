@@ -177,7 +177,8 @@ successful action.
 Each worker owns one resident native runtime within its existing CAS instance.
 Assignment, admission and execution share verified indexed tree leases;
 warm input lookup does not reread the manifest or rescan its blobs while
-the lease is alive. Composed recipes memoize their verified identity and
+the lease is alive. Assignment reserves only blobs not covered by complete
+resident tree leases, avoiding redundant per-blob index and filesystem probes. Composed recipes memoize their verified identity and
 retain constituent leases. A bounded LRU of 16 immutable filesystem views
 preserves the filesystem backing across actions, while weak per-identity
 memo entries do not independently pin storage. Eviction retires idle views
