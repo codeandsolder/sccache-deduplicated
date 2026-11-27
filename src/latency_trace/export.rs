@@ -178,7 +178,9 @@ pub(super) fn flush() {
     if let Some(export) = EXPORT.get() {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        if !enqueue_barrier(export, sender, deadline) {
+        let enqueued = enqueue_barrier(export, &sender, deadline);
+        drop(sender);
+        if !enqueued {
             log::warn!("trace spool shutdown flush unavailable");
         } else if receiver
             .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
@@ -191,7 +193,7 @@ pub(super) fn flush() {
 
 fn enqueue_barrier(
     export: &Exporter,
-    sender: std::sync::mpsc::SyncSender<()>,
+    sender: &std::sync::mpsc::SyncSender<()>,
     deadline: std::time::Instant,
 ) -> bool {
     loop {
@@ -383,11 +385,11 @@ struct Batch {
 }
 
 impl Batch {
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.submissions.is_empty()
     }
 
-    fn fits(&self, next: &Submission) -> bool {
+    const fn fits(&self, next: &Submission) -> bool {
         self.submissions.len() < BATCH_REQUESTS
             && self.bytes.saturating_add(next.bytes) <= MAX_BATCH_MEMORY
             && self.count.saturating_add(next.spans.len()) <= MAX_BATCH_SPANS
@@ -413,11 +415,12 @@ async fn write_spool(mut receiver: mpsc::Receiver<Message>, delivery: &Delivery,
     let mut batch = Batch::default();
     let mut deadline = tokio::time::Instant::now();
     loop {
-        match if batch.is_empty() {
+        let message = if batch.is_empty() {
             Ok(receiver.recv().await)
         } else {
             tokio::time::timeout_at(deadline, receiver.recv()).await
-        } {
+        };
+        match message {
             Ok(Some(Message::Spans(submission))) => {
                 if batch.is_empty() || !batch.fits(&submission) {
                     batch.flush(delivery, instance);
@@ -435,10 +438,11 @@ async fn write_spool(mut receiver: mpsc::Receiver<Message>, delivery: &Delivery,
             Err(_) => batch.flush(delivery, instance),
             Ok(None) => {
                 batch.flush(delivery, instance);
-                return;
+                break;
             }
         }
     }
+    drop(batch);
 }
 
 async fn deliver(delivery: &Delivery, client: &wreq::Client, endpoint: &url::Url) {
