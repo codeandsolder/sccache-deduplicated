@@ -149,27 +149,27 @@ pub(super) fn submit(spans: Vec<LatencySpan>) {
         }
         let count = u64::try_from(spans.len()).unwrap_or(u64::MAX);
         let bytes = submission_size(&spans, spans.capacity());
-        let permit = u32::try_from(bytes)
+        let accepted = u32::try_from(bytes)
             .ok()
             .filter(|_| bytes <= MAX_BATCH_MEMORY)
             .and_then(|bytes| {
                 Arc::clone(&export.budget)
                     .try_acquire_many_owned(bytes)
                     .ok()
+            })
+            .is_some_and(|permit| {
+                export
+                    .sender
+                    .try_send(Message::Spans(Submission {
+                        spans,
+                        bytes,
+                        _permit: permit,
+                    }))
+                    .is_ok()
             });
-        if let Some(permit) = permit
-            && export
-                .sender
-                .try_send(Message::Spans(Submission {
-                    spans,
-                    bytes,
-                    _permit: permit,
-                }))
-                .is_ok()
-        {
-            return;
+        if !accepted {
+            DROPPED.fetch_add(count, Ordering::Relaxed);
         }
-        DROPPED.fetch_add(count, Ordering::Relaxed);
     }
 }
 
@@ -178,29 +178,29 @@ pub(super) fn flush() {
     if let Some(export) = EXPORT.get() {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut message = Message::Flush(sender);
-        loop {
-            match export.sender.try_send(message) {
-                Ok(()) => {
-                    if receiver
-                        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                        .is_err()
-                    {
-                        log::warn!("trace spool shutdown flush timed out");
-                    }
-                    break;
-                }
-                Err(mpsc::error::TrySendError::Full(pending))
-                    if std::time::Instant::now() < deadline =>
-                {
-                    message = pending;
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => {
-                    log::warn!("trace spool shutdown flush unavailable");
-                    break;
-                }
+        if !enqueue_barrier(export, sender, deadline) {
+            log::warn!("trace spool shutdown flush unavailable");
+        } else if receiver
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .is_err()
+        {
+            log::warn!("trace spool shutdown flush timed out");
+        }
+    }
+}
+
+fn enqueue_barrier(
+    export: &Exporter,
+    sender: std::sync::mpsc::SyncSender<()>,
+    deadline: std::time::Instant,
+) -> bool {
+    loop {
+        match export.sender.try_send(Message::Flush(sender.clone())) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Full(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
             }
+            Err(_) => return false,
         }
     }
 }
@@ -375,45 +375,69 @@ fn persist(delivery: &Delivery, instance: &str, submissions: Vec<Submission>) {
     report_drops();
 }
 
+#[derive(Default)]
+struct Batch {
+    submissions: Vec<Submission>,
+    bytes: usize,
+    count: usize,
+}
+
+impl Batch {
+    fn is_empty(&self) -> bool {
+        self.submissions.is_empty()
+    }
+
+    fn fits(&self, next: &Submission) -> bool {
+        self.submissions.len() < BATCH_REQUESTS
+            && self.bytes.saturating_add(next.bytes) <= MAX_BATCH_MEMORY
+            && self.count.saturating_add(next.spans.len()) <= MAX_BATCH_SPANS
+    }
+
+    fn push(&mut self, submission: Submission) {
+        self.bytes += submission.bytes;
+        self.count += submission.spans.len();
+        self.submissions.push(submission);
+    }
+
+    fn flush(&mut self, delivery: &Delivery, instance: &str) {
+        if !self.is_empty() {
+            let submissions = std::mem::take(&mut self.submissions);
+            self.bytes = 0;
+            self.count = 0;
+            persist(delivery, instance, submissions);
+        }
+    }
+}
+
 async fn write_spool(mut receiver: mpsc::Receiver<Message>, delivery: &Delivery, instance: &str) {
-    let mut pending = None;
+    let mut batch = Batch::default();
+    let mut deadline = tokio::time::Instant::now();
     loop {
-        let message = match pending.take() {
-            Some(message) => message,
-            None => match receiver.recv().await {
-                Some(message) => message,
-                None => return,
-            },
-        };
-        let first = match message {
-            Message::Flush(sender) => {
-                let _ = sender.send(());
-                continue;
+        match if batch.is_empty() {
+            Ok(receiver.recv().await)
+        } else {
+            tokio::time::timeout_at(deadline, receiver.recv()).await
+        } {
+            Ok(Some(Message::Spans(submission))) => {
+                if batch.is_empty() || !batch.fits(&submission) {
+                    batch.flush(delivery, instance);
+                    deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+                }
+                batch.push(submission);
+                if batch.submissions.len() == BATCH_REQUESTS {
+                    batch.flush(delivery, instance);
+                }
             }
-            Message::Spans(first) => first,
-        };
-        let mut bytes = first.bytes;
-        let mut count = first.spans.len();
-        let mut submissions = vec![first];
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
-        for _ in 1..BATCH_REQUESTS {
-            match tokio::time::timeout_at(deadline, receiver.recv()).await {
-                Ok(Some(Message::Spans(next)))
-                    if bytes.saturating_add(next.bytes) <= MAX_BATCH_MEMORY
-                        && count.saturating_add(next.spans.len()) <= MAX_BATCH_SPANS =>
-                {
-                    bytes += next.bytes;
-                    count += next.spans.len();
-                    submissions.push(next);
-                }
-                Ok(Some(message)) => {
-                    pending = Some(message);
-                    break;
-                }
-                _ => break,
+            Ok(Some(Message::Flush(sender))) => {
+                batch.flush(delivery, instance);
+                let _ = sender.send(());
+            }
+            Err(_) => batch.flush(delivery, instance),
+            Ok(None) => {
+                batch.flush(delivery, instance);
+                return;
             }
         }
-        persist(delivery, instance, submissions);
     }
 }
 
@@ -445,6 +469,18 @@ async fn deliver(delivery: &Delivery, client: &wreq::Client, endpoint: &url::Url
         match send(client, endpoint, record.body).await {
             SendResult::Retry(error) => {
                 log::warn!("trace batch retained for retry: {error:#}");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(RETRY_MAX);
+                continue;
+            }
+            SendResult::Rejected {
+                rejected: Some(rejected),
+                ..
+            } if rejected > record.count => {
+                log::warn!(
+                    "invalid OTLP rejection count {rejected} for {} spans; retaining batch",
+                    record.count
+                );
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(RETRY_MAX);
                 continue;

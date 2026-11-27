@@ -53,16 +53,19 @@ fn git_path(root: &Path, name: &str, watch_parent: bool) {
 fn revision(root: &Path) -> io::Result<String> {
     let archive_path = root.join("source-revision");
     watch(&archive_path);
-    // Git archive expands the placeholder. A checkout retains it literally.
-    let archive = fs::read_to_string(&archive_path)?;
-    if valid_revision(archive.trim()) {
-        return Ok(archive.trim().to_owned());
-    }
-    let Some(top) = git(root, &["rev-parse", "--show-toplevel"]) else {
-        return Ok("unknown".into());
-    };
-    if Path::new(&top).canonicalize()? != root {
-        return Ok("unknown".into());
+    // Prefer a real checkout over a potentially locally edited archive marker.
+    // Git archives expand the placeholder and may themselves be nested in a
+    // different repository, so the top-level directory must match exactly.
+    let checkout = git(root, &["rev-parse", "--show-toplevel"])
+        .and_then(|top| Path::new(&top).canonicalize().ok())
+        .is_some_and(|top| top == root);
+    if !checkout {
+        let archive = fs::read_to_string(&archive_path)?;
+        return Ok(if valid_revision(archive.trim()) {
+            archive.trim().to_owned()
+        } else {
+            "unknown".into()
+        });
     }
     for name in ["HEAD", "index", "packed-refs"] {
         git_path(root, name, false);

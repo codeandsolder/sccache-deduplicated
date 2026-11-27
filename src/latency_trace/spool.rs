@@ -76,7 +76,11 @@ impl Spool {
         {
             use std::os::unix::fs::PermissionsExt as _;
             ensure!(
-                fs::metadata(directory)?.permissions().mode() & 0o077 == 0,
+                fs::metadata(directory)?
+                    .permissions()
+                    .mode()
+                    .trailing_zeros()
+                    >= 6,
                 "trace spool directory must be private (0700)"
             );
         }
@@ -229,16 +233,17 @@ mod tests {
     #[test]
     fn fifo_survives_restart_and_rejects_overflow() -> Result<()> {
         let directory = tempfile::tempdir()?;
+        let path = directory.path().join("spool");
         let capacity = 1024 * 1024;
         let body = vec![3; 600_000];
         {
-            let mut spool = Spool::open(directory.path(), capacity)?;
-            assert!(Spool::open(directory.path(), capacity).is_err());
+            let mut spool = Spool::open(&path, capacity)?;
+            assert!(Spool::open(&path, capacity).is_err());
             assert!(spool.push(17, &body)?);
             assert!(!spool.push(18, &body)?);
             assert!(spool.push(19, b"second")?);
         }
-        let mut spool = Spool::open(directory.path(), capacity)?;
+        let mut spool = Spool::open(&path, capacity)?;
         let first = spool.front()?.context("missing persisted first record")?;
         assert_eq!(first.count, 17);
         assert_eq!(first.body, body);
@@ -258,18 +263,19 @@ mod tests {
     #[test]
     fn incomplete_publication_and_corruption_do_not_block_later_records() -> Result<()> {
         let directory = tempfile::tempdir()?;
+        let path = directory.path().join("spool");
         {
-            let mut spool = Spool::open(directory.path(), 1024 * 1024)?;
+            let mut spool = Spool::open(&path, 1024 * 1024)?;
             assert!(spool.push(1, b"corrupted")?);
             assert!(spool.push(2, b"intact")?);
         }
-        fs::write(directory.path().join(".trace-pending-crash"), b"partial")?;
-        fs::write(directory.path().join("00000000000000000000.otlp"), [0; 49])?;
-        let mut spool = Spool::open(directory.path(), 1024 * 1024)?;
+        fs::write(path.join(".trace-pending-crash"), b"partial")?;
+        fs::write(path.join("00000000000000000000.otlp"), [0; 49])?;
+        let mut spool = Spool::open(&path, 1024 * 1024)?;
         let record = spool.front()?.context("later valid record lost")?;
         assert_eq!(record.count, 2);
         assert_eq!(record.body, b"intact");
-        assert!(!directory.path().join(".trace-pending-crash").exists());
+        assert!(!path.join(".trace-pending-crash").exists());
         spool.ack(record.sequence)?;
         assert_eq!(spool.bytes, 0);
         Ok(())

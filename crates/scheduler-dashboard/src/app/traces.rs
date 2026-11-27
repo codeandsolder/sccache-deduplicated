@@ -24,12 +24,19 @@ fn ms(ns: u64) -> String {
 }
 
 fn revision_label(revision: &str) -> String {
-    if revision.len() >= 40
-        && revision
-            .get(..40)
-            .is_some_and(|sha| sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    if revision
+        .get(..40)
+        .is_some_and(|sha| sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
     {
-        format!("{}{}", &revision[..12], &revision[40..])
+        let base = &revision[..12];
+        let suffix = &revision[40..];
+        if let Some(digest) = suffix.strip_prefix("-dirty-") {
+            return format!(
+                "{base}-dirty-{}",
+                digest.chars().take(12).collect::<String>()
+            );
+        }
+        format!("{base}{suffix}")
     } else {
         revision.to_owned()
     }

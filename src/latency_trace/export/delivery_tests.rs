@@ -93,8 +93,9 @@ fn submission(name: &'static str) -> Result<Message> {
 #[tokio::test]
 async fn outage_persists_independent_of_delivery_and_replays_identical_bytes() -> Result<()> {
     let directory = tempfile::tempdir()?;
+    let path = directory.path().join("spool");
     let mut collector = Receiver::start().await?;
-    let delivery = open(directory.path())?;
+    let delivery = open(&path)?;
     let transport = start_delivery(&delivery, &collector.endpoint)?;
     let (sender, receiver) = mpsc::channel(QUEUE);
     let writer_state = Arc::clone(&delivery);
@@ -115,7 +116,7 @@ async fn outage_persists_independent_of_delivery_and_replays_identical_bytes() -
     let _ = transport.await;
     drop(delivery);
     // Reconstruct the spool from disk, with no in-memory state preserved.
-    let delivery = open(directory.path())?;
+    let delivery = open(&path)?;
     while collector.attempts.try_recv().is_ok() {}
     collector.mode.store(1, Ordering::Release);
     let transport = start_delivery(&delivery, &collector.endpoint)?;

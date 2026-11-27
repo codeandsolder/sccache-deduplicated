@@ -2181,14 +2181,22 @@ impl TraceCollector {
                     let Ok(request) = ExportTraceServiceRequest::decode(body) else {
                         return http::StatusCode::BAD_REQUEST;
                     };
-                    for span in request
-                        .resource_spans
-                        .into_iter()
-                        .flat_map(|resource| resource.scope_spans)
-                        .flat_map(|scope| scope.spans)
-                    {
+                    for resource in request.resource_spans {
+                        let revision = resource.resource.as_ref().and_then(|resource| {
+                            resource.attributes.iter().find(|attr| attr.key == "service.version")
+                        }).and_then(|attr| attr.value.as_ref()).and_then(|value| {
+                            match &value.value {
+                                Some(opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(value)) => Some(value.as_str()),
+                                _ => None,
+                            }
+                        });
+                        if revision != Some(sccache::BUILD_REVISION) {
+                            return http::StatusCode::BAD_REQUEST;
+                        }
+                        for span in resource.scope_spans.into_iter().flat_map(|scope| scope.spans) {
                         if sender.send(span).is_err() {
                             return http::StatusCode::SERVICE_UNAVAILABLE;
+                        }
                         }
                     }
                     http::StatusCode::OK
@@ -2401,6 +2409,18 @@ impl Drop for LocalService {
 #[test]
 #[ignore = "requires Linux Bubblewrap, GCC and ldd"]
 fn request_traces_follow_real_worker_and_cache_hit() -> Result<()> {
+    for binary in [
+        env!("CARGO_BIN_EXE_sccache"),
+        env!("CARGO_BIN_EXE_sccache-dist"),
+    ] {
+        let output = Command::new(binary).arg("--version").output()?;
+        ensure!(output.status.success(), "version command failed");
+        assert!(
+            String::from_utf8(output.stdout)?
+                .trim()
+                .ends_with(sccache::BUILD_VERSION)
+        );
+    }
     let temp = tempfile::Builder::new()
         .prefix("native-trace-")
         .tempdir_in("/tmp")?;
