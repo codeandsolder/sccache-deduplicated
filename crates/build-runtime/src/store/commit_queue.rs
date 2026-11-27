@@ -174,7 +174,7 @@ impl Prepared {
                     completion.send(result.lease(store));
                     None
                 }
-                Ok(plan) => Some(Validated::Result(result, plan, completion)),
+                Ok(plan) => Some(Validated::Result(Box::new(result), plan, completion)),
                 Err(error) => {
                     completion.send(Err(error));
                     None
@@ -193,7 +193,11 @@ impl Prepared {
 
 enum Validated {
     Tree(PreparedTree, Completion<TreeLease>),
-    Result(PreparedResult<'static>, ResultPlan, Completion<ResultLease>),
+    Result(
+        Box<PreparedResult<'static>>,
+        ResultPlan,
+        Completion<ResultLease>,
+    ),
 }
 
 impl Validated {

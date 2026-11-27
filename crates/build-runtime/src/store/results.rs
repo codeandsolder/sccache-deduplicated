@@ -128,7 +128,7 @@ impl<'a> PreparedResult<'a> {
         })
     }
 
-    pub(super) fn published(&self, plan: &ResultPlan) -> Published {
+    pub(super) const fn published(&self, plan: &ResultPlan) -> Published {
         Published {
             action: self.action,
             result: self.result,
