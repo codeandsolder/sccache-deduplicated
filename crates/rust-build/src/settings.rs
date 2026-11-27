@@ -65,6 +65,45 @@ impl Toolchain {
         docs: bool,
     ) -> Result<Self> {
         let rustc = tool("rustc", rustc, toolchain, cwd)?;
+        Self::from_compiler(cwd, rustc, toolchain, target, clippy, docs, None)
+    }
+
+    /// Use a specific complete installation (e.g. a read-only ZFS snapshot).
+    /// Never pick companion executables from an unrelated live rustup tree.
+    pub fn from_root(
+        cwd: &Path,
+        root: &Path,
+        target: Option<&OsStr>,
+        clippy: bool,
+        docs: bool,
+    ) -> Result<Self> {
+        let root = cwd.join(root).canonicalize()?;
+        let compiler = root
+            .join("bin")
+            .join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+        Self::from_compiler(cwd, compiler, None, target, clippy, docs, Some(&root))
+    }
+
+    fn from_compiler(
+        cwd: &Path,
+        rustc: PathBuf,
+        toolchain: Option<&str>,
+        target: Option<&OsStr>,
+        clippy: bool,
+        docs: bool,
+        root: Option<&Path>,
+    ) -> Result<Self> {
+        if let Some(root) = root {
+            ensure!(
+                rustc.canonicalize()?.starts_with(root),
+                "rustc escapes the selected installation"
+            );
+            let reported = output(Command::new(&rustc).current_dir(cwd).arg("--print=sysroot"))?;
+            ensure!(
+                Path::new(&reported).canonicalize()? == root,
+                "rustc reported a different sysroot: {reported}"
+            );
+        }
         let version = output(Command::new(&rustc).current_dir(cwd).arg("-vV"))?;
         let host = version
             .lines()
@@ -93,8 +132,15 @@ impl Toolchain {
             host.clone()
         };
         let companion = |name: &str| -> Result<PathBuf> {
-            let path = rustc.with_file_name(name);
-            if path.is_file() {
+            let path = rustc.with_file_name(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            if let Some(root) = root {
+                ensure!(
+                    path.canonicalize()?.starts_with(root),
+                    "{name} escapes the selected installation"
+                );
+                ensure!(path.is_file(), "{name} missing from selected installation");
+                Ok(path)
+            } else if path.is_file() {
                 Ok(path)
             } else {
                 tool(name, None, toolchain, cwd)
@@ -191,7 +237,7 @@ impl Settings {
             if !path.is_file() {
                 continue;
             }
-            let table: Table = toml::from_str(&fs::read_to_string(&path)?)
+            let mut table: Table = toml::from_str(&fs::read_to_string(&path)?)
                 .with_context(|| format!("parse {}", path.display()))?;
             if let Some(env) = table.get("env").and_then(Value::as_table) {
                 for (key, value) in env {
@@ -219,6 +265,27 @@ impl Settings {
                     }
                 }
             }
+            if let Some(value) = table
+                .get_mut("build")
+                .and_then(Value::as_table_mut)
+                .and_then(|build| build.get_mut("toolchain-root"))
+            {
+                let root = Path::new(
+                    value
+                        .as_str()
+                        .context("build.toolchain-root must be a path")?,
+                );
+                let root = if root.is_absolute() {
+                    root.to_path_buf()
+                } else {
+                    dir.parent().context("config has no parent")?.join(root)
+                };
+                *value = Value::String(
+                    root.to_str()
+                        .context("toolchain root must be UTF-8")?
+                        .to_owned(),
+                );
+            }
             merge(&mut result.document, table);
         }
         // Never inherit another tool's jobserver or incremental policy.
@@ -237,6 +304,15 @@ impl Settings {
             result.environment.remove(OsStr::new(key));
         }
         Ok(result)
+    }
+
+    pub fn toolchain_root(&self) -> Option<&Path> {
+        self.document
+            .get("build")
+            .and_then(Value::as_table)
+            .and_then(|build| build.get("toolchain-root"))
+            .and_then(Value::as_str)
+            .map(Path::new)
     }
 
     pub fn target_dir(&self) -> Option<&Path> {

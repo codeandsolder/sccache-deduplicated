@@ -56,3 +56,7 @@ required-features = ["store"]
 [[example]]
 name = "package_probe"
 required-features = ["store"]
+
+[[example]]
+name = "immutable_digest_probe"
+required-features = ["mapping"]

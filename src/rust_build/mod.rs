@@ -101,6 +101,8 @@ pub struct RustBuildArgs {
     target_dir: Option<PathBuf>,
     #[arg(long)]
     rustc: Option<PathBuf>,
+    #[arg(long, conflicts_with_all = ["rustc", "toolchain"])]
+    toolchain_root: Option<PathBuf>,
     #[arg(long)]
     import_root: Option<PathBuf>,
     #[arg(long)]
@@ -334,14 +336,27 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
         .target
         .as_deref()
         .or_else(|| settings.target().map(OsStr::new));
-    let toolchain = Toolchain::discover(
-        &cwd,
-        args.rustc.as_deref(),
-        args.toolchain.as_deref(),
-        target,
-        args.mode == Mode::Clippy,
-        args.mode == Mode::Doc || (args.mode == Mode::Test && !args.no_run && !args.no_doc),
-    )?;
+    let needs_docs =
+        args.mode == Mode::Doc || (args.mode == Mode::Test && !args.no_run && !args.no_doc);
+    let installation = args.toolchain_root.as_deref().or_else(|| {
+        if args.rustc.is_none() && args.toolchain.is_none() {
+            settings.toolchain_root()
+        } else {
+            None
+        }
+    });
+    let toolchain = if let Some(root) = installation {
+        Toolchain::from_root(&cwd, root, target, args.mode == Mode::Clippy, needs_docs)?
+    } else {
+        Toolchain::discover(
+            &cwd,
+            args.rustc.as_deref(),
+            args.toolchain.as_deref(),
+            target,
+            args.mode == Mode::Clippy,
+            needs_docs,
+        )?
+    };
     if matches!(args.mode, Mode::GenerateLockfile | Mode::Update) {
         ensure!(
             !args.locked,
