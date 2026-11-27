@@ -63,6 +63,7 @@ pub(super) fn NativeStatus(data: DashboardSource, tab: RwSignal<Tab>) -> impl In
             Tab::CacheHits => view! {<AdmissionPanel telemetry=telemetry history=history/>}.into_any(),
             Tab::CacheAnalytics => view! {<super::analytics::CacheAnalytics telemetry=telemetry workers=workers/>}.into_any(),
             Tab::Network => view! {<NetworkPanel telemetry=telemetry/>}.into_any(),
+            Tab::Traces => view! {<super::traces::TracePanel data=data/>}.into_any(),
             Tab::Fleet => ().into_any(),
         }}
     }.into_any()
@@ -799,6 +800,7 @@ mod job_tests {
     use super::*;
     fn job(id: &str, name: &str, phase: &str, remaining: u64) -> Job {
         Job {
+            trace_id: None,
             id: id.into(),
             worker: "acer".into(),
             worker_id: "worker-id".into(),

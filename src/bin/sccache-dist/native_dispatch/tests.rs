@@ -46,6 +46,7 @@ fn worker(
 
 fn assignment(marker: u8) -> Result<NativeAssignment> {
     Ok(NativeAssignment {
+        trace: None,
         estimated_result_bytes: None,
         receiver: None,
         delivery_profile: None,
@@ -446,6 +447,7 @@ fn native_dispatcher_reaps_only_expired_terminal_reservations() {
                 remaining: RemainingInputs::default(),
                 cancelled: Arc::new(AtomicBool::new(false)),
                 state,
+                trace: None,
             },
         );
     }

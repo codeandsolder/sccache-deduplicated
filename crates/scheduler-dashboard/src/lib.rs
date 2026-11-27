@@ -7,6 +7,7 @@ mod app;
 pub mod server;
 #[cfg(any(feature = "ssr", feature = "hydrate"))]
 mod styles;
+pub mod traces;
 
 /// Content-derived compatibility identity, independent of host architecture.
 pub const GENERATION: &str = include_str!(concat!(env!("OUT_DIR"), "/dashboard-generation"));
@@ -92,6 +93,7 @@ pub struct JobDescription {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Job {
+    pub trace_id: Option<String>,
     pub id: String,
     pub description: Option<JobDescription>,
     pub worker: String,
@@ -286,6 +288,7 @@ impl AdmissionCounts {
 /// Independent, periodically collected CAS and network observations.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NativeTelemetry {
+    pub live_traces: Option<sccache_build::wire::LiveTraceSnapshot>,
     pub cache_sampled_at: Option<u64>,
     pub admission: Option<AdmissionCounts>,
     pub analytics: Option<AnalyticsObservation>,

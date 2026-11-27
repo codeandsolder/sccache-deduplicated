@@ -58,6 +58,7 @@ pub(super) fn snapshot(sessions: &NativeSessions, network: &NetworkMeter) -> Nat
             busy: admissions.busy,
             errors: admissions.errors,
         }),
+        live_traces: sessions.live_traces().ok(),
         ..Default::default()
     };
     match sessions.store().stats() {

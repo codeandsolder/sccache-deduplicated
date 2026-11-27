@@ -132,6 +132,7 @@ const ENABLED_FEATURES_HELP: &str = concat!(
 fn get_clap_command() -> clap::Command {
     clap::Command::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
+        .long_version(crate::BUILD_VERSION)
         .max_term_width(110)
         .after_help(ENABLED_FEATURES_HELP)
         .args(&[

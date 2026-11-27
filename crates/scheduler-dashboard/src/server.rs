@@ -25,9 +25,32 @@ use crate::{
     make_patch,
 };
 
+fn telemetry_source(url: &str) -> Result<(url::Url, wreq::Client)> {
+    let mut base = url::Url::parse(url)?;
+    ensure!(
+        matches!(base.scheme(), "http" | "https")
+            && base.host().is_some()
+            && base.username().is_empty()
+            && base.password().is_none()
+            && base.query().is_none()
+            && base.fragment().is_none(),
+        "telemetry URL must be an HTTP(S) base URL without credentials or query"
+    );
+    if !base.path().ends_with('/') {
+        base.set_path(&format!("{}/", base.path()));
+    }
+    let client = wreq::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(wreq::redirect::Policy::none())
+        .no_proxy()
+        .build()?;
+    Ok((base, client))
+}
+
 mod assets;
 mod broadcast;
 mod metrics;
+pub(crate) mod traces;
 
 #[derive(Clone)]
 pub(crate) struct DashboardState {
@@ -114,6 +137,13 @@ pub(super) fn now() -> u64 {
         .as_secs()
 }
 
+#[derive(Clone, Copy)]
+pub struct TelemetrySources<'a> {
+    pub metrics_url: Option<&'a str>,
+    pub metrics_ingress_host: Option<&'a str>,
+    pub traces_url: Option<&'a str>,
+}
+
 /// Verify the exact files and embedded WASM identity before packaging or startup.
 ///
 /// # Errors
@@ -138,8 +168,7 @@ pub fn verify_assets(directory: &Path, source: Option<&Path>) -> Result<()> {
 pub fn spawn(
     address: SocketAddr,
     assets: &Path,
-    metrics_url: Option<&str>,
-    metrics_ingress_host: Option<&str>,
+    sources: TelemetrySources<'_>,
     snapshot: impl Fn() -> Result<Snapshot> + Send + 'static,
     telemetry: impl Fn() -> Option<NativeTelemetry> + Send + 'static,
     wake: std::sync::mpsc::Receiver<()>,
@@ -153,7 +182,8 @@ pub fn spawn(
         "dashboard assets must be an absolute path"
     );
     let assets = assets::Assets::load(assets)?;
-    let metrics = metrics::MetricsService::new(metrics_url, metrics_ingress_host)?;
+    let metrics = metrics::MetricsService::new(sources.metrics_url, sources.metrics_ingress_host)?;
+    let traces = traces::TraceService::new(sources.traces_url)?;
     let listener = TcpListener::bind(address).context("bind scheduler dashboard")?;
     let address = listener.local_addr()?;
     listener.set_nonblocking(true)?;
@@ -167,7 +197,7 @@ pub fn spawn(
         .spawn(move || {
             sample_loop(&status_state, snapshot, telemetry, &wake);
         })?;
-    let router = router(state, metrics, assets);
+    let router = router(state, metrics, traces, assets);
     std::thread::Builder::new()
         .name("scheduler-dashboard-http".into())
         .spawn(move || {
@@ -235,6 +265,7 @@ fn sample_loop(
 fn router(
     state: DashboardState,
     metrics: metrics::MetricsService,
+    traces: traces::TraceService,
     assets: assets::Assets,
 ) -> Router {
     let _ = any_spawner::Executor::init_tokio();
@@ -248,8 +279,20 @@ fn router(
         move || provide_context(ssr_state.clone()),
         move || crate::app::shell(options.clone()),
     );
+    let trace_rpc = move |request: Request| {
+        let traces = traces.clone();
+        async move {
+            leptos_axum::handle_server_fns_with_context(
+                move || provide_context(traces.clone()),
+                request,
+            )
+            .await
+        }
+    };
     Router::new()
         .route("/", get(render))
+        .route("/api/trace_search", post(trace_rpc.clone()))
+        .route("/api/trace_detail", post(trace_rpc))
         .route(
             "/api/snapshot",
             post(move |request: Request| {
@@ -462,7 +505,12 @@ mod tests {
         let metrics = metrics::MetricsService::new(None, None)?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
-        let router = router(state.clone(), metrics, assets::Assets::default());
+        let router = router(
+            state.clone(),
+            metrics,
+            traces::TraceService::new(None)?,
+            assets::Assets::default(),
+        );
         let server = tokio::spawn(async move { axum::serve(listener, router).await });
         let client = wreq::Client::builder()
             .no_proxy()

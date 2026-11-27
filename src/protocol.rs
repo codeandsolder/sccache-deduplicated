@@ -36,7 +36,7 @@ pub enum Request {
     /// Open a dedicated observation connection for a caller-owned compile.
     ObserveCompile(CompileIdentity),
     /// Report caller-monotonic phase ages on that connection.
-    ObservePhase(crate::server::activity::CompileActivity),
+    ObservePhase(Box<crate::server::activity::CompileActivity>),
 }
 
 /// A server response.
@@ -81,7 +81,7 @@ pub enum Response {
 /// Maximum application payload in a transfer frame. The framing envelope
 /// stays well below the default 8 MiB IPC frame limit.
 pub const TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
-pub const NAMESPACE_PROTOCOL_VERSION: u32 = 7;
+pub const NAMESPACE_PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum StorageBlob {

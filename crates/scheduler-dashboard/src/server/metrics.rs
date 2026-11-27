@@ -159,26 +159,10 @@ impl MetricsService {
         );
         let source = url
             .map(|url| -> Result<_> {
-                let mut base = url::Url::parse(url)?;
-                ensure!(
-                    matches!(base.scheme(), "http" | "https")
-                        && base.host().is_some()
-                        && base.username().is_empty()
-                        && base.password().is_none()
-                        && base.query().is_none()
-                        && base.fragment().is_none(),
-                    "metrics URL must be an HTTP(S) base URL without credentials or query"
-                );
-                if !base.path().ends_with('/') {
-                    base.set_path(&format!("{}/", base.path()));
-                }
+                let (base, client) = super::telemetry_source(url)?;
                 Ok(Arc::new(Source {
                     base,
-                    client: wreq::Client::builder()
-                        .timeout(Duration::from_secs(10))
-                        .redirect(wreq::redirect::Policy::none())
-                        .no_proxy()
-                        .build()?,
+                    client,
                     definitions: serde_json::from_str(include_str!("../panels.json"))?,
                     ingress_host: ingress_host.map(str::to_owned),
                     queries: Semaphore::new(4),

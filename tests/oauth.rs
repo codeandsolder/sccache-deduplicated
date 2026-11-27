@@ -67,6 +67,7 @@ fn config_with_dist_auth(
         shared_daemon: None,
         compiler_aliases: Default::default(),
         compile_limits: Default::default(),
+        traces: None,
     }
 }
 

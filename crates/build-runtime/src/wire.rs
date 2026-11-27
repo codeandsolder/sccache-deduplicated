@@ -10,6 +10,79 @@ use crate::{
     TreeManifest, identity::typed_digest,
 };
 
+/// Correlation only; never included in an action fingerprint or execution spec.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TraceContext {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+}
+
+impl TraceContext {
+    #[must_use = "the context identifies the client request, not the action"]
+    pub fn request(id: &str) -> Self {
+        let digest = blake3::hash(id.as_bytes());
+        let mut trace_id = [0; 16];
+        let mut span_id = [0; 8];
+        trace_id.copy_from_slice(&digest.as_bytes()[..16]);
+        span_id.copy_from_slice(&digest.as_bytes()[16..24]);
+        Self { trace_id, span_id }
+    }
+
+    #[must_use = "the hexadecimal identifier selects a trace in the dashboard"]
+    pub fn hex_id(self) -> String {
+        use std::fmt::Write as _;
+        self.trace_id
+            .iter()
+            .fold(String::with_capacity(32), |mut output, byte| {
+                let _ = write!(output, "{byte:02x}");
+                output
+            })
+    }
+
+    #[must_use = "the IDs must be nonzero before accepting remote context"]
+    pub fn valid(self) -> bool {
+        self.trace_id != [0; 16] && self.span_id != [0; 8]
+    }
+}
+
+/// Maximum request records in a single bounded live report.
+pub const MAX_LIVE_TRACE_ROWS: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveTraceRequest {
+    pub trace: TraceContext,
+    pub compiler: String,
+    pub output: String,
+    pub phase: String,
+    pub elapsed_ms: u64,
+    pub phase_age_ms: u64,
+    pub worker: String,
+    pub job: Option<u64>,
+    pub producer: Option<TraceContext>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveTraceBatch {
+    pub generation: u64,
+    pub instance: String,
+    pub active: u64,
+    pub requests: Vec<LiveTraceRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveTraceRow {
+    pub peer: crate::PeerId,
+    pub instance: String,
+    pub observation_age_ms: u64,
+    pub request: LiveTraceRequest,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveTraceSnapshot {
+    pub active: u64,
+    pub rows: Vec<LiveTraceRow>,
+}
+
 /// A short-lived, unguessable capability. Never log its bytes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -140,7 +213,9 @@ pub enum NativeAdmission {
         ticket: Ticket,
         manifest: ResultManifest,
     },
-    InFlight,
+    InFlight {
+        producer: Option<TraceContext>,
+    },
     MissingInputs {
         trees: BTreeSet<TreeId>,
     },

@@ -69,6 +69,8 @@ log = "0.4"
 lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "0c49fad815ce76bbd63f0e8b79270db30968e289", optional = true }
 memchr = "2"
 mime = "0.3"
+opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"], optional = true }
+prost = { version = "0.14", optional = true }
 object = { version = "0.41", default-features = false, features = ["read", "std"] }
 opendal = { version = "0.59.0", optional = true, default-features = false }
 http-body = { version = "1", optional = true }
@@ -116,6 +118,9 @@ zlib-rs-fast = { package = "zlib-rs", version = "=0.6.8", optional = true, defau
 # dist-server only
 socket2 = { version = "0.6", optional = true }
 syslog = { version = "7", optional = true }
+
+[build-dependencies]
+sha2 = "0.11"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -217,7 +222,7 @@ oss = [
   "http-client",
 ]
 redis = ["dep:url", "opendal/services-redis", "opendal-layer-logging"]
-http-client = ["dep:wreq", "dep:url"]
+http-client = ["dep:wreq", "dep:url", "dep:opentelemetry-proto", "dep:prost"]
 s3 = [
   "opendal/services-s3",
   "opendal-layer-logging",

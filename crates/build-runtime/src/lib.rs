@@ -83,7 +83,8 @@ mod execution;
 pub mod sandbox;
 #[cfg(all(target_os = "linux", feature = "store"))]
 pub use execution::{
-    CapturedExecution, ExecutionPolicy, ExecutionTimings, acquire_execution_inputs, execute,
+    CapturedExecution, ExecutionPhase, ExecutionPolicy, ExecutionTimings, acquire_execution_inputs,
+    execute,
 };
 
 #[cfg(all(target_os = "linux", feature = "store"))]

@@ -45,8 +45,11 @@ if (( dashboard )); then
     git archive "$source_sha" | tar -xf - -C "$tmp/source"
     "$stage/sccache-dist" verify-dashboard --assets "$stage/pkg" --source "$tmp/source"
 fi
-"$stage/sccache" --version
-"$stage/sccache-dist" --version
+for binary in "$stage/sccache" "$stage/sccache-dist"; do
+    version="$("$binary" --version)"
+    printf '%s\n' "$version"
+    [[ "$version" == *"($source_sha)" ]] || { echo "binary revision mismatch: $binary" >&2; exit 1; }
+done
 capabilities="$("$stage/sccache" --capabilities | paste -sd, -)"
 [[ ",$capabilities," == *,direct-metrics,* ]]
 {

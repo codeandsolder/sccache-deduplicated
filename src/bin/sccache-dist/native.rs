@@ -229,9 +229,9 @@ impl NativeWorker {
         &self,
         prepared: PreparedWorker,
         queue: &sccache::dist::execution_queue::ExecutionQueue,
-        on_start: impl FnOnce(),
+        on_phase: impl FnMut(sccache::build_runtime::ExecutionPhase),
     ) -> CompletedWorker {
-        prepared.execute(&self.store, &self.policy, self.delivery(queue), on_start)
+        prepared.execute(&self.store, &self.policy, self.delivery(queue), on_phase)
     }
 
     pub(super) async fn publish(&self, completed: CompletedWorker) -> Result<CapturedExecution> {

@@ -782,6 +782,7 @@ pub struct NativeSessions {
     peer_wake: Arc<tokio::sync::Notify>,
     manifests: Mutex<ManifestCatalog>,
     recovery: recovery::RecoveryQueue,
+    live_traces: live::LiveTraces,
 }
 
 /// A bounded service slot is occupied. Clients can retry without changing
@@ -841,7 +842,26 @@ impl NativeSessions {
             peer_wake: Arc::new(tokio::sync::Notify::new()),
             manifests: Mutex::new(ManifestCatalog::default()),
             recovery: recovery::RecoveryQueue::default(),
+            live_traces: live::LiveTraces::default(),
         })
+    }
+
+    /// Record a complete bounded client snapshot, replacing its previous report.
+    /// # Errors
+    /// Invalid observation or exceeded reporter capacity.
+    pub fn report_live_traces(
+        &self,
+        peer: crate::PeerId,
+        report: crate::wire::LiveTraceBatch,
+    ) -> Result<()> {
+        self.live_traces.report(peer, report, Instant::now())
+    }
+
+    /// Observe current, unexpired request reports.
+    /// # Errors
+    /// The live observation registry is poisoned.
+    pub fn live_traces(&self) -> Result<crate::wire::LiveTraceSnapshot> {
+        self.live_traces.snapshot(Instant::now())
     }
 
     #[must_use = "the store contains the native content and action index"]
@@ -1075,18 +1095,20 @@ impl NativeSessions {
     /// or storage failure.
     pub fn admit(
         &self,
+        trace: Option<crate::wire::TraceContext>,
         request: ActionRequest,
         publisher: Publisher,
         mode: ActionMode,
         declared: BTreeMap<TreeId, TreeManifest>,
     ) -> Result<NativeAdmission> {
-        let result = self.admit_inner(request, publisher, mode, declared);
+        let result = self.admit_inner(trace, request, publisher, mode, declared);
         self.admission_counters.record(mode, &result);
         result
     }
 
     fn admit_inner(
         &self,
+        trace: Option<crate::wire::TraceContext>,
         request: ActionRequest,
         publisher: Publisher,
         mode: ActionMode,
@@ -1094,8 +1116,8 @@ impl NativeSessions {
     ) -> Result<NativeAdmission> {
         self.reap()?;
         let fingerprint = request.action_fingerprint()?;
-        match self.coordinator.admit(fingerprint, mode)? {
-            Admission::InFlight => Ok(NativeAdmission::InFlight),
+        match self.coordinator.admit(trace, fingerprint, mode)? {
+            Admission::InFlight(producer) => Ok(NativeAdmission::InFlight { producer }),
             Admission::Cached(lease) => {
                 self.recovery
                     .release_ready(request.action_fingerprint()?.key()?)?;
@@ -1123,7 +1145,7 @@ impl NativeSessions {
                         self.limits.idle_timeout,
                     )?
                     else {
-                        return Ok(NativeAdmission::InFlight);
+                        return Ok(NativeAdmission::InFlight { producer: None });
                     };
                     permit
                 } else {
@@ -2634,6 +2656,7 @@ impl Drop for UploadSlot {
     }
 }
 
+mod live;
 mod recovery;
 mod retention;
 mod telemetry;
