@@ -407,7 +407,7 @@ dependencies = [
 [[package]]
 name = "btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=c94b59be27af2bcd8531cc005fd1ea6fdd281bcb#c94b59be27af2bcd8531cc005fd1ea6fdd281bcb"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=53c46285a85742dc8c3ab48fbb66613da6b4a297#53c46285a85742dc8c3ab48fbb66613da6b4a297"
 dependencies = [
  "bitflags",
  "btls-sys",
@@ -419,7 +419,7 @@ dependencies = [
 [[package]]
 name = "btls-sys"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=c94b59be27af2bcd8531cc005fd1ea6fdd281bcb#c94b59be27af2bcd8531cc005fd1ea6fdd281bcb"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=53c46285a85742dc8c3ab48fbb66613da6b4a297#53c46285a85742dc8c3ab48fbb66613da6b4a297"
 dependencies = [
  "bindgen",
  "cmake",
@@ -2244,7 +2244,7 @@ dependencies = [
 [[package]]
 name = "jsonwebtoken-btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=c94b59be27af2bcd8531cc005fd1ea6fdd281bcb#c94b59be27af2bcd8531cc005fd1ea6fdd281bcb"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=53c46285a85742dc8c3ab48fbb66613da6b4a297#53c46285a85742dc8c3ab48fbb66613da6b4a297"
 dependencies = [
  "btls",
  "jsonwebtoken",
@@ -2583,7 +2583,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 [[package]]
 name = "lurkmoar"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/lurkmoar-rs?rev=e40a202c3218fa4fc5adcdf01b55082be2c91e9f#e40a202c3218fa4fc5adcdf01b55082be2c91e9f"
+source = "git+https://github.com/codeandsolder/lurkmoar-rs?rev=a97f149e673c45c795a8176667f379c1bf215327#a97f149e673c45c795a8176667f379c1bf215327"
 dependencies = [
  "bytes",
  "flate2",
@@ -3909,7 +3909,7 @@ dependencies = [
 [[package]]
 name = "reqsign-azure-storage"
 version = "3.3.1"
-source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=47f82a7fc98c591a16a803de9eeeaa527c2779cb#47f82a7fc98c591a16a803de9eeeaa527c2779cb"
+source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=8480e6c3e8fe8b965a8acd7bcb53741079149006#8480e6c3e8fe8b965a8acd7bcb53741079149006"
 dependencies = [
  "anyhow",
  "asyncband 0.8.0",
@@ -3930,7 +3930,7 @@ dependencies = [
 [[package]]
 name = "reqsign-core"
 version = "3.3.3"
-source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=47f82a7fc98c591a16a803de9eeeaa527c2779cb#47f82a7fc98c591a16a803de9eeeaa527c2779cb"
+source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=8480e6c3e8fe8b965a8acd7bcb53741079149006#8480e6c3e8fe8b965a8acd7bcb53741079149006"
 dependencies = [
  "anyhow",
  "asyncband 0.8.0",
@@ -3965,7 +3965,7 @@ dependencies = [
 [[package]]
 name = "reqsign-google"
 version = "3.3.0"
-source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=47f82a7fc98c591a16a803de9eeeaa527c2779cb#47f82a7fc98c591a16a803de9eeeaa527c2779cb"
+source = "git+https://github.com/codeandsolder/cargo-patches.git?rev=8480e6c3e8fe8b965a8acd7bcb53741079149006#8480e6c3e8fe8b965a8acd7bcb53741079149006"
 dependencies = [
  "bytes",
  "form_urlencoded",
@@ -5280,7 +5280,7 @@ dependencies = [
 [[package]]
 name = "tokio-btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=c94b59be27af2bcd8531cc005fd1ea6fdd281bcb#c94b59be27af2bcd8531cc005fd1ea6fdd281bcb"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=53c46285a85742dc8c3ab48fbb66613da6b4a297#53c46285a85742dc8c3ab48fbb66613da6b4a297"
 dependencies = [
  "btls",
  "btls-sys",
@@ -6044,7 +6044,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "wreq"
 version = "0.16.1"
-source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=0b8137802090cc611933c73f027c80adfb248011#0b8137802090cc611933c73f027c80adfb248011"
+source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=7c0668c3b3e137f233c0aaee132028ab39572dbd#7c0668c3b3e137f233c0aaee132028ab39572dbd"
 dependencies = [
  "base64 0.23.1",
  "btls",
