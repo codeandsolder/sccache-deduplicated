@@ -18,7 +18,7 @@ use std::{
     fs::File,
     io::{Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 fn connection() -> Result<ServerConnection> {
@@ -26,10 +26,47 @@ fn connection() -> Result<ServerConnection> {
         .context("connect to managed intermediate daemon")
 }
 
-pub struct Content;
+pub struct Content {
+    session: Ticket,
+    // These identities came directly from the daemon after it pinned the
+    // package tree. No per-file authorization roundtrip is required to attach
+    // a member of that same tree to the launcher's private filesystem.
+    packages: Mutex<BTreeMap<crate::build_runtime::ContentId, u64>>,
+}
+
+impl Content {
+    fn register_package(&self, package: &crate::build_runtime::RetainedPackage) -> Result<()> {
+        let blobs = package.manifest.blobs()?;
+        let mut packages = self
+            .packages
+            .lock()
+            .map_err(|_| anyhow::anyhow!("package authorization map poisoned"))?;
+        for (id, size) in blobs {
+            ensure!(
+                packages.get(&id).is_none_or(|old| *old == size),
+                "conflicting package content length"
+            );
+            packages.insert(id, size);
+        }
+        Ok(())
+    }
+}
 
 impl IntermediateContent for Content {
     fn authorize(&self, reference: IntermediateReference) -> Result<()> {
+        ensure!(
+            reference.session == self.session,
+            "foreign intermediate session"
+        );
+        if self
+            .packages
+            .lock()
+            .map_err(|_| anyhow::anyhow!("package authorization map poisoned"))?
+            .get(&reference.blob.id)
+            == Some(&reference.blob.size)
+        {
+            return Ok(());
+        }
         ensure!(
             matches!(
                 connection()?.transfer(TransferRequest::IntermediateAuthorize {
@@ -44,44 +81,53 @@ impl IntermediateContent for Content {
     }
 
     fn fetch(&self, reference: IntermediateReference, destination: &mut File) -> Result<()> {
-        let mut connection = connection()?;
-        let TransferReply::ReadStarted(Some(mut remaining)) =
-            connection.transfer(TransferRequest::IntermediateRead {
-                session: reference.session,
-                blob: reference.blob,
-            })?
-        else {
-            anyhow::bail!("unexpected retained content response");
-        };
-        ensure!(
-            remaining == reference.blob.size,
-            "retained content length mismatch"
-        );
-        while remaining > 0 {
-            let TransferReply::Chunk(chunk) =
-                connection.transfer(TransferRequest::IntermediateChunk)?
-            else {
-                anyhow::bail!("unexpected retained chunk response");
-            };
-            ensure!(
-                !chunk.is_empty() && chunk.len() as u64 <= remaining,
-                "invalid retained chunk size"
-            );
-            destination.write_all(&chunk)?;
-            remaining -= chunk.len() as u64;
-        }
-        Ok(())
+        fetch_retained(reference, destination)
     }
 }
 
+fn fetch_retained(reference: IntermediateReference, destination: &mut File) -> Result<()> {
+    let mut connection = connection()?;
+    let TransferReply::ReadStarted(Some(mut remaining)) =
+        connection.transfer(TransferRequest::IntermediateRead {
+            session: reference.session,
+            blob: reference.blob,
+        })?
+    else {
+        anyhow::bail!("unexpected retained content response");
+    };
+    ensure!(
+        remaining == reference.blob.size,
+        "retained content length mismatch"
+    );
+    while remaining > 0 {
+        let TransferReply::Chunk(chunk) =
+            connection.transfer(TransferRequest::IntermediateChunk)?
+        else {
+            anyhow::bail!("unexpected retained chunk response");
+        };
+        ensure!(
+            !chunk.is_empty() && chunk.len() as u64 <= remaining,
+            "invalid retained chunk size"
+        );
+        destination.write_all(&chunk)?;
+        remaining -= chunk.len() as u64;
+    }
+    Ok(())
+}
+
+/// Materialize registry sources as immutable leased CAS references, not a
+/// decompressed duplicate of the original archive. Only metadata and files
+/// actually read by the caller have to traverse the network.
 pub fn package(
-    session: Ticket,
+    content: &Content,
     identity: crate::build_runtime::PackageIdentity,
     upstream: &str,
     path: &str,
     offline: bool,
-    destination: &mut File,
+    destination: &std::path::Path,
+    stem: &str,
 ) -> Result<bool> {
+    let session = content.session;
     let mut connection = connection()?;
     let TransferReply::ReadStarted(length) =
         connection.transfer(TransferRequest::IntermediatePackage {
@@ -92,25 +138,76 @@ pub fn package(
             offline,
         })?
     else {
-        anyhow::bail!("unexpected package delivery reply");
+        anyhow::bail!("unexpected package tree reply");
     };
     let Some(mut remaining) = length else {
         return Ok(false);
     };
+    // Stream potentially large metadata through the existing chunk protocol.
+    let mut file = tempfile::tempfile()?;
     while remaining > 0 {
         let TransferReply::Chunk(chunk) =
             connection.transfer(TransferRequest::IntermediateChunk)?
         else {
-            anyhow::bail!("unexpected package chunk reply");
+            anyhow::bail!("unexpected package tree chunk reply");
         };
         ensure!(
             !chunk.is_empty() && chunk.len() as u64 <= remaining,
-            "invalid package chunk size"
+            "invalid package tree chunk size"
         );
-        destination.write_all(&chunk)?;
+        file.write_all(&chunk)?;
         remaining -= chunk.len() as u64;
     }
+    file.rewind()?;
+    let package: crate::build_runtime::RetainedPackage = bincode::deserialize_from(&mut file)?;
+    ensure!(
+        file.stream_position()? == file.metadata()?.len(),
+        "trailing package tree metadata"
+    );
+    package.validate(identity)?;
+    validate_registry_tree(&package.manifest, stem)?;
+    content.register_package(&package)?;
+    let parent = destination
+        .parent()
+        .context("missing package destination parent")?;
+    std::fs::create_dir_all(parent)?;
+    let tree = materialize_tree(&package.manifest, parent, |blob, path| {
+        let file = File::create_new(path)?;
+        attach_intermediate(&file, IntermediateReference { session, blob })
+    })?;
+    tree.publish(destination)?;
     Ok(true)
+}
+
+fn validate_registry_tree(manifest: &crate::build_runtime::TreeManifest, stem: &str) -> Result<()> {
+    use crate::build_runtime::TreeEntry;
+    let prefix = format!("{stem}/");
+    for (path, entry) in &manifest.entries {
+        ensure!(
+            path.as_bytes() == stem.as_bytes() || path.as_bytes().starts_with(prefix.as_bytes()),
+            "archive entry outside package root"
+        );
+        ensure!(
+            matches!(entry, TreeEntry::Directory(_) | TreeEntry::File { .. }),
+            "unsupported registry archive entry"
+        );
+    }
+    ensure!(
+        matches!(
+            manifest.entries.get(stem.as_bytes()),
+            Some(TreeEntry::Directory(_))
+        ),
+        "registry package has no root"
+    );
+    let manifest_path = format!("{stem}/Cargo.toml");
+    ensure!(
+        matches!(
+            manifest.entries.get(manifest_path.as_bytes()),
+            Some(TreeEntry::File { .. })
+        ),
+        "registry package has no manifest"
+    );
+    Ok(())
 }
 
 pub fn open() -> Result<(Ticket, ServerConnection)> {
@@ -130,7 +227,7 @@ pub fn source(reference: IntermediateReference) -> ReferenceBlobProvider {
             "different requested retained content"
         );
         let mut file = tempfile::tempfile()?;
-        Content.fetch(reference, &mut file)?;
+        fetch_retained(reference, &mut file)?;
         file.seek(SeekFrom::Start(0))?;
         Ok(Box::new(file))
     })
@@ -208,6 +305,9 @@ impl Destinations {
     }
 }
 
-pub fn content() -> Arc<dyn IntermediateContent> {
-    Arc::new(Content)
+pub fn content(session: Ticket) -> Arc<Content> {
+    Arc::new(Content {
+        session,
+        packages: Mutex::default(),
+    })
 }

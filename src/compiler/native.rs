@@ -186,7 +186,10 @@ impl NativeCompilerClient {
         files: &[PathBuf],
         pool: &tokio::runtime::Handle,
     ) -> Result<Vec<String>> {
-        let jobs = files.iter().map(|path| {
+        let jobs = files.iter().map(|path| async {
+            if path.is_dir() {
+                return crate::util::Digest::file(path, pool).await;
+            }
             let client = Arc::clone(self);
             let path = path.clone();
             pool.spawn_blocking(move || {
@@ -197,11 +200,9 @@ impl NativeCompilerClient {
                     crate::util::Digest::reader_sync(file)
                 }
             })
-        });
-        futures::future::try_join_all(jobs)
             .await?
-            .into_iter()
-            .collect()
+        });
+        futures::future::try_join_all(jobs).await
     }
 
     pub fn toolchain_digests(&self) -> Arc<SourceDigestCache> {

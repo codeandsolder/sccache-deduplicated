@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::build_runtime::{
     ActionMode, BlobEncoding, BlobRef, ContentId, ExecutionSpec, InstallationManifest,
-    PackageIdentity, PackageReceipt, PackageSource, PackageTransferCost, ResultManifest, TreeId,
-    TreeManifest,
+    PackageIdentity, PackageReceipt, PackageSource, PackageTransferCost, ResultManifest,
+    RetainedPackage, TreeId, TreeManifest,
     wire::{
         BeginResult, InputDemand, InputPoll, NativeAdmission, NativeRunRequest, NativeRunResult,
         NativeStatus, ScheduleReply, Ticket, TreeOffer, TreeRead, UploadHeader, WorkerAllocation,
@@ -48,7 +48,8 @@ pub(super) const UPLOAD_PARALLELISM_HEADER: &str = "x-sccache-upload-parallelism
 type LeaseCheck<'a> = dyn Fn() -> Result<()> + Sync + 'a;
 
 #[derive(Serialize, Deserialize)]
-pub(super) struct PackageOriginalRequest {
+pub(super) struct PackageTreeRequest {
+    pub group: Ticket,
     pub locator: PackageLocator,
     pub offline: bool,
 }
@@ -617,50 +618,33 @@ impl NativeCacheClient {
         Ok(receipt)
     }
 
-    /// Retrieve the verified original from the scheduler-owned package store.
-    /// An offline request cannot cause an upstream fetch.
-    pub(crate) fn original_package(
+    /// Retain the already verified package tree without downloading its
+    /// original compressed archive. Offline requests never fetch upstream.
+    pub(crate) fn retain_package(
         &self,
+        group: Ticket,
         locator: &PackageLocator,
         offline: bool,
-    ) -> Result<Option<File>> {
+    ) -> Result<Option<RetainedPackage>> {
         locator.validate()?;
-        let data = codec()
-            .with_limit(self.metadata_limit)
-            .serialize(&PackageOriginalRequest {
+        let result: Option<RetainedPackage> = self.package_control(
+            "package_tree",
+            &PackageTreeRequest {
+                group,
                 locator: locator.clone(),
                 offline,
-            })?;
-        let start = Instant::now();
-        let response = loop {
-            let remaining = self
-                .timeout
-                .checked_sub(start.elapsed())
-                .context("package delivery deadline expired")?;
-            let response = self.send_replayable("package_original", data.clone(), remaining)?;
-            if response.status() == http::StatusCode::NOT_FOUND {
-                return Ok(None);
-            }
-            if response.status() != http::StatusCode::SERVICE_UNAVAILABLE {
-                break response.error_for_status()?;
-            }
-            std::thread::sleep(Duration::from_millis(250));
-        };
-        let length = response
-            .content_length()
-            .context("missing original archive length")?;
-        ensure!(
-            locator.expected_size.is_none_or(|size| size == length),
-            "incorrect archive length"
-        );
-        let mut reader = crate::http_client::ResponseReader::new(response)?;
-        let mut file = tempfile::tempfile()?;
-        ensure!(
-            io::copy(&mut reader, &mut file)? == length,
-            "truncated original archive"
-        );
-        file.rewind()?;
-        Ok(Some(file))
+            },
+        )?;
+        if let Some(package) = &result {
+            package.validate(locator.identity)?;
+            ensure!(
+                locator
+                    .expected_size
+                    .is_none_or(|size| size == package.receipt.source.size),
+                "incorrect retained package archive length"
+            );
+        }
+        Ok(result)
     }
 
     /// Upload the exact original archive for generic compressed transport.

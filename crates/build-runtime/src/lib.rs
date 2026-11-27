@@ -26,7 +26,7 @@ mod placement_class;
 pub use installation::{InstallationManifest, InstallationRecipe, InstalledComponent};
 pub use package::{
     ArchiveLength, PackageArchive, PackageCatalog, PackageCompression, PackageDeliveryLimits,
-    PackageIdentity, PackageReceipt, PackageSource, PackageTransferCost,
+    PackageIdentity, PackageReceipt, PackageSource, PackageTransferCost, RetainedPackage,
 };
 mod recipe;
 mod residency;

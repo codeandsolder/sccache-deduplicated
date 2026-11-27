@@ -3012,6 +3012,15 @@ where
             }
             source_files.sort();
             source_files.dedup();
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            let source_hashes = if let Some(native) = &native {
+                native
+                    .hash_files(&source_files, &source_hashes_pool)
+                    .await?
+            } else {
+                hash_all(&source_files, &source_hashes_pool).await?
+            };
+            #[cfg(not(all(feature = "dist-client", target_os = "linux")))]
             let source_hashes = hash_all(&source_files, &source_hashes_pool).await?;
             Ok((source_files, source_hashes, env_deps, dep_info_text))
         };

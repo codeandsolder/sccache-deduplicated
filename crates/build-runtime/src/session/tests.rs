@@ -2275,3 +2275,79 @@ fn interrupted_incremental_upload_releases_claim_and_rejects_failed_finish() -> 
     assert_eq!(service.commit(ticket, worker)?, output);
     Ok(())
 }
+
+#[test]
+fn build_retention_pins_verified_package_tree_without_original_archive() -> Result<()> {
+    use crate::{PackageCompression, PackageDecoder, PackagePolicy};
+    use sha2::{Digest, Sha256};
+    let temp = tempfile::tempdir()?;
+    let service = service(temp.path())?;
+    let mut archive = tar::Builder::new(Vec::new());
+    let bytes = b"[package]\nname = \"example\"\nversion = \"1.0.0\"\n";
+    let mut header = tar::Header::new_gnu();
+    header.set_mode(0o644);
+    header.set_size(bytes.len() as u64);
+    header.set_cksum();
+    archive.append_data(&mut header, "example-1.0.0/Cargo.toml", &bytes[..])?;
+    let archive = archive.into_inner()?;
+    let identity = PackageIdentity {
+        sha256: Sha256::digest(&archive).into(),
+        compression: PackageCompression::Tar,
+    };
+    let policy = PackagePolicy::normalized_archive(100, 100_000, 100_000, 100_000)?;
+    let package = service.store().import_package(
+        identity,
+        ArchiveLength::Exact(archive.len() as u64),
+        policy,
+        &archive[..],
+        PackageDecoder::InProcess,
+    )?;
+    let owner = test_peer(1);
+    let foreign = test_peer(2);
+    let group = service.open_retention(owner)?;
+    let tree = package.tree().id();
+    let another = service
+        .store()
+        .lookup_package(identity, policy)?
+        .context("missing verified package")?;
+    assert!(service.retain_package(group, foreign, another).is_err());
+    let package = service.retain_package(group, owner, package)?;
+    package.validate(identity)?;
+    let (id, size) = package
+        .manifest
+        .blobs()?
+        .into_iter()
+        .next()
+        .context("missing package file")?;
+    let blob = BlobRef { id, size };
+    let duplicate = service
+        .store()
+        .lookup_package(identity, policy)?
+        .context("missing pinned package")?;
+    assert_eq!(service.retain_package(group, owner, duplicate)?, package);
+    assert_eq!(service.store().evict_tree(tree)?, Eviction::Pinned);
+    assert!(
+        service
+            .store()
+            .lookup_package_archive(identity, policy)?
+            .is_none()
+    );
+    assert!(service.download_retained(group, foreign, blob).is_err());
+    let unrelated = BlobRef {
+        id: ContentId::of(b"not in package"),
+        size: 14,
+    };
+    assert!(service.download_retained(group, owner, unrelated).is_err());
+    let download = service.download_retained(group, owner, blob)?;
+    let mut reader = crate::BlobReader::open(download.file, download.encoding)?;
+    let mut output = Vec::new();
+    reader.read_to_end(&mut output)?;
+    assert_eq!(output, bytes);
+    drop(reader);
+    service.close_retention(group, owner)?;
+    assert!(!matches!(
+        service.store().evict_tree(tree)?,
+        Eviction::Pinned
+    ));
+    Ok(())
+}

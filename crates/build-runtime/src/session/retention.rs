@@ -5,7 +5,7 @@ use super::{
     NativeDownload, NativeSessions, Phase, Publisher, Ready, Result, ResultLease, Ticket, anyhow,
     bail, ensure,
 };
-use crate::ResultId;
+use crate::{ResultId, RetainedPackage, TreeId, VerifiedPackage};
 
 #[derive(Default)]
 pub(super) struct RetentionGroups {
@@ -16,8 +16,40 @@ struct Group {
     owner: crate::PeerId,
     expires: Instant,
     metadata_bytes: u64,
-    results: BTreeMap<ResultId, Arc<ResultLease>>,
-    blobs: BTreeMap<ContentId, (u64, ResultId)>,
+    roots: BTreeMap<RootId, RetainedLease>,
+    blobs: BTreeMap<ContentId, (u64, RootId)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RootId {
+    Result(ResultId),
+    Package(TreeId),
+}
+
+#[derive(Clone)]
+enum RetainedLease {
+    Result(Arc<ResultLease>),
+    Package(Arc<VerifiedPackage>),
+}
+
+impl RetainedLease {
+    fn bytes(&self) -> Result<u64> {
+        Ok(match self {
+            Self::Result(lease) => bincode::serialized_size(lease.manifest())?,
+            Self::Package(package) => bincode::serialized_size(package.tree().manifest())?,
+        })
+    }
+
+    fn download(&self, blob: BlobRef) -> Result<NativeDownload> {
+        let (file, encoding) = match self {
+            Self::Result(lease) => (lease.open_file(blob.id)?, lease.physical_encoding(blob.id)?),
+            Self::Package(package) => (
+                package.tree().open_file(blob.id)?,
+                package.tree().physical_encoding(blob.id)?,
+            ),
+        };
+        Ok(NativeDownload::blob((file, encoding), blob.size))
+    }
 }
 
 impl RetentionGroups {
@@ -53,17 +85,18 @@ impl Group {
 
     fn insert(
         &mut self,
-        lease: Arc<ResultLease>,
-        id: ResultId,
+        lease: RetainedLease,
+        id: RootId,
         blobs: BTreeMap<ContentId, u64>,
         max_metadata: u64,
     ) -> Result<()> {
-        if self.results.contains_key(&id) {
+        if self.roots.contains_key(&id) {
             return Ok(());
         }
         // Bound both the retained manifests and their unique content lookup
         // entries. The physical store's existing quota bounds pinned bytes.
-        let bytes = bincode::serialized_size(lease.manifest())?
+        let bytes = lease
+            .bytes()?
             .checked_add(u64::try_from(blobs.len())?.saturating_mul(128))
             .and_then(|bytes| bytes.checked_add(256))
             .context("native retention metadata size overflow")?;
@@ -86,21 +119,18 @@ impl Group {
         for (blob, size) in blobs {
             self.blobs.entry(blob).or_insert((size, id));
         }
-        self.results.insert(id, lease);
+        self.roots.insert(id, lease);
         self.metadata_bytes = next;
         Ok(())
     }
 
-    fn source(&self, blob: BlobRef) -> Result<Arc<ResultLease>> {
+    fn source(&self, blob: BlobRef) -> Result<RetainedLease> {
         let (size, id) = self
             .blobs
             .get(&blob.id)
             .context("undeclared retained blob")?;
         ensure!(*size == blob.size, "incorrect retained blob length");
-        self.results
-            .get(id)
-            .cloned()
-            .context("retained result missing")
+        self.roots.get(id).cloned().context("retained root missing")
     }
 }
 
@@ -127,7 +157,7 @@ impl NativeSessions {
                 owner,
                 expires: self.deadline(),
                 metadata_bytes: 0,
-                results: BTreeMap::new(),
+                roots: BTreeMap::new(),
                 blobs: BTreeMap::new(),
             },
         );
@@ -176,13 +206,46 @@ impl NativeSessions {
             .context("unknown or expired native retention group")?;
         group.touch(owner, self.deadline())?;
         let result = group.insert(
-            lease,
-            expected,
+            RetainedLease::Result(lease),
+            RootId::Result(expected),
             blobs,
             u64::try_from(self.limits.max_manifest_cache_bytes)?,
         );
         drop(groups);
         result
+    }
+
+    /// Transfer the verified package pin into an authenticated build lease.
+    /// The caller must pass the package obtained from the verified archive
+    /// index/acquisition operation, never an arbitrary client-supplied tree.
+    /// # Errors
+    /// Invalid group, quota, or package from another store.
+    pub fn retain_package(
+        &self,
+        group: Ticket,
+        owner: crate::PeerId,
+        package: VerifiedPackage,
+    ) -> Result<RetainedPackage> {
+        ensure!(
+            package.tree().belongs_to(self.store()),
+            "package belongs to a different store"
+        );
+        let receipt = package.receipt();
+        let manifest = package.tree().manifest().clone();
+        let blobs = package.tree().blobs().clone();
+        let mut groups = self.retained.lock()?;
+        let group = groups
+            .get_mut(&group)
+            .context("unknown or expired native retention group")?;
+        group.touch(owner, self.deadline())?;
+        group.insert(
+            RetainedLease::Package(Arc::new(package)),
+            RootId::Package(receipt.tree),
+            blobs,
+            u64::try_from(self.limits.max_manifest_cache_bytes)?,
+        )?;
+        drop(groups);
+        Ok(RetainedPackage { receipt, manifest })
     }
 
     /// Renew a build-wide lease, independent of the number of retained results.
@@ -241,10 +304,7 @@ impl NativeSessions {
             drop(groups);
             lease
         };
-        Ok(NativeDownload::blob(
-            (lease.open_file(blob.id)?, lease.physical_encoding(blob.id)?),
-            blob.size,
-        ))
+        lease.download(blob)
     }
 
     /// Close a group, releasing all its content pins outside the registry lock.

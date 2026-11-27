@@ -117,6 +117,11 @@ pub struct Sources<'a> {
     pub download: Option<&'a (dyn Fn(&str, &mut fs::File) -> Result<()> + Sync)>,
     pub archive:
         Option<&'a (dyn Fn(&LockedPackage, &Registry, &mut fs::File) -> Result<bool> + Sync)>,
+    /// The managed frontend may expose an already verified CAS tree without
+    /// acquiring or decoding its original archive.
+    pub package_tree: Option<
+        &'a (dyn Fn(&LockedPackage, &Registry, &str, &str) -> Result<Option<PathBuf>> + Sync),
+    >,
     pub registries: Registries,
     materialized: Memo<String, PathBuf>,
     manifests: Memo<PathBuf, Manifest>,
@@ -165,6 +170,7 @@ impl<'a> Sources<'a> {
             scratch,
             download: None,
             archive: None,
+            package_tree: None,
             registries: Registries::default(),
             materialized: Memo::default(),
             manifests: Memo::default(),
@@ -465,6 +471,15 @@ impl<'a> Sources<'a> {
             "invalid registry package name"
         );
         let stem = format!("{}-{}", name, package.version);
+        if let Some(tree) = self.package_tree
+            && let Some(root) = tree(package, &registry, key, &stem)?
+        {
+            ensure!(
+                root.join("Cargo.toml").is_file(),
+                "verified package tree lacks Cargo.toml"
+            );
+            return Ok(root);
+        }
         let filename = format!("{stem}.crate");
         let root = self
             .scratch

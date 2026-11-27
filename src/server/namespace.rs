@@ -280,7 +280,14 @@ impl TransferSession {
                 );
                 let group = client.intermediate(uid, session)?;
                 let file = tokio::task::spawn_blocking(move || {
-                    group.original_package(identity, upstream, path, offline)
+                    let Some(package) = group.retain_package(identity, upstream, path, offline)?
+                    else {
+                        return Ok::<_, anyhow::Error>(None);
+                    };
+                    let mut file = tempfile::tempfile()?;
+                    bincode::serialize_into(&mut file, &package)?;
+                    file.rewind()?;
+                    Ok(Some(file))
                 })
                 .await??;
                 let Some(file) = file else {

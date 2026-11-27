@@ -38,6 +38,10 @@ impl NativeResultSession {
         let blobs = manifest.blobs()?;
         self.client
             .retain_result(self.group, action, manifest.id()?)?;
+        self.record_blobs(blobs)
+    }
+
+    fn record_blobs(&self, blobs: BTreeMap<ContentId, u64>) -> Result<()> {
         let mut retained = self
             .blobs
             .lock()
@@ -49,7 +53,6 @@ impl NativeResultSession {
             );
             retained.insert(id, size);
         }
-        drop(retained);
         Ok(())
     }
 
@@ -66,13 +69,13 @@ impl NativeResultSession {
         Ok(())
     }
 
-    pub fn original_package(
+    pub fn retain_package(
         &self,
         identity: crate::build_runtime::PackageIdentity,
         upstream: String,
         path: String,
         offline: bool,
-    ) -> Result<Option<File>> {
+    ) -> Result<Option<crate::build_runtime::RetainedPackage>> {
         self.check()?;
         let locator = super::PackageLocator {
             identity,
@@ -80,7 +83,11 @@ impl NativeResultSession {
             upstream,
             path,
         };
-        self.client.original_package(&locator, offline)
+        let package = self.client.retain_package(self.group, &locator, offline)?;
+        if let Some(package) = &package {
+            self.record_blobs(package.manifest.blobs()?)?;
+        }
+        Ok(package)
     }
 
     pub fn read(&self, blob: BlobRef) -> Result<File> {

@@ -410,12 +410,13 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
         "--locked requires an existing lockfile"
     );
     let config = Config::load()?;
-    crate::build_lease::with_build_intermediates(|lease, intermediate, token| {
+    crate::build_lease::with_build_intermediates(|lease, intermediate, content| {
         let sources_root = lease.root().join("sources");
         fs::create_dir_all(&sources_root)?;
-        let archive = |package: &sccache_rust_build::LockedPackage,
-                       registry: &sccache_rust_build::Registry,
-                       file: &mut fs::File| {
+        let package_tree = |package: &sccache_rust_build::LockedPackage,
+                            registry: &sccache_rust_build::Registry,
+                            key: &str,
+                            stem: &str| {
             let checksum = package
                 .checksum
                 .as_deref()
@@ -426,18 +427,26 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
             )?;
             let path =
                 registry.archive_path(&package.name, &package.version.to_string(), checksum)?;
-            crate::dist::native::intermediate::package(
-                token,
+            let destination = intermediate
+                .join("package-sources")
+                .join(blake3::hash(key.as_bytes()).to_hex().as_str());
+            if crate::dist::native::intermediate::package(
+                content,
                 identity,
                 &registry.upstream,
                 &path,
                 args.offline,
-                file,
-            )
+                &destination,
+                stem,
+            )? {
+                Ok(Some(destination.join(stem)))
+            } else {
+                Ok(None)
+            }
         };
         let mut sources = Sources::new(&workspace, lock, import, sources_root);
         sources.registries = registries;
-        sources.archive = Some(&archive);
+        sources.package_tree = Some(&package_tree);
         if !args.offline {
             sources.download = Some(&download);
         }

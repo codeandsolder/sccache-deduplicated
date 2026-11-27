@@ -93,6 +93,31 @@ pub struct PackageReceipt {
     pub tree: crate::TreeId,
 }
 
+/// Verified package provenance, retained under a build lease. Clients can
+/// materialize the normalized tree as lazy references to the original CAS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainedPackage {
+    pub receipt: PackageReceipt,
+    pub manifest: crate::TreeManifest,
+}
+
+impl RetainedPackage {
+    /// Check that the scheduler returned the requested package and exact tree.
+    /// # Errors
+    /// Invalid topology or mismatched verified identity.
+    pub fn validate(&self, identity: PackageIdentity) -> Result<()> {
+        ensure!(
+            self.receipt.source.identity == identity,
+            "retained package provenance mismatch"
+        );
+        ensure!(
+            self.manifest.id()? == self.receipt.tree,
+            "retained package tree mismatch"
+        );
+        Ok(())
+    }
+}
+
 /// Length expectation for original archive ingestion. A checksum is mandatory
 /// even when the upstream HTTP response has no Content-Length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

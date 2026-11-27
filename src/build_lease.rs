@@ -165,7 +165,7 @@ impl Drop for ScratchLease {
 /// store for the duration of a command or a whole native planning session.
 #[cfg(feature = "dist-client")]
 pub(crate) fn with_build_intermediates<T>(
-    execute: impl FnOnce(&ScratchLease, &Path, crate::build_runtime::wire::Ticket) -> Result<T>,
+    execute: impl FnOnce(&ScratchLease, &Path, &crate::dist::native::intermediate::Content) -> Result<T>,
 ) -> Result<T> {
     // The launcher owns the mount and one connection-owned retention
     // lease. It is not a compiler or another cache daemon.
@@ -190,15 +190,16 @@ pub(crate) fn with_build_intermediates<T>(
         fs::create_dir(path)?;
     }
     let (token, connection) = crate::dist::native::intermediate::open()?;
+    let content = crate::dist::native::intermediate::content(token);
     let filesystem = crate::build_runtime::intermediate_fs::mount_intermediates(
         &mount,
         &backing,
         &spool,
         token,
-        crate::dist::native::intermediate::content(),
+        content.clone(),
     )
     .context("mount leased build intermediates")?;
-    let result = execute(&scratch, &mount, token);
+    let result = execute(&scratch, &mount, &content);
     scratch.wait_for_descendants()?;
     drop(filesystem);
     drop(connection);
