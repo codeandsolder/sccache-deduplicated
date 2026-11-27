@@ -254,7 +254,7 @@ pub struct AdmissionCounts {
 }
 
 impl AdmissionCounts {
-    #[must_use]
+    #[must_use = "Counter deltas are unavailable if any counter regressed."]
     pub fn since(self, baseline: Self) -> Option<Self> {
         Some(Self {
             hits: self.hits.checked_sub(baseline.hits)?,

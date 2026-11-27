@@ -62,7 +62,7 @@ impl AdmissionCounters {
 
 impl NativeSessions {
     /// Process-lifetime counters; no storage locks or external telemetry.
-    #[must_use]
+    #[must_use = "Admission statistics are a read-only observation."]
     pub fn admission_stats(&self) -> AdmissionStats {
         self.admission_counters.snapshot()
     }

@@ -318,18 +318,18 @@ const fn execution_protocols(archive: bool, native: bool) -> &'static str {
 fn row_text<T, F>(
     row: Memo<Option<T>>,
     format: F,
-) -> impl Fn() -> String + Send + Sync + Clone + 'static
+) -> impl Fn() -> String + Send + Sync + Copy + 'static
 where
     T: Send + Sync + 'static,
-    F: Fn(&T) -> String + Send + Sync + Clone + 'static,
+    F: Fn(&T) -> String + Send + Sync + Copy + 'static,
 {
     move || row.with(|value| value.as_ref().map_or_else(String::new, &format))
 }
 
 fn native_text(
     worker: Memo<Option<Worker>>,
-    format: impl Fn(&crate::NativeWorker) -> String + Send + Sync + Clone + 'static,
-) -> impl Fn() -> String + Send + Sync + Clone + 'static {
+    format: impl Fn(&crate::NativeWorker) -> String + Send + Sync + Copy + 'static,
+) -> impl Fn() -> String + Send + Sync + Copy + 'static {
     row_text(worker, move |worker| {
         worker.native.as_ref().map_or_else(|| "—".into(), &format)
     })
@@ -352,14 +352,14 @@ fn WorkerCells(worker: Memo<Option<Worker>>, sampled_at: Memo<Option<u64>>) -> i
         })
     });
     view! {
-        <td><b>{row_text(worker, |worker| worker.name.clone())}</b><small title=identity.clone()>{identity}</small>
+        <td><b>{row_text(worker, |worker| worker.name.clone())}</b><small title=identity>{identity}</small>
             <small>{row_text(worker, |worker| execution_protocols(worker.archive_available.is_some(), worker.native_available.is_some()).into())}</small>
         </td>
         <td>
             <span class=move || if worker.with(|worker| worker.as_ref().is_some_and(|worker| sampled_at.get().is_some_and(|now| now.saturating_mul(1000).saturating_sub(worker.heartbeat_at_ms)>15_000))) {styles::warning} else {styles::healthy}>
                 {row_text(worker, move |worker| age_since(sampled_at.get(),worker.heartbeat_at_ms))}
             </span>
-            <small class=styles::warning title=last_error.clone()>{last_error}</small>
+            <small class=styles::warning title=last_error>{last_error}</small>
         </td>
         <td>{row_text(worker, |worker| format!("{:.1}",worker.cpu_capacity))}</td>
         <td>{row_text(worker, |worker| worker.assigned.to_string())}<small>{row_text(worker, |worker| format!("{} assigning",worker.assigning))}</small></td>
@@ -369,7 +369,7 @@ fn WorkerCells(worker: Memo<Option<Worker>>, sampled_at: Memo<Option<u64>>) -> i
             <small>{row_text(worker, |worker| format!("CAS: {}",worker.native_available.map_or_else(||"—".into(),|value|value.to_string())))}</small></td>
         <td>{native_text(worker, |native| format!("{} / {}", native.compiler_active, native.compiler_slots))}</td>
         <td>{native_text(worker, |native| format!("{} / {}", native.reservations, native.capacity))}</td>
-        <td title=phases.clone()><span class=styles::clamped>{phases}</span></td>
+        <td title=phases><span class=styles::clamped>{phases}</span></td>
         <td>{native_text(worker, |native| bytes(native.remaining_input_bytes))}</td>
         <td>
             {native_text(worker, |native| if native.execution_ns == 0 {"Execution unobserved".into()} else {format!("{} execution", age(std::time::Duration::from_nanos(native.execution_ns).as_secs_f64()))})}
@@ -481,12 +481,12 @@ fn JobCells(job: Memo<Option<Job>>, sampled_at: Memo<Option<u64>>) -> impl IntoV
     let worker_id = row_text(job, |job| job.worker_id.clone());
     view! {
         <td>
-            <b class=styles::clamped title=title.clone()>{title}</b>
+            <b class=styles::clamped title=title>{title}</b>
             <small>{row_text(job, |job| job.description.as_ref().map_or_else(String::new, |description| description.target.clone().unwrap_or_else(|| "Target not explicit".into())))}</small>
             <small title=requester>{row_text(job, |job| job.description.as_ref().map_or_else(String::new, |description| description.requester.as_ref().map_or_else(|| "Requester not reported".into(), |id| format!("Client {}", id.chars().take(12).collect::<String>()))))}</small>
             <small>{row_text(job, |job| format!("Job {}",job.id))}</small>
         </td>
-        <td>{row_text(job, |job| job.worker.clone())}<small title=worker_id.clone()>{worker_id}</small></td>
+        <td>{row_text(job, |job| job.worker.clone())}<small title=worker_id>{worker_id}</small></td>
         <td>{row_text(job, |job| job.state.clone())}</td>
         <td>{row_text(job, |job| job.native_phase.as_deref().map_or_else(|| "—".into(), |phase| phase_label(phase).into()))}
             <small>{row_text(job, |job| job.native_phase_observed_ns.map_or_else(String::new, |ns| format!("{} at observation",age(std::time::Duration::from_nanos(ns).as_secs_f64()))))}</small>
