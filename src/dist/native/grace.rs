@@ -491,6 +491,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parked_forecast_wakes_on_release() -> Result<()> {
+        let pool = ArtifactGrace::new(Duration::from_secs(300), 8)?;
+        let held = pool.reserve(8)?.context("initial forecast")?;
+        let check = || Ok(());
+        let waiting = pool.reserve_until(8, Duration::from_secs(2), &check);
+        tokio::pin!(waiting);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(held);
+        let (reservation, waited) = waiting.await?;
+        assert!(waited);
+        assert!(pool.reserve(1)?.is_none());
+        drop(reservation);
+        assert!(pool.reserve(8)?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parked_exact_publication_wakes_at_expiry() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = NativeStore::open(directory.path())?;
+        let pool = ArtifactGrace::new(Duration::from_millis(100), 8)?;
+        let first = pool.reserve(4)?.context("first forecast")?;
+        let second = pool.reserve(4)?.context("second forecast")?;
+        let lease = result(&store, b"12345678")?;
+        let next = result(&store, b"abcdefgh")?;
+        let (expiry, _) = first
+            .promote()
+            .commit(lease, (Duration::ZERO, &|| Ok(())))
+            .await?;
+        let check = || Ok(());
+        let waiting = second
+            .promote()
+            .commit(next, (Duration::from_secs(2), &check));
+        tokio::pin!(waiting);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(pool.reserve(0)?.is_none());
+        let (_, waited) = waiting.await?;
+        assert!(waited);
+        assert!(Instant::now() >= expiry);
+        let state = pool.state.lock().unwrap();
+        assert_eq!(state.bytes, 8);
+        assert_eq!(state.results.len(), 1);
+        assert_eq!(state.waiting_publishers, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_grace_exact_publishers_supersede_forecasts_without_early_eviction() -> Result<()>
     {
         let directory = tempfile::tempdir()?;
