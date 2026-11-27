@@ -701,7 +701,7 @@ fn JobTable(
                         <option value="">"All phases"</option>
                         <For each=move || phase_keys.get() key=Clone::clone children=move |key| {
                             let name = key.clone();
-                            view!{<option value=key>{move || format!("{} ({})",name,phases.with(|counts| counts.get(&name).copied().unwrap_or_default()))}</option>}
+                            view!{<option value=key>{move || format!("{name} ({})",phases.with(|counts| counts.get(&name).copied().unwrap_or_default()))}</option>}
                         }/>
                     </select>
                 </label>
@@ -726,6 +726,9 @@ fn JobTable(
 }
 
 fn input_coverage(job: &Job) -> Option<f64> {
+    if job.native_phase.as_deref() == Some("Terminal") {
+        return None;
+    }
     let total = job.description.as_ref()?.input_bytes;
     let remaining = job.remaining_input_bytes?;
     if total == 0 || remaining > total {
@@ -828,6 +831,7 @@ mod job_tests {
             input_coverage(&jobs[0]).is_some_and(|coverage| (coverage - 90.0).abs() < f64::EPSILON)
         );
         assert_eq!(input_coverage(&job("4", "serde", "Staging", 101)), None);
+        assert_eq!(input_coverage(&job("4", "serde", "Terminal", 0)), None);
         let mut unknown = job("4", "serde", "Staging", 0);
         unknown.assigned_at_ms = None;
         unknown.remaining_input_bytes = None;

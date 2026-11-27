@@ -115,13 +115,14 @@ impl DashboardSource {
         Memo::new(move |_| {
             let _ = version.get();
             self.live.with_untracked(|live| {
-                if let Some(live) = live {
-                    read(Some(live))
-                } else {
-                    self.initial.with(|initial| {
-                        read(initial.as_ref().and_then(|result| result.as_ref().ok()))
-                    })
-                }
+                live.as_ref().map_or_else(
+                    || {
+                        self.initial.with(|initial| {
+                            read(initial.as_ref().and_then(|result| result.as_ref().ok()))
+                        })
+                    },
+                    |live| read(Some(live)),
+                )
             })
         })
     }
