@@ -626,6 +626,11 @@ docker run -ti --rm -v $PWD:/sccache luser/sccache-musl-build:0.1 /bin/bash -c "
 
 ## Local scheduler status dashboard
 
+The dashboard opens on Overview. The remaining tabs are Workers, Jobs, CAS,
+Cache hits, Cache storage, Topology, Network and Fleet metrics. Switching tabs
+preserves filters, pagination and topology selection; updates retain keyed table
+cells and fixed column widths instead of rebuilding rows.
+
 ### Live network topology
 
 The dashboard's **Topology** view projects authenticated scheduler, worker,
@@ -702,14 +707,36 @@ are not recomputed in response to scheduler mutations.
 All scheduler-owned reservations, including assignment RPCs in flight, are
 available through a searchable, paginated table. Archive and native admission
 headroom are shown separately; they share compiler capacity and must not be added.
+Worker protocol labels distinguish CAS execution, legacy archive, both, or
+neither; CAS execution describes the transport/execution protocol, not the
+compiler's target architecture. Native job rows include the executable basename,
+Rust crate name or declared output basename, explicit target when present,
+requester identity and total/remaining input bytes and blob counts. The dashboard
+does not retain full command lines, environment variables or authorization data.
 No thousand-job truncation. Expired workers are excluded without
 mutating scheduling state. Native compiler slots are not legacy allocations;
 logical CAS bytes are not physical filesystem usage; measured transport
 goodput is not physical link capacity.
 
+### Cache hit statistics
+
+The Cache hits tab includes native scheduler admissions independently of the
+fleet metrics backend. Counts are available since scheduler start and for
+observed rolling five- and fifteen-minute windows. The admission hit rate is
+hits divided by hits plus reuse-mode compile admissions. Forced refreshes,
+in-flight requests, missing-input responses, busy responses and errors are
+reported separately rather than counted as cache misses. Admissions are not
+completed compilations or guarantees of successful result delivery.
+An idle denominator or unavailable window is displayed as unavailable.
+
+Fleet metrics separately report completed client cache outcomes over the selected
+range and rolling windows, broken down by client and compiler/language, plus
+legacy tier operations, bypasses and errors. The two sources are not summed.
+Counter increases account for restarts; absent samples remain absent.
+
 ### Fleet history
 
-If configured, Liberta supplies the existing Grafana dashboard plus cache-tier analytics (42 query
+If configured, Liberta supplies the existing Grafana dashboard plus cache-tier analytics (50 query
 panels total). Select an exact client or all clients and a range from 15 minutes
 to seven days. Requests use fixed server-side PromQL templates; user labels
 are escaped as literal regular expressions. Linux host-wide panels include monitored Linux hosts rather than claiming all

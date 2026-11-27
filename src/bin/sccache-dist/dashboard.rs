@@ -6,12 +6,66 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use sccache_dashboard::{
-    HostRole, Job, NativeWorker, NetworkHost, NetworkLink, RouteEvidence, Snapshot, Worker,
+    HostRole, Job, JobDescription, NativeWorker, NetworkHost, NetworkLink, RouteEvidence, Snapshot,
+    Worker,
 };
 
 use super::{Scheduler, ServerDetails};
 use sccache::build_runtime::wire::NativeJobPhase;
 use sccache::dist::{self, ServerId};
+
+// Keep only bounded, human-facing labels. Never retain argv, environment,
+// authorization, or absolute paths in the dashboard's job roster.
+fn label(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(96)
+        .collect()
+}
+
+fn basename(path: &[u8]) -> String {
+    label(path.rsplit(|byte| *byte == b'/').next().unwrap_or(path))
+}
+
+fn argument_value(arguments: &[Vec<u8>], flag: &[u8]) -> Option<String> {
+    arguments.iter().enumerate().find_map(|(index, argument)| {
+        let value = if argument == flag {
+            arguments.get(index + 1)?.as_slice()
+        } else {
+            argument.strip_prefix(flag)?.strip_prefix(b"=")?
+        };
+        // A custom target JSON path is not a target triple. Use only its basename.
+        let value = basename(value);
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+pub(super) fn describe_native(assignment: &dist::NativeAssignment) -> JobDescription {
+    let spec = &assignment.spec;
+    let subject = argument_value(&spec.command.arguments, b"--crate-name").or_else(|| {
+        let mut outputs = spec.outputs.values();
+        let first = basename(outputs.next()?.path.as_bytes());
+        let remaining = outputs.len();
+        Some(if remaining == 0 {
+            first
+        } else {
+            format!("{first} (+{remaining} outputs)")
+        })
+    });
+    JobDescription {
+        executable: basename(spec.command.executable.as_bytes()),
+        subject,
+        target: argument_value(&spec.command.arguments, b"--target"),
+        requester: assignment.receiver.as_ref().map(|(id, _)| id.to_string()),
+        input_bytes: assignment
+            .input_blobs
+            .values()
+            .copied()
+            .fold(0, u64::saturating_add),
+        input_blobs: assignment.input_blobs.len(),
+    }
+}
 
 fn timestamp_ms(instant: Instant) -> u64 {
     static ORIGIN: std::sync::OnceLock<(Instant, u64)> = std::sync::OnceLock::new();
@@ -265,6 +319,11 @@ pub fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
             );
             snapshot.jobs.push(Job {
                 id: job_id.to_string(),
+                description: details
+                    .jobs_assigned
+                    .get(job_id)
+                    .and_then(Option::as_ref)
+                    .and_then(|native| native.dashboard.clone()),
                 worker: worker.name.clone(),
                 worker_id: worker.id.clone(),
                 state,

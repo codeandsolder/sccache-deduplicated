@@ -1,7 +1,8 @@
 //! Read-only projection of the existing CAS and transport measurements.
 use crate::build_runtime::{NativeSessions, NetworkMeter, SessionStatus, SpaceStatus};
 use sccache_dashboard::{
-    CacheSpace, ManifestCache, NativeService, NativeTelemetry, RecoveryQueue, TicketCounts,
+    AdmissionCounts, CacheSpace, ManifestCache, NativeService, NativeTelemetry, RecoveryQueue,
+    TicketCounts,
 };
 
 fn service(status: SessionStatus) -> NativeService {
@@ -46,7 +47,19 @@ fn space(status: SpaceStatus) -> CacheSpace {
 }
 
 pub(super) fn snapshot(sessions: &NativeSessions, network: &NetworkMeter) -> NativeTelemetry {
-    let mut snapshot = NativeTelemetry::default();
+    let stats = sessions.admission_stats();
+    let mut snapshot = NativeTelemetry {
+        admission: Some(AdmissionCounts {
+            hits: stats.hits,
+            misses: stats.misses,
+            refreshes: stats.refreshes,
+            in_flight: stats.in_flight,
+            missing_inputs: stats.missing_inputs,
+            busy: stats.busy,
+            errors: stats.errors,
+        }),
+        ..Default::default()
+    };
     match sessions.store().stats() {
         Ok(stats) => {
             snapshot.cache = Some(sccache_dashboard::Cache {

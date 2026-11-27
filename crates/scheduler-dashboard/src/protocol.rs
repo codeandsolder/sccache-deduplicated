@@ -116,6 +116,7 @@ mod tests {
     fn job(id: &str) -> Job {
         Job {
             id: id.into(),
+            description: None,
             worker: "worker".into(),
             worker_id: "127.0.0.1:1".into(),
             state: "ready".into(),
@@ -179,6 +180,7 @@ mod tests {
             ..Default::default()
         };
         let sample = Sample {
+            admission: None,
             unix_secs: 1,
             totals: Totals::default(),
         };
@@ -277,6 +279,7 @@ mod tests {
             Some(&snapshot),
             Some(1),
             Some(Sample {
+                admission: None,
                 unix_secs: 1,
                 totals: Totals::default(),
             }),
@@ -345,7 +348,11 @@ fn series_patch(old: &MetricSeries, new: &MetricSeries) -> Option<SeriesPatch> {
 }
 
 fn panel_patch(old: &MetricPanel, new: &MetricPanel) -> Option<PanelPatch> {
-    if old.title != new.title || old.unit != new.unit || old.kind != new.kind {
+    if old.title != new.title
+        || old.unit != new.unit
+        || old.kind != new.kind
+        || old.cache_hits != new.cache_hits
+    {
         return Some(PanelPatch::Replace(new.clone()));
     }
     let mut previous: BTreeMap<_, _> = old
@@ -490,6 +497,7 @@ mod metrics_tests {
     fn rolling_range_and_late_correction_reconstruct_exact_data() {
         let panel = MetricPanel {
             key: 0,
+            cache_hits: false,
             kind: crate::PanelKind::Timeseries,
             title: "Test".into(),
             unit: "s".into(),

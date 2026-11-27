@@ -64,9 +64,21 @@ pub struct NativeWorker {
     pub residency_reported: bool,
 }
 
+/// Bounded display metadata projected from an admitted execution declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobDescription {
+    pub executable: String,
+    pub subject: Option<String>,
+    pub target: Option<String>,
+    pub requester: Option<String>,
+    pub input_bytes: u64,
+    pub input_blobs: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Job {
     pub id: String,
+    pub description: Option<JobDescription>,
     pub worker: String,
     pub worker_id: String,
     pub state: String,
@@ -230,9 +242,36 @@ pub struct NativeService {
 
 pub use sccache_build::analytics::CacheAnalyticsSample as AnalyticsObservation;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionCounts {
+    pub hits: u64,
+    pub misses: u64,
+    pub refreshes: u64,
+    pub in_flight: u64,
+    pub missing_inputs: u64,
+    pub busy: u64,
+    pub errors: u64,
+}
+
+impl AdmissionCounts {
+    #[must_use]
+    pub fn since(self, baseline: Self) -> Option<Self> {
+        Some(Self {
+            hits: self.hits.checked_sub(baseline.hits)?,
+            misses: self.misses.checked_sub(baseline.misses)?,
+            refreshes: self.refreshes.checked_sub(baseline.refreshes)?,
+            in_flight: self.in_flight.checked_sub(baseline.in_flight)?,
+            missing_inputs: self.missing_inputs.checked_sub(baseline.missing_inputs)?,
+            busy: self.busy.checked_sub(baseline.busy)?,
+            errors: self.errors.checked_sub(baseline.errors)?,
+        })
+    }
+}
+
 /// Independent, periodically collected CAS and network observations.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NativeTelemetry {
+    pub admission: Option<AdmissionCounts>,
     pub analytics: Option<AnalyticsObservation>,
     pub sampled_at: u64,
     pub cache: Option<Cache>,
@@ -248,6 +287,7 @@ pub struct NativeTelemetry {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
+    pub admission: Option<AdmissionCounts>,
     pub unix_secs: u64,
     pub totals: Totals,
 }
@@ -281,6 +321,7 @@ pub enum PanelKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricPanel {
     pub key: usize,
+    pub cache_hits: bool,
     pub kind: PanelKind,
     pub title: String,
     pub unit: String,

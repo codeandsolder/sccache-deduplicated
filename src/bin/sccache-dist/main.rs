@@ -1432,6 +1432,8 @@ impl Scheduler {
         let class = native
             .map(|assignment| placement::ActionClass::from_spec(&assignment.spec))
             .transpose()?;
+        #[cfg(feature = "scheduler-dashboard")]
+        let description = native.map(dashboard::describe_native);
         // LOCKS
         let mut servers = self
             .servers
@@ -1512,6 +1514,8 @@ impl Scheduler {
             }));
         }
         let assigned = native_inputs.map(|inputs| placement::AssignedNative {
+            #[cfg(feature = "scheduler-dashboard")]
+            dashboard: description,
             packages: std::sync::Arc::clone(packages),
             inputs: inputs.clone(),
             class,
@@ -3021,6 +3025,8 @@ mod scheduler_tests {
             (
                 JobId(1),
                 Some(placement::AssignedNative {
+                    #[cfg(feature = "scheduler-dashboard")]
+                    dashboard: None,
                     packages: Default::default(),
                     inputs: inputs.clone(),
                     class: None,
@@ -3031,6 +3037,8 @@ mod scheduler_tests {
             (
                 JobId(2),
                 Some(placement::AssignedNative {
+                    #[cfg(feature = "scheduler-dashboard")]
+                    dashboard: None,
                     packages: Default::default(),
                     inputs: inputs.clone(),
                     class: None,
@@ -3602,8 +3610,13 @@ mod scheduler_tests {
                 native_placement: Some(dist::NativePlacement::default()),
             },
         )?;
-        let assignment =
+        let mut assignment =
             native_test_assignment(platform, BTreeMap::from([(ContentId([1; 32]), 10)]))?;
+        assignment.spec.command.arguments = vec![
+            b"--crate-name".to_vec(),
+            b"example_crate".to_vec(),
+            b"--target=x86_64-unknown-linux-gnu".to_vec(),
+        ];
         let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
             .handle_alloc_native_job(
                 &AcceptAssign,
@@ -3622,6 +3635,23 @@ mod scheduler_tests {
                 .map(|job| &job.inputs),
             Some(&BTreeMap::from([(ContentId([1; 32]), 10)]))
         );
+        #[cfg(feature = "scheduler-dashboard")]
+        {
+            let snapshot = scheduler.handle_dashboard_snapshot()?;
+            let job = &snapshot.jobs[0];
+            let description = job
+                .description
+                .as_ref()
+                .context("missing job description")?;
+            assert_eq!(description.executable, "tool");
+            assert_eq!(description.subject.as_deref(), Some("example_crate"));
+            assert_eq!(
+                description.target.as_deref(),
+                Some("x86_64-unknown-linux-gnu")
+            );
+            assert_eq!(description.input_bytes, 10);
+            assert_eq!(description.input_blobs, 1);
+        }
         let saturated = Arc::clone(&scheduler)
             .handle_alloc_native_job(
                 &AcceptAssign,

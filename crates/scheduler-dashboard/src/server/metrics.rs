@@ -36,6 +36,8 @@ struct PanelDefinition {
     queries: Vec<QueryDefinition>,
     #[serde(default)]
     requires_client: bool,
+    #[serde(default)]
+    cache_hits: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -464,6 +466,7 @@ async fn read_panel(
 ) -> MetricPanel {
     let mut panel = MetricPanel {
         key,
+        cache_hits: definition.cache_hits,
         kind: definition.kind,
         title: definition.title,
         unit: definition.unit,
@@ -701,7 +704,7 @@ mod tests {
     #[test]
     fn manifest_is_complete_and_client_cannot_inject_promql() -> Result<()> {
         let panels: Vec<PanelDefinition> = serde_json::from_str(include_str!("../panels.json"))?;
-        assert_eq!(panels.len(), 42);
+        assert_eq!(panels.len(), 50);
         let view = MetricsView {
             client: "host.*\"} or vector(1) #".into(),
             ..Default::default()

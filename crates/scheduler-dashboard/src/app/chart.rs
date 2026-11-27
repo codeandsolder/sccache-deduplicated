@@ -204,15 +204,27 @@ pub(super) fn PanelContent(
     if panel.kind == PanelKind::Timeseries {
         return graph(panel.series, &panel.unit, step).into_any();
     }
+    let current_only = panel.cache_hits && panel.kind == PanelKind::Stat;
     let rows = panel
         .series
         .into_iter()
         .filter_map(|series| {
-            let (time, value) = series
-                .points
-                .iter()
-                .rev()
-                .find_map(|(time, value)| value.map(|value| (*time, value)))?;
+            let (time, value) = if current_only {
+                let (time, value) = series.points.last()?;
+                (*time, (*value)?)
+            } else {
+                series
+                    .points
+                    .iter()
+                    .rev()
+                    .find_map(|(time, value)| value.map(|value| (*time, value)))?
+            };
+            if current_only
+                && sampled_at
+                    .is_some_and(|end| display_count(end) - time > display_count(step) * 1.5)
+            {
+                return None;
+            }
             Some((series.label, time, value))
         })
         .collect::<Vec<_>>();

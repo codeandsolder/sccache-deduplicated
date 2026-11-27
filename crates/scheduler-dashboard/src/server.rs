@@ -64,6 +64,7 @@ impl DashboardState {
                     }
                     let timestamp = now();
                     let sample = history.then(|| Sample {
+                        admission: telemetry.as_ref().and_then(|value| value.admission),
                         unix_secs: timestamp,
                         totals: snapshot.totals.clone(),
                     });

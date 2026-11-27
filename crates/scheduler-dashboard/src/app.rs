@@ -112,6 +112,37 @@ fn ConnectionIndicator(status: RwSignal<ConnectionStatus>, retry: RwSignal<u64>)
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Overview,
+    Workers,
+    Jobs,
+    Cas,
+    CacheHits,
+    CacheAnalytics,
+    Topology,
+    Network,
+    Fleet,
+}
+
+impl Tab {
+    const ALL: [(Self, &'static str); 9] = [
+        (Self::Overview, "Overview"),
+        (Self::Workers, "Workers"),
+        (Self::Jobs, "Jobs"),
+        (Self::Cas, "CAS"),
+        (Self::CacheHits, "Cache hits"),
+        (Self::CacheAnalytics, "Cache storage"),
+        (Self::Topology, "Topology"),
+        (Self::Network, "Network"),
+        (Self::Fleet, "Fleet metrics"),
+    ];
+
+    const fn metrics(self) -> bool {
+        matches!(self, Self::CacheHits | Self::Fleet)
+    }
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
@@ -121,6 +152,7 @@ pub fn App() -> impl IntoView {
     let live = RwSignal::new(None::<DashboardData>);
     let status = RwSignal::new(ConnectionStatus::Connecting);
     let retry = RwSignal::new(0_u64);
+    let tab = RwSignal::new(Tab::Overview);
     #[cfg(target_arch = "wasm32")]
     Effect::new(move |_| {
         let _ = retry.get();
@@ -142,20 +174,25 @@ pub fn App() -> impl IntoView {
         <Title text="sccache | Scheduler status"/>
         <header class=styles::top>
             <div><small>"SCCACHE / DISTRIBUTED BUILD"</small><h1>"Scheduler status"</h1></div>
-            <nav><a href="#workers">"Workers"</a><a href="#jobs">"Jobs"</a><a href="#cas">"CAS"</a><a href="#cache-analytics">"Cache analytics"</a><a href="#topology">"Topology"</a><a href="#network">"Network"</a><a href="#metrics">"Fleet metrics"</a></nav>
+            <nav aria-label="Dashboard views">
+                {Tab::ALL.into_iter().map(|(item, label)| view! {
+                    <button class=styles::tab aria-pressed=move || (tab.get() == item).to_string()
+                        on:click=move |_| tab.set(item)>{label}</button>
+                }).collect_view()}
+            </nav>
         </header>
         <main>
             <ConnectionIndicator status=status retry=retry/>
             <Suspense fallback=|| view! { <p>"Waiting for initial scheduler snapshot…"</p> }>
-                <native::NativeStatus data=data/>
+                <native::NativeStatus data=data tab=tab/>
             </Suspense>
-            <FleetMetrics/>
+            <FleetMetrics tab=tab/>
         </main>
     }
 }
 
 #[component]
-fn FleetMetrics() -> impl IntoView {
+fn FleetMetrics(tab: RwSignal<Tab>) -> impl IntoView {
     let view = RwSignal::new(MetricsView::default());
     let data = RwSignal::new(MetricsData::default());
     let clients = RwSignal::new(Vec::<String>::new());
@@ -207,7 +244,11 @@ fn FleetMetrics() -> impl IntoView {
     });
     let step = Signal::derive(move || data.with(|data| data.view.range.step()));
     view! {
-        <section id="metrics"><h2>"Fleet telemetry"</h2>
+        <section id="metrics" hidden=move || !tab.get().metrics()>
+            <h2>{move || if tab.get() == Tab::CacheHits {"Cache hit statistics"} else {"Fleet telemetry"}}</h2>
+            <p class=styles::muted hidden=move || tab.get() != Tab::CacheHits>
+                "Hit rate = hits / (hits + misses), including native and legacy compiler results. Errors and bypasses are shown separately; tier lookups are not compile requests. Window counts are counter increases (extrapolated at scrape boundaries). No traffic or unavailable telemetry is not a 0% hit rate."
+            </p>
             <ConnectionIndicator status=status retry=retry/>
             <div class=styles::controls>
                 <label>"Range"
@@ -235,7 +276,8 @@ fn FleetMetrics() -> impl IntoView {
                 <For each=move || panels.get() key=|key| *key children=move |key| {
                     let panel = Memo::new(move |_| panel_data.with(|panels| panels.get(&key).cloned()));
                     view! {
-                        <article>{move || panel.get().map(|panel| {
+                        <article hidden=move || panel.with(|panel| panel.as_ref().is_none_or(|panel| panel.cache_hits != (tab.get() == Tab::CacheHits)))>
+                        {move || panel.get().map(|panel| {
                             let title = panel.title.clone();
                             let error = panel.error.clone();
                             let sampled_at = data.with(|data| data.sampled_at);
