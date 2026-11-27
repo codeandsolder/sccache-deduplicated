@@ -69,13 +69,18 @@ fn physical_pressure_evicts_oldest_root_but_never_active_leases() -> Result<()> 
     )?;
     // Simulate physical pressure which is relieved by reclaiming the newer
     // action, not by assuming its logical length equals reclaimed disk space.
-    let report = store.reclaim(policy(), 10, 20, || {
-        Ok(if store.stats()?.actions == 2 {
-            100
-        } else {
-            250
-        })
-    })?;
+    let report = store.reclaim(
+        policy(),
+        || Ok(10),
+        20,
+        || {
+            Ok(if store.stats()?.actions == 2 {
+                100
+            } else {
+                250
+            })
+        },
+    )?;
     assert_eq!(report.evicted_roots, 1);
     assert!(report.minimum_satisfied);
     assert!(store.lookup(newer)?.is_none());
@@ -93,7 +98,7 @@ fn unreclaimable_space_rejects_admission_and_work_is_bounded() -> Result<()> {
     let new = publish(&store, "new")?;
     let mut p = policy();
     p.max_evictions_per_pass = 1;
-    let report = store.reclaim(p, 50, 50, || Ok(10))?;
+    let report = store.reclaim(p, || Ok(50), 50, || Ok(10))?;
     assert_eq!(report.evicted_roots, 1);
     assert!(!report.minimum_satisfied);
     assert!(store.lookup(old)?.is_none());
@@ -145,9 +150,12 @@ fn reuse_favors_a_hot_root_over_a_newer_cold_root() -> Result<()> {
     let cold = publish(&store, "cold")?;
     let mut limit = policy();
     limit.max_evictions_per_pass = 1;
-    let report = store.reclaim(limit, 0, 0, || {
-        Ok(if store.stats()?.actions == 2 { 0 } else { 300 })
-    })?;
+    let report = store.reclaim(
+        limit,
+        || Ok(0),
+        0,
+        || Ok(if store.stats()?.actions == 2 { 0 } else { 300 }),
+    )?;
     assert_eq!(report.evicted_roots, 1);
     assert!(store.lookup(hot)?.is_some());
     assert!(store.lookup(cold)?.is_none());
@@ -255,9 +263,12 @@ fn usage_survives_restart_and_is_removed_with_evicted_roots() -> Result<()> {
     drop(usage);
     let mut limit = policy();
     limit.max_evictions_per_pass = 1;
-    let report = store.reclaim(limit, 0, 0, || {
-        Ok(if store.stats()?.actions == 2 { 0 } else { 300 })
-    })?;
+    let report = store.reclaim(
+        limit,
+        || Ok(0),
+        0,
+        || Ok(if store.stats()?.actions == 2 { 0 } else { 300 }),
+    )?;
     assert_eq!(report.evicted_roots, 1);
     assert!(store.lookup(hot)?.is_some());
     assert!(store.lookup(cold)?.is_none());
@@ -286,7 +297,7 @@ fn resident_limit_evicts_even_when_filesystem_has_plenty_of_space() -> Result<()
     let mut limit = policy();
     limit.max_resident_bytes = 8;
     limit.target_resident_bytes = 6;
-    let report = store.reclaim(limit, 0, 0, || Ok(100_000))?;
+    let report = store.reclaim(limit, || Ok(0), 0, || Ok(100_000))?;
     assert!(report.minimum_satisfied);
     assert_eq!(report.evicted_roots, 2);
     assert!(report.resident_bytes <= 6);
@@ -305,11 +316,11 @@ fn active_content_is_never_evicted_to_meet_a_worker_budget() -> Result<()> {
     let mut limit = policy();
     limit.max_resident_bytes = 1;
     limit.target_resident_bytes = 1;
-    let report = store.reclaim(limit, 0, 0, || Ok(100_000))?;
+    let report = store.reclaim(limit, || Ok(0), 0, || Ok(100_000))?;
     assert_eq!(report.evicted_roots, 0);
     assert!(!report.minimum_satisfied);
     drop(pin);
-    let report = store.reclaim(limit, 0, 0, || Ok(100_000))?;
+    let report = store.reclaim(limit, || Ok(0), 0, || Ok(100_000))?;
     assert!(report.minimum_satisfied);
     assert_eq!(report.resident_bytes, 0);
     Ok(())
@@ -934,7 +945,7 @@ fn observation_does_not_reclaim_or_wait_for_admission() -> Result<()> {
 }
 
 #[test]
-fn admission_reclaims_only_the_required_headroom() -> Result<()> {
+fn maintenance_replenishes_headroom_before_admission_pressure() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = NativeStore::open(dir.path())?;
     for name in ["aaa", "bbb", "ccc"] {
@@ -943,10 +954,10 @@ fn admission_reclaims_only_the_required_headroom() -> Result<()> {
     let mut limit = policy();
     limit.max_resident_bytes = 9;
     limit.target_resident_bytes = 3;
-    let report = store.reclaim(limit, 0, 1, || Ok(100_000))?;
+    let report = store.reclaim(limit, || Ok(0), 1, || Ok(100_000))?;
     assert!(report.minimum_satisfied);
-    assert_eq!(report.evicted_roots, 1);
-    assert_eq!(store.stats()?.actions, 2);
+    assert_eq!(report.evicted_roots, 2);
+    assert_eq!(store.stats()?.actions, 1);
     Ok(())
 }
 
@@ -965,5 +976,38 @@ fn reservations_that_cannot_fit_do_not_evict_resident_content() -> Result<()> {
     let refused = store.reserve_staging(21);
     assert!(matches!(refused, Err(error) if error.is::<StageSpaceTooLarge>()));
     assert!(store.lookup(hot)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn full_admission_does_not_evict_until_maintenance_replenishes_headroom() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut limit = policy();
+    limit.max_resident_bytes = 12;
+    limit.target_resident_bytes = 8;
+    let store = NativeStore::open_managed(dir.path(), limit)?;
+    for name in ["aaaa", "bbbb", "cccc"] {
+        publish(&store, name)?;
+    }
+    assert!(matches!(store.reserve_staging(4), Err(error) if error.is::<StageSpaceExhausted>()));
+    assert_eq!(store.stats()?.actions, 3);
+    let report = store.maintain_space()?.context("missing policy")?;
+    assert_eq!(report.evicted_roots, 1);
+    let _admitted = store.reserve_staging(4)?;
+    assert_eq!(store.stats()?.actions, 2);
+    Ok(())
+}
+
+#[test]
+fn maintenance_exclusion_does_not_block_headroom_admission() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open_managed(dir.path(), policy())?;
+    let _maintenance = store
+        .inner
+        .space_maintenance
+        .lock()
+        .map_err(|_| anyhow!("maintenance poisoned"))?;
+    let _reservation = store.reserve_staging(4096)?;
+    assert!(store.maintain_space()?.is_none());
     Ok(())
 }

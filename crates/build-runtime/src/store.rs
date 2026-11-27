@@ -666,6 +666,7 @@ struct Inner {
     publications: publications::PublicationWaits,
     space_policy: Option<SpacePolicy>,
     space: Mutex<space::SpaceState>,
+    space_maintenance: Mutex<()>,
     // Releases never acquire the space admission lock, avoiding lock-order
     // inversion with transactional publication and eviction.
     space_released: AtomicU64,
@@ -1256,6 +1257,7 @@ impl NativeStore {
             publications: publications::PublicationWaits::default(),
             space_policy,
             space: Mutex::default(),
+            space_maintenance: Mutex::default(),
             space_released: AtomicU64::new(0),
             result_history_limit: AtomicU64::new(result_history_limit),
         });
@@ -2448,7 +2450,7 @@ impl<L> Seek for LeasedReader<'_, L> {
 mod history;
 mod space;
 use crate::SpacePolicy;
-pub(crate) use space::StagingReservation;
+pub use space::StagingReservation;
 pub use space::{
     CacheAnalyticsSampler, SpaceReport, SpaceStatus, StageBudget, StageSpaceExhausted,
     StageSpaceTooLarge,

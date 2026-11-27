@@ -9,7 +9,7 @@ pub struct SpacePolicy {
     pub target_available_bytes: u64,
     /// Upper bound on total resident uncompressed content, including queued GC.
     pub max_resident_bytes: u64,
-    /// Eviction hysteresis target when the resident budget is exceeded.
+    /// Proactive resident retention target, leaving headroom below the hard limit.
     pub target_resident_bytes: u64,
     pub max_evictions_per_pass: usize,
     pub gc_batch: usize,

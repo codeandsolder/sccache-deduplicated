@@ -1615,7 +1615,9 @@ impl NativeSessions {
                 .transfer_mut()
                 .context("no negotiated native upload")?;
             transfer.start(blob, self.limits.max_concurrent_uploads)?;
-            transfer.budget.clone()
+            let budget = transfer.budget.clone();
+            drop(state);
+            budget
         };
         let guard = UploadGuard {
             session,

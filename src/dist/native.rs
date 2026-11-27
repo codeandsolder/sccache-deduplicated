@@ -1190,6 +1190,9 @@ impl NativeCacheClient {
                                     Err(error) if stream.interrupted => {
                                         debug!("retrying interrupted native blob transfer {blob:?}: {error:#}");
                                     }
+                                    Err(error) if error.is::<crate::build_runtime::StageSpaceExhausted>() => {
+                                        debug!("waiting for native input headroom {blob:?}: {error:#}");
+                                    }
                                     Err(error) => return Err(error),
                                 }
                             }

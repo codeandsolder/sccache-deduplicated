@@ -286,9 +286,10 @@ reserves the complete missing content closure before receiving any blobs;
 individual transfers share that charge even when a stream must be retried.
 A temporarily occupied budget returns retryable HTTP 503 rather than a
 terminal publication error. Impossible single reservations are rejected
-without eviction. Admission reclaims only enough room for the incoming
-content, while maintenance may use the low watermark when no reservations
-are outstanding. Compiler input leases are released before output publication.
+without eviction. Admission never performs eviction or GC. Background maintenance replenishes
+headroom proactively to the retention target (4 GiB below the hard limit
+in the fleet), and observes larger rejected reservations as demand for
+additional headroom. It never holds the admission lock during reclamation. Compiler input leases are released before output publication.
 
 Under cache pressure, eviction ranks roots by the expected reuse cost per
 byte that deleting them could actually reclaim. It follows the transactional

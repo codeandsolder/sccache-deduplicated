@@ -95,6 +95,7 @@ fn now_ms() -> u64 {
 #[derive(Default)]
 pub(super) struct SpaceState {
     reserved: u64,
+    waiting: u64,
 }
 
 /// Result of a bounded physical-space and resident-content maintenance pass.
@@ -279,73 +280,94 @@ impl NativeStore {
         let Some(policy) = self.inner.space_policy else {
             return Ok(None);
         };
+        let _maintenance = match self.inner.space_maintenance.try_lock() {
+            Ok(lock) => lock,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(anyhow!("native maintenance lock poisoned"));
+            }
+        };
         self.checkpoint_usage_if_due()?;
-        let mut state = self
-            .inner
-            .space
-            .lock()
-            .map_err(|_| anyhow!("native space lock poisoned"))?;
-        self.apply_releases(&mut state)?;
-        let report = self.reclaim(policy, state.reserved, 0, || self.available_bytes());
-        drop(state);
-        report.map(Some)
+        let incoming = {
+            let mut state = self
+                .inner
+                .space
+                .lock()
+                .map_err(|_| anyhow!("native space lock poisoned"))?;
+            self.apply_releases(&mut state)?;
+            let incoming = std::mem::take(&mut state.waiting);
+            drop(state);
+            incoming
+        };
+        self.reclaim(
+            policy,
+            || {
+                let mut state = self
+                    .inner
+                    .space
+                    .lock()
+                    .map_err(|_| anyhow!("native space lock poisoned"))?;
+                self.apply_releases(&mut state)?;
+                Ok(state.reserved)
+            },
+            incoming,
+            || self.available_bytes(),
+        )
+        .map(Some)
     }
 
     fn reclaim(
         &self,
         policy: SpacePolicy,
-        reserved: u64,
+        mut reservations: impl FnMut() -> Result<u64>,
         incoming: u64,
         mut available: impl FnMut() -> Result<u64>,
     ) -> Result<SpaceReport> {
-        let need = reserved
-            .checked_add(incoming)
-            .context("native space reservation overflow")?;
-        let minimum = policy
-            .min_available_bytes
-            .checked_add(need)
-            .context("native minimum space overflow")?;
-        let target = policy
+        // The soft watermarks maintain a ready buffer for new work. A larger
+        // observed request can ask the next pass for additional headroom.
+        let resident_target = policy
+            .target_resident_bytes
+            .min(policy.max_resident_bytes.saturating_sub(incoming));
+        let available_target = policy
             .target_available_bytes
-            .checked_add(need)
-            .context("native target space overflow")?;
+            .max(policy.min_available_bytes.saturating_add(incoming));
         self.collect_garbage(policy.gc_batch)?;
-        let mut observe = || -> Result<(u64, u64)> {
+        let mut observe = || -> Result<(u64, u64, u64)> {
+            let reserved = reservations()?;
             Ok((
                 available()?,
-                self.resident_bytes()?
-                    .checked_add(need)
-                    .context("native resident reservation overflow")?,
+                self.resident_bytes()?.saturating_add(reserved),
+                reserved,
             ))
         };
-        let (mut free, mut resident) = observe()?;
+        let (mut free, mut resident, mut reserved) = observe()?;
         let mut evicted_roots = 0;
-        if free < minimum || resident > policy.max_resident_bytes {
+        // A transient inability to admit the requested reservation cannot be
+        // solved by eviction if active writers alone exceed the ceiling.
+        if reserved <= policy.max_resident_bytes.saturating_sub(incoming)
+            && (free.saturating_sub(reserved) < available_target || resident > resident_target)
+        {
             #[cfg(target_os = "linux")]
             self.drop_idle_views(None)?;
-            let candidates =
-                self.eviction_candidates(policy.max_evictions_per_pass, free < minimum)?;
-            (free, resident) = observe()?;
+            let candidates = self.eviction_candidates(
+                policy.max_evictions_per_pass,
+                free.saturating_sub(reserved) < available_target,
+            )?;
+            (free, resident, reserved) = observe()?;
             for candidate in candidates {
-                // A request needs only enough room for its actual bytes. Do
-                // not evict the entire hysteresis band for each admission.
-                // Maintenance may reclaim to the low watermark when no
-                // in-flight reservations are inflating the resident count.
-                let (free_limit, resident_limit) = if evicted_roots == 0 || need != 0 {
-                    (minimum, policy.max_resident_bytes)
-                } else {
-                    (target, policy.target_resident_bytes)
-                };
-                if free >= free_limit && resident <= resident_limit {
+                if reserved > policy.max_resident_bytes.saturating_sub(incoming)
+                    || (free.saturating_sub(reserved) >= available_target
+                        && resident <= resident_target)
+                {
                     break;
                 }
                 if matches!(candidate.evict(self)?, Eviction::Removed { .. }) {
                     evicted_roots += 1;
                     self.collect_garbage(policy.gc_batch)?;
                 }
-                // Ranking and pin checks may race with publication/GC;
-                // always observe actual capacity before further eviction.
-                (free, resident) = observe()?;
+                // Observe current reservations after every eviction. The
+                // admission lock is never held across eviction or filesystem GC.
+                (free, resident, reserved) = observe()?;
             }
         }
         Ok(SpaceReport {
@@ -353,7 +375,8 @@ impl NativeStore {
             reserved_bytes: reserved,
             resident_bytes: resident,
             evicted_roots,
-            minimum_satisfied: free >= minimum && resident <= policy.max_resident_bytes,
+            minimum_satisfied: free.saturating_sub(reserved) >= policy.min_available_bytes
+                && resident <= policy.max_resident_bytes,
         })
     }
 
@@ -783,43 +806,25 @@ impl StageBudget {
             .reserved
             .checked_add(extra)
             .context("native stage reservation overflow")?;
-        let current_resident = self.store.resident_bytes()?;
-        // Evicting resident blobs cannot help if the reservations alone
-        // exceed the budget. In particular, do not empty a hot cache while
-        // competing publications only need to finish and release headroom.
-        ensure!(
-            need <= policy.max_resident_bytes,
-            StageSpaceExhausted {
+        let resident = self.store.resident_bytes()?.saturating_add(need);
+        let available = self.store.available_bytes()?;
+        if available.saturating_sub(need) < policy.min_available_bytes
+            || resident > policy.max_resident_bytes
+        {
+            // No cache scanning, eviction or garbage collection on the
+            // admission path. The maintenance service prepares more room.
+            // Maintenance defers eviction while outstanding reservations
+            // alone make admission impossible.
+            state.waiting = state.waiting.max(extra);
+            return Err(StageSpaceExhausted {
                 requested: extra,
                 reserved: state.reserved,
-                resident: current_resident.saturating_add(need),
-                available: self.store.available_bytes()?,
+                resident,
+                available,
                 limit: policy.max_resident_bytes,
                 evicted: 0,
             }
-        );
-        let minimum = policy
-            .min_available_bytes
-            .checked_add(need)
-            .context("native minimum space overflow")?;
-        let resident = current_resident
-            .checked_add(need)
-            .context("native resident reservation overflow")?;
-        if self.store.available_bytes()? < minimum || resident > policy.max_resident_bytes {
-            let report = self.store.reclaim(policy, state.reserved, extra, || {
-                self.store.available_bytes()
-            })?;
-            ensure!(
-                report.minimum_satisfied,
-                StageSpaceExhausted {
-                    requested: extra,
-                    reserved: state.reserved,
-                    resident: report.resident_bytes,
-                    available: report.available_bytes,
-                    limit: policy.max_resident_bytes,
-                    evicted: report.evicted_roots,
-                }
-            );
+            .into());
         }
         state.reserved = need;
         self.reserved = size;
@@ -850,7 +855,7 @@ impl StageBudget {
 }
 
 #[derive(Clone)]
-pub(crate) struct StagingReservation {
+pub struct StagingReservation {
     _charge: Arc<StagingCharge>,
 }
 

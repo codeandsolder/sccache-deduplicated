@@ -318,6 +318,7 @@ fn competing_results_reserve_complete_missing_closures_and_retry() -> Result<()>
     assert_eq!(service.commit(first, worker)?, first_manifest);
     assert_eq!(service.store().space_status()?.reserved_bytes, Some(0));
     service.close(first, Publisher::Client)?;
+    service.store().maintain_space()?;
     service.begin(second, worker, second_manifest.clone())?;
     upload_encoded(
         &service,
