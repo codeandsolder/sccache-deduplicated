@@ -50,7 +50,7 @@ reject "$binary" verify-dashboard --assets "$root/mixed"
 
 # Even a mutually matching pair from another source revision is rejected.
 mkdir "$root/source"
-git archive HEAD -- Cargo.toml Cargo.lock rust-toolchain.toml src crates scripts/build-scheduler-dashboard.sh scripts/publish-dashboard-assets.sh contrib/codeandsolder/release-protocol.env | tar -xf - -C "$root/source"
+git archive HEAD | tar -xf - -C "$root/source"
 test "$("$binary" verify-dashboard --assets "$assets" --source "$root/source")" = "$generation"
 printf '\n/* changed source */\n' >> "$root/source/crates/scheduler-dashboard/src/styles.module.css"
 reject "$binary" verify-dashboard --assets "$assets" --source "$root/source"

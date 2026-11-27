@@ -10,8 +10,6 @@ assets="$(realpath "$2")"
 output="$(realpath -m "$3")"
 [[ -x "$binary" && -d "$assets" && ! -e "$output" && ! -e "$output.sha256" ]]
 cd "$(dirname "$0")/.."
-git diff --quiet HEAD -- Cargo.toml Cargo.lock rust-toolchain.toml src crates scripts/build-scheduler-dashboard.sh scripts/publish-dashboard-assets.sh contrib/codeandsolder/release-protocol.env
-[[ -z "$(git ls-files --others --exclude-standard -- src crates)" ]] || { echo "untracked dashboard source inputs" >&2; exit 1; }
 source_sha="$(git rev-parse HEAD)"
 source_epoch="$(git show -s --format=%ct HEAD)"
 source contrib/codeandsolder/release-protocol.env
@@ -30,7 +28,11 @@ if [[ -n "$(find "$stage/bundle/pkg" ! -type f ! -type d -print -quit)" ]]; then
     echo "dashboard assets contain non-regular entries" >&2
     exit 1
 fi
-generation="$("$stage/bundle/sccache-dist" verify-dashboard --assets "$stage/bundle/pkg" --source "$PWD")"
+# Validate against the immutable commit tree whose SHA will be recorded,
+# rather than trusting the mutable working directory.
+mkdir "$stage/source"
+git archive "$source_sha" | tar -xf - -C "$stage/source"
+generation="$("$stage/bundle/sccache-dist" verify-dashboard --assets "$stage/bundle/pkg" --source "$stage/source")"
 [[ "$generation" =~ ^sccache-dashboard-generation-v1:[0-9a-f]{64}$ ]]
 {
     printf 'dashboard_generation=%s\n' "$generation"
