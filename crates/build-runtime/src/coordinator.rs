@@ -135,6 +135,25 @@ impl CompilePermit {
             .store
             .publish_pinned(&self.fingerprint, manifest, staged, self.mode)
     }
+
+    /// Queue the exact reserved result while retaining compile ownership and
+    /// any caller pins through the durable transaction.
+    ///
+    /// # Errors
+    /// Returns an error for invalid results, missing content or storage failure.
+    pub async fn publish_pinned_async<R: Send + 'static>(
+        self,
+        manifest: ResultManifest,
+        staged: Vec<StagedBlob>,
+        retained: R,
+    ) -> Result<ResultLease> {
+        let store = self.inner.store.clone();
+        let fingerprint = self.fingerprint.clone();
+        let mode = self.mode;
+        store
+            .publish_pinned_async(fingerprint, manifest, staged, mode, (self, retained))
+            .await
+    }
 }
 
 impl Drop for CompilePermit {

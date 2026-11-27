@@ -188,6 +188,24 @@ fn with_native_service(
             let schedule_network = Arc::clone(&network);
             let upload_sessions = Arc::clone(&sessions);
             let upload_network = Arc::clone(&network);
+            let observe_result: Arc<ResultObserver<'static>> =
+                Arc::new(move |server, job, event| {
+                    let result = match event {
+                        crate::dist::NativeLifecycleEvent::Delivered(_) => return,
+                        crate::dist::NativeLifecycleEvent::InputsStaged => Observation::Staged,
+                        crate::dist::NativeLifecycleEvent::Negotiated => Observation::Negotiated,
+                        crate::dist::NativeLifecycleEvent::Committed {
+                            manifest,
+                            retained_after_begin,
+                            ..
+                        } => Observation::Committed(manifest.clone(), retained_after_begin),
+                    };
+                    observations.lock().unwrap().push((server, job, result));
+                });
+            let commit_routes = CommitRoutes {
+                sessions: Arc::clone(&sessions),
+                observe_result: Arc::clone(&observe_result),
+            };
             native_router(
                 move |request, role, operation| {
                     respond(
@@ -206,26 +224,7 @@ fn with_native_service(
                                     .cloned()
                                     .unwrap_or_default())
                             },
-                            observe_result: &|server, job, event| {
-                                let result = match event {
-                                    crate::dist::NativeLifecycleEvent::Delivered(_) => return,
-                                    crate::dist::NativeLifecycleEvent::InputsStaged => {
-                                        Observation::Staged
-                                    }
-                                    crate::dist::NativeLifecycleEvent::Negotiated => {
-                                        Observation::Negotiated
-                                    }
-                                    crate::dist::NativeLifecycleEvent::Committed {
-                                        manifest,
-                                        retained_after_begin,
-                                        ..
-                                    } => Observation::Committed(
-                                        manifest.clone(),
-                                        retained_after_begin,
-                                    ),
-                                };
-                                observations.lock().unwrap().push((server, job, result));
-                            },
+                            observe_result: observe_result.as_ref(),
                         },
                         1024 * 1024,
                     )
@@ -259,6 +258,7 @@ fn with_native_service(
                         1024 * 1024,
                     )
                 },
+                &commit_routes,
                 None,
                 1024 * 1024,
             )

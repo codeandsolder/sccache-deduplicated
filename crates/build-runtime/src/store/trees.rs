@@ -410,7 +410,7 @@ impl NativeStore {
         Ok(id)
     }
 
-    fn attach_tree(
+    pub(super) fn attach_tree(
         &self,
         write: &redb::WriteTransaction,
         id: TreeId,
@@ -509,6 +509,29 @@ impl NativeStore {
         let manifest: TreeManifest = encoding().deserialize(record.value())?;
         ensure!(manifest.id()? == id, "invalid indexed tree");
         Ok(Some(manifest))
+    }
+
+    pub(super) fn lease_prepared_tree(
+        &self,
+        id: TreeId,
+        manifest: TreeManifest,
+        blobs: BTreeMap<ContentId, u64>,
+    ) -> Result<TreeLease> {
+        let mut pins = self.inner.lock_pins()?;
+        let count = pins.trees.entry(id).or_default();
+        *count = count.checked_add(1).context("tree pin count overflow")?;
+        pins.touch(Root::Tree(id));
+        drop(pins);
+        Ok(TreeLease {
+            inner: Arc::clone(&self.inner),
+            id,
+            manifest,
+            blobs,
+            pins: vec![TreePin {
+                inner: Arc::clone(&self.inner),
+                id,
+            }],
+        })
     }
 
     /// Pin a tree while its files are consumed.
@@ -688,9 +711,6 @@ impl Drop for TreePin {
         }
     }
 }
-
-mod publication;
-pub(super) use publication::TreePublicationQueue;
 
 #[cfg(target_os = "linux")]
 mod capture;

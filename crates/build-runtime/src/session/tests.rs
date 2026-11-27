@@ -8,6 +8,47 @@ use std::{
     io::{Read, Seek, SeekFrom},
 };
 
+#[tokio::test]
+async fn cancelled_async_commit_finishes_session_and_can_be_replayed() -> Result<()> {
+    use std::{
+        future::{Future, poll_fn},
+        task::Poll,
+    };
+    let temp = tempfile::tempdir()?;
+    let service = Arc::new(service(temp.path())?);
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
+    let NativeAdmission::Compile { ticket } =
+        service.admit(request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("expected compilation")
+    };
+    let output = manifest(b"object");
+    let blob = output.outputs["obj"].test_file_blob();
+    service.begin(ticket, worker, output.clone())?;
+    upload_encoded(&service, ticket, worker, blob, b"object")?;
+    let mut commit = Box::pin(service.commit_async(ticket, worker));
+    poll_fn(|cx| {
+        assert!(commit.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(commit);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if service.status(ticket)? == NativeStatus::Ready(output.clone()) {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    assert_eq!(service.commit_async(ticket, worker).await?, output);
+    Ok(())
+}
+
 fn service(dir: &std::path::Path) -> Result<NativeSessions> {
     let store = NativeStore::open(dir)?;
     store.publish_tree(&empty_root(), vec![])?;

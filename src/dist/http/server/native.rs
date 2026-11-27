@@ -135,6 +135,60 @@ impl PackageService {
 }
 
 #[derive(Clone)]
+struct CommitRoutes {
+    sessions: Arc<NativeSessions>,
+    observe_result: Arc<ResultObserver<'static>>,
+}
+
+async fn commit_response(
+    mut request: Request,
+    role: &'static str,
+    operation: &'static str,
+    routes: CommitRoutes,
+    limit: usize,
+) -> Response {
+    let publisher = match request_publisher(&request, role) {
+        Ok(publisher) => publisher,
+        Err(response) => return *response,
+    };
+    let result = async {
+        let data = request
+            .read_bounded(limit)
+            .await
+            .map_err(|error| anyhow::anyhow!("native metadata body: {error:?}"))?;
+        if operation == "tree_commit" {
+            return encode(
+                &routes
+                    .sessions
+                    .commit_tree_async(decode_metadata(&data, limit)?)
+                    .await?,
+                limit,
+            );
+        }
+        let CommitRequest {
+            ticket,
+            retained_after_begin_millis,
+            observation,
+        } = decode_metadata(&data, limit)?;
+        let manifest = routes.sessions.commit_async(ticket, publisher).await?;
+        if let Publisher::Worker { peer, job } = publisher {
+            (routes.observe_result)(
+                peer,
+                crate::dist::JobId(job),
+                crate::dist::NativeLifecycleEvent::Committed {
+                    manifest: &manifest,
+                    retained_after_begin: Duration::from_millis(retained_after_begin_millis),
+                    observation,
+                },
+            );
+        }
+        encode(&manifest, limit)
+    }
+    .await;
+    native_response(operation, result)
+}
+
+#[derive(Clone)]
 struct PackageRoutes {
     service: Arc<PackageService>,
     sessions: Arc<NativeSessions>,
@@ -276,6 +330,11 @@ where
     let bound = socket.local_addr()?;
     let limits = config.session_limits()?;
     let sessions = Arc::new(NativeSessions::new(store, limits)?);
+    let observe_result: Arc<ResultObserver<'static>> = Arc::new(observe_result);
+    let commit_routes = CommitRoutes {
+        sessions: Arc::clone(&sessions),
+        observe_result: Arc::clone(&observe_result),
+    };
     let maintenance = Arc::downgrade(&sessions);
     let fetch_peer = Arc::new(fetch_peer);
     // Keep source acquisition bounded separately from compiler execution
@@ -364,7 +423,7 @@ where
                         packages: packages.as_deref(),
                         network: &network,
                         source_plan: &source_plan,
-                        observe_result: &observe_result,
+                        observe_result: observe_result.as_ref(),
                     },
                     metadata_limit,
                 )
@@ -388,6 +447,7 @@ where
                     metadata_limit,
                 )
             },
+            &commit_routes,
             package_routes,
             metadata_limit,
         ),
@@ -439,13 +499,11 @@ fn native_admission_class((_, operation): &(String, String)) -> AdmissionClass {
         | "blob_sources"
         | "retain_sources"
         | "tree_offer"
-        | "tree_commit"
         | "tree_open"
         | "package_plan"
         | "package_lookup"
         | "rust_package_lookup"
-        | "begin"
-        | "commit" => AdmissionClass::Metadata,
+        | "begin" => AdmissionClass::Metadata,
         _ => AdmissionClass::Bulk,
     }
 }
@@ -458,6 +516,7 @@ fn native_router<F, A, Fut, U, UFut>(
     handler: F,
     schedule: A,
     upload: U,
+    commits: &CommitRoutes,
     packages: Option<PackageRoutes>,
     metadata_limit: usize,
 ) -> Router
@@ -515,6 +574,23 @@ where
                 },
             ),
         );
+    for (path, role, operation) in [
+        ("/api/v5/native/client/commit", "client", "commit"),
+        ("/api/v5/native/worker/commit", "worker", "commit"),
+        ("/api/v5/native/client/tree_commit", "client", "tree_commit"),
+    ] {
+        let commits = commits.clone();
+        router = router.route(
+            path,
+            async_route(
+                MethodFilter::POST,
+                AdmissionClass::Metadata,
+                move |_: Arc<F>, request| {
+                    commit_response(request, role, operation, commits.clone(), metadata_limit)
+                },
+            ),
+        );
+    }
     if let Some(packages) = packages {
         for (path, operation) in [
             ("/api/v5/native/client/package_import", "package_import"),
@@ -1115,9 +1191,6 @@ fn dispatch(
         "tree_offer" if publisher == Publisher::Client => {
             encode(&sessions.offer_tree(metadata(request, limit)?)?, limit)
         }
-        "tree_commit" if publisher == Publisher::Client => {
-            encode(&sessions.commit_tree(metadata(request, limit)?)?, limit)
-        }
         "tree_open" => {
             let OpenTreeRequest { action, tree } = metadata(request, limit)?;
             encode(&sessions.open_tree(tree, publisher, action)?, limit)
@@ -1151,26 +1224,6 @@ fn dispatch(
             }
             encode(&reply, limit)
         }
-        "commit" => {
-            let CommitRequest {
-                ticket,
-                retained_after_begin_millis,
-                observation,
-            } = metadata(request, limit)?;
-            let manifest = sessions.commit(ticket, publisher)?;
-            if let Publisher::Worker { peer, job } = publisher {
-                observe_result(
-                    peer,
-                    crate::dist::JobId(job),
-                    crate::dist::NativeLifecycleEvent::Committed {
-                        manifest: &manifest,
-                        retained_after_begin: Duration::from_millis(retained_after_begin_millis),
-                        observation,
-                    },
-                );
-            }
-            encode(&manifest, limit)
-        }
         "renew" => {
             sessions.renew(metadata(request, limit)?, publisher)?;
             encode(&(), limit)
@@ -1187,9 +1240,13 @@ pub(super) fn metadata<T: DeserializeOwned>(request: &Request, limit: usize) -> 
     let data = request
         .read_buffered(limit)
         .map_err(|error| anyhow::anyhow!("native metadata body: {error:?}"))?;
+    decode_metadata(&data, limit)
+}
+
+fn decode_metadata<T: DeserializeOwned>(data: &[u8], limit: usize) -> Result<T> {
     Ok(codec()
         .with_limit(u64::try_from(limit)?)
-        .deserialize(&data)?)
+        .deserialize(data)?)
 }
 
 fn encode<T: Serialize>(value: &T, limit: usize) -> Result<Response> {

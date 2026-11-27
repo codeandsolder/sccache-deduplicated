@@ -253,6 +253,39 @@ impl Pending {
             )))),
         }
     }
+
+    async fn publish_async(self, store: &NativeStore) -> Result<Ready> {
+        match self {
+            Self::Action(action) => {
+                let PendingAction { permit, upload, .. } = *action;
+                let (manifest, transfer) = upload.context("missing result negotiation")?;
+                let Transfer {
+                    reservation,
+                    staged,
+                    ..
+                } = transfer;
+                let result = permit
+                    .publish_pinned_async(manifest, staged.into_values().collect(), reservation)
+                    .await?;
+                Ok(Ready::Result(Arc::new(result)))
+            }
+            Self::Tree { manifest, transfer } => {
+                let Transfer {
+                    reservation,
+                    staged,
+                    ..
+                } = transfer;
+                let tree = store
+                    .publish_tree_pinned_async(
+                        manifest,
+                        staged.into_values().collect(),
+                        reservation,
+                    )
+                    .await?;
+                Ok(Ready::Tree(Box::new(TreeDelivery::new(tree))))
+            }
+        }
+    }
 }
 
 enum TreeSource {
@@ -471,6 +504,14 @@ impl Session {
 }
 
 type SharedSession = Arc<Mutex<Session>>;
+
+enum CommitStart {
+    Ready(Committed),
+    Pending {
+        session: SharedSession,
+        pending: Box<Pending>,
+    },
+}
 
 // The allocation claim owns no mutex guard. Failure or unwinding releases
 // only its own intent, never a later retry.
@@ -1578,36 +1619,36 @@ impl NativeSessions {
         Ok(())
     }
 
-    fn commit_pending(
+    fn begin_commit(
         &self,
         ticket: Ticket,
         publisher: Publisher,
         kind: Kind,
-    ) -> Result<Committed> {
+    ) -> Result<CommitStart> {
         let session = self.get(ticket)?;
-        let pending = {
-            let mut state = Self::lock(&session)?;
-            self.authorize(&mut state, publisher)?;
-            ensure!(
-                state.kind == kind,
-                "native ticket has wrong publication kind"
-            );
-            match &state.phase {
-                Phase::Ready(lease) => return lease.committed(),
-                Phase::Pending(pending) => pending.check_complete()?,
-                _ => bail!("native session cannot commit"),
-            }
-            let preview = state.negotiated_result().cloned();
-            let Phase::Pending(pending) =
-                std::mem::replace(&mut state.phase, Phase::Publishing(preview))
-            else {
-                bail!("native phase changed");
-            };
-            drop(state);
-            pending
-        };
-        let result = pending.publish(self.store());
         let mut state = Self::lock(&session)?;
+        self.authorize(&mut state, publisher)?;
+        ensure!(
+            state.kind == kind,
+            "native ticket has wrong publication kind"
+        );
+        match &state.phase {
+            Phase::Ready(lease) => return Ok(CommitStart::Ready(lease.committed()?)),
+            Phase::Pending(pending) => pending.check_complete()?,
+            _ => bail!("native session cannot commit"),
+        }
+        let preview = state.negotiated_result().cloned();
+        let Phase::Pending(pending) =
+            std::mem::replace(&mut state.phase, Phase::Publishing(preview))
+        else {
+            bail!("native phase changed");
+        };
+        drop(state);
+        Ok(CommitStart::Pending { session, pending })
+    }
+
+    fn finish_commit(&self, session: &SharedSession, result: Result<Ready>) -> Result<Committed> {
+        let mut state = Self::lock(session)?;
         state.expires = self.deadline();
         let reply = match result {
             Ok(lease) => {
@@ -1622,6 +1663,42 @@ impl NativeSessions {
         };
         drop(state);
         reply
+    }
+
+    fn commit_pending(
+        &self,
+        ticket: Ticket,
+        publisher: Publisher,
+        kind: Kind,
+    ) -> Result<Committed> {
+        match self.begin_commit(ticket, publisher, kind)? {
+            CommitStart::Ready(reply) => Ok(reply),
+            CommitStart::Pending { session, pending } => {
+                let result = pending.publish(self.store());
+                self.finish_commit(&session, result)
+            }
+        }
+    }
+
+    async fn commit_pending_async(
+        self: &Arc<Self>,
+        ticket: Ticket,
+        publisher: Publisher,
+        kind: Kind,
+    ) -> Result<Committed> {
+        let sessions = Arc::clone(self);
+        // Keep the session transition alive independently of a disconnected
+        // response waiter. A queued publication must never strand Publishing.
+        tokio::spawn(async move {
+            match sessions.begin_commit(ticket, publisher, kind)? {
+                CommitStart::Ready(reply) => Ok(reply),
+                CommitStart::Pending { session, pending } => {
+                    let result = pending.publish_async(sessions.store()).await;
+                    sessions.finish_commit(&session, result)
+                }
+            }
+        })
+        .await?
     }
 
     /// Commit a negotiated successful result and retain its delivery lease.
@@ -1641,6 +1718,38 @@ impl NativeSessions {
     /// Returns an error for invalid tickets, incomplete uploads or storage failure.
     pub fn commit_tree(&self, ticket: Ticket) -> Result<TreeId> {
         match self.commit_pending(ticket, Publisher::Client, Kind::Tree)? {
+            Committed::Tree(id) => Ok(id),
+            Committed::Result(_) => bail!("native tree publication returned a result"),
+        }
+    }
+
+    /// Commit a negotiated result through the asynchronous CAS queue.
+    ///
+    /// # Errors
+    /// Returns an error for invalid tickets, incomplete uploads or storage failure.
+    pub async fn commit_async(
+        self: &Arc<Self>,
+        ticket: Ticket,
+        publisher: Publisher,
+    ) -> Result<ResultManifest> {
+        match self
+            .commit_pending_async(ticket, publisher, Kind::Action)
+            .await?
+        {
+            Committed::Result(manifest) => Ok(manifest),
+            Committed::Tree(_) => bail!("native result publication returned a tree"),
+        }
+    }
+
+    /// Commit a negotiated tree through the asynchronous CAS queue.
+    ///
+    /// # Errors
+    /// Returns an error for invalid tickets, incomplete uploads or storage failure.
+    pub async fn commit_tree_async(self: &Arc<Self>, ticket: Ticket) -> Result<TreeId> {
+        match self
+            .commit_pending_async(ticket, Publisher::Client, Kind::Tree)
+            .await?
+        {
             Committed::Tree(id) => Ok(id),
             Committed::Result(_) => bail!("native tree publication returned a result"),
         }
