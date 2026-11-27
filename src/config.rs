@@ -3948,6 +3948,7 @@ fn server_toml_parse() {
     assert_eq!(
         server_config,
         server::Config {
+            traces: None,
             cluster: sccache_peer_identity::PeerConfig {
                 directory: "/tmp/worker-identity".into(),
                 ca_certificate: "/tmp/ca.pem".into(),

@@ -25,6 +25,28 @@ use crate::{
     make_patch,
 };
 
+fn telemetry_source(url: &str) -> Result<(url::Url, wreq::Client)> {
+    let mut base = url::Url::parse(url)?;
+    ensure!(
+        matches!(base.scheme(), "http" | "https")
+            && base.host().is_some()
+            && base.username().is_empty()
+            && base.password().is_none()
+            && base.query().is_none()
+            && base.fragment().is_none(),
+        "telemetry URL must be an HTTP(S) base URL without credentials or query"
+    );
+    if !base.path().ends_with('/') {
+        base.set_path(&format!("{}/", base.path()));
+    }
+    let client = wreq::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(wreq::redirect::Policy::none())
+        .no_proxy()
+        .build()?;
+    Ok((base, client))
+}
+
 mod broadcast;
 mod metrics;
 pub(crate) mod traces;

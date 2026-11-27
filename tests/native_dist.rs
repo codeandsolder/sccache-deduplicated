@@ -170,6 +170,7 @@ fn native_worker_config(
     transfer: sccache::build_runtime::PackageTransferCost,
 ) -> server::Config {
     server::Config {
+        traces: None,
         cluster,
         builder: server::BuilderType::Native,
         cache_dir: None,
@@ -305,6 +306,7 @@ impl Fleet {
             root,
             "scheduler",
             &scheduler::Config {
+                traces: None,
                 cluster_directory,
                 local_worker,
                 public_addr: scheduler_address,

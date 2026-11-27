@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result, ensure};
 use futures::StreamExt as _;
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Semaphore;
 
 use crate::traces::{
@@ -29,26 +29,10 @@ impl TraceService {
     pub(super) fn new(url: Option<&str>) -> Result<Self> {
         let source = url
             .map(|url| -> Result<_> {
-                let mut base = url::Url::parse(url)?;
-                ensure!(
-                    matches!(base.scheme(), "http" | "https")
-                        && base.host().is_some()
-                        && base.username().is_empty()
-                        && base.password().is_none()
-                        && base.query().is_none()
-                        && base.fragment().is_none(),
-                    "invalid trace query base URL"
-                );
-                if !base.path().ends_with('/') {
-                    base.set_path(&format!("{}/", base.path()));
-                }
+                let (base, client) = super::telemetry_source(url)?;
                 Ok(Arc::new(Source {
                     base,
-                    client: wreq::Client::builder()
-                        .timeout(Duration::from_secs(10))
-                        .redirect(wreq::redirect::Policy::none())
-                        .no_proxy()
-                        .build()?,
+                    client,
                     queries: Semaphore::new(4),
                 }))
             })
