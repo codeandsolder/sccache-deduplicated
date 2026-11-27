@@ -174,6 +174,63 @@ mod tests {
     }
 
     #[test]
+    fn package_readers_pin_the_same_index_snapshot_without_waiting_for_publication() -> Result<()> {
+        use std::{sync::mpsc, thread, time::Duration};
+        let directory = tempfile::tempdir()?;
+        let store = NativeStore::open(directory.path())?;
+        let (tar, blob) = fixture()?;
+        let bytes = gzip(&tar, flate2::Compression::best())?;
+        let source = source(&bytes, PackageCompression::Gzip)?;
+        let policy = PackagePolicy {
+            retain_original: true,
+            ..PackagePolicy::normalized_archive(100, 1 << 20, 1 << 20, 1 << 20)?
+        };
+        let package = store.import_package(
+            source.identity,
+            ArchiveLength::Exact(source.size),
+            policy,
+            &bytes[..],
+            PackageDecoder::InProcess,
+        )?;
+        let id = package.tree().id();
+        drop(package);
+        let mutation = store.inner.lock_mutations()?;
+        let (package, offers) = thread::scope(|scope| -> Result<_> {
+            let (send, receive) = mpsc::channel();
+            let store = &store;
+            let reader = scope.spawn(move || {
+                let found = (|| -> Result<_> {
+                    let package = store
+                        .lookup_package(source.identity, policy)?
+                        .context("missing warm package")?;
+                    let offers = store.plan_package_downloads(&[blob], 8, u64::MAX, slow_link())?;
+                    Ok((package, offers))
+                })();
+                send.send(found)
+            });
+            let observed = receive.recv_timeout(Duration::from_secs(2));
+            drop(mutation);
+            reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("package reader panicked"))??;
+            observed?
+        })?;
+        assert_eq!(package.source(), source);
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].archive().source, source);
+        assert_eq!(store.evict_tree(id)?, crate::Eviction::Pinned);
+        drop(package);
+        assert_eq!(store.evict_tree(id)?, crate::Eviction::Pinned);
+        drop(offers);
+        assert!(matches!(
+            store.evict_tree(id)?,
+            crate::Eviction::Removed { .. }
+        ));
+        assert!(store.lookup_package(source.identity, policy)?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn original_archive_digest_reused_from_encoded_output_keeps_source_bytes() -> Result<()> {
         use crate::{TreeEntry, TreeManifest, TreeMetadata, TreePath};
         let directory = tempfile::tempdir()?;

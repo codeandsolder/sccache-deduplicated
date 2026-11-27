@@ -147,6 +147,81 @@ fn reuse_favors_a_hot_root_over_a_newer_cold_root() -> Result<()> {
 }
 
 #[test]
+fn empty_gc_and_healthy_space_maintenance_do_not_wait_for_publication() -> Result<()> {
+    use std::{sync::mpsc, thread};
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open_managed(temp.path(), policy())?;
+    let key = publish(&store, "data")?;
+    let mutation = store.inner.lock_mutations()?;
+    let report = thread::scope(|scope| -> Result<_> {
+        let (send, receive) = mpsc::channel();
+        let store = &store;
+        let worker = scope.spawn(move || send.send(store.maintain_space()));
+        let observed = receive.recv_timeout(Duration::from_secs(2));
+        drop(mutation);
+        worker
+            .join()
+            .map_err(|_| anyhow!("maintenance worker panicked"))??;
+        observed?
+    })?
+    .context("missing space policy")?;
+    assert!(report.minimum_satisfied);
+    assert_eq!(report.resident_bytes, 4);
+    // A due checkpoint was postponed, not dropped, while publication owned
+    // the mutation mutex.
+    assert!(
+        store
+            .inner
+            .lock_pins()?
+            .dirty_usage
+            .contains(&Root::Action(key))
+    );
+    store.maintain_space()?;
+    assert!(store.inner.lock_pins()?.dirty_usage.is_empty());
+    assert!(matches!(store.evict(key)?, Eviction::Removed { .. }));
+    assert_eq!(
+        store
+            .maintain_space()?
+            .context("missing space policy")?
+            .resident_bytes,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn usage_checkpoint_preserves_touches_after_its_snapshot() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    let key = publish(&store, "data")?;
+    let root = Root::Action(key);
+    let unchanged = Root::Action(publish(&store, "unchanged")?);
+    let snapshot = store.inner.lock_pins()?.usage_snapshot();
+    let before = store.inner.lock_pins()?.usage[&root];
+    drop(store.lookup(key)?.context("missing result")?);
+    persist_usage(&store.inner.db, &snapshot)?;
+    {
+        let mut pins = store.inner.lock_pins()?;
+        pins.finish_usage_checkpoint(&snapshot);
+        assert!(pins.dirty_usage.contains(&root));
+        assert!(!pins.dirty_usage.contains(&unchanged));
+        assert_eq!(pins.usage[&root].hits, before.hits + 1);
+    }
+    store.checkpoint_usage()?;
+    assert!(store.inner.lock_pins()?.dirty_usage.is_empty());
+    let read = store.inner.db.begin_read()?;
+    let usage = read.open_table(super::super::USAGE)?;
+    let saved: UsageRecord = encoding().deserialize(
+        usage
+            .get(&root.key())?
+            .context("missing checkpoint")?
+            .value(),
+    )?;
+    assert_eq!(saved.hits, before.hits + 1);
+    Ok(())
+}
+
+#[test]
 fn usage_survives_restart_and_is_removed_with_evicted_roots() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let (hot, cold) = {
