@@ -189,6 +189,7 @@ pub fn App() -> impl IntoView {
             <FleetMetrics tab=tab/>
         </main>
     }
+    .into_any()
 }
 
 #[component]
@@ -198,8 +199,13 @@ fn FleetMetrics(tab: RwSignal<Tab>) -> impl IntoView {
     let clients = RwSignal::new(Vec::<String>::new());
     let status = RwSignal::new(ConnectionStatus::Connecting);
     let retry = RwSignal::new(0_u64);
+    let active = Memo::new(move |_| tab.get().metrics());
     #[cfg(target_arch = "wasm32")]
     Effect::new(move |_| {
+        if !active.get() {
+            status.set(ConnectionStatus::Connecting);
+            return;
+        }
         let selected = view.get();
         let _ = retry.get();
         data.set(MetricsData {
@@ -244,7 +250,8 @@ fn FleetMetrics(tab: RwSignal<Tab>) -> impl IntoView {
     });
     let step = Signal::derive(move || data.with(|data| data.view.range.step()));
     view! {
-        <section id="metrics" hidden=move || !tab.get().metrics()>
+        <Show when=move || active.get()>
+        <section id="metrics">
             <h2>{move || if tab.get() == Tab::CacheHits {"Cache hit statistics"} else {"Fleet telemetry"}}</h2>
             <p class=styles::muted hidden=move || tab.get() != Tab::CacheHits>
                 "Hit rate = hits / (hits + misses), including native and legacy compiler results. Errors and bypasses are shown separately; tier lookups are not compile requests. Window counts are counter increases (extrapolated at scrape boundaries). No traffic or unavailable telemetry is not a 0% hit rate."
@@ -291,7 +298,8 @@ fn FleetMetrics(tab: RwSignal<Tab>) -> impl IntoView {
                 }/>
             </div>
         </section>
-    }
+        </Show>
+    }.into_any()
 }
 
 // These values feed rounded human-readable labels and SVG coordinates, never

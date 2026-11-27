@@ -80,19 +80,19 @@ await_js() {
     return 1
 }
 webdriver url "$(jq -n --arg url "$dashboard/" '{url: $url}')" >/dev/null
-await_js 'return [...document.querySelectorAll("[role=status]")].length === 2 && [...document.querySelectorAll("[role=status]")].every(x => x.textContent.trim() === "Live")'
+await_js 'return document.querySelectorAll("[role=status]").length === 1 && document.querySelector("[role=status]").textContent.trim() === "Live"'
 await_js 'return document.body.innerText.includes("NO WORKERS")'
-await_js 'return document.querySelector("nav button[aria-pressed=true]").textContent.trim() === "Overview" && document.querySelector("#topology").getClientRects().length === 0'
+await_js 'return document.querySelector("nav button[aria-pressed=true]").textContent.trim() === "Overview" && document.querySelector("#topology") === null'
 select_tab() {
     js "const tab=[...document.querySelectorAll('nav button')].find(x=>x.textContent.trim()==='$1'); tab.click(); return true" >/dev/null
 }
 select_tab Jobs
-await_js 'return document.querySelector("#jobs").getClientRects().length > 0 && document.querySelector("#workers").getClientRects().length === 0'
-js 'window.jobFilter=document.querySelector("#jobs input"); window.jobTable=document.querySelector("#jobs table"); jobFilter.value="rustc"; jobFilter.dispatchEvent(new Event("input",{bubbles:true})); return true' >/dev/null
+await_js 'return document.querySelector("#jobs") !== null && document.querySelector("#workers") === null'
+js 'const jobFilter=document.querySelector("#jobs input"); jobFilter.value="rustc"; jobFilter.dispatchEvent(new Event("input",{bubbles:true})); return true' >/dev/null
 select_tab "Cache hits"
-await_js 'return document.querySelector("#admission").getClientRects().length > 0 && document.querySelector("#jobs").getClientRects().length === 0'
+await_js 'return document.querySelector("#admission") !== null && document.querySelector("#jobs") === null'
 select_tab Jobs
-await_js 'return document.querySelector("#jobs input") === window.jobFilter && jobFilter.value === "rustc" && document.querySelector("#jobs table") === window.jobTable'
+await_js 'return document.querySelector("#jobs input")?.value === "rustc" && document.querySelector("#jobs table") !== null'
 select_tab Topology
 await_js 'return document.querySelector("#topology svg") !== null && document.querySelector("#topology").innerText.includes("1 identities")'
 js 'const e=document.querySelector("#topology select"); e.selectedIndex=1; e.dispatchEvent(new Event("change",{bubbles:true})); return true' >/dev/null
@@ -111,6 +111,7 @@ await_js 'return document.body.innerText.includes("DRAINING")'
 rm "$root/drain"
 await_js 'return document.body.innerText.includes("NO WORKERS")'
 select_tab "Fleet metrics"
+await_js 'return document.querySelector("#metrics [role=status]")?.textContent.trim() === "Live"'
 js 'const e=document.querySelector("#metrics select"); e.value="six_hours"; e.dispatchEvent(new Event("change",{bubbles:true})); return true' >/dev/null
 await_js 'return document.querySelector("#metrics").innerText.includes("60 s resolution") && document.querySelector("#metrics [role=status]").textContent.trim() === "Live"'
 js 'document.querySelector("main button").click(); return true' >/dev/null

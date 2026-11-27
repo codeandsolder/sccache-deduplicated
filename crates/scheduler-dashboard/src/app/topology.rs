@@ -113,8 +113,7 @@ fn connections(links: &[NetworkLink]) -> BTreeMap<Pair, Connection> {
 }
 
 #[component]
-pub(super) fn Topology(graph: Memo<NetworkGraph>) -> impl IntoView {
-    let selected = RwSignal::new(String::new());
+pub(super) fn Topology(graph: Memo<NetworkGraph>, selected: RwSignal<String>) -> impl IntoView {
     let hosts = Memo::new(move |_| {
         graph.with(|graph| {
             graph
@@ -161,7 +160,7 @@ pub(super) fn Topology(graph: Memo<NetworkGraph>) -> impl IntoView {
             {move || selected_host.get().map(|host|view!{<HostDetails host=host/>})}
             <RouteTable links=links hosts=hosts/>
         </section>
-    }
+    }.into_any()
 }
 
 type Hosts = BTreeMap<String, NetworkHost>;

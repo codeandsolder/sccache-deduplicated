@@ -8,6 +8,8 @@ use leptos::prelude::*;
 
 #[component]
 pub(super) fn NativeStatus(data: Memo<Option<DashboardData>>, tab: RwSignal<Tab>) -> impl IntoView {
+    let job_controls = JobControls::new();
+    let selected_host = RwSignal::new(String::new());
     let snapshot =
         Memo::new(move |_| data.with(|data| data.as_ref().and_then(|data| data.snapshot.clone())));
     let sampled_at =
@@ -56,7 +58,23 @@ pub(super) fn NativeStatus(data: Memo<Option<DashboardData>>, tab: RwSignal<Tab>
             <span class=styles::muted>{move || timestamp(sampled_at.get())}</span>
         </div>
         {move || data.with(|data| data.as_ref().and_then(|data| data.error.clone())).map(|error| view!{<p class=styles::warning>{error}</p>})}
-        <div hidden=move || tab.get() != Tab::Overview>
+        {move || match tab.get() {
+            Tab::Overview => view! {<Overview totals=totals history=history/>}.into_any(),
+            Tab::Workers => view! {<WorkerTable workers=workers sampled_at=sampled_at/>}.into_any(),
+            Tab::Jobs => view! {<JobTable jobs=jobs sampled_at=sampled_at controls=job_controls/>}.into_any(),
+            Tab::Cas => view! {<CasPanel telemetry=telemetry/>}.into_any(),
+            Tab::Topology => view! {<super::topology::Topology graph=topology selected=selected_host/>}.into_any(),
+            Tab::CacheHits => view! {<AdmissionPanel telemetry=telemetry history=history/>}.into_any(),
+            Tab::CacheAnalytics => view! {<super::analytics::CacheAnalytics telemetry=telemetry workers=workers/>}.into_any(),
+            Tab::Network => view! {<NetworkPanel telemetry=telemetry/>}.into_any(),
+            Tab::Fleet => ().into_any(),
+        }}
+    }.into_any()
+}
+
+#[component]
+fn Overview(totals: Memo<Option<Totals>>, history: Memo<Vec<Sample>>) -> impl IntoView {
+    view! {
         {move || totals.get().map(|totals| view! {
             <div class=styles::stats>
                 <Stat label="Workers" value=totals.workers.to_string()/>
@@ -80,15 +98,7 @@ pub(super) fn NativeStatus(data: Memo<Option<DashboardData>>, tab: RwSignal<Tab>
                 graph(series, "jobs", 2)
             }}
         </section>
-        </div>
-        <div hidden=move || tab.get() != Tab::Workers><WorkerTable workers=workers sampled_at=sampled_at/></div>
-        <div hidden=move || tab.get() != Tab::Jobs><JobTable jobs=jobs sampled_at=sampled_at/></div>
-        <div hidden=move || tab.get() != Tab::Cas><CasPanel telemetry=telemetry/></div>
-        <div hidden=move || tab.get() != Tab::Topology><super::topology::Topology graph=topology/></div>
-        <div hidden=move || tab.get() != Tab::CacheHits><AdmissionPanel telemetry=telemetry history=history/></div>
-        <div hidden=move || tab.get() != Tab::CacheAnalytics><super::analytics::CacheAnalytics telemetry=telemetry workers=workers/></div>
-        <div hidden=move || tab.get() != Tab::Network><NetworkPanel telemetry=telemetry/></div>
-    }
+    }.into_any()
 }
 
 fn admission_window(
@@ -157,7 +167,7 @@ fn AdmissionPanel(
                 }}
             </tbody></table></div>
         </section>
-    }
+    }.into_any()
 }
 
 #[cfg(test)]
@@ -246,7 +256,7 @@ fn CasPanel(telemetry: Memo<Option<NativeTelemetry>>) -> impl IntoView {
                 {service.map(|service|view!{<ServiceStatus service=service/>})}
             })}
         </section>
-    }
+    }.into_any()
 }
 
 #[component]
@@ -282,7 +292,7 @@ fn NetworkPanel(telemetry: Memo<Option<NativeTelemetry>>) -> impl IntoView {
                 </tbody></table></div>
             })}
         </section>
-    }
+    }.into_any()
 }
 
 #[component]
@@ -301,7 +311,7 @@ fn WorkerTable(workers: Memo<Vec<Worker>>, sampled_at: Memo<Option<u64>>) -> imp
             </tbody></table></div>
             {move || workers.with(Vec::is_empty).then(|| view!{<p class=styles::muted>"No active workers"</p>})}
         </section>
-    }
+    }.into_any()
 }
 
 const fn execution_protocols(archive: bool, native: bool) -> &'static str {
@@ -378,7 +388,7 @@ fn WorkerCells(worker: Memo<Option<Worker>>, sampled_at: Memo<Option<u64>>) -> i
             <small>{native_text(worker, |native| format!("Rev {} · {} output samples",native.timing_revision,native.output_observations))}</small>
             <small>{native_text(worker, |native| if native.residency_reported {"Residency reported".into()} else {"Residency unknown".into()})}</small>
         </td>
-    }
+    }.into_any()
 }
 
 fn phase_label(phase: &str) -> &str {
@@ -397,10 +407,28 @@ fn phase_label(phase: &str) -> &str {
 
 const PAGE_SIZE: usize = 100;
 
+#[derive(Clone, Copy)]
+struct JobControls {
+    filter: RwSignal<String>,
+    page: RwSignal<usize>,
+}
+
+impl JobControls {
+    fn new() -> Self {
+        Self {
+            filter: RwSignal::new(String::new()),
+            page: RwSignal::new(0),
+        }
+    }
+}
+
 #[component]
-fn JobTable(jobs: Memo<Vec<Job>>, sampled_at: Memo<Option<u64>>) -> impl IntoView {
-    let filter = RwSignal::new(String::new());
-    let page = RwSignal::new(0_usize);
+fn JobTable(
+    jobs: Memo<Vec<Job>>,
+    sampled_at: Memo<Option<u64>>,
+    controls: JobControls,
+) -> impl IntoView {
+    let JobControls { filter, page } = controls;
     let indexed = super::keyed_index(jobs, |job| &job.id);
     let matching = Memo::new(move |_| {
         let filter = filter.get().to_lowercase();
@@ -456,7 +484,7 @@ fn JobTable(jobs: Memo<Vec<Job>>, sampled_at: Memo<Option<u64>>) -> impl IntoVie
                 }/>
             </tbody></table></div>
         </section>
-    }
+    }.into_any()
 }
 
 #[component]
@@ -498,7 +526,7 @@ fn JobCells(job: Memo<Option<Job>>, sampled_at: Memo<Option<u64>>) -> impl IntoV
             <small>{row_text(job, |job| job.description.as_ref().map_or_else(String::new, |description| format!("{} · {} blobs total", bytes(description.input_bytes), description.input_blobs)))}</small>
         </td>
         <td>{row_text(job, |job| job.predicted_completion_secs.map_or_else(|| "—".into(), age))}</td>
-    }
+    }.into_any()
 }
 
 #[component]

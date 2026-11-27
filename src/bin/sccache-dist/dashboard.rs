@@ -10,9 +10,9 @@ use sccache_dashboard::{
     Worker,
 };
 
-use super::{Scheduler, ServerDetails};
+use super::{JobDetail, Scheduler, ServerDetails};
 use sccache::build_runtime::wire::NativeJobPhase;
-use sccache::dist::{self, ServerId};
+use sccache::dist::{self, JobId, ServerId};
 
 // Keep only bounded, human-facing labels. Never retain argv, environment,
 // authorization, or absolute paths in the dashboard's job roster.
@@ -41,7 +41,7 @@ fn argument_value(arguments: &[Vec<u8>], flag: &[u8]) -> Option<String> {
     })
 }
 
-pub(super) fn describe_native(assignment: &dist::NativeAssignment) -> JobDescription {
+pub fn describe_native(assignment: &dist::NativeAssignment) -> JobDescription {
     let spec = &assignment.spec;
     let subject = argument_value(&spec.command.arguments, b"--crate-name").or_else(|| {
         let mut outputs = spec.outputs.values();
@@ -257,6 +257,56 @@ fn accumulate_worker(snapshot: &mut Snapshot, worker: &Worker) {
     }
 }
 
+fn project_job(
+    job_id: &JobId,
+    details: &ServerDetails,
+    worker: &Worker,
+    detail: Option<&JobDetail>,
+) -> Job {
+    let progress = details
+        .capabilities
+        .native_placement
+        .as_ref()
+        .and_then(|placement| placement.queue.jobs.get(job_id));
+    let (state, assigned_at, state_since, prediction) = detail.map_or_else(
+        || {
+            details.jobs_assigning.get(job_id).map_or_else(
+                // Preserve the reservation in the count, but never invent a timestamp.
+                || ("Missing scheduler state".into(), None, None, None),
+                |&since| ("Assigning".into(), Some(since), Some(since), None),
+            )
+        },
+        |detail| {
+            (
+                detail.state.to_string(),
+                Some(detail.assigned_at),
+                Some(detail.state_since),
+                detail.prediction,
+            )
+        },
+    );
+    Job {
+        id: job_id.to_string(),
+        description: details
+            .jobs_assigned
+            .get(job_id)
+            .and_then(Option::as_ref)
+            .and_then(|native| native.dashboard.clone()),
+        worker: worker.name.clone(),
+        worker_id: worker.id.clone(),
+        state,
+        native_phase: progress.map(|progress| format!("{:?}", progress.phase)),
+        native_phase_observed_ns: progress.map(|progress| progress.phase_nanoseconds),
+        assigned_at_ms: assigned_at.map(timestamp_ms),
+        state_since_ms: state_since.map(timestamp_ms),
+        remaining_input_bytes: progress.map(|progress| progress.remaining_input_bytes),
+        remaining_input_blobs: progress.map(|progress| progress.remaining_input_blobs),
+        predicted_completion_secs: prediction
+            .map(|estimate| estimate.completion_seconds)
+            .filter(|value| value.is_finite()),
+    }
+}
+
 pub fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
     // Filesystem checks and ordering work must not hold the scheduler mutexes.
     let draining = scheduler.is_draining();
@@ -295,48 +345,9 @@ pub fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
         }
         accumulate_worker(&mut snapshot, &worker);
         for job_id in details.jobs_assigned.keys() {
-            let progress = details
-                .capabilities
-                .native_placement
-                .as_ref()
-                .and_then(|placement| placement.queue.jobs.get(job_id));
-            let (state, assigned_at, state_since, prediction) = jobs.get(job_id).map_or_else(
-                || {
-                    details.jobs_assigning.get(job_id).map_or_else(
-                        // Preserve the reservation in the count, but never invent a timestamp.
-                        || ("Missing scheduler state".into(), None, None, None),
-                        |&since| ("Assigning".into(), Some(since), Some(since), None),
-                    )
-                },
-                |detail| {
-                    (
-                        detail.state.to_string(),
-                        Some(detail.assigned_at),
-                        Some(detail.state_since),
-                        detail.prediction,
-                    )
-                },
-            );
-            snapshot.jobs.push(Job {
-                id: job_id.to_string(),
-                description: details
-                    .jobs_assigned
-                    .get(job_id)
-                    .and_then(Option::as_ref)
-                    .and_then(|native| native.dashboard.clone()),
-                worker: worker.name.clone(),
-                worker_id: worker.id.clone(),
-                state,
-                native_phase: progress.map(|progress| format!("{:?}", progress.phase)),
-                native_phase_observed_ns: progress.map(|progress| progress.phase_nanoseconds),
-                assigned_at_ms: assigned_at.map(timestamp_ms),
-                state_since_ms: state_since.map(timestamp_ms),
-                remaining_input_bytes: progress.map(|progress| progress.remaining_input_bytes),
-                remaining_input_blobs: progress.map(|progress| progress.remaining_input_blobs),
-                predicted_completion_secs: prediction
-                    .map(|estimate| estimate.completion_seconds)
-                    .filter(|value| value.is_finite()),
-            });
+            snapshot
+                .jobs
+                .push(project_job(job_id, details, &worker, jobs.get(job_id)));
         }
         snapshot.workers.push(worker);
     }

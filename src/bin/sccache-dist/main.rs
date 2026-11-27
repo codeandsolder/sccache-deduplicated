@@ -1486,11 +1486,6 @@ impl Scheduler {
         let Some(server_id) = selected else {
             return Ok(Err(candidates.no_capacity(servers.len())));
         };
-        let CandidateSet {
-            healthy,
-            predictions,
-            ..
-        } = candidates;
         let server_details = servers.get_mut(&server_id).ok_or_else(|| {
             anyhow::anyhow!("selected worker disappeared while scheduler lock held")
         })?;
@@ -1503,14 +1498,14 @@ impl Scheduler {
             .job_authorizer
             .generate_token(job_id)
             .context("Could not create an auth token for this job")?;
-        let prediction = predictions.get(&server_id).copied();
+        let prediction = candidates.predictions.get(&server_id).copied();
         if let Some(class) = class {
             trace!(target: "native_placement_replay", "{}", serde_json::json!({
                 "kind": "assigned", "job": job_id.0, "worker": server_id, "class": class,
-                "candidates": predictions,
+                "candidates": candidates.predictions,
                 "estimated_result_bytes": estimated_result_bytes,
                 "host_prior": server_details.capabilities.native_placement.as_ref().map(placement::ActionCost::baseline),
-                "healthy": healthy.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                "healthy": candidates.healthy.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             }));
         }
         let assigned = native_inputs.map(|inputs| placement::AssignedNative {
@@ -1519,7 +1514,10 @@ impl Scheduler {
             packages: std::sync::Arc::clone(packages),
             inputs: inputs.clone(),
             class,
-            cost: predictions.get(&server_id).map(|estimate| estimate.cost),
+            cost: candidates
+                .predictions
+                .get(&server_id)
+                .map(|estimate| estimate.cost),
             milestone: None,
         });
         server_details.reserve(job_id, assigned);

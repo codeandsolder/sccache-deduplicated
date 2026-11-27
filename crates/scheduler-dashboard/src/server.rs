@@ -444,6 +444,10 @@ mod tests {
             .await?;
         assert!(html.contains("Scheduler status"));
         assert!(html.contains("sccache-dashboard.css"));
+        assert!(html.contains("Scheduler activity"));
+        assert!(!html.contains("id=\"jobs\""));
+        assert!(!html.contains("id=\"topology\""));
+        assert!(!html.contains("id=\"metrics\""));
         server.abort();
         Ok(())
     }

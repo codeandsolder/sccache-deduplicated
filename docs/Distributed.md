@@ -627,9 +627,10 @@ docker run -ti --rm -v $PWD:/sccache luser/sccache-musl-build:0.1 /bin/bash -c "
 ## Local scheduler status dashboard
 
 The dashboard opens on Overview. The remaining tabs are Workers, Jobs, CAS,
-Cache hits, Cache storage, Topology, Network and Fleet metrics. Switching tabs
-preserves filters, pagination and topology selection; updates retain keyed table
-cells and fixed column widths instead of rebuilding rows.
+Cache hits, Cache storage, Topology, Network and Fleet metrics. Only the active tab is rendered, with filters, pagination and topology selection
+kept outside its view lifetime. Updates retain keyed table cells and fixed column
+widths instead of rebuilding rows. The optional fleet metrics stream disconnects
+when leaving its tabs, avoiding inactive query and rendering load.
 
 ### Live network topology
 
