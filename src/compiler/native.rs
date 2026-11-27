@@ -1102,6 +1102,50 @@ mod tests {
         Ok(config)
     }
 
+    fn hash_test_invocation(
+        rt: &tokio::runtime::Runtime,
+        creator: &ProcessCommandCreator,
+        executable: &Path,
+        cwd: &Path,
+        args: &[OsString],
+        environment: &[(OsString, OsString)],
+        config: &Config,
+    ) -> Result<super::super::HashResult<ProcessCommandCreator>> {
+        let pool = rt.handle();
+        let storage = storage_from_config(config, pool)?;
+        assert_eq!(storage.cache_type_name(), "native");
+        let (compiler, _) = rt.block_on(get_compiler_info(
+            creator.clone(),
+            executable,
+            cwd,
+            args,
+            environment,
+            pool,
+            crate::compiler::CompilerDiscovery::default(),
+        ))?;
+        let CompilerArguments::Ok(mut hasher) = compiler.parse_arguments(
+            args,
+            cwd,
+            environment,
+            super::super::CompilerCachePolicy::Native,
+        ) else {
+            anyhow::bail!("real compiler arguments are not cacheable");
+        };
+        let hashed = rt.block_on(hasher.generate_hash_key(GenerateHashKeyContext {
+            native: None,
+            creator,
+            cwd: cwd.to_owned(),
+            env_vars: environment.to_vec(),
+            may_dist: true,
+            pool,
+            rewrite_includes_only: false,
+            storage,
+            cache_control: CacheControl::Default,
+        }))?;
+        assert_eq!(hashed.cache_control, CacheControl::Default);
+        Ok(hashed)
+    }
+
     fn verify_compilation(
         executable: &Path,
         args: &[&str],
@@ -1116,43 +1160,19 @@ mod tests {
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
         let environment = vec![("PATH".into(), "/usr/bin:/bin".into())];
         let rt = tokio::runtime::Runtime::new()?;
-        let pool = rt.handle();
         let mut config = config()?;
         config.fallback_cache.dir = cwd.join("unexpected-archive-cache");
         config.dist.cache_dir = cwd.join("unexpected-toolchain-cache");
-        let storage = storage_from_config(&config, pool)?;
-        assert_eq!(storage.cache_type_name(), "native");
         let creator = ProcessCommandCreator::new(&Client::new_num(1));
-        let (compiler, _) = rt.block_on(get_compiler_info(
-            creator.clone(),
+        let hashed = hash_test_invocation(
+            &rt,
+            &creator,
             executable,
             &cwd,
             &args,
             &environment,
-            pool,
-            crate::compiler::CompilerDiscovery::default(),
-        ))?;
-        let CompilerArguments::Ok(mut hasher) = compiler.parse_arguments(
-            &args,
-            &cwd,
-            &environment,
-            super::super::CompilerCachePolicy::Native,
-        ) else {
-            anyhow::bail!("real compiler arguments are not cacheable");
-        };
-        let hashed = rt.block_on(hasher.generate_hash_key(GenerateHashKeyContext {
-            #[cfg(all(feature = "dist-client", target_os = "linux"))]
-            native: None,
-            creator: &creator,
-            cwd: cwd.clone(),
-            env_vars: environment.clone(),
-            may_dist: true,
-            pool,
-            rewrite_includes_only: false,
-            storage,
-            cache_control: CacheControl::Default,
-        }))?;
-        assert_eq!(hashed.cache_control, CacheControl::Default);
+            &config,
+        )?;
         let compilation = hashed.compilation;
         let result_policy = compilation.native_result_policy();
         let mut transformer = dist::PathTransformer::new();
@@ -1382,40 +1402,19 @@ mod tests {
             "-o".into(),
             cwd.join("input.o").into_os_string(),
         ];
-        let pool = rt.handle();
         let mut config = config()?;
         config.fallback_cache.dir = root.join("unexpected-archive-cache");
         config.dist.cache_dir = root.join("unexpected-toolchain-cache");
-        let storage = storage_from_config(&config, pool)?;
         let creator = ProcessCommandCreator::new(&Client::new_num(1));
-        let (compiler, _) = rt.block_on(get_compiler_info(
-            creator.clone(),
+        let hash = hash_test_invocation(
+            rt,
+            &creator,
             compiler_path,
             &cwd,
             &args,
             &environment,
-            pool,
-            crate::compiler::CompilerDiscovery::default(),
-        ))?;
-        let CompilerArguments::Ok(mut hasher) = compiler.parse_arguments(
-            &args,
-            &cwd,
-            &environment,
-            super::super::CompilerCachePolicy::Native,
-        ) else {
-            anyhow::bail!("real C++ invocation was not cacheable");
-        };
-        let hash = rt.block_on(hasher.generate_hash_key(GenerateHashKeyContext {
-            native: None,
-            creator: &creator,
-            cwd: cwd.clone(),
-            env_vars: environment,
-            may_dist: true,
-            pool,
-            rewrite_includes_only: false,
-            storage,
-            cache_control: CacheControl::Default,
-        }))?;
+            &config,
+        )?;
         let compilation = hash.compilation;
         let policy = compilation.native_result_policy();
         let mut transformer = dist::PathTransformer::new();
