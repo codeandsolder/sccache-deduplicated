@@ -85,7 +85,7 @@ fn job(index: usize, phase: u64) -> Job {
         assigned_at_ms: Some(now().saturating_sub(30) * 1000),
         state_since_ms: Some(now().saturating_sub(10) * 1000),
         remaining_input_bytes: Some(remaining),
-        remaining_input_blobs: Some(usize::try_from(remaining / 1024).unwrap_or_default()),
+        remaining_input_blobs: Some(remaining / 1024),
         predicted_completion_secs: Some(12.0),
     }
 }

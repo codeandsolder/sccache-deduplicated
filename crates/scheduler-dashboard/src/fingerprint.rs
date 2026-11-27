@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(crate) const INPUTS: &[&str] = &[
+pub const INPUTS: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
     "rust-toolchain.toml",
