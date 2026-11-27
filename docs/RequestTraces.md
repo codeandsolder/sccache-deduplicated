@@ -67,8 +67,13 @@ loopback and the private Tailscale address.
 
 ## Dashboard
 
-Open Traces for recent or slow completed requests, filtering by exact
-host/revision/compiler/output/outcome. Select an individual request or paste its trace ID.
+Traces opens on Completed requests by default, filtering recent or slow
+requests by exact host/revision/compiler/output/outcome. Active requests,
+Active jobs, Phase latency, and Request detail have separate bounded scroll
+views, so live row insertions and removals cannot reposition completed history
+or the selected request. Inspect a request or paste its trace ID to open
+Request detail; Back to list retains the prior view and its filters. Refresh
+detail is independent of Search / refresh.
 The timeline aligns spans by wall-clock start times and uses monotonic duration
 measurements within each host. Cross-host clock disagreement can make spans
 appear outside the root; the UI flags that instead of changing measurements.
@@ -80,7 +85,7 @@ phase count once; conflicting phases are reported as ambiguous overlap;
 unrecorded gaps and instrumenter omissions remain visible. Parallel
 diagnostic intervals and other hosts are excluded from this accounting.
 A producer link opens its separate trace. The browser regression exercises
-live row identity, trace selection, producer navigation and revision search. The fleet table reports histogram-based estimates of p50/p95/p99 and
+live row identity, layout and focus across live row count changes, trace selection, producer navigation and revision search. The fleet table reports histogram-based estimates of p50/p95/p99 and
 cumulative elapsed time by phase, service, host and exact source revision.
 Searches freeze the requested time range and split it into disjoint windows
 of at most 100,000 raw spans before replay deduplication. The dashboard merges

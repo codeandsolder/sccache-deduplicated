@@ -194,18 +194,47 @@ control phase 6
 await_js 'return routeRow===document.querySelector("#topology tbody tr") && routeCell===routeRow.cells[3] && routePath===document.querySelector("#topology svg path[marker-end]") && routeCell.innerText!==oldRoute'
 
 select_tab Traces
-await_js 'return document.querySelector("#traces")?.innerText.includes("1 reported active") && document.querySelector("#traces")?.innerText.includes("fixture-traced-crate") && document.querySelector("#traces")?.innerText.includes("Fleet-wide phase latency")'
-js 'window.traceRow=document.querySelector("#traces tbody tr"); window.tracePhase=traceRow.cells[2]; return tracePhase.innerText==="hash_inputs"' | jq -e '.value==true' >/dev/null
+trace_tab() {
+    js "const tab=[...document.querySelectorAll('#traces [aria-label=\"Trace views\"] button')].find(x=>x.textContent.trim()==='$1'); tab.click(); return true" >/dev/null
+}
+await_js 'return document.querySelector("#trace-completed:not([hidden]) tbody tr")?.innerText.includes("fixture-traced-crate") && document.querySelector("#trace-active-requests").hidden && document.querySelector("#trace-active-jobs").hidden'
+js 'window.historyPane=document.querySelector("#trace-completed"); window.historyRow=historyPane.querySelector("tbody tr"); window.scrollTo(0,0); historyPane.scrollTop=180; window.historyScroll=historyPane.scrollTop; window.historyBox=historyPane.getBoundingClientRect(); window.historyRowBox=historyRow.getBoundingClientRect(); window.historyFilter=[...document.querySelectorAll("#traces label")].find(l=>l.textContent.includes("Revision (full SHA)")).querySelector("input"); historyFilter.focus({preventScroll:true}); historyFilter.value="partial-filter"; historyFilter.dispatchEvent(new Event("input",{bubbles:true})); window.historyStable=()=>historyScroll>0&&historyPane.scrollTop===historyScroll&&historyPane===document.querySelector("#trace-completed")&&historyRow===historyPane.querySelector("tbody tr")&&historyPane.getBoundingClientRect().y===historyBox.y&&historyPane.getBoundingClientRect().height===historyBox.height&&historyRow.getBoundingClientRect().y===historyRowBox.y&&historyFilter.value==="partial-filter"; return historyStable()' | jq -e '.value==true' >/dev/null
+control phase 8
+await_js 'return document.querySelectorAll("#trace-active-requests tbody tr").length===48 && document.querySelectorAll("#trace-active-jobs tbody tr").length===11 && historyStable() && document.activeElement===historyFilter'
+control phase 9
+await_js 'return document.querySelectorAll("#trace-active-requests tbody tr").length===0 && document.querySelectorAll("#trace-active-jobs tbody tr").length===2 && historyStable() && document.activeElement===historyFilter'
+control phase 6
+trace_tab "Active requests"
+await_js 'return document.querySelector("#trace-active-requests:not([hidden])")?.innerText.includes("1 reported active") && document.querySelector("#trace-completed").hidden'
+js 'window.traceRow=document.querySelector("#trace-active-requests tbody tr"); window.tracePhase=traceRow.cells[2]; window.livePane=document.querySelector("#trace-active-requests"); window.liveBox=livePane.getBoundingClientRect(); return tracePhase.innerText==="hash_inputs"' | jq -e '.value==true' >/dev/null
+control phase 8
+await_js 'return document.querySelectorAll("#trace-active-requests tbody tr").length===48 && traceRow===document.querySelector("#trace-active-requests tbody tr") && livePane.getBoundingClientRect().height===liveBox.height && livePane.getBoundingClientRect().y===liveBox.y && livePane.scrollHeight>livePane.clientHeight'
 control phase 7
-await_js 'return traceRow===document.querySelector("#traces tbody tr") && tracePhase===traceRow.cells[2] && tracePhase.innerText==="wait_for_producer"'
+await_js 'return traceRow===document.querySelector("#trace-active-requests tbody tr") && tracePhase===traceRow.cells[2] && tracePhase.innerText==="wait_for_producer" && livePane.getBoundingClientRect().height===liveBox.height'
 js 'traceRow.querySelector("a").click(); return true' >/dev/null
-await_js 'const detail=document.querySelector("#trace-detail"); return detail?.innerText.includes("fixture-traced-crate") && detail.innerText.includes("Action key:") && detail.innerText.includes("Latency attribution") && [...detail.querySelectorAll(".trace-breakdown tbody tr")].some(row=>row.innerText.includes("wait_for_producer")&&row.innerText.includes("60.000 ms")&&row.innerText.includes("60.0%")) && [...detail.querySelectorAll(".trace-breakdown tbody tr")].some(row=>row.innerText.includes("Unobserved")&&row.innerText.includes("10.000 ms")) && detail.querySelectorAll(".trace-waterfall tbody tr").length===4'
+await_js 'const detail=document.querySelector("#trace-detail:not([hidden])"); return detail?.innerText.includes("fixture-traced-crate") && detail.innerText.includes("Action key:") && detail.innerText.includes("Latency attribution") && [...detail.querySelectorAll(".trace-breakdown tbody tr")].some(row=>row.innerText.includes("wait_for_producer")&&row.innerText.includes("60.000 ms")&&row.innerText.includes("60.0%")) && [...detail.querySelectorAll(".trace-breakdown tbody tr")].some(row=>row.innerText.includes("Unobserved")&&row.innerText.includes("10.000 ms")) && detail.querySelectorAll(".trace-waterfall tbody tr").length===4'
+js 'window.detailPane=document.querySelector("#trace-detail"); window.detailRow=detailPane.querySelector(".trace-waterfall tbody tr"); window.detailBox=detailPane.getBoundingClientRect(); return true' >/dev/null
+control phase 8
+await_js 'return document.querySelectorAll("#trace-active-requests tbody tr").length===48 && detailRow===detailPane.querySelector(".trace-waterfall tbody tr") && detailPane.getBoundingClientRect().y===detailBox.y && detailPane.getBoundingClientRect().height===detailBox.height'
 js 'document.querySelector("#trace-detail .trace-waterfall a").click(); return true' >/dev/null
-await_js 'const detail=document.querySelector("#trace-detail"); return detail?.innerText.includes("fixture-producer") && detail.innerText.includes("clock skew or asynchronous completion") && detail.querySelectorAll(".trace-breakdown").length===2 && [...detail.querySelectorAll(".trace-breakdown tbody tr")].some(row=>row.innerText.includes("compiler_process")&&row.innerText.includes("50.000 ms")&&row.innerText.includes("62.5%"))'
-js 'const input=[...document.querySelectorAll("#traces label")].find(l=>l.textContent.includes("Revision (full SHA)")).querySelector("input"); input.value="wrong-revision"; input.dispatchEvent(new Event("input",{bubbles:true})); [...document.querySelectorAll("#traces button")].find(b=>b.textContent.includes("Search / refresh")).click(); return true' >/dev/null
-await_js 'return ![...document.querySelectorAll("#traces table")].some(t=>t.querySelector("thead")?.innerText.includes("Outcome")&&t.querySelector("tbody tr")) && document.querySelector("#traces").innerText.includes("Fleet-wide phase latency")'
-js 'const input=[...document.querySelectorAll("#traces label")].find(l=>l.textContent.includes("Revision (full SHA)")).querySelector("input"); input.value="0123456789abcdef0123456789abcdef01234567"; input.dispatchEvent(new Event("input",{bubbles:true})); [...document.querySelectorAll("#traces button")].find(b=>b.textContent.includes("Search / refresh")).click(); return true' >/dev/null
-await_js 'return [...document.querySelectorAll("#traces table")].some(t=>t.querySelector("thead")?.innerText.includes("Outcome")&&t.querySelector("tbody tr")?.innerText.includes("fixture-traced-crate"))'
+await_js 'const detail=document.querySelector("#trace-detail:not([hidden])"); return detail?.innerText.includes("fixture-producer") && detail.innerText.includes("clock skew or asynchronous completion") && detail.querySelectorAll(".trace-breakdown").length===2 && [...detail.querySelectorAll(".trace-breakdown tbody tr")].some(row=>row.innerText.includes("compiler_process")&&row.innerText.includes("50.000 ms")&&row.innerText.includes("62.5%"))'
+js '[...document.querySelectorAll("#traces button")].find(b=>b.textContent==="Back to list").click(); return true' >/dev/null
+await_js 'return !document.querySelector("#trace-active-requests").hidden && document.querySelector("#trace-detail").hidden'
+trace_tab "Active jobs"
+await_js 'return !document.querySelector("#trace-active-jobs").hidden && document.querySelectorAll("#trace-active-jobs tbody tr").length===11'
+js 'window.jobsPane=document.querySelector("#trace-active-jobs"); window.jobsBox=jobsPane.getBoundingClientRect(); return true' >/dev/null
+control phase 9
+await_js 'return document.querySelectorAll("#trace-active-jobs tbody tr").length===2 && jobsPane.getBoundingClientRect().height===jobsBox.height && jobsPane.getBoundingClientRect().y===jobsBox.y'
+trace_tab "Completed requests"
+js 'window.scrollTo(0,0); return true' >/dev/null
+await_js 'return historyStable() && !historyPane.hidden'
+js 'historyFilter.value="wrong-revision"; historyFilter.dispatchEvent(new Event("input",{bubbles:true})); [...document.querySelectorAll("#traces button")].find(b=>b.textContent.includes("Search / refresh")).click(); return true' >/dev/null
+await_js 'return !document.querySelector("#trace-completed tbody tr")'
+trace_tab "Phase latency"
+await_js 'return document.querySelector("#trace-phases:not([hidden])")?.innerText.includes("Fleet-wide phase latency") && document.querySelector("#trace-completed").hidden'
+trace_tab "Completed requests"
+js 'historyFilter.value="0123456789abcdef0123456789abcdef01234567"; historyFilter.dispatchEvent(new Event("input",{bubbles:true})); [...document.querySelectorAll("#traces button")].find(b=>b.textContent.includes("Search / refresh")).click(); return true' >/dev/null
+await_js 'return document.querySelector("#trace-completed:not([hidden]) tbody tr")?.innerText.includes("fixture-traced-crate")'
 
 control phase 6
 select_tab "Cache hits"
