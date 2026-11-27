@@ -264,6 +264,10 @@ pub fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
                 },
             );
             snapshot.jobs.push(Job {
+                trace_id: jobs
+                    .get(job_id)
+                    .and_then(|detail| detail.trace)
+                    .map(sccache::latency_trace::TraceContext::hex_id),
                 id: job_id.to_string(),
                 worker: worker.name.clone(),
                 worker_id: worker.id.clone(),

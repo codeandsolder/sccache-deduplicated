@@ -154,7 +154,7 @@ pub fn App() -> impl IntoView {
             </Suspense>
             <FleetMetrics/>
             </Show>
-            <Show when=move || show_traces.get()><traces::TracePanel/></Show>
+            <Show when=move || show_traces.get()><traces::TracePanel data=data/></Show>
         </main>
     }
 }

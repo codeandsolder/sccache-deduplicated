@@ -67,6 +67,7 @@ pub struct NativeWorker {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Job {
+    pub trace_id: Option<String>,
     pub id: String,
     pub worker: String,
     pub worker_id: String,

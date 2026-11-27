@@ -895,6 +895,7 @@ const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Copy, Clone)]
 struct JobDetail {
+    trace: Option<sccache::latency_trace::TraceContext>,
     server_id: ServerId,
     state: JobState,
     // Time spent in the current phase, not the total time since allocation.
@@ -1252,6 +1253,7 @@ fn weighted_server(candidates: &[(ServerId, f64)], draw: f64) -> Option<ServerId
 }
 
 struct Reservation {
+    trace: Option<sccache::latency_trace::TraceContext>,
     job_id: JobId,
     server_id: ServerId,
     auth: String,
@@ -1526,6 +1528,7 @@ impl Scheduler {
         drop(servers);
         info!("Job {job_id} created and will be assigned to server {server_id:?}");
         Ok(Ok(Reservation {
+            trace: native.and_then(|assignment| assignment.trace),
             job_id,
             server_id,
             auth,
@@ -1607,6 +1610,7 @@ impl Scheduler {
         assigned_at: Instant,
     ) -> Result<AllocJobResult> {
         let Reservation {
+            trace,
             job_id,
             server_id,
             auth,
@@ -1649,6 +1653,7 @@ impl Scheduler {
                 jobs.insert(
                     job_id,
                     JobDetail {
+                        trace,
                         server_id,
                         state,
                         state_since: Instant::now(),

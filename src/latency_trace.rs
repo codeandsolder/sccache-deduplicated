@@ -37,6 +37,17 @@ impl TraceContext {
         Self { span_id, ..self }
     }
 
+    #[must_use = "the hexadecimal identifier selects a trace in the dashboard"]
+    pub fn hex_id(self) -> String {
+        use std::fmt::Write as _;
+        self.trace_id
+            .iter()
+            .fold(String::with_capacity(32), |mut output, byte| {
+                let _ = write!(output, "{byte:02x}");
+                output
+            })
+    }
+
     #[must_use = "the IDs must be nonzero before accepting remote context"]
     pub fn valid(self) -> bool {
         self.trace_id != [0; 16] && self.span_id != [0; 8]

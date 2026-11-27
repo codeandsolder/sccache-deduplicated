@@ -6,14 +6,14 @@ use crate::{
 };
 
 #[server(endpoint = "trace_search")]
-async fn trace_search(search: TraceSearch) -> Result<TraceOverview, ServerFnError> {
+async fn load_trace_search(search: TraceSearch) -> Result<TraceOverview, ServerFnError> {
     let service = use_context::<crate::server::traces::TraceService>()
         .ok_or_else(|| ServerFnError::new("Trace service unavailable"))?;
     service.search(search).await.map_err(ServerFnError::new)
 }
 
 #[server(endpoint = "trace_detail")]
-async fn trace_detail(id: String) -> Result<TraceDetail, ServerFnError> {
+async fn load_trace_detail(id: String) -> Result<TraceDetail, ServerFnError> {
     let service = use_context::<crate::server::traces::TraceService>()
         .ok_or_else(|| ServerFnError::new("Trace service unavailable"))?;
     service.detail(id).await.map_err(ServerFnError::new)
@@ -98,7 +98,7 @@ fn Timeline(detail: TraceDetail) -> impl IntoView {
 }
 
 #[component]
-pub(super) fn TracePanel() -> impl IntoView {
+pub(super) fn TracePanel(data: Memo<Option<crate::DashboardData>>) -> impl IntoView {
     let filters = RwSignal::new(TraceSearch::default());
     let applied = RwSignal::new(TraceSearch::default());
     let revision = RwSignal::new(0_u64);
@@ -106,7 +106,7 @@ pub(super) fn TracePanel() -> impl IntoView {
     let lookup = RwSignal::new(String::new());
     let overview = Resource::new(
         move || (applied.get(), revision.get()),
-        |(query, _)| trace_search(query),
+        |(query, _)| load_trace_search(query),
     );
     let detail = Resource::new(
         move || (selected.get(), revision.get()),
@@ -114,13 +114,24 @@ pub(super) fn TracePanel() -> impl IntoView {
             if id.is_empty() {
                 Ok(None)
             } else {
-                trace_detail(id).await.map(Some)
+                load_trace_detail(id).await.map(Some)
             }
         },
     );
     view! {
         <section id="traces">
             <h2>"Request traces"</h2>
+            <h3>"Active distributed jobs"</h3>
+            <p class=styles::muted>"Live scheduler state; client-only work is not listed here. Completed spans become available in trace storage."</p>
+            <table><thead><tr><th>"Job"</th><th>"Worker"</th><th>"Phase"</th><th>"Phase elapsed"</th><th>"Trace"</th></tr></thead>
+                <tbody>{move || data.get().and_then(|data| data.snapshot).map(|snapshot| snapshot.jobs.into_iter().map(|job| {
+                    let trace = job.trace_id;
+                    view!{<tr><td>{job.id}</td><td>{job.worker}</td>
+                        <td>{job.native_phase.unwrap_or(job.state)}</td>
+                        <td>{job.native_phase_observed_ns.map_or_else(|| "—".into(), ms)}</td>
+                        <td>{trace.map(|id| view!{<button on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Inspect"</button>})}</td></tr>}
+                }).collect_view())}</tbody>
+            </table>
             <div class=styles::controls>
                 <label>"Range"<select on:change=move |ev| filters.update(|f| f.lookback_secs = event_target_value(&ev).parse().unwrap_or(3600))>
                     <option value="300">"5 minutes"</option><option value="3600" selected=true>"1 hour"</option><option value="86400">"1 day"</option><option value="604800">"7 days"</option>

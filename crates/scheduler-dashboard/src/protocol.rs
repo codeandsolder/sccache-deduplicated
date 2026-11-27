@@ -115,6 +115,7 @@ mod tests {
 
     fn job(id: &str) -> Job {
         Job {
+            trace_id: None,
             id: id.into(),
             worker: "worker".into(),
             worker_id: "127.0.0.1:1".into(),
