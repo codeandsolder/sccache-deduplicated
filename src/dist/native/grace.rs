@@ -140,21 +140,24 @@ impl GraceReservation {
             return Ok((captured, None));
         }
         let publication = self.promote();
-        let (captured, lease, warm) = tokio::task::spawn_blocking(move || {
+        let staging_store = store.clone();
+        let (captured, manifest, staged, existing, warm) = tokio::task::spawn_blocking(move || {
             let manifest = captured
                 .successful_result()
-                .context("failed execution cannot be retained")?;
-            let existing = store.reserve_upload(manifest)?;
+                .context("failed execution cannot be retained")?
+                .clone();
+            let existing = staging_store.reserve_upload(&manifest)?;
             let warm = existing.missing().is_empty();
             let mut staged = Vec::new();
             for &blob in existing.missing() {
                 staged.push(budget.stage_expected(blob, captured.open_blob(blob.id)?)?);
             }
-            let lease =
-                store.publish_pinned(&fingerprint, manifest, staged, ActionMode::Refresh)?;
-            Ok::<_, anyhow::Error>((captured, lease, warm))
+            Ok::<_, anyhow::Error>((captured, manifest, staged, existing, warm))
         })
         .await??;
+        let lease = store
+            .publish_pinned_async(fingerprint, manifest, staged, ActionMode::Refresh, existing)
+            .await?;
         let (deadline, waited) = publication.commit(lease, wait).await?;
         Ok((
             captured,
