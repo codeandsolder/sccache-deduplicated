@@ -335,6 +335,17 @@ struct BackfillUpload {
     _slot: UploadSlot,
 }
 
+impl BackfillUpload {
+    fn complete(self, lease: Arc<TreeLease>) -> Result<()> {
+        let mut pending = self.flight.lock()?;
+        pending.ready = Some(lease);
+        pending.peer_until = None;
+        pending.peer_retry_at = None;
+        drop(pending);
+        Ok(())
+    }
+}
+
 impl Drop for BackfillUpload {
     fn drop(&mut self) {
         if let Ok(mut state) = self.flight.lock() {
@@ -493,7 +504,7 @@ enum UploadPublication {
     Direct(UploadGuard),
     Backfill {
         manifest: TreeManifest,
-        _reserved: UploadReservation,
+        reserved: UploadReservation,
         guard: BackfillUpload,
     },
 }
@@ -1491,29 +1502,67 @@ impl NativeSessions {
             stager,
             publication,
         } = upload;
-        let mut guard = match publication {
+        let guard = match publication {
             UploadPublication::Direct(guard) => guard,
             UploadPublication::Backfill {
                 manifest,
-                _reserved,
+                reserved: _reserved,
                 guard,
             } => {
                 return (|| {
                     let lease = self
                         .store()
                         .publish_tree_pinned(&manifest, vec![stager.finish()?])?;
-                    let mut pending = guard.flight.lock()?;
-                    pending.ready = Some(Arc::new(lease));
-                    pending.peer_until = None;
-                    pending.peer_retry_at = None;
-                    drop(pending);
-                    drop(guard);
-                    Ok(())
+                    guard.complete(Arc::new(lease))
                 })()
                 .map_err(backfill_error);
             }
         };
-        let staged = stager.finish()?;
+        self.attach_direct_upload(guard, stager.finish()?)
+    }
+
+    /// Complete a received upload without parking a blocking worker behind
+    /// the CAS publication queue. The owned task holds the upload claim
+    /// through the committed backfill receipt even if its caller disconnects.
+    ///
+    /// # Errors
+    /// Returns an error for invalid content, expired transfers or storage failure.
+    pub async fn finish_upload_async(self: &Arc<Self>, upload: NativeUpload) -> Result<()> {
+        let sessions = Arc::clone(self);
+        tokio::spawn(async move {
+            let NativeUpload {
+                stager,
+                publication,
+            } = upload;
+            match publication {
+                UploadPublication::Direct(guard) => {
+                    tokio::task::spawn_blocking(move || {
+                        sessions.attach_direct_upload(guard, stager.finish()?)
+                    })
+                    .await?
+                }
+                UploadPublication::Backfill {
+                    manifest,
+                    reserved,
+                    guard,
+                } => {
+                    let result = async {
+                        let staged = tokio::task::spawn_blocking(move || stager.finish()).await??;
+                        let lease = sessions
+                            .store()
+                            .publish_tree_pinned_async(manifest, vec![staged], reserved)
+                            .await?;
+                        guard.complete(Arc::new(lease))
+                    }
+                    .await;
+                    result.map_err(backfill_error)
+                }
+            }
+        })
+        .await?
+    }
+
+    fn attach_direct_upload(&self, mut guard: UploadGuard, staged: StagedBlob) -> Result<()> {
         let mut state = Self::lock(&guard.session)?;
         self.authorize(&mut state, guard.publisher)?;
         let Phase::Pending(pending) = &mut state.phase else {
@@ -1664,10 +1713,7 @@ impl NativeSessions {
             .map(|allocation| allocation.worker.peer);
         let (producer, pinned) = match &state.phase {
             Phase::Ready(Ready::Result(lease)) => {
-                ensure!(
-                    declared(&lease.manifest().blobs()?),
-                    "undeclared result source"
-                );
+                ensure!(declared(lease.blobs()), "undeclared result source");
                 (producer, true)
             }
             Phase::Ready(Ready::Tree(delivery)) => match &delivery.source {
@@ -1695,10 +1741,7 @@ impl NativeSessions {
         let availability = if pinned {
             vec![true; blobs.len()]
         } else {
-            blobs
-                .iter()
-                .map(|&blob| Ok(self.store().open_available_physical(blob)?.is_some()))
-                .collect::<Result<Vec<_>>>()?
+            self.store().available_blobs(blobs)?
         };
         Ok((producer, availability))
     }
@@ -1794,18 +1837,23 @@ impl NativeSessions {
         missing: Vec<BlobRef>,
     ) -> Result<()> {
         let session = self.get(ticket)?;
-        let mut state = Self::lock(&session)?;
-        self.authorize_reader(&mut state, reader)?;
-        let Phase::Ready(Ready::Tree(delivery)) = &mut state.phase else {
-            bail!("input prefetch requires a tree delivery");
-        };
-        let TreeSource::Action {
-            ticket: action,
-            id: tree,
-            input,
-        } = &delivery.source
-        else {
-            bail!("input prefetch requires an assigned action");
+        let (action, tree, input) = {
+            let mut state = Self::lock(&session)?;
+            self.authorize_reader(&mut state, reader)?;
+            let Phase::Ready(Ready::Tree(delivery)) = &state.phase else {
+                bail!("input prefetch requires a tree delivery");
+            };
+            let TreeSource::Action {
+                ticket: action,
+                id: tree,
+                input,
+            } = &delivery.source
+            else {
+                bail!("input prefetch requires an assigned action");
+            };
+            let target = (*action, *tree, Arc::clone(input));
+            drop(state);
+            target
         };
         let mut blobs = BTreeMap::new();
         for blob in missing {
@@ -1815,13 +1863,26 @@ impl NativeSessions {
                 "undeclared or duplicate input prefetch"
             );
         }
-        let action = *action;
-        let tree = *tree;
-        let reservation = self.store().reserve_blobs(blobs)?;
+        // Physical validation and pending-content reservation may wait for
+        // storage/GC. Lease renewal and close must not wait behind either.
+        let reservation = self.store().reserve_blobs(&blobs)?;
         let absent = reservation.missing().to_vec();
-        delivery.requested.extend(absent.iter().map(|blob| blob.id));
-        delivery.reservation = Some(reservation);
-        drop(state);
+        let previous = {
+            let mut state = Self::lock(&session)?;
+            self.authorize_reader(&mut state, reader)?;
+            let Phase::Ready(Ready::Tree(delivery)) = &mut state.phase else {
+                bail!("input delivery closed during prefetch");
+            };
+            ensure!(
+                matches!(&delivery.source, TreeSource::Action { ticket, id, .. } if *ticket == action && *id == tree),
+                "input delivery changed during prefetch"
+            );
+            delivery.requested.extend(absent.iter().map(|blob| blob.id));
+            let previous = delivery.reservation.replace(reservation);
+            drop(state);
+            previous
+        };
+        drop(previous);
         self.request_backfills(action, reader, tree, &absent)
     }
 
@@ -1981,13 +2042,7 @@ impl NativeSessions {
             let lease = sessions
                 .acquire_peer_blob(claim.blob(), deadline, &fetch)
                 .await?;
-            let mut pending = claim.0.flight.lock()?;
-            pending.ready = Some(lease);
-            pending.peer_until = None;
-            pending.peer_retry_at = None;
-            drop(pending);
-            drop(claim);
-            Ok(())
+            claim.0.complete(lease)
         })
         .await?
     }
@@ -2268,7 +2323,7 @@ impl NativeSessions {
                 stager,
                 publication: UploadPublication::Backfill {
                     manifest,
-                    _reserved: reserved,
+                    reserved,
                     guard,
                 },
             })

@@ -1007,12 +1007,7 @@ impl NativeCacheClient {
                 for lease in &leases { on_tree(lease); }
                 acquired.extend(leases);
             }
-            let store = store.clone();
-            let tree = tokio::task::spawn_blocking(move || {
-                let tree = store.publish_tree_pinned(&manifest, Vec::new())?;
-                drop((acquired, packages, updated));
-                Ok::<_, anyhow::Error>(tree)
-            }).await??;
+            let tree = store.publish_tree_pinned_async(manifest, Vec::new(), (acquired, packages, updated)).await?;
             if log::log_enabled!(target: "native_cas_replay", log::Level::Trace) {
                 log::trace!(target: "native_cas_replay", "{}", serde_json::json!({
                     "kind": "tree_transfer", "tree": id, "raw_missing_blobs": raw_missing.len(),
@@ -1074,13 +1069,9 @@ impl NativeCacheClient {
             pins.extend(store.await_blobs(blobs, deadline, cancelled).await?);
         }
         check()?;
-        let owned = store.clone();
-        tokio::task::spawn_blocking(move || {
-            let tree = owned.publish_tree_pinned(&manifest, Vec::new())?;
-            drop(pins);
-            Ok(tree)
-        })
-        .await?
+        store
+            .publish_tree_pinned_async(manifest, Vec::new(), pins)
+            .await
     }
 
     #[cfg(all(target_os = "linux", feature = "native-store"))]
@@ -1170,12 +1161,7 @@ impl NativeCacheClient {
                     }
                 }
             };
-            let store = store.clone();
-            tokio::task::spawn_blocking(move || {
-                let tree = store.publish_tree_pinned(&manifest, staged)?;
-                drop(reservation);
-                Ok(tree)
-            }).await?
+            store.publish_tree_pinned_async(manifest, staged, reservation).await
         })).await.map(|(lease, _)| lease)
     }
 

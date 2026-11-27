@@ -55,6 +55,236 @@ fn sample_tree(blob: BlobRef) -> Result<TreeManifest> {
     })
 }
 
+#[tokio::test]
+async fn concurrent_tree_publications_commit_together_and_isolate_invalid_requests() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    let first = store.stage(&b"first input"[..])?;
+    let duplicate = store.stage(&b"first input"[..])?;
+    let second = store.stage(&b"second input"[..])?;
+    let one = NativeStore::blob_retention_manifest(first.reference())?;
+    let two = NativeStore::blob_retention_manifest(second.reference())?;
+    let missing = NativeStore::blob_retention_manifest(BlobRef {
+        id: ContentId::of(b"not uploaded"),
+        size: 12,
+    })?;
+    let (a, bad, b, replay) = tokio::join!(
+        store.publish_tree_pinned_async(one.clone(), vec![first], ()),
+        store.publish_tree_pinned_async(missing.clone(), Vec::new(), ()),
+        store.publish_tree_pinned_async(two.clone(), vec![second], ()),
+        store.publish_tree_pinned_async(one.clone(), vec![duplicate], ()),
+    );
+    let (a, b, replay) = (a?, b?, replay?);
+    assert!(bad.is_err());
+    assert_eq!(a.id(), replay.id());
+    assert_eq!(a.manifest(), &one);
+    assert_eq!(b.manifest(), &two);
+    assert_eq!(
+        store
+            .inner
+            .tree_publications
+            .committed_batches
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert!(store.lookup_tree(missing.id()?)?.is_none());
+    assert_eq!(store.stats()?.trees, 2);
+    assert_eq!(store.evict_tree(a.id())?, Eviction::Pinned);
+    assert_eq!(store.evict_tree(b.id())?, Eviction::Pinned);
+    drop((a, b, replay));
+    let replay = store.publish_tree_pinned_async(one, Vec::new(), ()).await?;
+    assert_eq!(
+        store
+            .inner
+            .tree_publications
+            .committed_batches
+            .load(Ordering::Relaxed),
+        1
+    );
+    drop(replay);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_tree_publication_retains_content_until_durable_commit() -> Result<()> {
+    use std::{
+        future::{Future, poll_fn},
+        task::Poll,
+        time::Duration,
+    };
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    let staged = store.stage(&b"shared input"[..])?;
+    let blob = staged.reference();
+    let original = NativeStore::blob_retention_manifest(blob)?;
+    let id = store.publish_tree(&original, vec![staged])?;
+    let reserve = store.reserve_tree_upload(&original)?;
+    let target = sample_tree(blob)?;
+    let target_id = target.id()?;
+    let published = store
+        .inner
+        .publications
+        .register(std::iter::once(blob.id))?;
+    let mut future = Box::pin(store.publish_tree_pinned_async(target, Vec::new(), reserve));
+    // Poll once to admit it, then drop the response waiter before the drain
+    // can run on this single-thread runtime.
+    poll_fn(|cx| {
+        assert!(future.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(future);
+    assert!(matches!(store.evict_tree(id)?, Eviction::Removed { .. }));
+    assert_eq!(store.collect_garbage(8)?.blobs, 0);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), published.next()).await?,
+        std::collections::BTreeSet::from([blob.id])
+    );
+    let lease = store
+        .lookup_tree(target_id)?
+        .context("cancelled publication lost its root")?;
+    assert_eq!(lease.blobs().get(&blob.id), Some(&blob.size));
+    assert_eq!(store.collect_garbage(8)?.blobs, 0);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "CAS group commit benchmark"]
+async fn benchmark_cas_group_commit() -> Result<()> {
+    use std::{sync::atomic::Ordering, time::Instant};
+    for grouped in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let store = NativeStore::open(temp.path())?;
+        let mut jobs = Vec::new();
+        for index in 0..256_u32 {
+            let bytes = index.to_le_bytes().repeat(1024);
+            let staged = store.stage(bytes.as_slice())?;
+            let manifest = NativeStore::blob_retention_manifest(staged.reference())?;
+            jobs.push((manifest, staged));
+        }
+        let start = Instant::now();
+        if grouped {
+            let mut active = Vec::new();
+            for (manifest, staged) in jobs {
+                let store = store.clone();
+                active.push(tokio::spawn(async move {
+                    store
+                        .publish_tree_pinned_async(manifest, vec![staged], ())
+                        .await
+                }));
+            }
+            for job in active {
+                drop(job.await??);
+            }
+        } else {
+            for (manifest, staged) in jobs {
+                drop(store.publish_tree_pinned(&manifest, vec![staged])?);
+            }
+        }
+        let commits = if grouped {
+            store
+                .inner
+                .tree_publications
+                .committed_batches
+                .load(Ordering::Relaxed)
+        } else {
+            256
+        };
+        assert_eq!(store.stats()?.trees, 256);
+        println!(
+            "CAS_GROUP_COMMIT grouped={grouped} requests=256 commits={commits} wall_ms={:.3}",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    Ok(())
+}
+
+/// Measure warm tree/result leases and reservation admission over the same
+/// immutable closure, including contention between independent consumers.
+#[test]
+#[ignore = "CAS metadata contention benchmark"]
+fn benchmark_cas_metadata_contention() -> Result<()> {
+    use std::{sync::Barrier, time::Instant};
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    let mut entries = BTreeMap::new();
+    let mut staged = Vec::new();
+    for index in 0..1024_u32 {
+        let data = index.to_le_bytes().repeat(256);
+        let blob = store.stage(data.as_slice())?;
+        entries.insert(
+            TreePath::new(format!("input-{index:04}").into_bytes())?,
+            TreeEntry::File {
+                blob: blob.reference(),
+                metadata: metadata(0o444),
+            },
+        );
+        staged.push(blob);
+    }
+    let tree = TreeManifest {
+        root: metadata(0o555),
+        entries,
+    };
+    let id = store.publish_tree(&tree, staged)?;
+    let result = ResultManifest {
+        outputs: BTreeMap::from([("tree".into(), Artifact::Tree(tree.clone()))]),
+        stdout: None,
+        stderr: None,
+    };
+    let fingerprint = ActionFingerprint {
+        schema: "metadata-benchmark".into(),
+        components: BTreeMap::new(),
+    };
+    let action = store
+        .publish(&fingerprint, &result, Vec::new(), crate::ActionMode::Reuse)?
+        .action;
+    let blobs = tree.blobs()?;
+    for width in [1, 8] {
+        let barrier = Barrier::new(width);
+        let elapsed = std::thread::scope(|scope| -> Result<_> {
+            let jobs = (0..width)
+                .map(|_| {
+                    scope.spawn(|| -> Result<_> {
+                        barrier.wait();
+                        let start = Instant::now();
+                        for _ in 0..16 {
+                            let tree = store.lookup_tree(id)?.context("benchmark tree missing")?;
+                            let result =
+                                store.lookup(action)?.context("benchmark result missing")?;
+                            let reserved = store.reserve_blobs(&blobs)?;
+                            anyhow::ensure!(
+                                reserved.missing().is_empty(),
+                                "benchmark input missing"
+                            );
+                            std::hint::black_box((&tree, &result, &reserved));
+                        }
+                        Ok(start.elapsed())
+                    })
+                })
+                .collect::<Vec<_>>();
+            jobs.into_iter()
+                .map(|job| {
+                    job.join()
+                        .map_err(|_| anyhow::anyhow!("benchmark worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let maximum = elapsed.iter().max().context("missing benchmark sample")?;
+        println!(
+            "CAS_METADATA threads={width} iterations=16 files=1024 wall_ms={:.3} mean_ms={:.3}",
+            maximum.as_secs_f64() * 1000.0,
+            elapsed
+                .iter()
+                .map(std::time::Duration::as_secs_f64)
+                .sum::<f64>()
+                * 1000.0
+                / f64::from(u32::try_from(width)?)
+        );
+    }
+    Ok(())
+}
+
 /// Copy representative real C/C++ headers into a deterministic CAS input.
 fn compiler_header_corpus(input: &std::path::Path) -> Result<(Vec<String>, u64)> {
     use std::{fs, path::PathBuf};
@@ -627,6 +857,7 @@ fn indexed_tree_repairs_only_physically_missing_content() -> Result<()> {
     let before = store.stats()?;
     std::fs::remove_file(store.inner.blob_path(bad_ref.id))?;
     assert!(store.lookup_tree(id)?.is_none());
+    assert!(!store.inner.lock_pins()?.trees.contains_key(&id));
     let reserve = store.reserve_tree_upload(&manifest)?;
     assert_eq!(reserve.missing(), &[bad_ref]);
     let repaired = store.stage_expected(bad_ref, &b"lost file"[..])?;
@@ -647,7 +878,7 @@ fn pending_gc_content_is_still_available_until_last_pin_releases() -> Result<()>
     let blob = staged.reference();
     let tree = sample_tree(blob)?;
     let id = store.publish_tree(&tree, vec![staged])?;
-    let reservation = store.reserve_blobs(BTreeMap::from([(blob.id, blob.size)]))?;
+    let reservation = store.reserve_blobs(&BTreeMap::from([(blob.id, blob.size)]))?;
     assert!(reservation.missing().is_empty());
     assert!(matches!(store.evict_tree(id)?, Eviction::Removed { .. }));
     assert!(store.lookup_tree(id)?.is_none());

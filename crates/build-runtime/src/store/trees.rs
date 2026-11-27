@@ -12,8 +12,8 @@ use redb::{ReadableDatabase, ReadableTable};
 
 use super::packages::PackageRecord;
 use super::{
-    BLOB_PACKAGES, Eviction, Inner, LeasedReader, NativeStore, PACKAGES, StagedBlob, TREE_PACKAGES,
-    TREES, USAGE, UploadReservation, encoding, release_pin, space::Root,
+    BLOB_PACKAGES, Eviction, Inner, LeasedReader, NativeStore, PACKAGES, Publication, StagedBlob,
+    TREE_PACKAGES, TREES, USAGE, UploadReservation, encoding, release_pin, space::Root,
 };
 use crate::{BlobRef, ContentId, PackageSource, TreeId, TreeManifest, TreeRecipe};
 
@@ -71,22 +71,34 @@ impl NativeStore {
         let read = self.inner.db.begin_read()?;
         let live = read.open_table(super::BLOBS)?;
         let pending = read.open_table(super::PENDING_DELETIONS)?;
-        let size = match live.get(&blob.id.0)? {
-            Some(size) => size.value(),
-            None => match pending.get(&blob.id.0)? {
-                Some(size) => size.value(),
-                None => return Ok(None),
-            },
+        let layouts = read.open_table(super::BLOB_LAYOUTS)?;
+        super::BlobIndex {
+            live: &live,
+            pending: &pending,
+            layouts: &layouts,
+        }
+        .open_available(&self.inner, blob)
+    }
+
+    /// Check a batch of physical content references against a single index
+    /// snapshot, preserving the caller's order. No delivery pin is acquired.
+    ///
+    /// # Errors
+    /// Returns an error for inconsistent lengths or storage failures.
+    pub(crate) fn available_blobs(&self, blobs: &[BlobRef]) -> Result<Vec<bool>> {
+        let read = self.inner.db.begin_read()?;
+        let live = read.open_table(super::BLOBS)?;
+        let pending = read.open_table(super::PENDING_DELETIONS)?;
+        let layouts = read.open_table(super::BLOB_LAYOUTS)?;
+        let index = super::BlobIndex {
+            live: &live,
+            pending: &pending,
+            layouts: &layouts,
         };
-        ensure!(size == blob.size, "inconsistent indexed blob length");
-        if !self.inner.blob_present(blob.id, blob.size)? {
-            return Ok(None);
-        }
-        match File::open(self.inner.blob_path(blob.id)) {
-            Ok(file) => Ok(Some((file, self.inner.blob_encoding(blob.id)?))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        blobs
+            .iter()
+            .map(|&blob| Ok(index.open_available(&self.inner, blob)?.is_some()))
+            .collect()
     }
 
     /// A canonical single-blob retention root. Uses the ordinary CAS and eviction
@@ -269,7 +281,7 @@ impl NativeStore {
     /// Returns an error for an invalid manifest or storage failure.
     pub fn reserve_tree_upload(&self, manifest: &TreeManifest) -> Result<UploadReservation> {
         manifest.validate()?;
-        self.reserve_blobs(manifest.blobs()?)
+        self.reserve_blobs(&manifest.blobs()?)
     }
 
     /// Retain one immutable tree root using the shared file-content index.
@@ -315,28 +327,22 @@ impl NativeStore {
         let id = manifest.id()?;
         let blobs = manifest.blobs()?;
         let staged = self.prepare_staging(&blobs, staged)?;
-        let write = self.inner.db.begin_write()?;
-        let mut staged_reservations = Vec::new();
-        {
-            let mut trees = write.open_table(TREES)?;
-            let exists = if let Some(stored) = trees.get(&id.0)? {
+        if package.is_none() {
+            let read = self.inner.db.begin_read()?;
+            let trees = read.open_table(TREES)?;
+            if let Some(stored) = trees.get(&id.0)? {
                 let stored: TreeManifest = encoding().deserialize(stored.value())?;
                 ensure!(stored == *manifest, "conflicting native tree");
-                true
-            } else {
-                false
-            };
-            self.attach_blobs(
-                &write,
-                &id.0,
-                &blobs,
-                staged,
-                exists,
-                &mut staged_reservations,
-            )?;
-            if !exists {
-                trees.insert(&id.0, encoding().serialize(manifest)?.as_slice())?;
+                if self.blobs_present(&blobs)? {
+                    self.inner.lock_pins()?.touch(Root::Tree(id));
+                    return Ok(id);
+                }
             }
+        }
+        let write = self.inner.db.begin_write()?;
+        let mut publication = Publication::default();
+        self.attach_tree(&write, id, manifest, &blobs, staged, &mut publication)?;
+        {
             if let Some((package, source, original)) = package {
                 let mut packages = write.open_table(PACKAGES)?;
                 let previous = packages
@@ -381,7 +387,7 @@ impl NativeStore {
                             package,
                             original,
                             &blobs,
-                            &mut staged_reservations,
+                            &mut publication,
                         )?;
                     }
                 } else if let Some(original) = original {
@@ -390,7 +396,7 @@ impl NativeStore {
                         package,
                         original,
                         &blobs,
-                        &mut staged_reservations,
+                        &mut publication,
                     )?;
                 }
                 packages.insert(&package.0, encoding().serialize(&record)?.as_slice())?;
@@ -399,11 +405,33 @@ impl NativeStore {
                     .insert(&id.0, &package.0)?;
             }
         }
-        write.commit()?;
-        self.inner.publications.send_modify(|()| {});
-        drop(staged_reservations);
+        publication.commit(&self.inner, write)?;
         self.inner.lock_pins()?.touch(Root::Tree(id));
         Ok(id)
+    }
+
+    fn attach_tree(
+        &self,
+        write: &redb::WriteTransaction,
+        id: TreeId,
+        manifest: &TreeManifest,
+        blobs: &BTreeMap<ContentId, u64>,
+        staged: BTreeMap<ContentId, StagedBlob>,
+        publication: &mut Publication,
+    ) -> Result<()> {
+        let mut trees = write.open_table(TREES)?;
+        let exists = if let Some(stored) = trees.get(&id.0)? {
+            let stored: TreeManifest = encoding().deserialize(stored.value())?;
+            ensure!(stored == *manifest, "conflicting native tree");
+            true
+        } else {
+            false
+        };
+        self.attach_blobs(write, &id.0, blobs, staged, exists, publication)?;
+        if !exists {
+            trees.insert(&id.0, encoding().serialize(manifest)?.as_slice())?;
+        }
+        Ok(())
     }
 
     fn attach_package_archive(
@@ -412,12 +440,12 @@ impl NativeStore {
         package: ContentId,
         original: StagedBlob,
         contents: &BTreeMap<ContentId, u64>,
-        reservations: &mut Vec<super::space::StagingReservation>,
+        publication: &mut Publication,
     ) -> Result<()> {
         let BlobRef { id, size } = original.reference();
         let blobs = BTreeMap::from([(id, size)]);
         let staged = self.prepare_staging(&blobs, vec![original])?;
-        self.attach_blobs(write, &package.0, &blobs, staged, false, reservations)?;
+        self.attach_blobs(write, &package.0, &blobs, staged, false, publication)?;
         let mut reverse = write.open_multimap_table(BLOB_PACKAGES)?;
         for id in contents.keys() {
             reverse.insert(&id.0, &package.0)?;
@@ -494,27 +522,28 @@ impl NativeStore {
         let Some(record) = trees.get(&id.0)? else {
             return Ok(None);
         };
-        let manifest: TreeManifest = encoding().deserialize(record.value())?;
-        ensure!(manifest.id()? == id, "invalid indexed tree");
-        let blobs = manifest.blobs()?;
-        for (&content, &size) in &blobs {
-            if !self.inner.blob_present(content, size)? {
-                return Ok(None);
-            }
-        }
-        pins.touch(Root::Tree(id));
+        // A tree's identity is immutable. Pin the root before validating
+        // its manifest and files, without retaining the shared pin mutex.
         let count = pins.trees.entry(id).or_default();
         *count = count.checked_add(1).context("tree pin count overflow")?;
         drop(pins);
+        let pin = TreePin {
+            inner: Arc::clone(&self.inner),
+            id,
+        };
+        let manifest: TreeManifest = encoding().deserialize(record.value())?;
+        ensure!(manifest.id()? == id, "invalid indexed tree");
+        let blobs = manifest.blobs()?;
+        if !self.blobs_present(&blobs)? {
+            return Ok(None);
+        }
+        self.inner.lock_pins()?.touch(Root::Tree(id));
         Ok(Some(TreeLease {
             inner: Arc::clone(&self.inner),
             id,
             manifest,
             blobs,
-            pins: vec![TreePin {
-                inner: Arc::clone(&self.inner),
-                id,
-            }],
+            pins: vec![pin],
         }))
     }
 
@@ -659,6 +688,9 @@ impl Drop for TreePin {
         }
     }
 }
+
+mod publication;
+pub(super) use publication::TreePublicationQueue;
 
 #[cfg(target_os = "linux")]
 mod capture;
