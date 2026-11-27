@@ -1543,6 +1543,110 @@ impl<'a> Planner<'a> {
             )
     }
 
+    /// Content-based build configuration for advisory impact baselines.
+    /// Source edits are deliberately excluded here: the revision snapshot
+    /// and coverage ranges track those independently.
+    pub fn impact_configuration(&self) -> Result<sccache_build::ContentId> {
+        use sccache_build::ContentId;
+        let local = |path: &Path| {
+            path.strip_prefix(&self.workspace.root)
+                .unwrap_or(path)
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec()
+        };
+        let package_keys = self
+            .graph
+            .packages
+            .iter()
+            .enumerate()
+            .map(|(index, package)| {
+                serde_json::to_string(&(
+                    &self.graph.sources[index],
+                    &package.package.name,
+                    &package.package.version,
+                    self.graph.sources[index]
+                        .is_none()
+                        .then(|| local(&package.root)),
+                ))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut packages = BTreeMap::new();
+        for (index, package) in self.graph.packages.iter().enumerate() {
+            packages.insert(
+                &package_keys[index],
+                crate::content_file(&package.root.join("Cargo.toml"))?,
+            );
+        }
+        let unit_key = |index: usize| {
+            let unit = &self.graph.units[index];
+            format!("{}:{:?}", package_keys[unit.package], unit.domain)
+        };
+        let mut units = BTreeMap::new();
+        for (index, unit) in self.graph.units.iter().enumerate() {
+            let edges = unit
+                .edges
+                .iter()
+                .map(|edge| {
+                    (
+                        edge.alias.clone(),
+                        unit_key(edge.unit),
+                        format!("{:?}", edge.kind),
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+            units.insert(unit_key(index), (&unit.features, unit.root, edges));
+        }
+        // Values are consumed only in the digest, never written to evidence.
+        let environment = self
+            .settings
+            .environment
+            .iter()
+            .map(|(key, value)| (key.as_encoded_bytes(), value.as_encoded_bytes()))
+            .collect::<Vec<_>>();
+        let lock = self.workspace.root.join("Cargo.lock");
+        let lock = lock
+            .is_file()
+            .then(|| crate::content_file(&lock))
+            .transpose()?;
+        let config = serde_json::to_vec(&(
+            "native-impact-config-v1",
+            packages,
+            units,
+            lock,
+            &self.workspace.document,
+            &self.settings.document,
+            environment,
+            format!("{:?}", self.options),
+            self.toolchain.host.environment(),
+            self.toolchain.target.environment(),
+            &self.toolchain.host.triple,
+            &self.toolchain.target.triple,
+            &self.toolchain.version,
+        ))?;
+        Ok(ContentId::of(&config))
+    }
+
+    /// The stable project/profile slot is separate from changing input
+    /// fingerprints, allowing a changed configuration to be reported as
+    /// an invalidation rather than silently losing its previous baseline.
+    pub fn impact_slot(&self, project: &str, git_root: &Path) -> Result<sccache_build::ContentId> {
+        let path = self
+            .workspace
+            .root
+            .strip_prefix(git_root)?
+            .as_os_str()
+            .as_encoded_bytes();
+        let selection = format!("{:?}", self.options);
+        Ok(sccache_build::ContentId::of(&serde_json::to_vec(&(
+            "native-impact-slot-v1",
+            project,
+            path,
+            &self.toolchain.target.triple,
+            selection,
+        ))?))
+    }
+
     pub fn coverage_sources(&self) -> Option<&crate::impact::sources::CoverageSources> {
         self.coverage_sources.as_ref()
     }

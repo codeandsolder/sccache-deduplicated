@@ -99,6 +99,12 @@ pub struct RustBuildArgs {
     /// Execute instrumented tests and write native coverage evidence.
     #[arg(long, value_name = "REPORT", conflicts_with = "no_run")]
     collect_coverage: Option<PathBuf>,
+    /// Persist complete advisory coverage evidence in the shared scheduler CAS.
+    #[arg(long, requires = "collect_coverage", value_name = "PROJECT")]
+    impact_project: Option<String>,
+    /// Compare predicted affected tests with an authoritative full run.
+    #[arg(long, requires = "impact_project")]
+    impact_shadow: bool,
     #[arg(long, requires = "collect_coverage")]
     aggregate_profile: Option<PathBuf>,
     #[arg(long, requires = "collect_coverage")]
@@ -561,6 +567,8 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
                 args.max_in_flight,
                 coverage::Options {
                     report,
+                    impact_project: args.impact_project.as_deref(),
+                    impact_shadow: args.impact_shadow,
                     aggregate: args.aggregate_profile.as_deref(),
                     mode: plan_options.coverage.context("missing coverage mode")?,
                     tools_dir: args.llvm_tools_dir.as_deref(),

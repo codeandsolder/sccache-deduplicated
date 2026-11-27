@@ -20,11 +20,12 @@ use sccache_rust_build::{
             executed_functions,
         },
         harness::{DiscoveredTest, HarnessOptions, inventory, verify_single_success},
-        revision::{RevisionSnapshot, git_root},
+        revision::{RevisionSnapshot, committed_changes, git_root},
+        selection::{Baseline, TestId, select},
         sources::CoverageSources,
     },
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
@@ -41,6 +42,8 @@ use tempfile::{NamedTempFile, TempDir};
 
 pub(crate) struct Options<'a> {
     pub report: &'a Path,
+    pub impact_project: Option<&'a str>,
+    pub impact_shadow: bool,
     pub aggregate: Option<&'a Path>,
     pub mode: CoverageMode,
     pub tools_dir: Option<&'a Path>,
@@ -712,6 +715,236 @@ impl Collector<'_> {
     }
 }
 
+// These records are advisory. A successful coverage run is not yet a
+// complete runtime input contract, so no client may skip tests from this
+// schema. Keep the distinction explicit in persisted evidence.
+#[derive(Serialize, Deserialize)]
+struct ImpactRecord {
+    schema: u32,
+    advisory: bool,
+    scope: ContentId,
+    revision: String,
+    tree: ContentId,
+    baselines: Vec<(TestId, Baseline)>,
+}
+
+struct ImpactContext {
+    slot: ContentId,
+    scope: ContentId,
+    previous: Option<(crate::build_runtime::wire::ImpactHead, ImpactRecord)>,
+    lookup_error: Option<String>,
+    shadow: bool,
+}
+
+#[derive(Serialize)]
+struct ImpactReport {
+    scope: ContentId,
+    previous: Option<crate::build_runtime::TreeId>,
+    lookup_error: Option<String>,
+    publication: Option<crate::build_runtime::wire::ImpactUpdate>,
+    publication_error: Option<String>,
+    comparison: Option<ShadowComparison>,
+}
+
+#[derive(Serialize)]
+struct ShadowComparison {
+    total: usize,
+    predicted: usize,
+    missed_failures: Vec<TestId>,
+    reasons: Vec<(
+        TestId,
+        BTreeSet<sccache_rust_build::impact::selection::Reason>,
+    )>,
+}
+
+impl ImpactContext {
+    fn new(
+        content: &Content,
+        planner: &Planner<'_>,
+        toolchain: &Toolchain,
+        tools: &LlvmTools,
+        git_root: &Path,
+        project: &str,
+        shadow: bool,
+    ) -> Result<Self> {
+        ensure!(
+            !project.trim().is_empty(),
+            "impact project must be nonempty"
+        );
+        let slot = planner.impact_slot(project, git_root)?;
+        let rustc = content_file(&toolchain.rustc)?;
+        let rustdoc = toolchain.rustdoc.as_deref().map(content_file).transpose()?;
+        let scope = ContentId::of(&serde_json::to_vec(&(
+            "advisory-impact-v1",
+            planner.impact_configuration()?,
+            rustc,
+            rustdoc,
+            tools.profdata_identity.content,
+            tools.cov_identity.content,
+        ))?);
+        let previous = content.lookup_impact_head(slot).and_then(|value| {
+            let Some((head, file)) = value else {
+                return Ok(None);
+            };
+            let record: ImpactRecord = serde_json::from_reader(file)?;
+            ensure!(
+                record.schema == 1 && record.advisory,
+                "unknown impact evidence schema"
+            );
+            Ok(Some((head, record)))
+        });
+        let (previous, lookup_error) = match previous {
+            Ok(previous) => (previous, None),
+            Err(error) => (None, Some(format!("{error:#}"))),
+        };
+        Ok(Self {
+            slot,
+            scope,
+            previous,
+            lookup_error,
+            shadow,
+        })
+    }
+
+    fn finish(
+        self,
+        collector: &Collector<'_>,
+        before: &RevisionSnapshot,
+        stable: bool,
+        passed: bool,
+        incomplete: bool,
+        suites: &[SuiteReport],
+    ) -> Result<ImpactReport> {
+        let previous = self.previous.as_ref().map(|(head, _)| head.tree);
+        let mut report = ImpactReport {
+            scope: self.scope,
+            previous,
+            lookup_error: self.lookup_error,
+            publication: None,
+            publication_error: None,
+            comparison: None,
+        };
+        if self.shadow {
+            let inventory = suites
+                .iter()
+                .flat_map(|suite| {
+                    suite.tests.iter().map(|test| {
+                        (
+                            TestId {
+                                unit: suite.unit.clone(),
+                                name: test.name.clone(),
+                            },
+                            self.scope,
+                        )
+                    })
+                })
+                .collect::<BTreeMap<_, _>>();
+            let baselines = self
+                .previous
+                .as_ref()
+                .map(|(_, record)| record.baselines.iter().cloned().collect::<BTreeMap<_, _>>())
+                .unwrap_or_default();
+            let mut changes = BTreeMap::new();
+            if before.clean
+                && stable
+                && let Some(head) = &before.head
+            {
+                let revisions = baselines
+                    .values()
+                    .map(|baseline| baseline.revision.clone())
+                    .collect::<BTreeSet<_>>();
+                for revision in revisions {
+                    let known = baselines
+                        .values()
+                        .filter(|baseline| baseline.revision == revision)
+                        .flat_map(|baseline| baseline.ranges.iter().map(|range| range.file.clone()))
+                        .collect();
+                    // Missing commits, malformed diffs and unverified inputs
+                    // never produce an empty successful change set.
+                    if let Ok(change) =
+                        committed_changes(&collector.git_root, &revision, head, &known)
+                    {
+                        changes.insert(revision, change);
+                    }
+                }
+            }
+            let selected = select(&inventory, &baselines, &changes)?;
+            let missed_failures = suites
+                .iter()
+                .flat_map(|suite| {
+                    suite
+                        .tests
+                        .iter()
+                        .filter(|test| !test.passed)
+                        .map(|test| TestId {
+                            unit: suite.unit.clone(),
+                            name: test.name.clone(),
+                        })
+                })
+                .filter(|test| !selected.contains_key(test))
+                .collect();
+            report.comparison = Some(ShadowComparison {
+                total: inventory.len(),
+                predicted: selected.len(),
+                missed_failures,
+                reasons: selected.into_iter().collect(),
+            });
+        }
+        // Untracked whole-harness runs remain full-run actions. Only complete
+        // per-test coverage is recorded, never a partial failed collection.
+        if passed
+            && stable
+            && before.clean
+            && !incomplete
+            && report.lookup_error.is_none()
+            && let Some(revision) = before.head.as_ref()
+        {
+            let mut baselines = Vec::new();
+            for suite in suites {
+                if let Some(executable) = suite.executable {
+                    for test in &suite.tests {
+                        if let Some(ranges) = &test.coverage {
+                            baselines.push((
+                                TestId {
+                                    unit: suite.unit.clone(),
+                                    name: test.name.clone(),
+                                },
+                                Baseline {
+                                    scope: self.scope,
+                                    revision: revision.clone(),
+                                    executable,
+                                    ranges: ranges.clone(),
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            baselines.sort_by(|a, b| a.0.cmp(&b.0));
+            if !baselines.is_empty() {
+                let record = ImpactRecord {
+                    schema: 1,
+                    advisory: true,
+                    scope: self.scope,
+                    revision: revision.clone(),
+                    tree: before.tree,
+                    baselines,
+                };
+                let mut file = tempfile::tempfile_in(&collector.scratch)?;
+                serde_json::to_writer(&mut file, &record)?;
+                match collector
+                    .content
+                    .publish_impact_head(self.slot, previous, file)
+                {
+                    Ok(update) => report.publication = Some(update),
+                    Err(error) => report.publication_error = Some(format!("{error:#}")),
+                }
+            }
+        }
+        Ok(report)
+    }
+}
+
 #[derive(Serialize)]
 struct Report<'a> {
     schema: u32,
@@ -724,6 +957,7 @@ struct Report<'a> {
     suites: Vec<SuiteReport>,
     aggregate_published: bool,
     aggregate_error: Option<String>,
+    impact: Option<ImpactReport>,
 }
 
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -804,6 +1038,20 @@ pub(crate) fn execute(
         capture(session, scratch.path(), &mut command)?,
         "empty LLVM profile",
     )?;
+    let impact = options
+        .impact_project
+        .map(|project| {
+            ImpactContext::new(
+                content,
+                planner,
+                toolchain,
+                &tools,
+                &git_root,
+                project,
+                options.impact_shadow,
+            )
+        })
+        .transpose()?;
     let collector = Collector {
         session,
         content,
@@ -889,6 +1137,9 @@ pub(crate) fn execute(
     } else {
         false
     };
+    let impact = impact
+        .map(|impact| impact.finish(&collector, &before, stable, passed, incomplete, &suites))
+        .transpose()?;
     let report = Report {
         schema: 1,
         mode: options.mode,
@@ -900,6 +1151,7 @@ pub(crate) fn execute(
         suites,
         aggregate_published,
         aggregate_error,
+        impact,
     };
     atomic_json(options.report, &report)?;
     eprintln!(
