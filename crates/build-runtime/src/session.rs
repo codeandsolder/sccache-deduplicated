@@ -1101,13 +1101,14 @@ impl NativeSessions {
         mode: ActionMode,
         declared: BTreeMap<TreeId, TreeManifest>,
     ) -> Result<NativeAdmission> {
-        let result = self.admit_inner(request, publisher, mode, declared);
+        let result = self.admit_inner(trace, request, publisher, mode, declared);
         self.admission_counters.record(mode, &result);
         result
     }
 
     fn admit_inner(
         &self,
+        trace: Option<crate::wire::TraceContext>,
         request: ActionRequest,
         publisher: Publisher,
         mode: ActionMode,
