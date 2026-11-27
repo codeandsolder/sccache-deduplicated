@@ -36,7 +36,7 @@ jobs:
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@343303848026ed142e48a6a82e7a889080b99b26 # Last reusable workflow without provider-only OIDC permission
     with:
       runner: ubuntu-26.04
-      rust-toolchain: "nightly-2026-11-22"
+      rust-toolchain: "nightly-2026-11-23"
       rust-components: clippy
       rust-targets: x86_64-pc-windows-gnu
       isolate-public-sccache-server: true
