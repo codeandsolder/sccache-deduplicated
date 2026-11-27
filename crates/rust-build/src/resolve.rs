@@ -39,6 +39,7 @@ pub struct Unit {
 pub struct Graph {
     pub packages: Vec<Manifest>,
     pub sources: Vec<Option<String>>,
+    pub source_roots: Vec<PathBuf>,
     pub units: Vec<Unit>,
     pub roots: Vec<usize>,
 }
@@ -460,6 +461,7 @@ impl Graph {
             graph: Self {
                 packages: Vec::new(),
                 sources: Vec::new(),
+                source_roots: Vec::new(),
                 units: Vec::new(),
                 roots: Vec::new(),
             },
@@ -517,6 +519,13 @@ impl Graph {
         resolver.graph.roots = roots;
         resolver.resolve_all()?;
         resolver.graph.canonicalize();
+        resolver.graph.source_roots = resolver
+            .graph
+            .packages
+            .iter()
+            .zip(&resolver.graph.sources)
+            .map(|(manifest, source)| resolver.sources.source_root(manifest, source.as_deref()))
+            .collect::<Result<_>>()?;
         let mut links = BTreeMap::new();
         for unit in &resolver.graph.units {
             let manifest = &resolver.graph.packages[unit.package];

@@ -229,6 +229,12 @@ impl<'a> Sources<'a> {
     pub(crate) fn source_root(&self, manifest: &Manifest, source: Option<&str>) -> Result<PathBuf> {
         if let Some(source) = source.filter(|s| s.starts_with("git+")) {
             self.git_checkout(source)
+        } else if source.is_none() {
+            if manifest.root.starts_with(&self.workspace.root) {
+                Ok(self.workspace.root.clone())
+            } else {
+                Ok(Workspace::discover(&manifest.root.join("Cargo.toml"))?.root)
+            }
         } else {
             Ok(manifest.root.clone())
         }

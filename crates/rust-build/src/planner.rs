@@ -940,12 +940,11 @@ impl<'a> Planner<'a> {
         if let Some(out) = self.script_out(unit) {
             set("OUT_DIR", out.as_os_str().to_owned());
         }
-        // All compiler intermediates share one stable canonical namespace.
-        let build_root = if manifest.root.starts_with(&self.workspace.root) {
-            &self.workspace.root
-        } else {
-            &manifest.root
-        };
+        // A Git checkout may contain several sibling crates and shared
+        // generated source paths. Canonicalize the complete source root, not
+        // the transient location of each individual package.
+        let build_root = &self.graph.source_roots[self.graph.units[unit].package];
+        set("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1".into());
         set(
             "SCCACHE_CANONICAL_BUILD_ROOT",
             build_root.as_os_str().to_owned(),
@@ -1161,6 +1160,7 @@ impl<'a> Planner<'a> {
             dir.push(self.output_dir(true));
             args.extend(["-L".into(), dir]);
         }
+        let mut aliases = BTreeMap::new();
         for edge in &self.graph.units[unit].edges {
             if if script {
                 edge.kind == DependencyKind::Build
@@ -1173,12 +1173,18 @@ impl<'a> Planner<'a> {
                                 TargetKind::Example | TargetKind::Test | TargetKind::Bench
                             )))
             } {
-                self.extern_arg(
-                    args,
-                    &edge.alias,
-                    self.libraries[edge.unit].context("missing extern library")?,
-                )?;
+                let library = self.libraries[edge.unit].context("missing extern library")?;
+                if let Some(previous) = aliases.insert(crate_name(&edge.alias), library) {
+                    ensure!(
+                        previous == library,
+                        "conflicting extern alias {} for selected target",
+                        edge.alias
+                    );
+                }
             }
+        }
+        for (alias, library) in aliases {
+            self.extern_arg(args, &alias, library)?;
         }
         if !script
             && target.kind != TargetKind::Library

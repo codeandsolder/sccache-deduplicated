@@ -123,12 +123,16 @@ pub fn workspace_metadata(
         for (index, manifest) in graph.packages.iter().enumerate() {
             let source = graph.sources[index].as_deref();
             let id = package_id(manifest, source)?;
-            let root = sources.source_root(manifest, source)?;
+            let root = if source.is_some() {
+                &graph.source_roots[index]
+            } else {
+                &manifest.root
+            };
             let locked = sources.locked_parent(manifest, source)?;
             let checksum = locked.and_then(|p| p.checksum.as_deref());
             packages.insert(
                 id.clone(),
-                package(manifest, source, &root, checksum, registries)?,
+                package(manifest, source, root, checksum, registries)?,
             );
             ids.push(id);
         }
@@ -188,6 +192,7 @@ mod tests {
         let graph = Graph {
             packages: vec![workspace.package(&local)?, Manifest::load(&external, None)?],
             sources: vec![None, Some(source)],
+            source_roots: vec![local.clone(), external.clone()],
             units: vec![
                 Unit {
                     package: 0,
