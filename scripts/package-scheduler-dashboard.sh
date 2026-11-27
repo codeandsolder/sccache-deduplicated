@@ -11,8 +11,7 @@ output="$(realpath -m "$3")"
 [[ -x "$binary" && -d "$assets" && ! -e "$output" && ! -e "$output.sha256" ]]
 cd "$(dirname "$0")/.."
 source_sha="$(git rev-parse HEAD)"
-source_epoch="$(git show -s --format=%ct HEAD)"
-source contrib/codeandsolder/release-protocol.env
+source_epoch="$(git show -s --format=%ct "$source_sha")"
 stage="$(mktemp -d "$(dirname "$output")/.dashboard-package.XXXXXXXX")"
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/bundle/pkg"
@@ -32,6 +31,9 @@ fi
 # rather than trusting the mutable working directory.
 mkdir "$stage/source"
 git archive "$source_sha" | tar -xf - -C "$stage/source"
+# Metadata describes that same immutable source revision, never local edits.
+# shellcheck source=contrib/codeandsolder/release-protocol.env
+source "$stage/source/contrib/codeandsolder/release-protocol.env"
 generation="$("$stage/bundle/sccache-dist" verify-dashboard --assets "$stage/bundle/pkg" --source "$stage/source")"
 [[ "$generation" =~ ^sccache-dashboard-generation-v1:[0-9a-f]{64}$ ]]
 {
