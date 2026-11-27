@@ -17,8 +17,9 @@ use super::{
 };
 use crate::{BlobRef, ContentId, ExecutionRoot, TreeId};
 
-/// The complete resident portion of an admitted input closure. Complete
-/// trees protect all their blobs; the remaining partial closure has its
+/// The resident portion of an admitted input closure.
+///
+/// Complete trees protect all their blobs; the remaining partial closure has its
 /// own reservation until the worker has acquired the missing trees.
 pub struct ResidentInputs {
     _trees: Vec<Arc<TreeLease>>,
@@ -180,6 +181,7 @@ impl ResidentRuntime {
             .lock()
             .map_err(|_| anyhow!("resident tree lock poisoned"))?;
         if let Some(lease) = memo.upgrade() {
+            drop(memo);
             store.inner.lock_pins()?.touch(Root::Tree(id));
             return Ok(Some(lease));
         }
@@ -187,6 +189,7 @@ impl ResidentRuntime {
         if let Some(lease) = &lease {
             *memo = Arc::downgrade(lease);
         }
+        drop(memo);
         Ok(lease)
     }
 
@@ -204,9 +207,11 @@ impl ResidentRuntime {
             .lock()
             .map_err(|_| anyhow!("resident tree lock poisoned"))?;
         if let Some(existing) = memo.upgrade() {
+            drop(memo);
             return Ok(existing);
         }
         *memo = Arc::downgrade(&lease);
+        drop(memo);
         Ok(lease)
     }
 
@@ -232,12 +237,14 @@ impl ResidentRuntime {
             .lock()
             .map_err(|_| anyhow!("resident recipe lock poisoned"))?;
         if let Some(lease) = memo.upgrade() {
+            drop(memo);
             root.verify(lease.id())?;
             return Ok(lease);
         }
         let lease = Arc::new(store.compose_leased_recipe(&root.recipe, inputs)?);
         root.verify(lease.id())?;
         *memo = Arc::downgrade(&lease);
+        drop(memo);
         Ok(lease)
     }
 
@@ -266,6 +273,7 @@ impl ResidentRuntime {
             .lock()
             .map_err(|_| anyhow!("resident view lock poisoned"))?;
         if let Some(view) = memo.upgrade() {
+            drop(memo);
             self.retain(key, Arc::clone(&view))?;
             return Ok(MountedTree::from_view(view, scratch));
         }
@@ -331,6 +339,7 @@ impl ResidentRuntime {
             ReadOnlyView::mount_fuse(lease, persistent)?
         });
         *memo = Arc::downgrade(&view);
+        drop(memo);
         self.retain(key, Arc::clone(&view))?;
         Ok(MountedTree::from_view(view, scratch))
     }

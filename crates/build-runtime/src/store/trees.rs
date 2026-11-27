@@ -510,8 +510,8 @@ impl NativeStore {
             id,
             manifest,
             blobs,
-            _pins: Vec::new(),
-            _constituents: leases.into_values().collect(),
+            pins: Vec::new(),
+            constituents: leases.into_values().collect(),
         })
     }
 
@@ -546,11 +546,11 @@ impl NativeStore {
             id,
             manifest,
             blobs,
-            _pins: vec![TreePin {
+            pins: vec![TreePin {
                 inner: Arc::clone(&self.inner),
                 id,
             }],
-            _constituents: Vec::new(),
+            constituents: Vec::new(),
         })
     }
 
@@ -600,8 +600,8 @@ impl NativeStore {
             id,
             manifest,
             blobs,
-            _pins: vec![pin],
-            _constituents: Vec::new(),
+            pins: vec![pin],
+            constituents: Vec::new(),
         }))
     }
 
@@ -672,8 +672,8 @@ pub struct TreeLease {
     id: TreeId,
     manifest: TreeManifest,
     blobs: BTreeMap<ContentId, u64>,
-    _pins: Vec<TreePin>,
-    _constituents: Vec<Arc<Self>>,
+    pins: Vec<TreePin>,
+    constituents: Vec<Arc<Self>>,
 }
 
 impl TreeLease {
@@ -681,15 +681,17 @@ impl TreeLease {
         Arc::ptr_eq(&self.inner, &store.inner)
     }
 
-    #[cfg(target_os = "linux")]
-    pub(crate) fn is_indexed(&self) -> bool {
-        self._pins.iter().any(|pin| pin.id == self.id)
+    /// Whether this lease owns a pin on its own indexed identity.
+    #[must_use = "distinguishes indexed input trees from composed roots"]
+    pub fn is_indexed(&self) -> bool {
+        self.pins.iter().any(|pin| pin.id == self.id)
     }
 
-    #[cfg(target_os = "linux")]
-    pub(super) fn holds_tree(&self, id: TreeId) -> bool {
-        self._pins.iter().any(|pin| pin.id == id)
-            || self._constituents.iter().any(|lease| lease.holds_tree(id))
+    /// Whether this lease retains the specified indexed tree.
+    #[must_use = "indicates whether eviction must wait for this lease"]
+    pub fn holds_tree(&self, id: TreeId) -> bool {
+        self.pins.iter().any(|pin| pin.id == id)
+            || self.constituents.iter().any(|lease| lease.holds_tree(id))
     }
 
     #[must_use = "the identifier names the leased tree"]

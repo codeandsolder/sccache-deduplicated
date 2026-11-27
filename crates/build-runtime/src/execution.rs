@@ -69,7 +69,7 @@ pub struct ExecutionTimings {
 }
 
 impl CapturedExecution {
-    #[must_use]
+    #[must_use = "the timings report execution phase durations"]
     pub const fn timings(&self) -> ExecutionTimings {
         self.timings
     }
