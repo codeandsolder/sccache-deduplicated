@@ -953,6 +953,11 @@ impl<'a> Planner<'a> {
         env: &mut BTreeMap<OsString, OsString>,
     ) -> Result<()> {
         let manifest = self.unit_manifest(unit);
+        // rustc does not place proc_macro in the extern prelude merely
+        // because the crate type is proc-macro.
+        if target.crate_types.iter().any(|kind| kind == "proc-macro") {
+            args.extend(["--extern".into(), "proc_macro".into()]);
+        }
         for feature in &self.graph.units[unit].features {
             args.extend(["--cfg".into(), format!("feature={feature:?}").into()]);
         }
