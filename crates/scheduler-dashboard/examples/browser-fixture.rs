@@ -31,6 +31,7 @@ struct Fixture {
     phase: Arc<AtomicU64>,
     mode: Arc<AtomicU64>,
     requests: Arc<AtomicU64>,
+    selected_queries: Arc<AtomicU64>,
     wake: mpsc::SyncSender<()>,
 }
 
@@ -56,10 +57,9 @@ fn analytics() -> AnalyticsObservation {
 fn job(index: usize, phase: u64) -> Job {
     let status = match (index, phase) {
         (0, 0) => "Queued",
-        (0, 1) => "Staging",
+        (0, 1) | (1, _) => "Staging",
         (0, 2) => "Executing",
         (0, _) => "Terminal",
-        (1, _) => "Staging",
         _ => "Executing",
     };
     let remaining = match status {
@@ -257,6 +257,9 @@ fn labels(State(fixture): State<Fixture>) -> Ready<Json<Value>> {
 
 fn metrics(State(fixture): State<Fixture>, Query(range): Query<Range>) -> Ready<Json<Value>> {
     fixture.requests.fetch_add(1, Ordering::Relaxed);
+    if range.query.contains(r#"instance=~"fixture-client""#) {
+        fixture.selected_queries.fetch_add(1, Ordering::Relaxed);
+    }
     let mode = fixture.mode.load(Ordering::Relaxed);
     if mode == 3 {
         return ready(Json(
@@ -293,6 +296,10 @@ fn count(State(fixture): State<Fixture>) -> Ready<String> {
     ready(fixture.requests.load(Ordering::Relaxed).to_string())
 }
 
+fn selected(State(fixture): State<Fixture>) -> Ready<String> {
+    ready(fixture.selected_queries.load(Ordering::Relaxed).to_string())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let assets = PathBuf::from(
@@ -305,6 +312,7 @@ async fn main() -> Result<()> {
         phase: Arc::default(),
         mode: Arc::default(),
         requests: Arc::default(),
+        selected_queries: Arc::default(),
         wake,
     };
     let api = Router::new()
@@ -313,6 +321,7 @@ async fn main() -> Result<()> {
         .route("/fixture/phase/{value}", post(phase))
         .route("/fixture/mode/{value}", post(mode))
         .route("/fixture/count", get(count))
+        .route("/fixture/selected", get(selected))
         .with_state(fixture.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;

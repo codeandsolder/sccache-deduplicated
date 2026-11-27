@@ -71,7 +71,7 @@ pub(super) fn connect<T: DeserializeOwned + 'static>(
     url: &str,
     status: RwSignal<ConnectionStatus>,
     retry: RwSignal<u64>,
-    stale_after: Option<Duration>,
+    stale_after: impl Fn() -> Option<Duration> + 'static,
     apply: impl Fn(T) -> bool + 'static,
 ) {
     status.set(ConnectionStatus::Connecting);
@@ -81,7 +81,7 @@ pub(super) fn connect<T: DeserializeOwned + 'static>(
     };
     let timer = RetryTimer::default();
     let watchdog = RetryTimer::default();
-    arm_watchdog(&watchdog, status, stale_after);
+    arm_watchdog(&watchdog, status, stale_after());
     let error_watchdog = Rc::clone(&watchdog);
     let error_timer = Rc::clone(&timer);
     let error_source = source.clone();
@@ -104,7 +104,7 @@ pub(super) fn connect<T: DeserializeOwned + 'static>(
             .and_then(|data| serde_json::from_str::<T>(&data).ok());
         if parsed.is_some_and(&apply) {
             status.set(ConnectionStatus::Connected);
-            arm_watchdog(&message_watchdog, status, stale_after);
+            arm_watchdog(&message_watchdog, status, stale_after());
         } else {
             clear_timer(&message_watchdog);
             close.close();

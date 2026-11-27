@@ -56,7 +56,9 @@ for ((i=0;i<100;i++)); do
     sleep .2
 done
 test -n "$driver"
-if [[ -n "$binary" ]]; then curl --noproxy '*' -fsS --max-time 10 "$dashboard/" | rg 'Scheduler status' >/dev/null; fi
+if [[ -n "$binary" ]]; then
+    "$(dirname "$0")/../contrib/codeandsolder/host-native-metadata" dashboard-ready "$binary" "$assets" "$dashboard"
+fi
 chrome="$(command -v chromium || command -v google-chrome || command -v google-chrome-stable)"
 caps="$(jq -n --arg chrome "$chrome" --arg profile "$root/chrome" '{
     capabilities: {alwaysMatch: {browserName: "chrome", pageLoadStrategy: "eager", timeouts: {pageLoad: 20000, script: 20000}, "goog:chromeOptions": {
@@ -196,6 +198,7 @@ await_js 'return document.querySelector("#admission")?.innerText.includes("80.0%
 await_js 'return [...document.querySelectorAll("#metrics select")[1].options].some(o=>o.value==="fixture-client")'
 js 'const e=document.querySelectorAll("#metrics select")[1]; e.value="fixture-client"; e.dispatchEvent(new Event("change",{bubbles:true})); return true' >/dev/null
 await_js 'return document.querySelectorAll("#metrics article").length===20 && document.querySelectorAll("#metrics select")[1].value==="fixture-client" && document.querySelector("#metrics [role=status]").textContent.trim()==="Live"'
+test "$(curl --noproxy '*' -fsS --max-time 5 "$fixture_metrics/fixture/selected")" -gt 0
 js 'window.metricCard=(title)=>[...document.querySelectorAll("#metrics article")].find(a=>a.querySelector("h3")?.textContent===title); window.statCard=metricCard("Cache hit rate (rolling)"); window.statValue=statCard.querySelector("strong"); window.metricHistory=metricCard("Completed cache hit rate · client history"); window.metricPath=metricHistory.querySelector("svg path[stroke-linecap]"); window.oldMetricPath=metricPath.getAttribute("d"); return !!statValue' | jq -e '.value==true' >/dev/null
 control mode 1
 await_js 'return statCard===metricCard("Cache hit rate (rolling)") && statValue===statCard.querySelector("strong") && statValue.textContent==="90.0%" && metricPath===metricHistory.querySelector("svg path[stroke-linecap]") && metricPath.getAttribute("d")!==oldMetricPath && document.querySelectorAll("#metrics select")[1].value==="fixture-client" && document.querySelectorAll("#metrics select")[1].selectedOptions[0].textContent.includes("not observed in range")'

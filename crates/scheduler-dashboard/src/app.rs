@@ -131,11 +131,18 @@ impl DashboardSource {
     fn apply(self, event: crate::NativeEvent) -> bool {
         let changes = changed_projections(&event);
         let valid = self.live.update_untracked(|data| {
-            if matches!(&event, crate::NativeEvent::Reset(_)) {
-                *data = Some(DashboardData::default());
+            if let Some(current) = data {
+                return crate::apply_event(current, event);
             }
-            data.as_mut()
-                .is_some_and(|data| crate::apply_event(data, event))
+            if !matches!(&event, crate::NativeEvent::Reset(_)) {
+                return false;
+            }
+            let mut current = DashboardData::default();
+            if !crate::apply_event(&mut current, event) {
+                return false;
+            }
+            *data = Some(current);
+            true
         });
         if valid {
             self.epochs.update(|epochs| {
@@ -266,7 +273,7 @@ pub fn App() -> impl IntoView {
             "/api/events",
             status,
             retry,
-            Some(std::time::Duration::from_secs(10)),
+            || Some(std::time::Duration::from_secs(10)),
             move |event| data.apply(event),
         );
     });
@@ -290,6 +297,28 @@ pub fn App() -> impl IntoView {
         </main>
     }
     .into_any()
+}
+
+/// The initial metrics query can fan out across many panels, while later
+/// updates are spaced by the selected sampling grid. A disabled backend is
+/// intentionally silent after its reset and must not be marked stalled.
+#[cfg(any(target_arch = "wasm32", test))]
+const fn metrics_watchdog(
+    configured: bool,
+    sampled: bool,
+    connecting: bool,
+    range: TimeRange,
+) -> Option<std::time::Duration> {
+    if !configured && !connecting {
+        None
+    } else {
+        let delay = if sampled {
+            range.step().saturating_add(120)
+        } else {
+            120
+        };
+        Some(std::time::Duration::from_secs(delay))
+    }
 }
 
 #[component]
@@ -319,11 +348,21 @@ fn FleetMetrics(tab: RwSignal<Tab>) -> impl IntoView {
             status.set(ConnectionStatus::Unavailable);
             return;
         };
+        let range = selected.range;
         sse::connect::<crate::MetricsEvent>(
             &format!("/api/metrics/events?{query}"),
             status,
             retry,
-            None,
+            move || {
+                data.with_untracked(|data| {
+                    metrics_watchdog(
+                        data.configured,
+                        data.sampled_at.is_some(),
+                        status.get_untracked() == ConnectionStatus::Connecting,
+                        range,
+                    )
+                })
+            },
             move |event| {
                 if matches!(&event, crate::MetricsEvent::Reset(reset) if reset.view != selected) {
                     return false;
@@ -503,5 +542,25 @@ fn native_patch_invalidates_only_affected_projections() {
         changed_projections(&crate::NativeEvent::Reset(Box::default()))
             .into_iter()
             .all(|change| change)
+    );
+}
+#[test]
+fn metrics_watchdog_distinguishes_disabled_backend_from_stalled_samples() {
+    use std::time::Duration;
+    assert_eq!(
+        metrics_watchdog(false, false, false, TimeRange::OneHour),
+        None
+    );
+    assert_eq!(
+        metrics_watchdog(false, false, true, TimeRange::OneHour),
+        Some(Duration::from_secs(120))
+    );
+    assert_eq!(
+        metrics_watchdog(true, true, false, TimeRange::OneHour),
+        Some(Duration::from_secs(135))
+    );
+    assert_eq!(
+        metrics_watchdog(true, true, false, TimeRange::SevenDays),
+        Some(Duration::from_secs(1920))
     );
 }
