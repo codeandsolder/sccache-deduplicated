@@ -47,7 +47,27 @@ fn package(
     let external = source.is_some();
     let paths = |path: &Path| -> Result<(Option<String>, String)> {
         if external {
-            let canonical = path.canonicalize()?;
+            // Resolve existing ancestors, including symlinks, even if an
+            // auxiliary target was intentionally omitted from the archive.
+            let mut ancestor = path;
+            let mut suffix = Vec::new();
+            let mut canonical = loop {
+                match ancestor.canonicalize() {
+                    Ok(path) => break path,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        suffix.push(
+                            ancestor
+                                .file_name()
+                                .context("missing source path component")?,
+                        );
+                        ancestor = ancestor.parent().context("missing source path parent")?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            for component in suffix.into_iter().rev() {
+                canonical.push(component);
+            }
             let relative = canonical
                 .strip_prefix(source_root)
                 .context("external package path escapes its source root")?;

@@ -430,11 +430,8 @@ fn target(
 ) -> Result<Target> {
     let name = text(spec, "name")?.unwrap_or(name).to_owned();
     let source = text(spec, "path")?.map_or(path, |path| root.join(path));
-    ensure!(
-        source.is_file(),
-        "missing target source {}",
-        source.display()
-    );
+    // Published dependencies may omit auxiliary test/example sources.
+    // Validate source existence when an action is actually requested.
     let mut crate_types = strings(spec.get("crate-type"))?;
     if boolean(spec, "proc-macro", false)? {
         crate_types = vec!["proc-macro".into()];

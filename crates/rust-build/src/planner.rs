@@ -755,6 +755,16 @@ impl<'a> Planner<'a> {
                 continue;
             }
             let node = &self.nodes[index];
+            if let Action::Compile { unit, target, .. } | Action::Rustdoc { unit, target, .. } =
+                node.action
+            {
+                let source = &self.target(unit, target).source;
+                ensure!(
+                    source.is_file(),
+                    "missing selected target source {}",
+                    source.display()
+                );
+            }
             pending.extend(node.deps.iter().copied());
             for path in &node.outputs {
                 ensure!(

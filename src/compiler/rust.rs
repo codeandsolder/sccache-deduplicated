@@ -3254,7 +3254,7 @@ where
         // A rustup manifest is not proof of the contents of an installation.
         // Fingerprint the actual runtime files, including the host and target
         // libraries, linker helpers and unrecognized rustlib extensions.
-        let runtime_root = self.sysroot.join(LIBS_DIR).join("rustlib");
+        let runtime_root = self.sysroot.join("lib").join("rustlib");
         let runtime_host = self.host.clone();
         let runtime_target = target.clone();
         #[cfg(all(feature = "dist-client", target_os = "linux"))]
