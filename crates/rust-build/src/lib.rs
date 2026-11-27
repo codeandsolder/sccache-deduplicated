@@ -15,4 +15,4 @@ pub use fingerprint::{content_file, content_tree};
 pub use manifest::{Dependency, DependencyKind, Manifest, Package, Target, TargetKind, Workspace};
 pub use platform::Platform;
 pub use resolve::{BuildDomain, Edge, Graph, ResolveOptions, Unit};
-pub use source::{LockedPackage, Lockfile, Sources};
+pub use source::{LockMismatch, LockedPackage, Lockfile, Sources};

@@ -12,6 +12,20 @@ use std::{
 
 use crate::{Dependency, Manifest, Workspace};
 
+/// The manifest graph no longer agrees with its lockfile. Distinguish this
+/// from source acquisition and compiler errors; only this error permits
+/// an automatic resolution retry.
+#[derive(Debug)]
+pub struct LockMismatch(pub String);
+
+impl std::fmt::Display for LockMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "lockfile mismatch: {}", self.0)
+    }
+}
+
+impl std::error::Error for LockMismatch {}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LockedPackage {
     pub name: String,
@@ -157,29 +171,30 @@ impl<'a> Sources<'a> {
                 let locked = self
                     .lock
                     .parent(parent, parent_source)?
-                    .context("parent is absent from lockfile")?;
+                    .ok_or_else(|| LockMismatch(format!("{} is absent", parent.package.name)))?;
                 let child = self
                     .lock
                     .parent(&manifest, parent_source)?
                     .or(self.lock.parent(&manifest, None)?)
-                    .context("path dependency absent from lockfile")?;
-                ensure!(
-                    locked
-                        .dependencies
-                        .iter()
-                        .any(|edge| locked_edge(edge, child)),
-                    "path edge {} is absent from lockfile",
-                    dep.alias
-                );
+                    .ok_or_else(|| {
+                        LockMismatch(format!("path dependency {} is absent", dep.alias))
+                    })?;
+                if !locked
+                    .dependencies
+                    .iter()
+                    .any(|edge| locked_edge(edge, child))
+                {
+                    return Err(LockMismatch(format!("path edge {} is absent", dep.alias)).into());
+                }
                 child_source = child.source.clone();
             }
             return Ok((manifest, child_source));
         }
-        let parent_lock = self.lock.parent(parent, parent_source)?.with_context(|| {
-            format!(
-                "{} requires a lockfile for external dependency {}",
+        let parent_lock = self.lock.parent(parent, parent_source)?.ok_or_else(|| {
+            LockMismatch(format!(
+                "{} has no locked edge for {}",
                 parent.package.name, dep.alias
-            )
+            ))
         })?;
         let candidates: Vec<_> = self
             .lock
@@ -200,13 +215,15 @@ impl<'a> Sources<'a> {
             })
             .cloned()
             .collect();
-        ensure!(
-            candidates.len() == 1,
-            "lockfile edge {} -> {} has {} candidates",
-            parent.package.name,
-            dep.alias,
-            candidates.len()
-        );
+        if candidates.len() != 1 {
+            return Err(LockMismatch(format!(
+                "edge {} -> {} has {} candidates",
+                parent.package.name,
+                dep.alias,
+                candidates.len()
+            ))
+            .into());
+        }
         let locked = &candidates[0];
         let root = match locked.source.as_deref() {
             Some(source) if source.starts_with("registry+") || source.starts_with("sparse+") => {

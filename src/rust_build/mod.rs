@@ -213,27 +213,41 @@ fn execute(args: RustBuildArgs) -> Result<i32> {
         if !args.offline {
             sources.download = Some(&download);
         }
-        if sources.lock.version.is_none() {
+        let options = ResolveOptions {
+            selected,
+            features: args
+                .features
+                .iter()
+                .flat_map(|f| f.split_whitespace())
+                .map(str::to_owned)
+                .collect(),
+            default_features: !args.no_default_features,
+            all_features: args.all_features,
+            dev_dependencies: args.mode == Mode::Test || args.all_targets,
+            host: toolchain.host.clone(),
+            target: toolchain.target.clone(),
+        };
+        let mut changed = sources.lock.version.is_none();
+        if changed {
             sources.lock = sources.resolve_lock(&toolchain.version)?;
+        }
+        let graph = match Graph::resolve(&mut sources, options.clone()) {
+            Ok(graph) => graph,
+            Err(error)
+                if !args.locked
+                    && error
+                        .downcast_ref::<sccache_rust_build::LockMismatch>()
+                        .is_some() =>
+            {
+                sources.lock = sources.resolve_lock(&toolchain.version)?;
+                changed = true;
+                Graph::resolve(&mut sources, options)?
+            }
+            Err(error) => return Err(error),
+        };
+        if changed {
             sources.lock.write(&workspace.root.join("Cargo.lock"))?;
         }
-        let graph = Graph::resolve(
-            &mut sources,
-            ResolveOptions {
-                selected,
-                features: args
-                    .features
-                    .iter()
-                    .flat_map(|f| f.split_whitespace())
-                    .map(str::to_owned)
-                    .collect(),
-                default_features: !args.no_default_features,
-                all_features: args.all_features,
-                dev_dependencies: args.mode == Mode::Test || args.all_targets,
-                host: toolchain.host.clone(),
-                target: toolchain.target.clone(),
-            },
-        )?;
         let planner = Planner::new(
             &graph,
             &workspace,

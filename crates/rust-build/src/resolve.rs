@@ -35,6 +35,7 @@ pub struct Graph {
     pub roots: Vec<usize>,
 }
 
+#[derive(Clone)]
 pub struct ResolveOptions {
     pub selected: Vec<PathBuf>,
     pub features: BTreeSet<String>,
@@ -319,6 +320,15 @@ impl Graph {
         let mut roots = Vec::new();
         for root in resolver.options.selected.clone() {
             let manifest = resolver.sources.workspace.package(&root)?;
+            if resolver.sources.lock.version.is_some()
+                && resolver.sources.lock.parent(&manifest, None)?.is_none()
+            {
+                return Err(crate::LockMismatch(format!(
+                    "root {} {} is absent",
+                    manifest.package.name, manifest.package.version
+                ))
+                .into());
+            }
             let mut features = BTreeSet::new();
             for requested in &resolver.options.features {
                 if let Some((package, feature)) = requested.split_once('/') {
