@@ -444,7 +444,7 @@ impl<'a> Planner<'a> {
                 let final_name = if test {
                     filename.to_owned()
                 } else {
-                    published_filename(filename, spec, &tag)
+                    published_filename(filename, &spec, &tag)
                 };
                 let destination = directory.join(final_name);
                 let publication = self.nodes.len();
