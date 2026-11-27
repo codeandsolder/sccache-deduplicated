@@ -46,6 +46,98 @@ enum Action {
     },
 }
 
+/// Rust libraries must satisfy the union of every consumer's linking needs.
+/// Only final link actions perform LTO; library dependencies provide bitcode.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum LtoPolicy {
+    #[default]
+    Object,
+    Bitcode,
+    Both,
+    Off,
+    Run(String),
+}
+impl LtoPolicy {
+    fn demand(&self) -> u8 {
+        match self {
+            Self::Object | Self::Off => 1,
+            Self::Bitcode | Self::Run(_) => 2,
+            Self::Both => 3,
+        }
+    }
+    fn arguments(&self) -> Vec<OsString> {
+        let flags = match self {
+            Self::Object => vec!["embed-bitcode=no".to_owned()],
+            Self::Bitcode => vec!["linker-plugin-lto".to_owned()],
+            Self::Both => Vec::new(),
+            Self::Off => vec!["lto=off".to_owned(), "embed-bitcode=no".to_owned()],
+            Self::Run(mode) => vec![format!("lto={mode}")],
+        };
+        flags
+            .into_iter()
+            .flat_map(|flag| [OsString::from("-C"), OsString::from(flag)])
+            .collect()
+    }
+}
+
+fn choose_lto(
+    profile: &Profile,
+    host: bool,
+    test: bool,
+    types: &[String],
+    demand: u8,
+) -> LtoPolicy {
+    if host {
+        return LtoPolicy::Object;
+    }
+    let requested = profile
+        .options
+        .get("lto")
+        .map(String::as_str)
+        .unwrap_or("false");
+    let enabled = !matches!(requested, "false" | "off");
+    if requested == "off" {
+        return LtoPolicy::Off;
+    }
+    if test
+        || types
+            .iter()
+            .all(|kind| matches!(kind.as_str(), "bin" | "cdylib" | "staticlib"))
+    {
+        return if enabled {
+            LtoPolicy::Run(
+                if requested == "true" {
+                    "fat"
+                } else {
+                    requested
+                }
+                .to_owned(),
+            )
+        } else {
+            LtoPolicy::Object
+        };
+    }
+    if types.iter().all(|kind| kind == "dylib") {
+        return LtoPolicy::Object;
+    }
+    let mut need = if demand == 0 {
+        if enabled { 2 } else { 1 }
+    } else {
+        demand
+    };
+    if types
+        .iter()
+        .any(|kind| !matches!(kind.as_str(), "lib" | "rlib"))
+    {
+        need |= 1;
+    }
+    match need {
+        1 => LtoPolicy::Object,
+        2 => LtoPolicy::Bitcode,
+        _ => LtoPolicy::Both,
+    }
+}
+
 #[derive(Debug)]
 struct Node {
     action: Action,
@@ -65,6 +157,7 @@ pub struct Planner<'a> {
     nodes: Vec<Node>,
     requested: BTreeSet<usize>,
     active_count: usize,
+    lto: Vec<LtoPolicy>,
     libraries: Vec<Option<usize>>,
     scripts: Vec<Option<usize>>,
     binaries: Vec<BTreeMap<String, (usize, PathBuf)>>,
@@ -138,6 +231,7 @@ impl<'a> Planner<'a> {
             nodes: Vec::new(),
             requested: BTreeSet::new(),
             active_count: 0,
+            lto: Vec::new(),
             libraries: vec![None; graph.units.len()],
             scripts: vec![None; graph.units.len()],
             binaries: vec![BTreeMap::new(); graph.units.len()],
@@ -146,6 +240,7 @@ impl<'a> Planner<'a> {
         };
         planner.allocate()?;
         planner.dependencies()?;
+        planner.resolve_lto()?;
         Ok(planner)
     }
 
@@ -169,13 +264,18 @@ impl<'a> Planner<'a> {
 
     fn profile(&self, unit: usize, script: bool) -> Result<Profile> {
         let manifest = self.unit_manifest(unit);
-        Profile::load(
+        let mut profile = Profile::load(
             &self.workspace.document,
             self.options.profile_name(),
             &manifest.package.name,
             self.host(unit, script),
-            self.graph.sources[self.graph.units[unit].package].is_some(),
-        )
+            !self.workspace.members.contains(&manifest.root),
+        )?;
+        // Test harnesses link dependencies built with unwinding enabled.
+        if self.options.mode == Mode::Test {
+            profile.options.remove("panic");
+        }
+        Ok(profile)
     }
 
     fn compile(&mut self, unit: usize, target: usize, test: bool, script: bool) -> Result<usize> {
@@ -669,6 +769,53 @@ impl<'a> Planner<'a> {
         Ok(())
     }
 
+    fn resolve_lto(&mut self) -> Result<()> {
+        let mut graph = self.graph()?;
+        let mut order = Vec::new();
+        while let Some(node) = graph.take_ready() {
+            order.push(node);
+            graph.complete(node)?;
+        }
+        let mut demand = vec![0_u8; self.nodes.len()];
+        let mut policies = vec![LtoPolicy::Object; self.nodes.len()];
+        for &index in order.iter().rev() {
+            let node = &self.nodes[index];
+            if let Action::Compile {
+                unit,
+                target,
+                test,
+                script,
+                profile,
+                ..
+            } = &node.action
+            {
+                let types = &self.target(*unit, *target).crate_types;
+                let policy = choose_lto(
+                    profile,
+                    self.host(*unit, *script),
+                    *test,
+                    types,
+                    demand[index],
+                );
+                for &dependency in &node.deps {
+                    if matches!(self.nodes[dependency].action, Action::Compile { .. }) {
+                        demand[dependency] |= policy.demand();
+                    }
+                }
+                policies[index] = policy;
+            } else if matches!(node.action, Action::Rustdoc { .. }) {
+                // Documentation tests can perform an ordinary native link.
+                for &dependency in &node.deps {
+                    if matches!(self.nodes[dependency].action, Action::Compile { .. }) {
+                        demand[dependency] |= 1;
+                    }
+                }
+            }
+        }
+        self.lto = policies;
+        Ok(())
+    }
+
     pub fn graph(&self) -> Result<BuildGraph> {
         let deps = self
             .nodes
@@ -875,6 +1022,7 @@ impl<'a> Planner<'a> {
         script: bool,
         tag: &str,
         profile: &Profile,
+        lto: &LtoPolicy,
     ) -> Result<PlanAction> {
         let manifest = self.unit_manifest(unit);
         let target = self.target(unit, target_index);
@@ -934,6 +1082,9 @@ impl<'a> Planner<'a> {
             args.extend(["--target".into(), target.clone()]);
         }
         args.extend(profile.arguments(test).into_iter().map(OsString::from));
+        if !metadata {
+            args.extend(lto.arguments());
+        }
         if let Some(linker) = self.settings.linker(platform)? {
             let mut arg = OsString::from("linker=");
             arg.push(linker);
@@ -1337,7 +1488,16 @@ impl<'a> Planner<'a> {
                 script,
                 tag,
                 profile,
-            } => self.compile_action(*unit, *target, *test, *metadata, *script, tag, profile)?,
+            } => self.compile_action(
+                *unit,
+                *target,
+                *test,
+                *metadata,
+                *script,
+                tag,
+                profile,
+                &self.lto[index],
+            )?,
             Action::Script {
                 unit,
                 compiler,
@@ -1448,6 +1608,34 @@ mod tests {
     use super::*;
     use crate::{Lockfile, ResolveOptions, Sources};
     use std::fs;
+
+    #[test]
+    fn lto_policy_distinguishes_final_links_and_library_consumers() {
+        let profile = Profile {
+            name: "release".into(),
+            options: BTreeMap::from([("lto".into(), "thin".into())]),
+        };
+        let lib = ["rlib".to_owned()];
+        let bin = ["bin".to_owned()];
+        let mixed = ["rlib".to_owned(), "cdylib".to_owned()];
+        assert_eq!(
+            choose_lto(&profile, false, false, &bin, 0),
+            LtoPolicy::Run("thin".into())
+        );
+        assert_eq!(
+            choose_lto(&profile, false, false, &lib, 2),
+            LtoPolicy::Bitcode
+        );
+        assert_eq!(choose_lto(&profile, false, false, &lib, 3), LtoPolicy::Both);
+        assert_eq!(
+            choose_lto(&profile, false, false, &mixed, 2),
+            LtoPolicy::Both
+        );
+        assert_eq!(
+            choose_lto(&profile, true, false, &lib, 2),
+            LtoPolicy::Object
+        );
+    }
 
     #[test]
     fn build_and_test_graphs_publish_declared_names_and_order_prerequisites() -> Result<()> {

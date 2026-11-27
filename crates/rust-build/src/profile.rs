@@ -94,17 +94,22 @@ impl Profile {
                     }
                 }
             }
-            if let Some(packages) = profiles
-                .get(name)
-                .and_then(Value::as_table)
-                .and_then(|p| p.get("package"))
-                .and_then(Value::as_table)
+            // Inherited wildcard overrides precede inherited specific ones.
+            // A child wildcard must not override a more specific parent rule.
+            for selector in [external.then_some("*"), Some(package)]
+                .into_iter()
+                .flatten()
             {
-                if external && let Some(overrides) = table(packages.get("*"), "package override")? {
-                    apply(&mut options, overrides)?;
-                }
-                if let Some(overrides) = table(packages.get(package), "package override")? {
-                    apply(&mut options, overrides)?;
+                for &name in chain.iter().rev() {
+                    if let Some(packages) = profiles
+                        .get(name)
+                        .and_then(Value::as_table)
+                        .and_then(|p| p.get("package"))
+                        .and_then(Value::as_table)
+                        && let Some(overrides) = table(packages.get(selector), "package override")?
+                    {
+                        apply(&mut options, overrides)?;
+                    }
                 }
             }
         } else if host {
@@ -133,8 +138,9 @@ impl Profile {
                         v => v,
                     },
                 ),
-                "lto" if value == "false" => continue,
-                "lto" if value == "true" => ("lto", "fat"),
+                // LTO depends on the consuming action graph, not just the
+                // profile of this package.
+                "lto" => continue,
                 "strip" if value == "false" => continue,
                 "strip" if value == "true" => ("strip", "symbols"),
                 "panic" if test => continue,
@@ -167,5 +173,37 @@ fn apply(options: &mut BTreeMap<String, String>, table: &Table) -> Result<()> {
             _ => bail!("unsupported profile setting {key}"),
         }
     }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn inherited_profile_package_overrides_follow_specificity() -> Result<()> {
+    let document: Table = toml::from_str(
+        r#"
+[profile.release]
+lto = "thin"
+[profile.release.package."*"]
+opt-level = 1
+[profile.release.package.foo]
+opt-level = 2
+[profile.custom]
+inherits = "release"
+[profile.custom.package."*"]
+opt-level = 3
+[profile.custom.package.foo]
+debug = true
+"#,
+    )?;
+    let profile = Profile::load(&document, "custom", "foo", false, true)?;
+    assert_eq!(profile.options["opt-level"], "2");
+    assert_eq!(profile.options["debug"], "true");
+    assert_eq!(profile.options["lto"], "thin");
+    assert!(
+        !profile
+            .arguments(false)
+            .iter()
+            .any(|arg| arg.starts_with("lto="))
+    );
     Ok(())
 }
