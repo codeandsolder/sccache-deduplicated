@@ -1318,6 +1318,10 @@ fn refresh_retains_shared_aliases_and_old_result_leases() -> Result<()> {
     let a = store.publish(&action("a"), &first, vec![old], ActionMode::Reuse)?;
     let b = store.publish(&action("b"), &first, vec![], ActionMode::Reuse)?;
     let reader = store.lookup(a.action)?.context("old result missing")?;
+    let alias = store.lookup(b.action)?.context("alias missing")?;
+    assert!(Arc::ptr_eq(&reader.content, &alias.content));
+    assert_eq!(store.inner.lock_pins()?.blobs.get(&old_blob.id), Some(&1));
+    drop(alias);
     let new = store.stage(&b"second"[..])?;
     let second = result(new.reference());
     let refreshed = store.publish(&action("a"), &second, vec![new], ActionMode::Refresh)?;
@@ -1339,6 +1343,7 @@ fn refresh_retains_shared_aliases_and_old_result_leases() -> Result<()> {
     reader.open_blob(old_blob.id)?.read_to_end(&mut bytes)?;
     assert_eq!(bytes, b"first");
     drop(reader);
+    assert!(!store.inner.lock_pins()?.results.contains_key(&a.result));
     assert_eq!(store.collect_garbage(8)?.blobs, 1);
     assert_eq!(
         store
@@ -1347,6 +1352,104 @@ fn refresh_retains_shared_aliases_and_old_result_leases() -> Result<()> {
             .manifest(),
         &second
     );
+    Ok(())
+}
+
+#[test]
+fn shared_result_snapshot_still_detects_missing_physical_content() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let staged = store.stage(&b"content"[..])?;
+    let blob = staged.reference();
+    let manifest = result(blob);
+    let fingerprint = action("repair");
+    let lease = store.publish_pinned(
+        &fingerprint,
+        &manifest,
+        vec![staged],
+        crate::ActionMode::Reuse,
+    )?;
+    let key = fingerprint.key()?;
+    fs::remove_file(store.inner.blob_path(blob.id))?;
+    assert!(store.lookup(key)?.is_none());
+    let repaired = store.stage(&b"content"[..])?;
+    let replacement = store.publish_pinned(
+        &fingerprint,
+        &manifest,
+        vec![repaired],
+        crate::ActionMode::Reuse,
+    )?;
+    assert!(Arc::ptr_eq(&lease.content, &replacement.content));
+    let reader = store.lookup(key)?.context("repaired result missing")?;
+    let mut bytes = Vec::new();
+    reader.open_blob(blob.id)?.read_to_end(&mut bytes)?;
+    assert_eq!(bytes, b"content");
+    assert_eq!(store.inner.lock_pins()?.blobs.get(&blob.id), Some(&1));
+    Ok(())
+}
+
+#[test]
+fn last_result_snapshot_drop_cannot_remove_replacement_pin() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let staged = store.stage(&b"content"[..])?;
+    let blob = staged.reference();
+    let manifest = result(blob);
+    let published = store.publish(
+        &action("race"),
+        &manifest,
+        vec![staged],
+        crate::ActionMode::Reuse,
+    )?;
+    let lease = store.lookup(published.action)?.context("missing result")?;
+    let old = Arc::clone(&lease.content);
+    drop(lease);
+    let mut prepared = Some(ResultSnapshot {
+        blobs: manifest.blobs()?,
+        manifest,
+    });
+    let mut pins = store.inner.lock_pins()?;
+    let weak = pins
+        .results
+        .get(&published.result)
+        .context("missing weak pin")?
+        .clone();
+    let replacement = thread::scope(|scope| {
+        let worker = scope.spawn(move || drop(old));
+        let started = Instant::now();
+        while weak.strong_count() != 0 && started.elapsed() < std::time::Duration::from_secs(2) {
+            thread::yield_now();
+        }
+        let acquired = if weak.strong_count() == 0 {
+            pins.pin_result(
+                &store.inner,
+                published.action,
+                published.result,
+                &mut prepared,
+            )
+        } else {
+            Err(anyhow::anyhow!("old content destructor did not start"))
+        };
+        drop(pins);
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("drop worker panicked"))?;
+        acquired
+    })?
+    .context("replacement pin missing")?;
+    {
+        let pins = store.inner.lock_pins()?;
+        assert_eq!(pins.blobs.get(&blob.id), Some(&1));
+        assert!(
+            pins.results
+                .get(&published.result)
+                .is_some_and(|weak| std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&replacement.content)))
+        );
+    }
+    drop(replacement);
+    let pins = store.inner.lock_pins()?;
+    assert!(!pins.results.contains_key(&published.result));
+    assert!(!pins.blobs.contains_key(&blob.id));
     Ok(())
 }
 
