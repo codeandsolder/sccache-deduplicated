@@ -101,7 +101,7 @@ jobs:
       - name: Install host validation dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ripgrep socat bubblewrap
+          sudo apt-get install -y --no-install-recommends ripgrep socat bubblewrap binutils
 
       - name: Validate managed host scripts
         run: |
@@ -110,6 +110,8 @@ jobs:
           shellcheck -x contrib/codeandsolder/sccache-dist-client-preflight contrib/codeandsolder/test-dist-client-preflight
           contrib/codeandsolder/test-dist-client-preflight
           contrib/codeandsolder/test-release-update-plan
+          shellcheck -x contrib/codeandsolder/verify-release-native-abi.sh contrib/codeandsolder/test-release-native-abi
+          contrib/codeandsolder/test-release-native-abi
           sudo contrib/codeandsolder/test-release-update-transaction
           shellcheck -x contrib/codeandsolder/sccache-client contrib/codeandsolder/sccache-cmake-launcher contrib/codeandsolder/test-sccache-router
           contrib/codeandsolder/test-wrappers
@@ -410,7 +412,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends binutils ripgrep
-          cargo +${{ steps.compiler.outputs.channel }} build --release --locked --no-default-features \
+          env -u RUSTC -u RUSTDOC cargo +${{ steps.compiler.outputs.channel }} build --release --locked --no-default-features \
             --features s3,gha,dist-client,dist-server,direct-metrics \
             --bin sccache --bin sccache-dist --message-format=json > "$RUNNER_TEMP/release-binaries.jsonl"
           mapfile -t binaries < <(jq -r 'select(.reason=="compiler-artifact" and .executable!=null and (.target.name=="sccache" or .target.name=="sccache-dist")) | .executable' "$RUNNER_TEMP/release-binaries.jsonl")
@@ -420,7 +422,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          packages="$(cargo +${{ steps.compiler.outputs.channel }} tree --locked --no-default-features \
+          packages="$(env -u RUSTC -u RUSTDOC cargo +${{ steps.compiler.outputs.channel }} tree --locked --no-default-features \
             --features s3,gha,dist-client,dist-server,direct-metrics,scheduler-dashboard \
             --edges normal --prefix none --format '{p}')"
           # These alternate application stacks were deliberately removed.
@@ -435,7 +437,7 @@ jobs:
           [[ "$btls" == *"github.com/codeandsolder/btls-fast"* && "$btls" != *$'\n'* ]]
           wreq="$(printf '%s\n' "$packages" | awk '$1 == "wreq" { sub(/ \(\*\)$/, ""); print }' | sort -u)"
           [[ "$wreq" == *"github.com/codeandsolder/wreq-exp"* && "$wreq" != *$'\n'* ]]
-          features="$(cargo +${{ steps.compiler.outputs.channel }} tree --locked --target x86_64-unknown-linux-gnu \
+          features="$(env -u RUSTC -u RUSTDOC cargo +${{ steps.compiler.outputs.channel }} tree --locked --target x86_64-unknown-linux-gnu \
             --no-default-features --features s3,gha,dist-client,dist-server,direct-metrics,scheduler-dashboard \
             --edges features -i btls-sys)"
           rg -q 'btls-sys feature "static-cxx-runtime"' <<<"$features"
@@ -443,7 +445,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo +${{ steps.compiler.outputs.channel }} build --release --locked --no-default-features \
+          env -u RUSTC -u RUSTDOC cargo +${{ steps.compiler.outputs.channel }} build --release --locked --no-default-features \
             --features s3,gha,dist-client,dist-server,direct-metrics,scheduler-dashboard \
             --bin sccache-dist --message-format=json > "$RUNNER_TEMP/release-dashboard.jsonl"
           mapfile -t binaries < <(jq -r 'select(.reason=="compiler-artifact" and .executable!=null and .target.name=="sccache-dist") | .executable' "$RUNNER_TEMP/release-dashboard.jsonl")

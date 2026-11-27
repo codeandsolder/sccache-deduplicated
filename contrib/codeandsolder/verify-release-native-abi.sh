@@ -15,8 +15,11 @@ fi
 
 for binary in "$@"; do
     header="$(readelf -W --file-header "$binary")"
-    if ! rg -q 'Machine:.*Advanced Micro Devices X86-64' <<<"$header" ||
-       ! rg -q 'Type:.*(EXEC|DYN)' <<<"$header"; then
+    if [[ ! "$header" =~ Class:[[:space:]]+ELF64 ||
+          ! "$header" =~ Data:.*little\ endian ||
+          ! "$header" =~ Machine:.*Advanced\ Micro\ Devices\ X86-64 ||
+          ! "$header" =~ Type:[[:space:]]+(EXEC|DYN) ||
+          ! "$header" =~ Entry\ point\ address:[[:space:]]+0x[0-9a-fA-F]*[1-9a-fA-F][0-9a-fA-F]* ]]; then
         echo "::error::$binary is not an x86-64 executable ELF file" >&2
         exit 1
     fi
@@ -29,8 +32,8 @@ for binary in "$@"; do
         echo "::error::$binary has unsupported interpreter $interpreter" >&2
         exit 1
     fi
-    if rg -q '\((RPATH|RUNPATH)\)' <<<"$dynamic"; then
-        echo "::error::$binary embeds a runtime library search path" >&2
+    if [[ "$dynamic" =~ \((RPATH|RUNPATH|AUDIT|DEPAUDIT|FILTER|AUXILIARY)\) ]]; then
+        echo "::error::$binary embeds a runtime library search or injection directive" >&2
         exit 1
     fi
     versions="$(readelf -W --version-info "$binary")"
@@ -58,6 +61,10 @@ for binary in "$@"; do
     done <<<"$labels"
     echo "$binary: verified libc ABI ceiling $max_supported"
     needed="$(sed -nE 's/^.*\(NEEDED\).*Shared library: \[([^]]+)\].*$/\1/p' <<<"$dynamic")"
+    if [[ "$dynamic" =~ \(NEEDED\) && -z "$needed" ]]; then
+        echo "::error::$binary contains unreadable DT_NEEDED entries" >&2
+        exit 1
+    fi
     if [[ -z "$needed" ]]; then
         if [[ -n "$interpreter" ]]; then
             echo "::error::$binary has a dynamic interpreter but no DT_NEEDED entries" >&2
