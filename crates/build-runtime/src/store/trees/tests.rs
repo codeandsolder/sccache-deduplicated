@@ -122,7 +122,10 @@ async fn cancelled_tree_publication_retains_content_until_durable_commit() -> Re
     let reserve = store.reserve_tree_upload(&original)?;
     let target = sample_tree(blob)?;
     let target_id = target.id()?;
-    let mut published = store.inner.publications.subscribe();
+    let published = store
+        .inner
+        .publications
+        .register(std::iter::once(blob.id))?;
     let mut future = Box::pin(store.publish_tree_pinned_async(target, Vec::new(), reserve));
     // Poll once to admit it, then drop the response waiter before the drain
     // can run on this single-thread runtime.
@@ -134,7 +137,10 @@ async fn cancelled_tree_publication_retains_content_until_durable_commit() -> Re
     drop(future);
     assert!(matches!(store.evict_tree(id)?, Eviction::Removed { .. }));
     assert_eq!(store.collect_garbage(8)?.blobs, 0);
-    tokio::time::timeout(Duration::from_secs(5), published.changed()).await??;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), published.next()).await?,
+        std::collections::BTreeSet::from([blob.id])
+    );
     let lease = store
         .lookup_tree(target_id)?
         .context("cancelled publication lost its root")?;

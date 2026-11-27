@@ -579,6 +579,8 @@ fn release_pin<K: Ord + std::fmt::Debug>(pins: &mut BTreeMap<K, usize>, key: &K)
     }
 }
 
+mod publications;
+
 struct Inner {
     root: PathBuf,
     db: Database,
@@ -592,7 +594,7 @@ struct Inner {
     package_imports: Mutex<BTreeSet<crate::PackageIdentity>>,
     tree_flights: trees::TreeFlights,
     tree_publications: trees::TreePublicationQueue,
-    publications: tokio::sync::watch::Sender<()>,
+    publications: publications::PublicationWaits,
     space_policy: Option<SpacePolicy>,
     space: Mutex<space::SpaceState>,
     // Releases never acquire the space admission lock, avoiding lock-order
@@ -670,13 +672,14 @@ where
 struct Publication {
     directories: BTreeSet<PathBuf>,
     reservations: Vec<space::StagingReservation>,
+    changed: Vec<ContentId>,
 }
 
 impl Publication {
     fn commit(self, inner: &Inner, write: WriteTransaction) -> Result<()> {
         inner.sync_publication_directories(&self.directories)?;
         write.commit()?;
-        inner.publications.send_modify(|()| {});
+        inner.publications.notify(&self.changed);
         // Only release staging reservations after the live accounting commit.
         drop(self);
         Ok(())
@@ -1175,7 +1178,7 @@ impl NativeStore {
             package_imports: Mutex::new(BTreeSet::new()),
             tree_flights: trees::TreeFlights::default(),
             tree_publications: trees::TreePublicationQueue::default(),
-            publications: tokio::sync::watch::Sender::new(()),
+            publications: publications::PublicationWaits::default(),
             space_policy,
             space: Mutex::default(),
             space_released: AtomicU64::new(0),
@@ -1506,55 +1509,69 @@ impl NativeStore {
     }
 
     /// Wait for independently produced content, pinning each available subset.
-    /// A publication notification is registered before checking residency, so
-    /// a concurrent commit cannot be lost between the check and the wait.
+    /// Register the desired content IDs before reading residency; subsequent
+    /// committed publications notify only consumers of the changed content.
     /// This does not claim acquisition ownership or request any network I/O.
     ///
     /// # Errors
     /// Returns an error for cancellation, timeout, invalid content or storage failure.
     pub async fn await_blobs<Cancel>(
         &self,
-        mut blobs: BTreeMap<ContentId, u64>,
+        blobs: BTreeMap<ContentId, u64>,
         deadline: Instant,
         cancelled: Cancel,
     ) -> Result<Vec<UploadReservation>>
     where
         Cancel: std::future::Future<Output = Result<()>> + Send,
     {
-        let mut publications = self.inner.publications.subscribe();
-        let mut cancelled = std::pin::pin!(cancelled);
+        if blobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        tokio::select! {
+            result = tokio::time::timeout_at(deadline.into(), self.wait_for_blobs(blobs)) => {
+                result.context("native content publication deadline exceeded")?
+            }
+            result = cancelled => {
+                result?;
+                anyhow::bail!("native content publication cancelled");
+            }
+        }
+    }
+
+    async fn wait_for_blobs(
+        &self,
+        mut missing: BTreeMap<ContentId, u64>,
+    ) -> Result<Vec<UploadReservation>> {
+        let subscription = self.inner.publications.register(missing.keys().copied())?;
+        let mut candidates = missing.clone();
         let mut pins = Vec::new();
-        while !blobs.is_empty() {
-            ensure!(
-                Instant::now() < deadline,
-                "native content publication deadline exceeded"
-            );
-            // Forget prior changes, then check the current durable index.
-            let _ = publications.borrow_and_update();
-            let count = blobs.len();
+        loop {
             let store = self.clone();
-            let ready = tokio::task::spawn_blocking(move || store.reserve_blobs(&blobs)).await??;
-            blobs = ready
-                .missing()
-                .iter()
-                .map(|blob| (blob.id, blob.size))
-                .collect();
-            if blobs.len() < count {
+            let ready =
+                tokio::task::spawn_blocking(move || store.reserve_blobs(&candidates)).await??;
+            for id in &ready.reserved {
+                missing.remove(id);
+            }
+            if !ready.reserved.is_empty() {
                 pins.push(ready);
             }
-            if !blobs.is_empty() {
-                tokio::select! {
-                    result = tokio::time::timeout_at(deadline.into(), publications.changed()) => {
-                        result.context("native content publication deadline exceeded")??;
-                    }
-                    result = &mut cancelled => {
-                        result?;
-                        anyhow::bail!("native content publication cancelled");
-                    }
+            if missing.is_empty() {
+                return Ok(pins);
+            }
+            // Only check newly published content. Accumulated events cannot
+            // overflow or be lost: each subscription has a finite ID set.
+            loop {
+                candidates = subscription
+                    .next()
+                    .await
+                    .into_iter()
+                    .filter_map(|id| missing.get(&id).map(|&size| (id, size)))
+                    .collect();
+                if !candidates.is_empty() {
+                    break;
                 }
             }
         }
-        Ok(pins)
     }
 
     /// Atomically publish a successful result. All newly referenced blobs must
@@ -1783,6 +1800,9 @@ impl NativeStore {
         let mut added = 0_u64;
         let mut pending_removed = 0_u64;
         for (id, size, disposition) in plans {
+            if disposition != Attachment::Live {
+                publication.changed.push(id);
+            }
             match disposition {
                 Attachment::Live => {}
                 Attachment::Repair => {
