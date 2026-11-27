@@ -222,7 +222,7 @@ fn GraphCanvas(
                     }/>
                 </svg>
             </div>
-    }
+    }.into_any()
 }
 
 #[component]
@@ -239,7 +239,7 @@ fn RouteTable(links: Memo<Vec<NetworkLink>>, hosts: Memo<Hosts>) -> impl IntoVie
                 }/>
             </tbody>
         </table></div>
-    }
+    }.into_any()
 }
 
 #[component]
@@ -258,7 +258,7 @@ fn RouteCells(link: NetworkLink, hosts: Memo<Hosts>) -> impl IntoView {
         <td><b>{move ||name(&target)}</b><small>{link.target_address.unwrap_or_else(||"Unknown endpoint".into())}</small></td>
         <td>{evidence(link.evidence)}</td><td>{optional_rate(link.wire_bytes_per_second)}</td><td>{optional_rate(link.logical_bytes_per_second)}</td>
         <td>{link.remaining_bytes.map_or_else(||"—".into(),super::bytes)}</td>
-    }
+    }.into_any()
 }
 
 fn edge_path(a: Point, b: Point) -> String {
@@ -304,7 +304,7 @@ fn HostDetails(host: NetworkHost) -> impl IntoView {
                 }).collect_view()}
             </tbody></table></div>
         </article>
-    }
+    }.into_any()
 }
 
 #[cfg(test)]

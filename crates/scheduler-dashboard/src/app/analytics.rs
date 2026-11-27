@@ -27,7 +27,7 @@ pub(super) fn CacheAnalytics(
             <FleetStorage workers=workers/>
             <p class=styles::muted>"Historical legacy L0/L1 distributions, per-tier capacity and shared managed-cache heat are below. Select an individual client to inspect distributions."</p>
         </section>
-    }
+    }.into_any()
 }
 
 #[expect(
@@ -105,7 +105,7 @@ fn Histogram(
                 </tbody>
             </table>
         </div>
-    }
+    }.into_any()
 }
 
 fn bucket_total(buckets: &[CacheBucket]) -> CacheWeight {
@@ -138,7 +138,7 @@ fn EvictionHistogram(
                 </tr> }
             }).collect_view()}</tbody>
         </table></div>
-    }
+    }.into_any()
 }
 
 fn cumulative(buckets: &[CacheBucket]) -> Vec<CacheWeight> {
@@ -260,7 +260,7 @@ fn Distribution(report: CacheDistribution) -> impl IntoView {
         </div>
         <EvictionHistogram title="Logical pressure: eviction score" buckets=report.eviction.logical physical=false/>
         <EvictionHistogram title="Physical pressure: eviction score" buckets=report.eviction.physical physical=true/>
-    }
+    }.into_any()
 }
 
 #[cfg(test)]
@@ -324,5 +324,5 @@ fn FleetStorage(workers: Memo<Vec<Worker>>) -> impl IntoView {
                 })
             }).collect_view()}</tbody>
         </table></div>
-    }
+    }.into_any()
 }

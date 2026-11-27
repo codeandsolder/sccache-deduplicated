@@ -875,7 +875,7 @@ fn SpaceStatus(space: CacheSpace, live: Option<u64>) -> impl IntoView {
         </div>
         {(space.min_available.is_some() && space.reserved.is_none()).then(||view!{<p class=styles::muted>"Space admission or reclamation in progress; reservation observation unavailable."</p>})}
         <p class=styles::muted>"Physical filesystem free space and uncompressed resident bytes are different quantities. Headroom estimates exclude prospective reclamation."</p>
-    }
+    }.into_any()
 }
 
 #[component]
@@ -898,5 +898,5 @@ fn ServiceStatus(service: NativeService) -> impl IntoView {
             </div>
         })}
         {service.tickets.is_none().then(||view!{<p class=styles::muted>"Ticket map busy; count unavailable in this sample."</p>})}
-    }
+    }.into_any()
 }
