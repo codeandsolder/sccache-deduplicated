@@ -207,6 +207,7 @@ mod tests {
                     Ok((package, offers))
                 })();
                 send.send(found)
+                    .map_err(|_| anyhow::anyhow!("package reader receiver disconnected"))
             });
             let observed = receive.recv_timeout(Duration::from_secs(2));
             drop(mutation);
