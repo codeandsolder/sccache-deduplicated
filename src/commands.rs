@@ -799,7 +799,11 @@ where
     C: CommandCreatorSync + Clone + Send + Sync + 'static,
 {
     trace!("do_compile_client_side");
-    let exe_path = which_in(invocation.exe, env::var_os("PATH"), invocation.cwd)?;
+    let path = invocation
+        .env_vars
+        .iter()
+        .find_map(|(name, value)| (name == "PATH").then(|| value.clone()));
+    let exe_path = which_in(invocation.exe, path, invocation.cwd)?;
     let compile = Compile {
         client_pid: std::process::id(),
         exe: exe_path.as_os_str().to_owned(),
@@ -1027,70 +1031,109 @@ fn package_toolchain(executable: PathBuf, out: PathBuf) -> Result<()> {
     })
 }
 
-fn run_compile_command(
-    config: &Config,
-    startup_timeout: Option<Duration>,
-    exe: &Path,
-    cmdline: Vec<OsString>,
-    cwd: &Path,
-    env_vars: Vec<(OsString, OsString)>,
-) -> Result<i32> {
-    trace!(
-        "Command::Compile {{ {}, {cmdline:?}, {} }}",
-        crate::util::debug_display(&exe),
-        crate::util::debug_display(&cwd)
-    );
+/// Share the client runtime and local process jobserver between all compiler
+/// requests in one frontend invocation. Remote worker admission remains owned
+/// by the existing daemon and distributed scheduler.
+pub(crate) struct CompileSession<'a> {
+    config: &'a Config,
+    runtime: Runtime,
+    jobserver: Client,
+}
 
-    for incremental_var in ["CARGO_BUILD_INCREMENTAL", "CARGO_INCREMENTAL"] {
-        if matches!(env::var(incremental_var), Ok(value) if value == "1") {
-            println!(
-                "sccache: incremental compilation is prohibited: Unset {incremental_var} to continue."
-            );
-            return Ok(1);
-        }
+impl<'a> CompileSession<'a> {
+    pub(crate) fn new(config: &'a Config, concurrent: bool) -> Result<Self> {
+        let runtime = if concurrent || config.client_side_mode {
+            Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?
+        } else {
+            new_client_runtime()?
+        };
+        Ok(Self {
+            config,
+            runtime,
+            jobserver: Client::new(),
+        })
     }
 
-    let jobserver = Client::new();
-    let conn = if config.client_side_mode {
-        connect_to_server(&get_addr())
-            .context("client-side compilation requires an existing daemon")?
-    } else {
-        connect_or_start_server(&get_addr(), startup_timeout, auto_start_server_enabled())?
-    };
-    let invocation = CompileInvocation {
-        exe,
-        cmdline,
-        cwd,
-        env_vars,
-    };
-    if config.client_side_mode {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()?;
-        return do_compile_client_side::<ProcessCommandCreator>(
-            &jobserver,
-            &runtime,
+    pub(crate) fn execute(
+        &self,
+        invocation: CompileInvocation<'_>,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> Result<i32> {
+        trace!(
+            "Command::Compile {{ {}, {:?}, {} }}",
+            crate::util::debug_display(&invocation.exe),
+            invocation.cmdline,
+            crate::util::debug_display(&invocation.cwd)
+        );
+
+        for incremental_var in ["CARGO_BUILD_INCREMENTAL", "CARGO_INCREMENTAL"] {
+            if invocation
+                .env_vars
+                .iter()
+                .any(|(name, value)| name == incremental_var && value == "1")
+            {
+                writeln!(
+                    stderr,
+                    "sccache: incremental compilation is prohibited: Unset {incremental_var} to continue."
+                )?;
+                return Ok(1);
+            }
+        }
+
+        let conn = if self.config.client_side_mode {
+            connect_to_server(&get_addr())
+                .context("client-side compilation requires an existing daemon")?
+        } else {
+            connect_or_start_server(
+                &get_addr(),
+                self.config.server_startup_timeout,
+                auto_start_server_enabled(),
+            )?
+        };
+        if self.config.client_side_mode {
+            return do_compile_client_side::<ProcessCommandCreator>(
+                &self.jobserver,
+                &self.runtime,
+                conn,
+                invocation,
+                self.config,
+                stdout,
+                stderr,
+            )
+            .context("failed to execute compile");
+        }
+
+        let path = invocation
+            .env_vars
+            .iter()
+            .find_map(|(name, value)| (name == "PATH").then(|| value.clone()));
+        do_compile(
+            ProcessCommandCreator::new(&self.jobserver),
+            &self.runtime,
             conn,
             invocation,
-            config,
-            &mut io::stdout(),
-            &mut io::stderr(),
+            path,
+            stdout,
+            stderr,
         )
-        .context("failed to execute compile");
+        .context("failed to execute compile")
     }
 
-    let runtime = new_client_runtime()?;
-    do_compile(
-        ProcessCommandCreator::new(&jobserver),
-        &runtime,
-        conn,
-        invocation,
-        env::var_os("PATH"),
-        &mut io::stdout(),
-        &mut io::stderr(),
-    )
-    .context("failed to execute compile")
+    #[cfg(unix)]
+    pub(crate) fn execute_process(
+        &self,
+        command: &mut process::Command,
+    ) -> Result<process::ExitStatus> {
+        // Only local, non-compiler actions acquire a local process slot here.
+        // Compiler requests go through their normal admission/placement path.
+        let _token = self.runtime.block_on(self.jobserver.acquire())?;
+        self.jobserver.configure(command);
+        command.status().context("execute local build action")
+    }
 }
 
 /// Run `cmd` and return the process exit status.
@@ -1139,19 +1182,35 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         Command::PackageToolchain(_executable, _out) => bail!(
             "Toolchain packaging not compiled in, please rebuild with the dist-client feature"
         ),
+        #[cfg(unix)]
+        Command::ExecutePlanner {
+            executable,
+            args,
+            max_in_flight,
+        } => crate::build_plan::execute_planner(&executable, &args, max_in_flight, config)?,
+        #[cfg(not(unix))]
+        Command::ExecutePlanner { .. } => {
+            bail!("live build planners currently require POSIX paths")
+        }
+        #[cfg(unix)]
+        Command::ExecutePlan(path, width) => crate::build_plan::execute(&path, width, config)?,
+        #[cfg(not(unix))]
+        Command::ExecutePlan(_, _) => bail!("native build plans currently require POSIX paths"),
         Command::Compile {
             exe,
             cmdline,
             cwd,
             env_vars,
         } => {
-            return run_compile_command(
-                config,
-                startup_timeout,
-                Path::new(&exe),
-                cmdline,
-                &cwd,
-                env_vars,
+            return CompileSession::new(config, false)?.execute(
+                CompileInvocation {
+                    exe: Path::new(&exe),
+                    cmdline,
+                    cwd: &cwd,
+                    env_vars,
+                },
+                &mut io::stdout(),
+                &mut io::stderr(),
             );
         }
     }

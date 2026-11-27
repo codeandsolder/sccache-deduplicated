@@ -16,6 +16,7 @@ use crate::errors::{Context, Result, anyhow, bail};
 use clap::{Arg, ArgAction, ArgGroup, ValueEnum, error::ErrorKind};
 use std::env;
 use std::ffi::OsString;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::str::FromStr;
 use which::which_in;
@@ -74,6 +75,14 @@ pub enum Command {
     DistAuth,
     /// Package a toolchain for distributed compilation (executable, out)
     PackageToolchain(PathBuf, PathBuf),
+    /// Execute an explicit, versioned build DAG.
+    ExecutePlan(PathBuf, NonZeroUsize),
+    /// Launch a live planner and execute its graph.
+    ExecutePlanner {
+        executable: PathBuf,
+        args: Vec<OsString>,
+        max_in_flight: NonZeroUsize,
+    },
     /// Run a compiler command.
     Compile {
         /// The binary to execute.
@@ -97,6 +106,7 @@ fn flag_infer_long(name: &'static str) -> Arg {
 }
 
 const ENABLED_FEATURES_HELP: &str = concat!(
+    "Live build planner: --execute-planner PATH [--max-in-flight N] -- [planner arguments]\n",
     "Linux Cargo launcher: --cargo-final -- [Cargo arguments] (temporary intermediates)\n",
     "                      --cargo-all -- [Cargo arguments] (normal Cargo retention)\n\n",
     "Enabled features:\n",
@@ -135,6 +145,15 @@ fn get_clap_command() -> clap::Command {
         .max_term_width(110)
         .after_help(ENABLED_FEATURES_HELP)
         .args(&[
+            flag_infer_long("execute-plan")
+                .help("execute a versioned build plan using the managed compiler client")
+                .value_parser(clap::value_parser!(PathBuf))
+                .value_name("PLAN"),
+            flag_infer_long("max-in-flight")
+                .help("maximum outstanding build plan actions (not a worker CPU quota)")
+                .value_parser(clap::value_parser!(NonZeroUsize))
+                .default_value("64")
+                .requires("execute-plan"),
             flag_infer_long("capabilities")
                 .help("print machine-readable build capabilities")
                 .action(ArgAction::SetTrue),
@@ -188,6 +207,7 @@ fn get_clap_command() -> clap::Command {
             ArgGroup::new("one_and_only_one")
                 .args([
                     "capabilities",
+                    "execute-plan",
                     "dist-auth",
                     "debug-preprocessor-cache",
                     "dist-status",
@@ -267,7 +287,13 @@ fn compile_command(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Command> 
 }
 
 fn command_from_matches(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Command> {
-    if matches.get_flag("capabilities") {
+    if let Some(path) = matches.get_one::<PathBuf>("execute-plan") {
+        let width = matches
+            .get_one::<NonZeroUsize>("max-in-flight")
+            .copied()
+            .context("missing build plan in-flight limit")?;
+        Ok(Command::ExecutePlan(path.clone(), width))
+    } else if matches.get_flag("capabilities") {
         Ok(Command::Capabilities)
     } else if matches.get_flag("show-stats") {
         Ok(Command::ShowStats(stats_format(matches)?, false))
@@ -298,6 +324,27 @@ fn command_from_matches(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Comm
     }
 }
 
+#[derive(clap::Parser)]
+#[command(name = "sccache")]
+struct PlannerArgs {
+    #[arg(long)]
+    execute_planner: PathBuf,
+    #[arg(long, default_value = "64")]
+    max_in_flight: NonZeroUsize,
+    #[arg(last = true)]
+    args: Vec<OsString>,
+}
+
+fn planner_command(args: &[OsString]) -> Result<Command> {
+    use clap::Parser as _;
+    let parsed = PlannerArgs::try_parse_from(args)?;
+    Ok(Command::ExecutePlanner {
+        executable: parsed.execute_planner,
+        args: parsed.args,
+        max_in_flight: parsed.max_in_flight,
+    })
+}
+
 /// Parse the commandline args into a Result<Command> to execute.
 pub fn try_parse() -> Result<Command> {
     trace!("parse");
@@ -308,6 +355,10 @@ pub fn try_parse() -> Result<Command> {
     // We only care if it's `1`
     let internal_start_server = env::var(ENV_VAR_INTERNAL_START_SERVER).as_deref() == Ok("1");
     let mut args: Vec<_> = env::args_os().collect();
+
+    if !internal_start_server && args.get(1).is_some_and(|arg| arg == "--execute-planner") {
+        return planner_command(&args);
+    }
 
     if !internal_start_server {
         // current_exe() follows symlinks on some OSes, so try argv[0] to get the original invocation
@@ -379,7 +430,7 @@ pub fn try_parse() -> Result<Command> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, command_from_matches, get_clap_command};
+    use super::{Command, command_from_matches, get_clap_command, planner_command};
     use std::path::PathBuf;
 
     #[test]
@@ -390,5 +441,23 @@ mod tests {
         let command = command_from_matches(&matches, PathBuf::from("."))
             .expect("capabilities should map to a command");
         assert!(matches!(command, Command::Capabilities));
+    }
+    #[test]
+    fn planner_arguments_are_not_interpreted_as_compiler_options() {
+        let args = [
+            "sccache",
+            "--execute-planner",
+            "/cargo",
+            "--max-in-flight",
+            "17",
+            "--",
+            "build",
+            "--release",
+        ]
+        .map(Into::into);
+        let command = planner_command(&args).unwrap();
+        assert!(
+            matches!(command, Command::ExecutePlanner { executable, args, max_in_flight } if executable == PathBuf::from("/cargo") && args == ["build", "--release"] && max_in_flight.get() == 17)
+        );
     }
 }

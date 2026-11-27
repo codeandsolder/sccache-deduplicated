@@ -26,6 +26,8 @@ mod test;
 pub mod errors;
 
 pub use sccache_build as build_runtime;
+#[cfg(unix)]
+mod build_plan;
 pub mod cache;
 #[cfg(target_os = "linux")]
 mod cargo_launcher;

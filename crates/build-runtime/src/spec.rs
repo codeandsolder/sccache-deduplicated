@@ -27,7 +27,7 @@ impl BuildPath {
         Ok(path)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(self.0.starts_with(b"/"), "build path must be absolute");
         if self.0 != b"/" {
             TreePath::new(self.0[1..].to_vec())?;

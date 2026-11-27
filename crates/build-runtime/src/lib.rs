@@ -7,6 +7,14 @@
 #![deny(rust_2018_idioms)]
 
 pub mod analytics;
+mod graph;
+pub use graph::BuildGraph;
+mod plan;
+mod plan_protocol;
+pub use plan::{
+    BUILD_PLAN_VERSION, BuildPlan, EnvironmentChange, PlanAction, PlanCommand, PlanNode,
+};
+pub use plan_protocol::{PlanConnection, PlannerReply, PlannerRequest};
 mod identity;
 mod installation;
 mod network;
