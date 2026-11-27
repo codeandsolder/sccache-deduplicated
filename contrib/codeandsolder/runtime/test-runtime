@@ -29,7 +29,7 @@ printf '%s\n' '#include <vector>' 'int resident_cxx(const std::vector<int>& x) {
 "$here/run" --image "$image" --offline --report-actions -- /bin/bash -ec '
     sccache /usr/bin/gcc -c probe.c -o probe.o > c.log 2>&1
     sccache /usr/bin/g++ -c probe.cc -o probe-cxx.o > cxx.log 2>&1
-    sccache --cargo-all -- build --offline -j2 -vv > rust.log 2>&1
+    sccache build --offline -j2 -vv > rust.log 2>&1
 '
 for language in c cxx rust; do
     printf '%s ' "$language"

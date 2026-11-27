@@ -37,6 +37,10 @@ pub enum Mode {
 pub struct RustBuildArgs {
     #[arg(value_enum)]
     pub mode: Mode,
+    #[arg(long)]
+    toolchain: Option<String>,
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
     #[arg(long, default_value = "Cargo.toml")]
     manifest_path: PathBuf,
     #[arg(short = 'p', long = "package")]
@@ -242,6 +246,7 @@ fn execute(args: RustBuildArgs) -> Result<i32> {
     let toolchain = Toolchain::discover(
         &cwd,
         args.rustc.as_deref(),
+        args.toolchain.as_deref(),
         target,
         args.mode == Mode::Clippy,
         false,
@@ -275,7 +280,7 @@ fn execute(args: RustBuildArgs) -> Result<i32> {
         "--locked requires an existing lockfile"
     );
     let config = Config::load()?;
-    crate::cargo_launcher::with_build_intermediates(|lease, intermediate| {
+    crate::build_lease::with_build_intermediates(|lease, intermediate| {
         let sources_root = lease.root().join("sources");
         fs::create_dir_all(&sources_root)?;
         let mut sources = Sources::new(&workspace, lock, import, sources_root);
@@ -337,6 +342,9 @@ fn execute(args: RustBuildArgs) -> Result<i32> {
             let node = planner
                 .prepare(index)
                 .with_context(|| format!("prepare build node {index}"))?;
+            if args.verbose > 0 {
+                eprintln!("{}", node.label);
+            }
             build_plan::execute_node(&session, &node, &node.action)
                 .with_context(|| node.label.clone())?;
             planner.complete(index)
@@ -346,10 +354,18 @@ fn execute(args: RustBuildArgs) -> Result<i32> {
 }
 
 pub(crate) fn run_if_requested() -> Option<Result<i32>> {
-    let args: Vec<_> = std::env::args_os().collect();
-    let mode = args.get(1)?.to_str()?;
+    let mut args: Vec<_> = std::env::args_os().collect();
+    let explicit = args.get(1)?.to_str()?.strip_prefix('+').map(str::to_owned);
+    let mode = args.get(if explicit.is_some() { 2 } else { 1 })?.to_str()?;
     if !matches!(mode, "build" | "check" | "test" | "clippy" | "run") {
         return None;
+    }
+    if let Some(toolchain) = explicit {
+        args.remove(1);
+        args.splice(
+            2..2,
+            [OsString::from("--toolchain"), OsString::from(toolchain)],
+        );
     }
     Some(match RustBuildArgs::try_parse_from(args) {
         Ok(args) => execute(args),

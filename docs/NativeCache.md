@@ -1392,14 +1392,13 @@ The only learning action is a choice among real placements, or a reordering
 of real input fetches. If there is no useful opportunity, the system simply
 uses the fastest predicted placement. New jobs can always proceed normally.
 
-### Build-scoped Cargo intermediate retention
+### Build-scoped intermediate retention
 
-On Linux, the managed Cargo launcher can use `sccache --cargo-final -- <cargo arguments>`.
-It invokes stock rustup-selected Cargo, with a private per-invocation build directory
-mounted through FUSE (requires access to `/dev/fuse` and `fusermount3`).
-The Cargo target directory is unchanged; durable final outputs are installed normally.
-`sccache --cargo-all -- <cargo arguments>` instead uses the regular Cargo build
-directory and retains materialized intermediates.
+The native Rust frontend resolves workspace manifests and locks directly and
+dispatches the resulting graph through the managed compiler client. On Linux,
+`sccache build` uses a private per-invocation FUSE filesystem (requires access
+to `/dev/fuse` and `fusermount3`). Final artifacts are installed atomically
+in the selected target directory; all intermediates use the shared CAS.
 
 The scheduler pins exact committed result manifests in a build-wide lease,
 independent of individual compilation tickets. The launcher holds the lease
@@ -1417,6 +1416,6 @@ content identity. Spools and namespace data are temporary, not another cache.
 
 An expired or unavailable lease fails the affected operation rather than
 exposing an empty placeholder or inventing a new content identity. Scratch
-reclamation respects inherited process ownership. The full Cargo graph and
+reclamation respects inherited process ownership. The full native graph and
 cross-user/namespace acceptance tests must pass before promoting this mode
 to the managed fleet.

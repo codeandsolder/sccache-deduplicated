@@ -61,7 +61,7 @@ From the repository to build:
 ```sh
 sccache-runtime --leased-intermediates -- cargo build --locked
 sccache-runtime --leased-intermediates -- cargo test --locked
-sccache-runtime -- sccache --cargo-all -- build --locked
+sccache-runtime -- sccache build --locked
 sccache-runtime -- sccache /usr/bin/clang -c source.c -o source.o
 ```
 

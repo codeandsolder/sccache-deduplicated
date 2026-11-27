@@ -2798,11 +2798,11 @@ fn native_local_execution_in_networkless_namespace_shares_remote_actions() -> Re
     Ok(())
 }
 
-/// Exercise the actual launcher, Cargo fingerprints, an intermediate Rust
+/// Exercise the native frontend, content fingerprints, an intermediate Rust
 /// library, the broker, a scheduler cache hit and final executable delivery.
 #[test]
-#[ignore = "requires a real FUSE mount, stock Cargo and native distributed test fleet"]
-fn cargo_leased_intermediates_deliver_a_working_binary() -> Result<()> {
+#[ignore = "requires a real FUSE mount and native distributed test fleet"]
+fn native_leased_intermediates_deliver_a_working_binary() -> Result<()> {
     let temp = tempfile::Builder::new()
         .prefix("native-cargo-")
         .tempdir_in("/tmp")?;
@@ -2835,7 +2835,7 @@ fn cargo_leased_intermediates_deliver_a_working_binary() -> Result<()> {
         let mut command = service.command(env!("CARGO_BIN_EXE_sccache"));
         command
             .current_dir(&workspace)
-            .args(["--cargo-final", "--", "build", "--offline", "-j", "2"])
+            .args(["build", "--offline", "-j", "2"])
             .env("SCCACHE_CONF", &direct_config)
             .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
             .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_sccache"))
@@ -2857,7 +2857,7 @@ fn cargo_leased_intermediates_deliver_a_working_binary() -> Result<()> {
         let output = command.output()?;
         ensure!(
             output.status.success(),
-            "Cargo leased build {round} failed: {}",
+            "native leased build {round} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         let result = Command::new(&binary).output()?;
@@ -2969,25 +2969,18 @@ fn run_mixed_cargo(
     workspace: &Path,
     root: &Path,
     target: &Path,
-    mode: &str,
-    build_directory: Option<&Path>,
 ) -> Result<()> {
     for subcommand in ["build", "test"] {
         let mut command = service.command(env!("CARGO_BIN_EXE_sccache"));
         command
             .current_dir(workspace)
-            .args([mode, "--", subcommand, "--offline", "-j", "2"])
+            .args([subcommand, "--offline", "-j", "2", "--target-dir"])
+            .arg(target)
             .env("SCCACHE_CONF", root.join("direct.toml"))
             .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
             .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_sccache"))
             .env("CARGO_TARGET_DIR", target)
             .env("TMPDIR", root);
-        if let Some(directory) = build_directory {
-            command.arg("--config").arg(format!(
-                "build.build-dir={}",
-                serde_json::to_string(directory)?
-            ));
-        }
         for key in [
             "PATH",
             "HOME",
@@ -3002,7 +2995,7 @@ fn run_mixed_cargo(
         let output = command.output()?;
         ensure!(
             output.status.success(),
-            "mixed Cargo {mode} {subcommand} failed for {}: {}\n{}",
+            "mixed native {subcommand} failed for {}: {}\n{}",
             target.display(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -3021,8 +3014,8 @@ fn run_mixed_cargo(
 }
 
 #[test]
-#[ignore = "requires Linux FUSE, stock Cargo, GCC, ar and an isolated distributed test fleet"]
-fn cargo_leased_intermediates_support_parallel_mixed_graphs() -> Result<()> {
+#[ignore = "requires Linux FUSE, GCC, ar and an isolated distributed test fleet"]
+fn native_leased_intermediates_support_parallel_mixed_graphs() -> Result<()> {
     let temp = tempfile::Builder::new()
         .prefix("native-mixed-cargo-")
         .tempdir_in("/tmp")?;
@@ -3033,46 +3026,21 @@ fn cargo_leased_intermediates_support_parallel_mixed_graphs() -> Result<()> {
     write_mixed_cargo_graph(&workspace)?;
     fs::write(root.join("direct.toml"), "client_side_mode = false\n")?;
     let cold_target = root.join("cold");
-    run_mixed_cargo(
-        &service,
-        &workspace,
-        &root,
-        &cold_target,
-        "--cargo-final",
-        None,
-    )?;
+    run_mixed_cargo(&service, &workspace, &root, &cold_target)?;
     let cold = service.stats()?;
     assert_eq!(cold.dist_errors, 0);
     assert!(cold.dist_compiles.values().sum::<usize>() >= 3);
     let warm_left = root.join("warm-left");
     let warm_right = root.join("warm-right");
     thread::scope(|scope| -> Result<()> {
-        let left = scope.spawn(|| {
-            run_mixed_cargo(
-                &service,
-                &workspace,
-                &root,
-                &warm_left,
-                "--cargo-final",
-                None,
-            )
-        });
-        let right = scope.spawn(|| {
-            run_mixed_cargo(
-                &service,
-                &workspace,
-                &root,
-                &warm_right,
-                "--cargo-final",
-                None,
-            )
-        });
+        let left = scope.spawn(|| run_mixed_cargo(&service, &workspace, &root, &warm_left));
+        let right = scope.spawn(|| run_mixed_cargo(&service, &workspace, &root, &warm_right));
         let left = left
             .join()
-            .map_err(|_| anyhow::anyhow!("left Cargo session panicked"))?;
+            .map_err(|_| anyhow::anyhow!("left native session panicked"))?;
         let right = right
             .join()
-            .map_err(|_| anyhow::anyhow!("right Cargo session panicked"))?;
+            .map_err(|_| anyhow::anyhow!("right native session panicked"))?;
         left?;
         right
     })?;
@@ -3084,7 +3052,7 @@ fn cargo_leased_intermediates_support_parallel_mixed_graphs() -> Result<()> {
         if entry
             .file_name()
             .to_string_lossy()
-            .starts_with("sccache-cargo-")
+            .starts_with("sccache-build-")
         {
             assert_eq!(
                 fs::read_dir(entry.path())?.count(),
@@ -3093,26 +3061,6 @@ fn cargo_leased_intermediates_support_parallel_mixed_graphs() -> Result<()> {
             );
         }
     }
-    // The full-export mode uses ordinary persistent Cargo build directories
-    // and must consume the same compiler graph without a FUSE session.
-    let all_target = root.join("all");
-    let all_intermediates = root.join("all-intermediates");
-    run_mixed_cargo(
-        &service,
-        &workspace,
-        &root,
-        &all_target,
-        "--cargo-all",
-        Some(&all_intermediates),
-    )?;
-    assert!(all_intermediates.is_dir());
-    assert_eq!(
-        fs::read(all_target.join("debug/leased-mixed-app"))?,
-        fs::read(cold_target.join("debug/leased-mixed-app"))?
-    );
-    let all = service.stats()?;
-    assert_eq!(all.dist_errors, 0);
-    assert!(all.cache_hits.all() > warm.cache_hits.all());
     service.stop()?;
     fleet.finish()?;
     Ok(())

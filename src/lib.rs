@@ -26,11 +26,11 @@ mod test;
 pub mod errors;
 
 pub use sccache_build as build_runtime;
+#[cfg(target_os = "linux")]
+mod build_lease;
 #[cfg(unix)]
 mod build_plan;
 pub mod cache;
-#[cfg(target_os = "linux")]
-mod cargo_launcher;
 mod client;
 mod cmdline;
 mod commands;
@@ -111,17 +111,6 @@ pub fn main() {
             Err(error) => {
                 eprintln!("sccache native build: {error:#}");
                 1
-            }
-        });
-    }
-
-    #[cfg(target_os = "linux")]
-    if let Some(result) = cargo_launcher::run_if_requested() {
-        std::process::exit(match result {
-            Ok(status) => status,
-            Err(error) => {
-                eprintln!("sccache Cargo launcher: {error:#}");
-                2
             }
         });
     }

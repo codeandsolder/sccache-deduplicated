@@ -31,19 +31,26 @@ fn output(command: &mut Command) -> Result<String> {
     Ok(String::from_utf8(result.stdout)?.trim_end().to_owned())
 }
 
-fn tool(name: &str, explicit: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
+fn tool(
+    name: &str,
+    explicit: Option<&Path>,
+    toolchain: Option<&str>,
+    cwd: &Path,
+) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(which::which_in(path, std::env::var_os("PATH"), cwd)?);
     }
     // rustup selects the toolchain named by rust-toolchain.toml, without
     // running Cargo or relying on a compiler proxy's timestamp.
-    let path = output(
-        Command::new("rustup")
-            .current_dir(cwd)
-            .args(["which", name]),
-    );
+    let mut command = Command::new("rustup");
+    command.current_dir(cwd).arg("which");
+    if let Some(toolchain) = toolchain {
+        command.args(["--toolchain", toolchain]);
+    }
+    let path = output(command.arg(name));
     match path {
         Ok(path) => Ok(PathBuf::from(path)),
+        Err(error) if toolchain.is_some() => Err(error),
         Err(_) => Ok(which::which_in(name, std::env::var_os("PATH"), cwd)?),
     }
 }
@@ -52,11 +59,12 @@ impl Toolchain {
     pub fn discover(
         cwd: &Path,
         rustc: Option<&Path>,
+        toolchain: Option<&str>,
         target: Option<&OsStr>,
         clippy: bool,
         docs: bool,
     ) -> Result<Self> {
-        let rustc = tool("rustc", rustc, cwd)?;
+        let rustc = tool("rustc", rustc, toolchain, cwd)?;
         let version = output(Command::new(&rustc).current_dir(cwd).arg("-vV"))?;
         let host = version
             .lines()
@@ -89,7 +97,7 @@ impl Toolchain {
             if path.is_file() {
                 Ok(path)
             } else {
-                tool(name, None, cwd)
+                tool(name, None, toolchain, cwd)
             }
         };
         let clippy = clippy.then(|| companion("clippy-driver")).transpose()?;

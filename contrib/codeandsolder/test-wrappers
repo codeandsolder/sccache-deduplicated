@@ -51,6 +51,6 @@ grep -Fxq 'args=+nightly check ' "$CARGO_LOG"
 # shellcheck source=contrib/codeandsolder/cargo-wrapper
 source contrib/codeandsolder/cargo-wrapper
 (cargo_wrapper_main "$root/bin/sccache" +1.99.0 test --locked -- --exact "with spaces")
-grep -Fxq 'args=--cargo-final -- +1.99.0 test --locked -- --exact with\ spaces ' "$CARGO_REAL_LOG"
+grep -Fxq 'args=+1.99.0 test --locked -- --exact with\ spaces ' "$CARGO_REAL_LOG"
 
 echo 'codeandsolder wrapper routing tests passed'

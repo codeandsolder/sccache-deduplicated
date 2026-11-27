@@ -67,7 +67,7 @@ sccache_wrapper_main() {
     fi
     readiness_seconds=$((10#$readiness_seconds))
 
-    if [[ "$mode" == compiler || ${1:-} == --cargo-final || (${1:-} != -* && $# -gt 0) ]]; then
+    if [[ "$mode" == compiler || (${1:-} != -* && $# -gt 0) ]]; then
         local deadline=$((SECONDS + readiness_seconds))
         while [[ -e "$drain" || -e "$fleet_guard" ]]; do
             if [[ -e "$fleet_guard" ]]; then
@@ -114,7 +114,7 @@ sccache_wrapper_main() {
             *) printf 'sccache: invalid managed endpoint %s\n' "$endpoint" >&2; return 78 ;;
         esac
         # Do not wait for an explicitly requested administrative command.
-        if [[ "$mode" == compiler || ${1:-} == --cargo-final || (${1:-} != -* && $# -gt 0) ]]; then
+        if [[ "$mode" == compiler || (${1:-} != -* && $# -gt 0) ]]; then
             sccache_wait_endpoint "$endpoint" "$service" "$readiness_seconds" || return "$?"
         fi
     fi

@@ -1040,7 +1040,7 @@ pub(crate) struct CompileSession<'a> {
     jobserver: Client,
     existing_only: bool,
     #[cfg(all(target_os = "linux", feature = "dist-client"))]
-    lease: Option<&'a crate::cargo_launcher::ScratchLease>,
+    lease: Option<&'a crate::build_lease::ScratchLease>,
 }
 
 impl<'a> CompileSession<'a> {
@@ -1064,7 +1064,7 @@ impl<'a> CompileSession<'a> {
     }
 
     #[cfg(all(target_os = "linux", feature = "dist-client"))]
-    pub(crate) fn with_lease(mut self, lease: &'a crate::cargo_launcher::ScratchLease) -> Self {
+    pub(crate) fn with_lease(mut self, lease: &'a crate::build_lease::ScratchLease) -> Self {
         self.lease = Some(lease);
         self
     }

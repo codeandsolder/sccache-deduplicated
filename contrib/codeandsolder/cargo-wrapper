@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# The binary owns Cargo scratch leases and invokes the selected upstream
-# toolchain. Do not parse or rewrite Cargo's command line here.
+# The native frontend owns dependency resolution and build-wide leases.
+# No upstream package manager process is launched.
 cargo_wrapper_main() {
     local binary="$1"
     shift
-    exec "$binary" --cargo-final -- "$@"
+    exec "$binary" "$@"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

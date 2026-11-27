@@ -4,7 +4,7 @@ These are the source-of-truth copies of the machine-wide Cargo/sccache wrappers,
 
 ## Contract
 
-- `cargo-wrapper` invokes the native Linux sccache launcher with `--cargo-final` and passes Cargo arguments unchanged. The launcher uses the unmodified upstream Cargo selected by rustup, and leases a unique temporary build directory via Cargo's standard `CARGO_BUILD_BUILD_DIR` workspace template. Final Cargo target-directory semantics remain unchanged. Explicit command-line Cargo configuration takes precedence; use `sccache --cargo-all -- <Cargo arguments>` for normal persistent intermediate retention and project build-dir configuration.
+- `cargo-wrapper` routes Rust build commands directly to the sccache native frontend. The frontend resolves packages, manages build-scoped leases and publishes final artifacts without launching Cargo.
 - The scratch lease is held across the Cargo process tree and reclaimed after exit or on a subsequent invocation after an interrupted build. Physical paths need not be deterministic: the distributed compiler maps the actual output tree to canonical paths. External Cargo subcommands inherit the standard build-dir configuration.
 - Configure upstream Cargo's `build.jobs` (site default 16) and managed `rustc-wrapper` in Cargo configuration. The launcher does not alter Cargo's resolver, explicit job settings or inherited jobserver. Remove the fork-only `ephemeral-intermediates` setting when migrating hosts.
 - `rustup-wrapper` routes `rustup run <toolchain> cargo ...` to the site Cargo launcher; non-Cargo commands remain ordinary rustup behavior.
