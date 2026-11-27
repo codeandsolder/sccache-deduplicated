@@ -863,7 +863,9 @@ impl Capture {
         let size = metadata.len();
         ensure!(size <= self.remaining, "native result byte limit exceeded");
         file.seek(SeekFrom::Start(0))?;
-        let stage = self.budget.as_mut()
+        let stage = self
+            .budget
+            .as_mut()
             .map(|budget| budget.try_stage_capture(size, &mut file))
             .transpose()?
             .flatten();

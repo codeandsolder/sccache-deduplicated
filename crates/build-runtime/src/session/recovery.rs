@@ -49,7 +49,10 @@ struct ActiveRecovery {
 
 impl Drop for ActiveRecovery {
     fn drop(&mut self) {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.active -= 1;
         state.active_bytes -= self.bytes;
     }
@@ -100,7 +103,8 @@ impl RecoveryQueue {
         state.prune(now);
         if state.failed.contains_key(&permit.key())
             || state.jobs.len().saturating_add(state.active) >= max_jobs
-            || bytes > max_bytes.saturating_sub(state.queued_bytes.saturating_add(state.active_bytes))
+            || bytes
+                > max_bytes.saturating_sub(state.queued_bytes.saturating_add(state.active_bytes))
         {
             return Ok(Some(permit));
         }
@@ -261,7 +265,9 @@ impl NativeSessions {
 
     #[cfg(test)]
     pub(super) async fn recover_next_result<F, Fut>(
-        self: &Arc<Self>, wait: Duration, fetch: F,
+        self: &Arc<Self>,
+        wait: Duration,
+        fetch: F,
     ) -> Result<bool>
     where
         F: Fn(BlobRef, NativeStore, Instant) -> Fut + Send + Sync + 'static,
@@ -310,18 +316,28 @@ impl NativeSessions {
             // Bound logical acquisitions by a metadata window, not by the
             // transport permit count. Followers do not consume transfer slots.
             while failure.is_none() && tasks.len() < crate::wire::MAX_SOURCE_BATCH {
-                let Some(blob) = missing.next() else { break; };
+                let Some(blob) = missing.next() else {
+                    break;
+                };
                 let sessions = Arc::clone(self);
                 let fetch = Arc::clone(&fetch);
                 tasks.spawn(async move {
-                    sessions.acquire_peer_blob(blob, deadline, true, &*fetch).await
+                    sessions
+                        .acquire_peer_blob(blob, deadline, true, &*fetch)
+                        .await
                 });
             }
-            let Some(result) = tasks.join_next().await else { break; };
+            let Some(result) = tasks.join_next().await else {
+                break;
+            };
             match result {
                 Ok(Ok(lease)) => acquired.push(lease),
-                Ok(Err(error)) => { failure.get_or_insert(error); }
-                Err(error) => { failure.get_or_insert(error.into()); }
+                Ok(Err(error)) => {
+                    failure.get_or_insert(error);
+                }
+                Err(error) => {
+                    failure.get_or_insert(error.into());
+                }
             }
         }
         if let Some(error) = failure {
@@ -333,7 +349,10 @@ impl NativeSessions {
 
     async fn await_peer_upload_slot(&self, deadline: Instant) -> Result<super::UploadSlot> {
         loop {
-            ensure!(Instant::now() < deadline, "native peer acquisition deadline exceeded");
+            ensure!(
+                Instant::now() < deadline,
+                "native peer acquisition deadline exceeded"
+            );
             let mut notified = std::pin::pin!(self.peer_wake.notified());
             notified.as_mut().enable();
             match self.upload_slot(UploadSource::Peer) {

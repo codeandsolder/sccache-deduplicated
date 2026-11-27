@@ -255,7 +255,10 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
                             return StatusCode::CONFLICT;
                         };
                         let status = tokio::time::timeout(Duration::from_secs(5), receive)
-                            .await.ok().and_then(|result| result.ok()).unwrap_or(503);
+                            .await
+                            .ok()
+                            .and_then(|result| result.ok())
+                            .unwrap_or(503);
                         StatusCode::from_u16(status).unwrap()
                     }
                 },
@@ -312,7 +315,10 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
         dispatcher.assign(second, assignment(2)?, Arc::clone(&requester))?;
         // Despite one compiler and a blocked first authorization, the
         // second admitted job must be able to begin staging.
-        assert_eq!(verification_rx.recv_timeout(Duration::from_secs(5))?, second);
+        assert_eq!(
+            verification_rx.recv_timeout(Duration::from_secs(5))?,
+            second
+        );
         assert_eq!(dispatcher.snapshot().staging_slots, 2);
         assert_eq!(dispatcher.snapshot().publication_slots, 2);
         assert!(dispatcher.snapshot().valid());
@@ -358,14 +364,20 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
                 .assign(third, assignment(3)?, Arc::clone(&requester))
                 .is_err()
         );
-        delegation_tx.remove(&second).context("second authorization")?
-            .send(409).map_err(|_| anyhow::anyhow!("second authorization lost"))?;
+        delegation_tx
+            .remove(&second)
+            .context("second authorization")?
+            .send(409)
+            .map_err(|_| anyhow::anyhow!("second authorization lost"))?;
         assert_eq!(
             states.recv_timeout(Duration::from_secs(5))?,
             (second, JobState::Complete)
         );
-        delegation_tx.remove(&first).context("first authorization")?
-            .send(200).map_err(|_| anyhow::anyhow!("first authorization lost"))?;
+        delegation_tx
+            .remove(&first)
+            .context("first authorization")?
+            .send(200)
+            .map_err(|_| anyhow::anyhow!("first authorization lost"))?;
         assert_eq!(
             states.recv_timeout(Duration::from_secs(5))?,
             (first, JobState::Started)
@@ -407,8 +419,11 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
         assert_eq!(verification_rx.recv_timeout(Duration::from_secs(5))?, third);
         assert_eq!(dispatcher.reconcile(&HashSet::new(), cutoff), 0);
         assert!(states.try_recv().is_err());
-        delegation_tx.remove(&third).context("third authorization")?
-            .send(409).map_err(|_| anyhow::anyhow!("third authorization lost"))?;
+        delegation_tx
+            .remove(&third)
+            .context("third authorization")?
+            .send(409)
+            .map_err(|_| anyhow::anyhow!("third authorization lost"))?;
         assert_eq!(
             states.recv_timeout(Duration::from_secs(5))?,
             (third, JobState::Complete)

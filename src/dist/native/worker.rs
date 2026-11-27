@@ -894,10 +894,12 @@ async fn resident_worker_inputs(
     let store = store.clone();
     let trees = request.input_trees.clone();
     tokio::task::spawn_blocking(move || {
-        trees.into_iter()
+        trees
+            .into_iter()
             .map(|id| Ok((id, store.lookup_resident_tree(id)?)))
             .collect()
-    }).await?
+    })
+    .await?
 }
 
 fn trace_tree_access(id: TreeId, tree: &TreeLease, hit: bool) -> Result<()> {
@@ -938,12 +940,15 @@ impl PreparedExecution {
     ) -> Option<super::grace::RetainedOutput> {
         let grace = self.grace.as_ref()?;
         let result = async {
-            grace.retain(
-                context.store.clone(),
-                self.request.action_fingerprint()?,
-                captured,
-            ).await
-        }.await;
+            grace
+                .retain(
+                    context.store.clone(),
+                    self.request.action_fingerprint()?,
+                    captured,
+                )
+                .await
+        }
+        .await;
         match result {
             Ok(retained) => retained,
             Err(error) => {
@@ -978,7 +983,9 @@ fn compile(
 ) -> Result<MeasuredExecution> {
     let _permit = queue.map(|queue| queue.acquire(check)).transpose()?;
     // Only actual captured output bytes enter managed CAS admission.
-    let budget = retain.then(|| context.store.reserve_staging(0)).transpose()?;
+    let budget = retain
+        .then(|| context.store.reserve_staging(0))
+        .transpose()?;
     let started = Instant::now();
     let captured = execute(
         context.spec,

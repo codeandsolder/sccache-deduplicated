@@ -741,10 +741,7 @@ impl StageBudget {
             let report = self.store.reclaim(policy, state.reserved, extra, || {
                 self.store.available_bytes()
             })?;
-            ensure!(
-                report.minimum_satisfied,
-                StageSpaceExhausted
-            );
+            ensure!(report.minimum_satisfied, StageSpaceExhausted);
         }
         state.reserved = need;
         self.reserved = size;

@@ -1608,8 +1608,17 @@ fn lazy_manifest_admission_and_cross_action_backfill_are_single_flight() -> Resu
     let slots = (0..service.limits.max_total_uploads)
         .map(|_| service.upload_slot(UploadSource::Direct))
         .collect::<Result<Vec<_>>>()?;
-    assert!(service.prepare_backfill(a, blob).err().unwrap().is::<NativeServiceBusy>());
-    assert_eq!(service.poll_input(a)?, InputPoll::Demand(InputDemand { tree: id, blob }));
+    assert!(
+        service
+            .prepare_backfill(a, blob)
+            .err()
+            .unwrap()
+            .is::<NativeServiceBusy>()
+    );
+    assert_eq!(
+        service.poll_input(a)?,
+        InputPoll::Demand(InputDemand { tree: id, blob })
+    );
     drop(slots);
     assert!(service.backfill_input(b, blob, &bytes[..]).is_err());
     assert!(service.backfill_input(a, other, &b"unused"[..]).is_err());

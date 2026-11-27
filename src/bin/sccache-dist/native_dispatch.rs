@@ -466,8 +466,12 @@ impl NativeDispatcher {
             runtime.spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(1)).await;
-                    let Some(shared) = shared.upgrade() else { break; };
-                    match tokio::task::spawn_blocking(move || shared.worker.maintain_local_store()).await {
+                    let Some(shared) = shared.upgrade() else {
+                        break;
+                    };
+                    match tokio::task::spawn_blocking(move || shared.worker.maintain_local_store())
+                        .await
+                    {
                         Ok(Ok(())) => (),
                         Ok(Err(error)) => warn!("native worker maintenance failed: {error:#}"),
                         Err(error) => {

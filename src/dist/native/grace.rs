@@ -111,9 +111,7 @@ impl ArtifactGrace {
     }
 
     fn fits(&self, contents: &Contents) -> Result<bool> {
-        self.with_reaped(|state| {
-            Ok(state.additional(contents)? <= self.max_bytes - state.bytes)
-        })
+        self.with_reaped(|state| Ok(state.additional(contents)? <= self.max_bytes - state.bytes))
     }
 
     fn try_commit(&self, lease: ResultLease) -> Result<Option<Instant>> {
@@ -146,9 +144,13 @@ impl ArtifactGrace {
         fingerprint: ActionFingerprint,
         captured: &mut CapturedExecution,
     ) -> Result<Option<RetainedOutput>> {
-        let manifest = captured.successful_result()
+        let manifest = captured
+            .successful_result()
             .context("failed execution cannot be retained")?;
-        if manifest.outputs.is_empty() || !captured.can_retain() || !self.fits(&manifest.blobs()?)? {
+        if manifest.outputs.is_empty()
+            || !captured.can_retain()
+            || !self.fits(&manifest.blobs()?)?
+        {
             return Ok(None);
         }
         let manifest = manifest.clone();
@@ -157,12 +159,15 @@ impl ArtifactGrace {
             let existing = staging_store.reserve_upload(&manifest)?;
             let warm = existing.missing().is_empty();
             Ok::<_, anyhow::Error>((manifest, existing, warm))
-        }).await??;
+        })
+        .await??;
         let staged = captured.seal_staged(existing.missing()).await?;
         let lease = store
             .publish_pinned_async(fingerprint, manifest, staged, ActionMode::Refresh, existing)
             .await?;
-        Ok(self.try_commit(lease)?.map(|deadline| RetainedOutput { deadline, warm }))
+        Ok(self
+            .try_commit(lease)?
+            .map(|deadline| RetainedOutput { deadline, warm }))
     }
 }
 
@@ -176,7 +181,11 @@ mod tests {
     use super::*;
     use crate::build_runtime::{Artifact, BlobRef, Eviction, ResultManifest};
 
-    fn result(store: &NativeStore, bytes: &[u8], marker: &[u8]) -> Result<(ActionFingerprint, ResultLease)> {
+    fn result(
+        store: &NativeStore,
+        bytes: &[u8],
+        marker: &[u8],
+    ) -> Result<(ActionFingerprint, ResultLease)> {
         let blob = BlobRef {
             id: ContentId::of(bytes),
             size: u64::try_from(bytes.len())?,
@@ -200,7 +209,8 @@ mod tests {
     }
 
     #[test]
-    fn full_grace_declines_new_content_without_waiting_or_evicting_protected_results() -> Result<()> {
+    fn full_grace_declines_new_content_without_waiting_or_evicting_protected_results() -> Result<()>
+    {
         let directory = tempfile::tempdir()?;
         let store = NativeStore::open(directory.path())?;
         let pool = ArtifactGrace::new(Duration::from_secs(300), 8)?;
@@ -210,7 +220,10 @@ mod tests {
         assert!(!pool.fits(&lease.manifest().blobs()?)?);
         assert!(pool.try_commit(lease)?.is_none());
         assert_eq!(store.evict(first.key()?)?, Eviction::Pinned);
-        assert!(matches!(store.evict(second.key()?)?, Eviction::Removed { .. }));
+        assert!(matches!(
+            store.evict(second.key()?)?,
+            Eviction::Removed { .. }
+        ));
         // A duplicate consumes zero additional bytes even when full.
         let (duplicate, lease) = result(&store, b"12345678", b"c")?;
         assert!(pool.try_commit(lease)?.is_some());
@@ -221,8 +234,14 @@ mod tests {
         assert_eq!(state.bytes, 0);
         drop(state);
         drop(expired);
-        assert!(matches!(store.evict(first.key()?)?, Eviction::Removed { .. }));
-        assert!(matches!(store.evict(duplicate.key()?)?, Eviction::Removed { .. }));
+        assert!(matches!(
+            store.evict(first.key()?)?,
+            Eviction::Removed { .. }
+        ));
+        assert!(matches!(
+            store.evict(duplicate.key()?)?,
+            Eviction::Removed { .. }
+        ));
         Ok(())
     }
 }

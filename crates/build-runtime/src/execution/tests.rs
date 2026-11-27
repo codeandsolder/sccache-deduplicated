@@ -785,10 +785,8 @@ fn capture_without_resident_headroom_still_has_verified_delivery_bytes() -> Resu
     assert!(capture.budget.is_none());
     assert!(capture.staged.is_empty());
     assert_eq!(store.space_status()?.reserved_bytes, Some(0));
-    let mut reader = crate::BlobReader::open(
-        capture.files[&blob.id].try_clone()?,
-        capture.encoding,
-    )?;
+    let mut reader =
+        crate::BlobReader::open(capture.files[&blob.id].try_clone()?, capture.encoding)?;
     let mut decoded = Vec::new();
     reader.read_to_end(&mut decoded)?;
     assert_eq!(decoded, bytes);
