@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Enforce native DSO compatibility with all managed sccache workers.
-# Release OpenSSL is vendored/static, so no shared OpenSSL SONAME is permitted.
-# A GLIBC symbol ceiling alone does not detect OpenSSL runtime dependencies.
+# Check the native TLS/C++ runtime and libc floor on the actual linked ELF.
 set -euo pipefail
+export LC_ALL=C
+# shellcheck source=contrib/codeandsolder/release-protocol.env
+source "$(dirname "$0")/release-protocol.env"
+[[ "$glibc_abi_max" =~ ^[0-9]+\.[0-9]+$ ]]
+max_supported="GLIBC_$glibc_abi_max"
 
 if (($# == 0)); then
     echo "usage: $0 release-binary..." >&2
@@ -19,9 +23,43 @@ for binary in "$@"; do
 
     # Capture readelf's exit code (a process-substitution failure is ignored).
     dynamic="$(readelf -W --dynamic "$binary")"
+    program_headers="$(readelf -W --program-headers "$binary")"
+    interpreter="$(sed -nE 's/^.*Requesting program interpreter: ([^]]+)\].*$/\1/p' <<<"$program_headers")"
+    if [[ -n "$interpreter" && "$interpreter" != /lib64/ld-linux-x86-64.so.2 ]]; then
+        echo "::error::$binary has unsupported interpreter $interpreter" >&2
+        exit 1
+    fi
+    if rg -q '\((RPATH|RUNPATH)\)' <<<"$dynamic"; then
+        echo "::error::$binary embeds a runtime library search path" >&2
+        exit 1
+    fi
+    versions="$(readelf -W --version-info "$binary")"
+    labels="$(sed -nE 's/^.*Name: ([^[:space:]]+).*$/\1/p' <<<"$versions" | sort -u)"
+    while IFS= read -r version; do
+        case "$version" in
+            GLIBC_ABI_DT_RELR) required="GLIBC_2.36" ;;
+            GLIBC_[0-9]*)
+                if [[ ! "$version" =~ ^GLIBC_[0-9]+(\.[0-9]+)+$ ]]; then
+                    echo "::error::$binary requires unknown libc ABI $version" >&2
+                    exit 1
+                fi
+                required="$version"
+                ;;
+            GLIBC_*|GLIBCXX_*|CXXABI_*)
+                echo "::error::$binary requires unsupported versioned ABI $version" >&2
+                exit 1
+                ;;
+            *) continue ;;
+        esac
+        if [[ "$(printf '%s\n%s\n' "$max_supported" "$required" | sort -V | tail -n 1)" != "$max_supported" ]]; then
+            echo "::error::$binary requires $required, newer than $max_supported" >&2
+            exit 1
+        fi
+    done <<<"$labels"
+    echo "$binary: verified libc ABI ceiling $max_supported"
     needed="$(sed -nE 's/^.*\(NEEDED\).*Shared library: \[([^]]+)\].*$/\1/p' <<<"$dynamic")"
     if [[ -z "$needed" ]]; then
-        if readelf -W --program-headers "$binary" | rg -q 'INTERP'; then
+        if [[ -n "$interpreter" ]]; then
             echo "::error::$binary has a dynamic interpreter but no DT_NEEDED entries" >&2
             exit 1
         fi
@@ -29,12 +67,20 @@ for binary in "$@"; do
         continue
     fi
 
+    if [[ "$interpreter" != /lib64/ld-linux-x86-64.so.2 ]]; then
+        echo "::error::$binary has native DSO dependencies without the fleet interpreter" >&2
+        exit 1
+    fi
     while IFS= read -r library; do
         # All names must be supported across the fleet, not merely on the build
         # machine. A new SONAME requires an explicit fleet compatibility review.
         case "$library" in
             libc.so.6|libm.so.6|libgcc_s.so.1|\
-            libpthread.so.0|libdl.so.2|librt.so.1)
+            libpthread.so.0|libdl.so.2|librt.so.1|ld-linux-x86-64.so.2)
+                # The loader is already mandatory as PT_INTERP. Its explicit
+                # DT_NEEDED entry may be emitted by the static C++ runtime.
+                # All versioned imports, including loader imports, are checked
+                # above; GLIBC_PRIVATE is forbidden.
                 ;;
             *)
                 echo "::error::$binary requires unsupported fleet DSO $library" >&2
