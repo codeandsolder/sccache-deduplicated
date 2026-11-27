@@ -11,6 +11,7 @@ use std::{
     os::unix::{ffi::OsStrExt, fs::MetadataExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{Child, ExitStatus, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -23,8 +24,10 @@ use rustix::{
 
 use crate::{
     Artifact, BlobEncoding, BlobRef, BuildPath, ContentId, ExecutionSpec, MountedTree, NativeStore,
-    OutputKind, ResultManifest, TreeEntry, TreeLease, TreeManifest, TreePath,
+    OutputKind, ResultManifest, StageBudget, StagedBlob, TreeEntry, TreeLease, TreeManifest,
+    TreePath,
     sandbox::{MountAccess, SandboxInvocation, SandboxPath, SandboxPlan},
+    store::CapturedStage,
 };
 
 /// Worker-local policy, not part of the client-controlled action.
@@ -48,7 +51,8 @@ pub struct ExecutionPolicy {
 pub struct CapturedExecution {
     status: ExitStatus,
     manifest: ResultManifest,
-    files: BTreeMap<ContentId, File>,
+    files: BTreeMap<ContentId, Arc<File>>,
+    staged: BTreeMap<ContentId, CapturedStage>,
     encoding: BlobEncoding,
 }
 
@@ -119,6 +123,45 @@ impl CapturedExecution {
             .try_clone()?;
         file.rewind()?;
         Ok(file)
+    }
+
+    /// Return the original captured inodes required for local publication,
+    /// syncing them on the asynchronous disk executor when available.
+    /// Already resident outputs need no writeback.
+    ///
+    /// # Errors
+    /// Returns an error if a requested capture is missing or cannot be synced.
+    pub async fn seal_staged(&mut self, missing: &[BlobRef]) -> Result<Vec<StagedBlob>> {
+        let mut pending = std::mem::take(&mut self.staged);
+        let selected = missing
+            .iter()
+            .map(|blob| {
+                let stage = pending
+                    .remove(&blob.id)
+                    .context("missing staged compiler output")?;
+                ensure!(
+                    stage.reference() == *blob,
+                    "staged compiler output length mismatch"
+                );
+                Ok(stage)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        drop(pending);
+        let mut selected = selected.into_iter();
+        let mut active = tokio::task::JoinSet::new();
+        // Keep per-result fanout bounded; the disk executor separately
+        // controls global in-flight operations across all publishers.
+        for stage in selected.by_ref().take(32) {
+            active.spawn(stage.seal());
+        }
+        let mut sealed = Vec::with_capacity(missing.len());
+        while let Some(stage) = active.join_next().await {
+            sealed.push(stage??);
+            if let Some(stage) = selected.next() {
+                active.spawn(stage.seal());
+            }
+        }
+        Ok(sealed)
     }
 }
 
@@ -603,9 +646,16 @@ pub fn execute(
     spec: &ExecutionSpec,
     store: &NativeStore,
     policy: &ExecutionPolicy,
+    budget: Option<StageBudget>,
     progress: impl FnMut() -> Result<()>,
 ) -> Result<CapturedExecution> {
     spec.validate()?;
+    ensure!(
+        budget
+            .as_ref()
+            .is_none_or(|budget| budget.belongs_to(store)),
+        "capture budget belongs to another store"
+    );
     ensure!(
         spec.platform == policy.platform,
         "native execution platform mismatch"
@@ -630,6 +680,8 @@ pub fn execute(
     .wait(policy.timeout, progress)?;
     let mut capture = Capture {
         files: BTreeMap::new(),
+        staged: BTreeMap::new(),
+        budget,
         remaining: policy.max_result_bytes,
         scratch: policy.scratch.clone(),
         encoding: store.physical_encoding(),
@@ -649,12 +701,15 @@ pub fn execute(
             stderr,
         },
         files: capture.files,
+        staged: capture.staged,
         encoding: store.physical_encoding(),
     })
 }
 
 struct Capture {
-    files: BTreeMap<ContentId, File>,
+    files: BTreeMap<ContentId, Arc<File>>,
+    staged: BTreeMap<ContentId, CapturedStage>,
+    budget: Option<StageBudget>,
     remaining: u64,
     scratch: PathBuf,
     encoding: BlobEncoding,
@@ -675,14 +730,24 @@ impl Capture {
         let size = metadata.len();
         ensure!(size <= self.remaining, "native result byte limit exceeded");
         file.seek(SeekFrom::Start(0))?;
-        let mut physical = tempfile::tempfile_in(&self.scratch)?;
-        let reference = match self.encoding {
-            BlobEncoding::Raw => {
-                crate::encode_native_raw_blob(&mut file, &mut physical, Some(size))?
-            }
-            BlobEncoding::ZstdChunks => {
-                crate::encode_native_blob(&mut file, &mut physical, Some(size))?
-            }
+        let (reference, physical) = if let Some(budget) = &mut self.budget {
+            let stage = budget.stage_capture(size, &mut file)?;
+            let reference = stage.reference();
+            let physical = stage.file();
+            self.staged.entry(reference.id).or_insert(stage);
+            (reference, physical)
+        } else {
+            let mut physical = tempfile::tempfile_in(&self.scratch)?;
+            let reference = match self.encoding {
+                BlobEncoding::Raw => {
+                    crate::encode_native_raw_blob(&mut file, &mut physical, Some(size))?
+                }
+                BlobEncoding::ZstdChunks => {
+                    crate::encode_native_blob(&mut file, &mut physical, Some(size))?
+                }
+            };
+            physical.rewind()?;
+            (reference, Arc::new(physical))
         };
         ensure!(
             reference.size == size
@@ -690,7 +755,6 @@ impl Capture {
                 && file.metadata()?.len() == size,
             "native output changed during compression and hashing"
         );
-        physical.rewind()?;
         self.remaining -= size;
         self.files.entry(reference.id).or_insert(physical);
         Ok(reference)

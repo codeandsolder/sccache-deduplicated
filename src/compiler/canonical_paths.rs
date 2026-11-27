@@ -483,7 +483,8 @@ impl CanonicalRustPaths {
         env: &[(OsString, OsString)],
         preserve: &HashSet<OsString>,
     ) -> Vec<(OsString, OsString)> {
-        env.iter()
+        let mut canonical: Vec<_> = env
+            .iter()
             .filter(|(k, _)| {
                 k != "SCCACHE_EXPERIMENTAL_CANONICAL_RUST"
                     && !k.to_string_lossy().starts_with("SCCACHE_CANONICAL_")
@@ -496,7 +497,30 @@ impl CanonicalRustPaths {
                 };
                 (k.clone(), value)
             })
-            .collect()
+            .collect();
+        let name = OsStr::new("CARGO_BUILD_BUILD_DIR");
+        if !preserve.contains(name)
+            && let Some(value) = self.implicit_build_directory(env)
+        {
+            canonical.push((name.to_owned(), value));
+        }
+        canonical
+    }
+
+    /// The compiler's discovered intermediate root is independent of whether
+    /// Cargo received its build directory through configuration or environment.
+    /// Only synthesize a default when a separate root was actually discovered;
+    /// never override an explicitly supplied value or an observed absence.
+    pub(super) fn implicit_build_directory(
+        &self,
+        env: &[(OsString, OsString)],
+    ) -> Option<OsString> {
+        if env.iter().any(|(name, _)| name == "CARGO_BUILD_BUILD_DIR") {
+            return None;
+        }
+        self.intermediate_root
+            .as_ref()
+            .map(|root| self.to_canonical(root).into_os_string())
     }
 
     pub(crate) fn env_value_to_canonical(&self, name: &OsStr, value: &OsStr) -> OsString {
