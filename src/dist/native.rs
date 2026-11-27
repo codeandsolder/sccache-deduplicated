@@ -39,6 +39,8 @@ pub use package::{
     validate_upstream_name,
 };
 
+pub(super) const UPLOAD_PARALLELISM_HEADER: &str = "x-sccache-upload-parallelism";
+
 type LeaseCheck<'a> = dyn Fn() -> Result<()> + Sync + 'a;
 
 #[derive(Serialize, Deserialize)]
@@ -463,6 +465,22 @@ impl NativeCacheClient {
         value: &T,
         timeout: Duration,
     ) -> Result<R> {
+        self.control_with_metadata_async(operation, value, timeout, |_| Ok(()))
+            .await
+            .map(|(value, ())| value)
+    }
+
+    async fn control_with_metadata_async<T, R, H>(
+        &self,
+        operation: &str,
+        value: &T,
+        timeout: Duration,
+        metadata: impl FnOnce(&wreq::Response) -> Result<H>,
+    ) -> Result<(R, H)>
+    where
+        T: Serialize + Sync,
+        R: DeserializeOwned,
+    {
         ensure!(
             !timeout.is_zero(),
             "native control request deadline expired"
@@ -473,7 +491,12 @@ impl NativeCacheClient {
             let (response, _) = self
                 .send_to_cache_async(operation, data, timeout, None)
                 .await?;
-            decode_response_async(response.error_for_status()?, self.metadata_limit).await
+            let response = response.error_for_status()?;
+            let metadata = metadata(&response)?;
+            Ok((
+                decode_response_async(response, self.metadata_limit).await?,
+                metadata,
+            ))
         })
         .await
         .map_err(|_| {

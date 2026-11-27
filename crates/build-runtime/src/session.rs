@@ -1299,6 +1299,17 @@ impl NativeSessions {
         }
     }
 
+    /// Maximum useful concurrency for independent uploads on a single
+    /// session. The global admission check still applies to every upload.
+    #[must_use = "use the negotiated limit to avoid excess upload requests"]
+    pub const fn upload_parallelism(&self) -> usize {
+        if self.limits.max_concurrent_uploads < self.limits.max_total_uploads {
+            self.limits.max_concurrent_uploads
+        } else {
+            self.limits.max_total_uploads
+        }
+    }
+
     /// Negotiate missing output content. Identical repeated requests are safe.
     ///
     /// # Errors

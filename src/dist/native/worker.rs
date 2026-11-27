@@ -786,15 +786,40 @@ impl NativeCacheClient {
         })
     }
 
+    async fn begin_result_upload(
+        &self,
+        ticket: Ticket,
+        manifest: crate::build_runtime::ResultManifest,
+    ) -> Result<(
+        crate::build_runtime::wire::BeginResult,
+        Option<NonZeroUsize>,
+    )> {
+        self.control_with_metadata_async(
+            "begin",
+            &super::ManifestRequest { ticket, manifest },
+            self.timeout,
+            |response| {
+                response
+                    .headers()
+                    .get(super::UPLOAD_PARALLELISM_HEADER)
+                    .map(|value| Ok(value.to_str()?.parse::<NonZeroUsize>()?))
+                    .transpose()
+            },
+        )
+        .await
+    }
+
     async fn upload_result_blobs(
         &self,
         ticket: Ticket,
         captured: &CapturedExecution,
         missing: Vec<BlobRef>,
+        scheduler_limit: Option<NonZeroUsize>,
         transport: Option<&PackageTransportTracker>,
         check: &LeaseCheck<'_>,
     ) -> Result<()> {
         let width = transport.map_or(NonZeroUsize::MIN, PackageTransportTracker::parallelism);
+        let width = scheduler_limit.map_or(width, |limit| limit.min(width));
         ingress::map_bounded(missing, width, |blob| async move {
             super::upload::retry_busy(self.timeout, || async {
                 check()?;
@@ -840,16 +865,7 @@ impl NativeCacheClient {
         prepared.request.validate_result(&manifest)?;
         let blobs = manifest.blobs()?;
         let (captured, retained) = prepared.retain_output(context, captured, check).await?;
-        let begin: crate::build_runtime::wire::BeginResult = self
-            .control_with_timeout_async(
-                "begin",
-                &super::ManifestRequest {
-                    ticket,
-                    manifest: manifest.clone(),
-                },
-                self.timeout,
-            )
-            .await?;
+        let (begin, scheduler_limit) = self.begin_result_upload(ticket, manifest.clone()).await?;
         let missing = begin.missing;
         ensure!(
             missing
@@ -870,8 +886,15 @@ impl NativeCacheClient {
             .fold(0_u64, u64::saturating_add);
         let requests = u64::try_from(missing.len())?;
         let started = Instant::now();
-        self.upload_result_blobs(ticket, &captured, missing, transport, check)
-            .await?;
+        self.upload_result_blobs(
+            ticket,
+            &captured,
+            missing,
+            scheduler_limit,
+            transport,
+            check,
+        )
+        .await?;
         let upload_duration = started.elapsed();
         let worker_timing = transport.map(|transport| {
             transport.observe_result(bytes, requests, upload_duration);
