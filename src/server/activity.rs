@@ -630,12 +630,44 @@ fn append_request_spans(
             .start
             .saturating_add(remote.elapsed)
             .clamp(child_start, end);
-        if child_start > start {
+        let mut cursor = start;
+        // The parent's only pre-child wait is executor admission, not
+        // process startup or a physical compiler permit. Keep them separate.
+        for interval in history
+            .intervals
+            .iter()
+            .filter(|i| i.kind == IntervalKind::JobserverWait)
+        {
+            let from = history
+                .start
+                .saturating_add(interval.start)
+                .clamp(cursor, child_start);
+            let until = history
+                .start
+                .saturating_add(interval.end)
+                .clamp(from, child_start);
+            for (name, left, right) in [
+                ("executor_startup", cursor, from),
+                ("executor_admission", from, until),
+            ] {
+                if right > left {
+                    spans.push(LatencySpan::phase(
+                        context,
+                        "sccache-client",
+                        name,
+                        left,
+                        right,
+                    ));
+                }
+            }
+            cursor = until;
+        }
+        if child_start > cursor {
             spans.push(LatencySpan::phase(
                 context,
                 "sccache-client",
                 "executor_startup",
-                start,
+                cursor,
                 child_start,
             ));
         }

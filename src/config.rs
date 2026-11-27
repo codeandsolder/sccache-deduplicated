@@ -1092,6 +1092,10 @@ fn compiler_alias_rejects_relative_paths_and_alias_chains() -> Result<()> {
 pub struct SharedDaemonConfig {
     pub socket_gid: u32,
     pub allowed_uids: std::collections::BTreeSet<u32>,
+    /// Maximum outstanding private executions, including remote I/O waits.
+    /// When absent, allow three executors per physical compiler permit.
+    #[serde(default)]
+    pub max_executors: Option<std::num::NonZeroUsize>,
 }
 
 // TODO: fields only pub for tests

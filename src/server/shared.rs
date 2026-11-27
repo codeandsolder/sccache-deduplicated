@@ -32,6 +32,7 @@ const MOUNT_FD: libc::c_int = 4;
 const ROOT_FD: libc::c_int = 5;
 const STDIN_FD: libc::c_int = 6;
 const PIDNS_FD: libc::c_int = 8;
+const PERMIT_FD: libc::c_int = 9;
 #[cfg(feature = "dist-client")]
 const DIGEST_FD: libc::c_int = 7;
 
@@ -66,6 +67,7 @@ enum ExecutorEvent {
 pub(super) struct SharedExecutor {
     pub(super) policy: SharedDaemonConfig,
     jobserver: Client,
+    executors: tokio::sync::Semaphore,
     aliases: CompilerAliases,
     toolchains: Vec<u8>,
     catalogs: Vec<std::path::PathBuf>,
@@ -238,9 +240,18 @@ impl SharedExecutor {
                     .is_none_or(|native| native.local_execution.is_none()),
             "shared daemon requires credential-isolated execution"
         );
+        let capacity = policy.max_executors.map_or_else(
+            || jobserver.capacity().saturating_mul(3).max(1),
+            std::num::NonZeroUsize::get,
+        );
+        ensure!(
+            capacity <= tokio::sync::Semaphore::MAX_PERMITS,
+            "shared executor limit exceeds semaphore capacity"
+        );
         Ok(Self {
             policy,
             jobserver,
+            executors: tokio::sync::Semaphore::new(capacity),
             aliases: config.compiler_aliases.clone(),
             toolchains: serde_json::to_vec(&config.dist.toolchains)?,
             catalogs: config.dist.native_installation_catalogs.clone(),
@@ -277,13 +288,14 @@ impl SharedExecutor {
     where
         C: CommandCreatorSync + Clone + Send + Sync + 'static,
     {
-        // The central jobserver gates all UIDs and every private executor.
+        // Bound outstanding executors separately from physical compiler work.
         let activity = activity::current().context("missing shared compile activity")?;
         let waiting = activity::ChildActivity::waiting();
-        let _token = self.jobserver.acquire().await?;
+        let _slot = self.executors.acquire().await?;
         drop(waiting);
         ensure!(peer::alive(peer.pidfd.as_fd())?, "compile requester exited");
         let (broker, helper) = UnixStream::pair()?;
+        let (permit_broker, permit_helper) = UnixStream::pair()?;
         #[cfg(feature = "dist-client")]
         let (digest_broker, digest_helper) = UnixStream::pair()?;
         let descriptors = [
@@ -291,6 +303,7 @@ impl SharedExecutor {
             (duplicate_high(peer.mount.as_fd())?, MOUNT_FD),
             (duplicate_high(peer.root.as_fd())?, ROOT_FD),
             (duplicate_high(peer.stdin.as_fd())?, STDIN_FD),
+            (duplicate_high(permit_helper.as_fd())?, PERMIT_FD),
             (duplicate_high(peer.pid_namespace.as_fd())?, PIDNS_FD),
             #[cfg(feature = "dist-client")]
             (duplicate_high(digest_helper.as_fd())?, DIGEST_FD),
@@ -322,6 +335,11 @@ impl SharedExecutor {
         let pid = i32::try_from(child.id().context("missing executor PID")?)?;
         let mut group = GroupGuard(Some(pid));
         drop(helper);
+        drop(permit_helper);
+        let permit_task = crate::util::spawn(crate::jobserver::remote::serve(
+            permit_broker,
+            self.jobserver.clone(),
+        ));
         #[cfg(feature = "dist-client")]
         let digest_task = {
             drop(digest_helper);
@@ -354,6 +372,7 @@ impl SharedExecutor {
         group.0 = None;
         // Wait until the private connection has closed, including pending stats.
         broker_task.await??;
+        permit_task.await??;
         #[cfg(feature = "dist-client")]
         digest_task.await??;
         ensure!(status.success(), "shared executor exited with {status}");
