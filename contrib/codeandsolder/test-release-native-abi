@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Real ELF fixtures, assembled and linked directly (no host C/C++ runtime).
+# These are inspected only, not executed.
+set -euo pipefail
+export LC_ALL=C
+here="$(cd "$(dirname "$0")" && pwd)"
+verify="$here/verify-release-native-abi.sh"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+cd "$tmp"
+cat > start.s <<'ASM'
+.globl _start
+.text
+_start:
+    ret
+ASM
+cat > call.s <<'ASM'
+.globl _start
+.text
+_start:
+    call fixture@PLT
+    ret
+ASM
+cat > library.s <<'ASM'
+.globl fixture
+.text
+fixture:
+    ret
+ASM
+as --64 -o start.o start.s
+as --64 -o call.o call.s
+as --64 -o library.o library.s
+loader=/lib64/ld-linux-x86-64.so.2
+
+accept() {
+    "$verify" "$1"
+}
+reject() {
+    local file="$1" reason="$2" log
+    if log="$("$verify" "$file" 2>&1)"; then
+        echo "Unexpected acceptance: $file" >&2
+        exit 1
+    fi
+    if [[ "$log" != *"$reason"* ]]; then
+        printf 'Wrong rejection for %s: %s\n' "$file" "$log" >&2
+        exit 1
+    fi
+    printf '%s: expected rejection (%s)\n' "$file" "$reason"
+}
+link_versioned() {
+    local version="$1" soname="$2" output="$3"
+    shift 3
+    printf '%s { global: fixture; local: *; };\n' "$version" > version.map
+    ld -shared -soname "$soname" --version-script version.map -o library.so library.o
+    ld -o "$output" --dynamic-linker "$loader" call.o ./library.so "$@"
+}
+ld -o static start.o
+accept static
+ld -pie --no-dynamic-linker -o static-pie start.o
+accept static-pie
+ld -shared -o not-executable.so library.o
+reject not-executable.so 'not an x86-64 executable'
+link_versioned GLIBC_2.39 libc.so.6 floor
+accept floor
+link_versioned GLIBC_2.2.5 libc.so.6 old
+accept old
+link_versioned GLIBC_ABI_DT_RELR libc.so.6 relr
+accept relr
+link_versioned GLIBC_2.3 ld-linux-x86-64.so.2 loader-import
+accept loader-import
+link_versioned GCC_14.0.0 libgcc_s.so.1 gcc-supported
+accept gcc-supported
+link_versioned GCC_15.0.0 libgcc_s.so.1 gcc-too-new
+reject gcc-too-new 'unsupported versioned ABI GCC_15.0.0'
+link_versioned GCC_11.0.0 libgcc_s.so.1 gcc-unknown
+reject gcc-unknown 'unsupported versioned ABI GCC_11.0.0'
+link_versioned GLIBC_2.40 libc.so.6 too-new
+reject too-new 'newer than GLIBC_2.39'
+link_versioned GLIBC_2.39.1 libc.so.6 patch-too-new
+reject patch-too-new 'newer than GLIBC_2.39'
+link_versioned GLIBC_PRIVATE libc.so.6 private
+reject private 'unsupported versioned ABI GLIBC_PRIVATE'
+link_versioned GLIBCXX_3.4 libstdc++.so.6 cpp-version
+reject cpp-version 'unsupported versioned ABI GLIBCXX_'
+link_versioned CXXABI_1.3 libc.so.6 cpp-abi
+reject cpp-abi 'unsupported versioned ABI CXXABI_'
+link_versioned FIXTURE_1 libstdc++.so.6 cpp-dso
+reject cpp-dso 'unsupported fleet DSO libstdc++.so.6'
+link_versioned FIXTURE_1 libcrypto.so.3 ssl-dso
+reject ssl-dso 'unsupported fleet DSO libcrypto.so.3'
+link_versioned GLIBC_2.39 libc.so.6 runpath -rpath /opt/fixture
+reject runpath 'runtime library search or injection directive'
+link_versioned GLIBC_2.39 libc.so.6 audit --audit libaudit.so
+reject audit 'runtime library search or injection directive'
+ld -o wrong-loader --dynamic-linker /opt/ld-fixture.so call.o ./library.so
+reject wrong-loader 'unsupported interpreter'
+ld -o missing-loader --no-dynamic-linker call.o ./library.so
+reject missing-loader 'without the fleet interpreter'
+printf 'not ELF\n' > invalid
+if "$verify" invalid >/dev/null 2>&1; then
+    echo 'Accepted invalid ELF' >&2
+    exit 1
+fi
+echo 'Native release ABI regression fixtures passed'

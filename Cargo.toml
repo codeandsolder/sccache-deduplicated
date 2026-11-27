@@ -62,11 +62,11 @@ http = "1.0"
 itertools = "0.15"
 jobserver = "0.1"
 jwt = { package = "jsonwebtoken", version = "12", optional = true, default-features = false }
-jsonwebtoken-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a4b12ba7391e03470626504fad60d887be790cfb", optional = true }
+jsonwebtoken-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "53c46285a85742dc8c3ab48fbb66613da6b4a297", optional = true }
 libc = "0.2.153"
 lru = "0.19"
 log = "0.4"
-lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "0c49fad815ce76bbd63f0e8b79270db30968e289", optional = true }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "a97f149e673c45c795a8176667f379c1bf215327", optional = true }
 memchr = "2"
 mime = "0.3"
 opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"], optional = true }
@@ -134,6 +134,13 @@ serial_test = "4.0"
 temp-env = "0.3.6"
 test-case = "3.3.1"
 thirtyfour = "0.38"
+
+# The Linux executables must not require a separate C++ runtime DSO.
+# Cargo unifies this feature with all Wreq/TLS users in the same graph.
+[target.'cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))'.dependencies]
+wreq = { workspace = true, optional = true, features = ["static-cxx-runtime"] }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "a97f149e673c45c795a8176667f379c1bf215327", optional = true, features = ["static-cxx-runtime"] }
+jsonwebtoken-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "53c46285a85742dc8c3ab48fbb66613da6b4a297", optional = true, features = ["static-cxx-runtime"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["net", "process"], optional = true }
@@ -282,9 +289,9 @@ exclude = ["tests/test-crate"]
 members = ["crates/build-runtime", "crates/cluster-identity", "crates/peer-identity", "crates/scheduler-dashboard", "tests/integration/randomize_readdir"]
 
 [workspace.dependencies]
-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a4b12ba7391e03470626504fad60d887be790cfb" }
-tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a4b12ba7391e03470626504fad60d887be790cfb" }
-wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "16a946b3a9170d6cac4233ef3d1779d0f2fff743", default-features = false, features = ["tokio-rt", "native-roots", "webpki-roots", "stream", "json", "form", "query", "system-proxy", "http2"] }
+btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "53c46285a85742dc8c3ab48fbb66613da6b4a297" }
+tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "53c46285a85742dc8c3ab48fbb66613da6b4a297" }
+wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "7c0668c3b3e137f233c0aaee132028ab39572dbd", default-features = false, features = ["tokio-rt", "native-roots", "webpki-roots", "stream", "json", "form", "query", "system-proxy", "http2"] }
 
 [[bench]]
 harness = false
@@ -313,6 +320,6 @@ unnecessary_semicolon = "warn"
 # One source identity for direct streams and all Flate2 consumers.
 [patch.crates-io]
 zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "98f76b3a242099f2229b048360eeb4707246a68f" }
-reqsign-core = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "47f82a7fc98c591a16a803de9eeeaa527c2779cb" }
-reqsign-azure-storage = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "47f82a7fc98c591a16a803de9eeeaa527c2779cb" }
-reqsign-google = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "47f82a7fc98c591a16a803de9eeeaa527c2779cb" }
+reqsign-core = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "8480e6c3e8fe8b965a8acd7bcb53741079149006" }
+reqsign-azure-storage = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "8480e6c3e8fe8b965a8acd7bcb53741079149006" }
+reqsign-google = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "8480e6c3e8fe8b965a8acd7bcb53741079149006" }

@@ -109,7 +109,7 @@ for literal in 'dist_protocol=7' 'rollout_epoch=8' 'glibc_abi_max=2.39'; do
 done
 for literal in 'source contrib/codeandsolder/release-protocol.env' 'direct-metrics' \
     'tls_backend=boringssl-static' 'Reject unsupported fleet native shared library ABIs' \
-    'Reject binaries requiring a newer GNU libc ABI' 'steps.protocol.outputs.dist_protocol' \
+    'verify-release-native-abi.sh' 'steps.protocol.outputs.dist_protocol' \
     'steps.protocol.outputs.rollout_epoch' 'not current main' \
     'Skipping superseded main release' "sccache-ci-\${{ needs.required-gates.outputs.sha }}"; do
     rg -Fq -- "$literal" "$publisher"
