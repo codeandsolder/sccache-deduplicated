@@ -310,7 +310,7 @@ impl AdmissionPools {
         }
     }
 
-    fn total_capacity(bulk: usize) -> usize {
+    const fn total_capacity(bulk: usize) -> usize {
         bulk.saturating_mul(4)
     }
 
