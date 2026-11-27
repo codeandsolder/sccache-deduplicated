@@ -157,6 +157,101 @@ fn manifest(bytes: &[u8]) -> ResultManifest {
 }
 
 #[test]
+fn concurrent_result_negotiation_keeps_one_reservation_and_rejects_changes() -> Result<()> {
+    use std::{sync::Barrier, thread};
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
+    let NativeAdmission::Compile { ticket } =
+        service.admit(request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("expected compilation")
+    };
+    let staged = service.store().stage(&b"object"[..])?;
+    let blob = staged.reference();
+    let tree = NativeStore::blob_retention_manifest(blob)?;
+    let id = service.store().publish_tree(&tree, vec![staged])?;
+    let output = manifest(b"object");
+    let barrier = Barrier::new(8);
+    thread::scope(|scope| -> Result<()> {
+        let jobs = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    service.begin(ticket, worker, output.clone())
+                })
+            })
+            .collect::<Vec<_>>();
+        for job in jobs {
+            assert!(
+                job.join()
+                    .map_err(|_| anyhow::anyhow!("begin thread panicked"))??
+                    .missing
+                    .is_empty()
+            );
+        }
+        Ok(())
+    })?;
+    assert!(
+        service
+            .begin(ticket, worker, manifest(b"different"))
+            .is_err()
+    );
+    assert!(matches!(
+        service.store().evict_tree(id)?,
+        Eviction::Removed { .. }
+    ));
+    assert_eq!(service.store().collect_garbage(8)?.blobs, 0);
+    service.close(ticket, Publisher::Client)?;
+    assert_eq!(service.store().collect_garbage(8)?.blobs, 1);
+    Ok(())
+}
+
+#[test]
+fn result_upload_saturation_is_retryable_and_does_not_consume_admission() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
+    let NativeAdmission::Compile { ticket } =
+        service.admit(request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("expected compilation")
+    };
+    let mut output = manifest(b"object");
+    let object = output.outputs["obj"].test_file_blob();
+    let stdout = BlobRef {
+        id: ContentId::of(b"stdout"),
+        size: 6,
+    };
+    let stderr = BlobRef {
+        id: ContentId::of(b"stderr"),
+        size: 6,
+    };
+    output.stdout = Some(stdout);
+    output.stderr = Some(stderr);
+    service.begin(ticket, worker, output.clone())?;
+    let first = service.prepare_upload(ticket, worker, object, crate::BlobEncoding::Raw)?;
+    let second = service.prepare_upload(ticket, worker, stdout, crate::BlobEncoding::Raw)?;
+    let refused = service.prepare_upload(ticket, worker, stderr, crate::BlobEncoding::Raw);
+    assert!(matches!(refused, Err(error) if error.is::<NativeServiceBusy>()));
+    service.renew(ticket, worker)?;
+    assert!(service.commit(ticket, worker).is_err());
+    drop(first);
+    upload_encoded(&service, ticket, worker, stderr, b"stderr")?;
+    drop(second);
+    upload_encoded(&service, ticket, worker, stdout, b"stdout")?;
+    upload_encoded(&service, ticket, worker, object, b"object")?;
+    assert_eq!(service.commit(ticket, worker)?, output);
+    Ok(())
+}
+
+#[test]
 fn semantic_reuse_does_not_weaken_execution_verification() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;

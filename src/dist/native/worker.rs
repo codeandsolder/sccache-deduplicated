@@ -30,12 +30,33 @@ use crate::build_runtime::{
 #[derive(Clone)]
 pub struct PackageTransportTracker {
     timing: Arc<Mutex<WorkerTiming>>,
-    slots: Arc<RawDownloadSlots>,
+    slots: Arc<TransferSlots>,
+    output_slots: Arc<TransferSlots>,
 }
 
-struct RawDownloadSlots {
+struct TransferSlots {
     limit: NonZeroUsize,
     permits: tokio::sync::Semaphore,
+}
+
+impl TransferSlots {
+    fn new(limit: NonZeroUsize) -> Self {
+        Self {
+            limit,
+            permits: tokio::sync::Semaphore::new(limit.get()),
+        }
+    }
+
+    async fn acquire(&self, check: &LeaseCheck<'_>) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        let mut acquire = std::pin::pin!(self.permits.acquire());
+        loop {
+            check()?;
+            tokio::select! {
+                permit = &mut acquire => return Ok(permit?),
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
 }
 
 impl PackageTransportTracker {
@@ -49,10 +70,8 @@ impl PackageTransportTracker {
             .context("zero raw download parallelism")?;
         Ok(Self {
             timing: Arc::new(Mutex::new(initial)),
-            slots: Arc::new(RawDownloadSlots {
-                limit,
-                permits: tokio::sync::Semaphore::new(limit.get()),
-            }),
+            slots: Arc::new(TransferSlots::new(limit)),
+            output_slots: Arc::new(TransferSlots::new(limit)),
         })
     }
 
@@ -70,14 +89,14 @@ impl PackageTransportTracker {
         &self,
         check: &LeaseCheck<'_>,
     ) -> Result<tokio::sync::SemaphorePermit<'_>> {
-        let mut acquire = std::pin::pin!(self.slots.permits.acquire());
-        loop {
-            check()?;
-            tokio::select! {
-                permit = &mut acquire => return Ok(permit?),
-                () = tokio::time::sleep(Duration::from_millis(50)) => {}
-            }
-        }
+        self.slots.acquire(check).await
+    }
+
+    async fn output_slot(
+        &self,
+        check: &LeaseCheck<'_>,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        self.output_slots.acquire(check).await
     }
 
     /// A point-in-time estimate to send with a package selection request.
@@ -256,6 +275,36 @@ mod transport_tests {
         tracker.observe_raw(8192, Duration::from_millis(35));
         assert!(tracker.estimate().raw_request_nanoseconds > initial);
         assert_eq!(tracker.estimate().raw_parallelism, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn output_slots_are_shared_across_jobs_but_independent_of_downloads() -> Result<()> {
+        let tracker = PackageTransportTracker::new(WorkerTiming {
+            transfer: PackageTransferCost {
+                raw_parallelism: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        })?;
+        let job_a = tracker.clone();
+        let job_b = tracker.clone();
+        let first = job_a.output_slot(&|| Ok(())).await?;
+        let second = job_b.output_slot(&|| Ok(())).await?;
+        assert_eq!(tracker.output_slots.permits.available_permits(), 0);
+        let incoming = tracker.raw_slot(&|| Ok(())).await?;
+        let waiting = tracker.output_slot(&|| Ok(()));
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(first);
+        let third = tokio::time::timeout(Duration::from_secs(1), waiting).await??;
+        assert_eq!(tracker.output_slots.permits.available_permits(), 0);
+        drop((second, third, incoming));
+        assert_eq!(tracker.output_slots.permits.available_permits(), 2);
         Ok(())
     }
 
@@ -737,6 +786,42 @@ impl NativeCacheClient {
         })
     }
 
+    async fn upload_result_blobs(
+        &self,
+        ticket: Ticket,
+        captured: &CapturedExecution,
+        missing: Vec<BlobRef>,
+        scheduler_limit: Option<NonZeroUsize>,
+        transport: Option<&PackageTransportTracker>,
+        check: &LeaseCheck<'_>,
+    ) -> Result<()> {
+        let width = transport.map_or(NonZeroUsize::MIN, PackageTransportTracker::parallelism);
+        let width = scheduler_limit.map_or(width, |limit| limit.min(width));
+        ingress::map_bounded(missing, width, |blob| async move {
+            super::upload::retry_busy(self.timeout, || async {
+                check()?;
+                let slot = if let Some(transport) = transport {
+                    Some(transport.output_slot(check).await?)
+                } else {
+                    None
+                };
+                let result = self
+                    .upload_stored_file_async(
+                        ticket,
+                        blob,
+                        captured.physical_encoding(),
+                        captured.open_file(blob.id)?,
+                    )
+                    .await;
+                drop(slot);
+                result
+            })
+            .await
+        })
+        .await?;
+        Ok(())
+    }
+
     async fn publish_execution(
         &self,
         context: ExecutionContext<'_>,
@@ -757,17 +842,14 @@ impl NativeCacheClient {
         prepared.request.validate_result(&manifest)?;
         let blobs = manifest.blobs()?;
         let (captured, retained) = prepared.retain_output(context, captured, check).await?;
-        let begin: crate::build_runtime::wire::BeginResult = self
-            .control_with_timeout_async(
-                "begin",
-                &super::ManifestRequest {
-                    ticket,
-                    manifest: manifest.clone(),
-                },
-                self.timeout,
-            )
-            .await?;
+        let (begin, scheduler_limit) = self.begin_result_upload(ticket, manifest.clone()).await?;
         let missing = begin.missing;
+        ensure!(
+            missing
+                .iter()
+                .all(|blob| blobs.get(&blob.id) == Some(&blob.size)),
+            "scheduler requested undeclared output"
+        );
         let publication_setup = retained
             .as_ref()
             .is_none_or(|output| output.warm)
@@ -781,20 +863,15 @@ impl NativeCacheClient {
             .fold(0_u64, u64::saturating_add);
         let requests = u64::try_from(missing.len())?;
         let started = Instant::now();
-        for missing in missing {
-            check()?;
-            ensure!(
-                blobs.get(&missing.id) == Some(&missing.size),
-                "scheduler requested undeclared output"
-            );
-            self.upload_stored_file_async(
-                ticket,
-                missing,
-                captured.physical_encoding(),
-                captured.open_file(missing.id)?,
-            )
-            .await?;
-        }
+        self.upload_result_blobs(
+            ticket,
+            &captured,
+            missing,
+            scheduler_limit,
+            transport,
+            check,
+        )
+        .await?;
         let upload_duration = started.elapsed();
         let worker_timing = transport.map(|transport| {
             transport.observe_result(bytes, requests, upload_duration);

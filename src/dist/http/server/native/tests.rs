@@ -688,9 +688,12 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
             stdout: None,
             stderr: None,
         };
+        let (begin, width) = crate::http_client::io_runtime()?
+            .block_on(worker_client.begin_result_upload(ticket, output.clone()))?;
+        assert_eq!(begin.missing, vec![blob]);
         assert_eq!(
-            worker_client.begin(ticket, output.clone())?.missing,
-            vec![blob]
+            width.map(std::num::NonZeroUsize::get),
+            Some(limits().max_concurrent_uploads)
         );
         assert_eq!(client.status(ticket)?, NativeStatus::Compiling);
         assert_eq!(
@@ -846,6 +849,98 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
     })
 }
 
+fn admit_empty_action(
+    client: &NativeCacheClient,
+) -> Result<(
+    crate::build_runtime::wire::Ticket,
+    crate::build_runtime::wire::Ticket,
+)> {
+    let root = TreeManifest {
+        root: TreeMetadata {
+            mode: 0o755,
+            modified: TreeTimestamp {
+                seconds: 1,
+                nanoseconds: 0,
+            },
+        },
+        entries: BTreeMap::new(),
+    };
+    let offered = client.offer_tree(&root)?;
+    client.commit_tree(offered.ticket)?;
+    let spec = action(&root)?;
+    let NativeAdmission::Compile { ticket } = client.admit(
+        &spec,
+        crate::build_runtime::ActionMode::Reuse,
+        &BTreeMap::new(),
+    )?
+    else {
+        anyhow::bail!("expected native compile");
+    };
+    assert!(matches!(
+        client.schedule(ticket, spec)?,
+        ScheduleReply::Assigned(_)
+    ));
+    Ok((ticket, offered.ticket))
+}
+
+#[test]
+fn result_upload_backpressure_preserves_negotiated_transfer() -> Result<()> {
+    with_native_service(|endpoint, sessions, _, _| {
+        let client = make_client(endpoint, "client-token")?;
+        let worker = make_client(endpoint, "worker-token")?.for_worker(JobId(42));
+        let (ticket, offered) = admit_empty_action(&client)?;
+        let blob = |bytes: &[u8]| BlobRef {
+            id: ContentId::of(bytes),
+            size: bytes.len() as u64,
+        };
+        let (object, stdout, stderr) = (blob(b"object"), blob(b"stdout"), blob(b"stderr"));
+        let manifest = ResultManifest {
+            outputs: BTreeMap::from([(
+                "obj".into(),
+                Artifact::File {
+                    blob: object,
+                    mode: Some(0o644),
+                },
+            )]),
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+        };
+        let (reply, width) = crate::http_client::io_runtime()?
+            .block_on(worker.begin_result_upload(ticket, manifest.clone()))?;
+        assert_eq!(width.map(std::num::NonZeroUsize::get), Some(2));
+        assert_eq!(reply.missing.len(), 3);
+        let publisher = Publisher::Worker {
+            peer: endpoint.worker.current()?.id()?,
+            job: 42,
+        };
+        let first = sessions.prepare_upload(ticket, publisher, object, BlobEncoding::Raw)?;
+        let second = sessions.prepare_upload(ticket, publisher, stdout, BlobEncoding::Raw)?;
+        let refusal = worker.upload(ticket, stderr, Cursor::new(b"stderr".to_vec()));
+        assert!(
+            matches!(refusal, Err(error) if error.downcast_ref::<wreq::Error>().and_then(wreq::Error::status) == Some(StatusCode::SERVICE_UNAVAILABLE))
+        );
+        worker.renew(ticket)?;
+        drop(first);
+        worker.upload(ticket, stderr, Cursor::new(b"stderr".to_vec()))?;
+        drop(second);
+        worker.upload(ticket, stdout, Cursor::new(b"stdout".to_vec()))?;
+        worker.upload(ticket, object, Cursor::new(b"object".to_vec()))?;
+        assert_eq!(worker.commit(ticket, Duration::ZERO, None)?, manifest);
+        for (reference, expected) in [
+            (object, b"object"),
+            (stdout, b"stdout"),
+            (stderr, b"stderr"),
+        ] {
+            let mut actual = Vec::new();
+            client.download(ticket, reference, &mut actual)?;
+            assert_eq!(&actual, expected);
+        }
+        client.close(ticket)?;
+        client.close(offered)?;
+        Ok(())
+    })
+}
+
 #[test]
 fn raw_physical_transport_preserves_original_magic_prefixed_bytes() -> Result<()> {
     use std::io::{Seek, Write};
@@ -853,31 +948,7 @@ fn raw_physical_transport_preserves_original_magic_prefixed_bytes() -> Result<()
     with_native_service(|url, _sessions, _, _| {
         let client = make_client(url, "client-token")?;
         let worker = make_client(url, "worker-token")?.for_worker(JobId(42));
-        let root = TreeManifest {
-            root: TreeMetadata {
-                mode: 0o755,
-                modified: TreeTimestamp {
-                    seconds: 1,
-                    nanoseconds: 0,
-                },
-            },
-            entries: BTreeMap::new(),
-        };
-        let offered = client.offer_tree(&root)?;
-        client.commit_tree(offered.ticket)?;
-        let spec = action(&root)?;
-        let NativeAdmission::Compile { ticket } = client.admit(
-            &spec,
-            crate::build_runtime::ActionMode::Reuse,
-            &BTreeMap::new(),
-        )?
-        else {
-            anyhow::bail!("expected native compile");
-        };
-        assert!(matches!(
-            client.schedule(ticket, spec)?,
-            ScheduleReply::Assigned(_)
-        ));
+        let (ticket, offered) = admit_empty_action(&client)?;
         let original = b"SC-CAS-ZSTD-0002an-original-uncompressed-package-blob";
         let blob = BlobRef {
             id: ContentId::of(original),
@@ -904,7 +975,7 @@ fn raw_physical_transport_preserves_original_magic_prefixed_bytes() -> Result<()
         client.download(ticket, blob, &mut received)?;
         assert_eq!(received, original);
         client.close(ticket)?;
-        client.close(offered.ticket)?;
+        client.close(offered)?;
         Ok(())
     })
 }
@@ -987,7 +1058,7 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
         let mut spec = action(root.manifest())?;
         spec.mounts
             .insert(BuildPath::new(b"/src".to_vec())?, source.id());
-        spec.command.arguments = vec![b"-c".to_vec(), b"IFS= read -r data < /src/input; printf '%s' \"$data\" > /out/obj; printf diagnostic >&2".to_vec()];
+        spec.command.arguments = vec![b"-c".to_vec(), b"IFS= read -r data < /src/input; printf '%s' \"$data\" > /out/obj; printf diagnostic >&2; printf stdout".to_vec()];
         let NativeAdmission::Compile { ticket } = client.admit(
             &spec,
             crate::build_runtime::ActionMode::Reuse,
@@ -1068,6 +1139,13 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
             &mut bytes,
         )?;
         assert_eq!(bytes, b"diagnostic");
+        bytes.clear();
+        client.download(
+            ticket,
+            manifest.stdout.context("missing stdout")?,
+            &mut bytes,
+        )?;
+        assert_eq!(bytes, b"stdout");
         assert_eq!(worker_store.stats()?.actions, 1);
         let key = spec.action_request()?.action_fingerprint()?.key()?;
         assert_eq!(

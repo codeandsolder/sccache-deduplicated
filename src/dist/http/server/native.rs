@@ -1222,7 +1222,12 @@ fn dispatch(
                     crate::dist::NativeLifecycleEvent::Negotiated,
                 );
             }
-            encode(&reply, limit)
+            let mut response = encode(&reply, limit)?;
+            response.headers_mut().insert(
+                crate::dist::native::UPLOAD_PARALLELISM_HEADER,
+                http::HeaderValue::from_str(&sessions.upload_parallelism().to_string())?,
+            );
+            Ok(response)
         }
         "renew" => {
             sessions.renew(metadata(request, limit)?, publisher)?;
