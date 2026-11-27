@@ -42,6 +42,11 @@ enum Action {
         unit: usize,
         compiler: usize,
     },
+    Rustdoc {
+        unit: usize,
+        target: usize,
+        test: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -163,7 +168,7 @@ impl<'a> Planner<'a> {
 
     fn compile(&mut self, unit: usize, target: usize, test: bool, script: bool) -> Result<usize> {
         let manifest = self.unit_manifest(unit);
-        let target_spec = &manifest.targets[target];
+        let target_spec = manifest.targets[target].clone();
         let host = self.host(unit, script);
         let metadata = !host && matches!(self.options.mode, Mode::Check | Mode::Clippy);
         let profile = self.profile(unit, script)?;
@@ -299,6 +304,9 @@ impl<'a> Planner<'a> {
                 self.scripts[unit] = Some(index);
             }
         }
+        if self.options.mode == Mode::Doc {
+            return self.allocate_docs();
+        }
         let mut roots = Vec::new();
         for &unit in &self.graph.roots {
             let targets = self.unit_manifest(unit).targets.clone();
@@ -352,6 +360,9 @@ impl<'a> Planner<'a> {
                 {
                     continue;
                 }
+                if self.options.mode == Mode::Test && self.options.doc {
+                    continue;
+                }
                 let harness_target = matches!(target.kind, TargetKind::Test | TargetKind::Bench);
                 let test_mode = self.options.mode == Mode::Test || harness_target;
                 if self.options.mode != Mode::Test || target.test || harness_target {
@@ -375,8 +386,10 @@ impl<'a> Planner<'a> {
                 }
             }
         }
+        let doctests =
+            self.options.mode == Mode::Test && !self.options.no_run && !self.options.no_doc;
         ensure!(
-            !roots.is_empty(),
+            !roots.is_empty() || (doctests && self.options.doc),
             "no selected targets have their required features"
         );
         ensure!(
@@ -448,6 +461,92 @@ impl<'a> Planner<'a> {
                 }
             }
         }
+        if doctests {
+            let mut docs = 0;
+            for &unit in &self.graph.roots {
+                let targets = self.unit_manifest(unit).targets.clone();
+                for (target, spec) in targets.iter().enumerate() {
+                    if spec.kind == TargetKind::Library
+                        && spec.doctest
+                        && self.options.selects(spec)
+                        && spec
+                            .required_features
+                            .is_subset(&self.graph.units[unit].features)
+                    {
+                        self.nodes.push(Node {
+                            action: Action::Rustdoc {
+                                unit,
+                                target,
+                                test: true,
+                            },
+                            deps: BTreeSet::new(),
+                            outputs: Vec::new(),
+                            label: format!("doctest {}", spec.name),
+                        });
+                        docs += 1;
+                    }
+                }
+            }
+            ensure!(
+                !self.options.doc || docs > 0,
+                "no selected documentation tests"
+            );
+        }
+        Ok(())
+    }
+
+    fn docs_directory(&self) -> PathBuf {
+        self.final_root
+            .parent()
+            .unwrap_or(&self.final_root)
+            .join("doc")
+    }
+
+    fn allocate_docs(&mut self) -> Result<()> {
+        // rustdoc writes a shared search index and static resources. Serialize
+        // writers while still compiling every prerequisite concurrently.
+        let mut previous = None;
+        for unit in 0..self.graph.units.len() {
+            let root = self.graph.units[unit].root;
+            if !root && self.options.no_deps {
+                continue;
+            }
+            let targets = self.unit_manifest(unit).targets.clone();
+            for (target, spec) in targets.iter().enumerate() {
+                if !spec.doc
+                    || !spec
+                        .required_features
+                        .is_subset(&self.graph.units[unit].features)
+                    || if root {
+                        !self.options.selects(spec)
+                    } else {
+                        spec.kind != TargetKind::Library
+                    }
+                {
+                    continue;
+                }
+                let mut deps = BTreeSet::new();
+                if let Some(previous) = previous {
+                    deps.insert(previous);
+                }
+                previous = Some(self.nodes.len());
+                self.nodes.push(Node {
+                    action: Action::Rustdoc {
+                        unit,
+                        target,
+                        test: false,
+                    },
+                    deps,
+                    outputs: vec![
+                        self.docs_directory()
+                            .join(crate_name(&spec.name))
+                            .join("index.html"),
+                    ],
+                    label: format!("document {}", spec.name),
+                });
+            }
+        }
+        ensure!(previous.is_some(), "no documentation targets selected");
         Ok(())
     }
 
@@ -503,6 +602,25 @@ impl<'a> Planner<'a> {
                         {
                             deps.insert(script);
                         }
+                    }
+                }
+                Action::Rustdoc { unit, target, test } => {
+                    for edge in &self.graph.units[unit].edges {
+                        if edge.kind == DependencyKind::Normal
+                            || (test && edge.kind == DependencyKind::Dev)
+                        {
+                            deps.insert(
+                                self.libraries[edge.unit].context("missing rustdoc dependency")?,
+                            );
+                        }
+                    }
+                    if let Some(script) = self.scripts[unit] {
+                        deps.insert(script);
+                    }
+                    if (test || self.target(unit, target).kind != TargetKind::Library)
+                        && let Some(lib) = self.libraries[unit]
+                    {
+                        deps.insert(lib);
                     }
                 }
                 Action::Publish { .. } | Action::Run { .. } => {}
@@ -789,6 +907,42 @@ impl<'a> Planner<'a> {
             arg.push(linker);
             args.extend(["-C".into(), arg]);
         }
+        self.dependency_arguments(unit, target, host, script, test, &mut args, &mut env)?;
+        args.extend(self.settings.rustflags(
+            platform,
+            host,
+            self.toolchain.explicit_target.is_some(),
+        )?);
+        if self.options.mode == Mode::Clippy && self.graph.units[unit].root && !script {
+            args.extend(self.options.trailing.iter().cloned());
+        }
+        if !self.graph.units[unit].root {
+            args.extend(["--cap-lints".into(), "allow".into()]);
+        }
+        let exe = if self.options.mode == Mode::Clippy && self.graph.units[unit].root && !script {
+            self.toolchain
+                .clippy
+                .as_deref()
+                .context("clippy driver unavailable")?
+        } else {
+            &self.toolchain.rustc
+        };
+        Ok(PlanAction::Compile {
+            command: command(exe, &manifest.root, args, env)?,
+        })
+    }
+
+    fn dependency_arguments(
+        &self,
+        unit: usize,
+        target: &Target,
+        host: bool,
+        script: bool,
+        test: bool,
+        args: &mut Vec<OsString>,
+        env: &mut BTreeMap<OsString, OsString>,
+    ) -> Result<()> {
+        let manifest = self.unit_manifest(unit);
         for feature in &self.graph.units[unit].features {
             args.extend(["--cfg".into(), format!("feature={feature:?}").into()]);
         }
@@ -831,7 +985,7 @@ impl<'a> Planner<'a> {
                             )))
             } {
                 self.extern_arg(
-                    &mut args,
+                    args,
                     &edge.alias,
                     self.libraries[edge.unit].context("missing extern library")?,
                 )?;
@@ -841,7 +995,7 @@ impl<'a> Planner<'a> {
             && target.kind != TargetKind::Library
             && let Some(lib) = self.libraries[unit]
         {
-            self.extern_arg(&mut args, &self.graph.library(unit)?.name, lib)?;
+            self.extern_arg(args, &self.graph.library(unit)?.name, lib)?;
         }
         for value in self.native_search(
             unit,
@@ -877,24 +1031,81 @@ impl<'a> Planner<'a> {
                 }
             }
         }
-        args.extend(self.settings.rustflags(
-            platform,
-            host,
-            self.toolchain.explicit_target.is_some(),
-        )?);
-        if !self.graph.units[unit].root {
-            args.extend(["--cap-lints".into(), "allow".into()]);
+        Ok(())
+    }
+
+    fn rustdoc_action(&self, unit: usize, target_index: usize, test: bool) -> Result<PlanAction> {
+        let manifest = self.unit_manifest(unit);
+        let target = self.target(unit, target_index);
+        let host = self.host(unit, false);
+        let mut env = self.env(unit, target);
+        let mut args = vec![
+            "--crate-name".into(),
+            crate_name(&target.name).into(),
+            "--edition".into(),
+            manifest.package.edition.clone().into(),
+            target.source.clone().into_os_string(),
+            "--crate-type".into(),
+            target.crate_types.join(",").into(),
+        ];
+        if !host && let Some(target) = &self.toolchain.explicit_target {
+            args.extend(["--target".into(), target.clone()]);
         }
-        let exe = if self.options.mode == Mode::Clippy && self.graph.units[unit].root && !script {
-            self.toolchain
-                .clippy
-                .as_deref()
-                .context("clippy driver unavailable")?
+        self.dependency_arguments(unit, target, host, false, test, &mut args, &mut env)?;
+        let platform = if host {
+            &self.toolchain.host
         } else {
-            &self.toolchain.rustc
+            &self.toolchain.target
         };
-        Ok(PlanAction::Compile {
-            command: command(exe, &manifest.root, args, env)?,
+        if let Some(linker) = self.settings.linker(platform)? {
+            let mut flag = OsString::from("linker=");
+            flag.push(linker);
+            args.extend(["-C".into(), flag]);
+        }
+        if test {
+            // Doctest rustc invocations enter the same managed compiler path.
+            args.extend([
+                "--test".into(),
+                "-Z".into(),
+                "unstable-options".into(),
+                "--test-builder".into(),
+                self.toolchain.rustc.clone().into_os_string(),
+                "--test-builder-wrapper".into(),
+                std::env::current_exe()?.into_os_string(),
+                "--test-run-directory".into(),
+                manifest.root.clone().into_os_string(),
+            ]);
+            if let Some(lib) = self.libraries[unit] {
+                self.extern_arg(&mut args, &target.name, lib)?;
+            }
+            for argument in &self.options.trailing {
+                args.extend(["--test-args".into(), argument.clone()]);
+            }
+        } else {
+            args.extend(["--out-dir".into(), self.docs_directory().into_os_string()]);
+            args.extend(self.options.trailing.iter().cloned());
+        }
+        if let Some(flags) = self.settings.environment.get(OsStr::new("RUSTDOCFLAGS")) {
+            args.extend(
+                flags
+                    .to_string_lossy()
+                    .split_whitespace()
+                    .map(OsString::from),
+            );
+        }
+        Ok(PlanAction::Process {
+            command: command(
+                self.toolchain
+                    .rustdoc
+                    .as_deref()
+                    .context("missing rustdoc")?,
+                &manifest.root,
+                args,
+                env,
+            )?,
+            stdout: None,
+            stderr: None,
+            inherit_stdin: false,
         })
     }
 
@@ -1032,6 +1243,7 @@ impl<'a> Planner<'a> {
                 source: path(source)?,
                 destination: path(destination)?,
             },
+            Action::Rustdoc { unit, target, test } => self.rustdoc_action(*unit, *target, *test)?,
             Action::Run { unit, compiler } => {
                 let executable = self.nodes[*compiler]
                     .outputs
