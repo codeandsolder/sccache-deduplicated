@@ -1,6 +1,7 @@
 //! Independent Rust workspace planning. The on-disk manifest and lock formats
 //! are interchange formats; this crate does not link to or invoke Cargo.
 mod fingerprint;
+pub mod impact;
 mod options;
 mod planner;
 pub mod settings;
