@@ -35,3 +35,5 @@ impl CoverageMode {
 }
 
 pub mod harness;
+
+pub mod revision;
