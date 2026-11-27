@@ -872,7 +872,12 @@ impl<'a> Planner<'a> {
             "--crate-name".into(),
             crate_name(&target.name).into(),
             "--edition".into(),
-            manifest.package.edition.clone().into(),
+            target
+                .edition
+                .as_ref()
+                .unwrap_or(&manifest.package.edition)
+                .clone()
+                .into(),
             target.source.clone().into_os_string(),
             "--crate-type".into(),
             if test {
@@ -923,6 +928,7 @@ impl<'a> Planner<'a> {
             host,
             self.toolchain.explicit_target.is_some(),
         )?);
+        args.extend(manifest.lint_arguments.iter().map(OsString::from));
         if self.options.mode == Mode::Clippy && self.graph.units[unit].root && !script {
             args.extend(self.options.trailing.iter().cloned());
         }
@@ -1058,7 +1064,12 @@ impl<'a> Planner<'a> {
             "--crate-name".into(),
             crate_name(&target.name).into(),
             "--edition".into(),
-            manifest.package.edition.clone().into(),
+            target
+                .edition
+                .as_ref()
+                .unwrap_or(&manifest.package.edition)
+                .clone()
+                .into(),
             target.source.clone().into_os_string(),
             "--crate-type".into(),
             target.crate_types.join(",").into(),
@@ -1100,6 +1111,7 @@ impl<'a> Planner<'a> {
             args.extend(["--out-dir".into(), self.docs_directory().into_os_string()]);
             args.extend(self.options.trailing.iter().cloned());
         }
+        args.extend(manifest.lint_arguments.iter().map(OsString::from));
         if let Some(flags) = self.settings.environment.get(OsStr::new("RUSTDOCFLAGS")) {
             args.extend(
                 flags

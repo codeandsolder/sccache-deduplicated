@@ -4381,6 +4381,7 @@ dependencies = [
  "blake3",
  "chrono",
  "flate2",
+ "glob",
  "sccache-build",
  "semver",
  "serde",

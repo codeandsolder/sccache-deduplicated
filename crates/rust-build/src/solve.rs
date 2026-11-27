@@ -118,6 +118,7 @@ impl IndexRecord {
                 dependencies,
                 features,
                 targets: Vec::new(),
+                lint_arguments: Vec::new(),
             },
             lock,
         })
@@ -321,7 +322,7 @@ impl Search<'_, '_> {
         if let Some(candidate) = self.paths.get(&key) {
             return Ok(Arc::clone(candidate));
         }
-        let manifest = if root.starts_with(&self.sources.workspace.root) {
+        let manifest = if self.sources.workspace.members.contains(&root) {
             Manifest::load(&root, Some(self.sources.workspace))?
         } else {
             load_discovered(&root)?

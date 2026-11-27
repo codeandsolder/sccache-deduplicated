@@ -51,6 +51,7 @@ pub struct Target {
     pub harness: bool,
     pub doctest: bool,
     pub doc: bool,
+    pub edition: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +70,7 @@ pub struct Manifest {
     pub dependencies: Vec<Dependency>,
     pub features: BTreeMap<String, Vec<String>>,
     pub targets: Vec<Target>,
+    pub lint_arguments: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -126,126 +128,108 @@ fn table<'a>(document: &'a Table, key: &str) -> Result<Option<&'a Table>> {
         .transpose()
 }
 
-// Workspace globs cover path components (including **). Do not recurse into
-// symlink directories: explicit members may still refer to external paths.
-fn glob(pattern: &[u8], name: &[u8]) -> bool {
-    let mut row = vec![false; name.len() + 1];
-    row[0] = true;
-    for &byte in pattern {
-        let mut next = vec![false; row.len()];
-        if byte == b'*' {
-            next[0] = row[0];
-            for j in 1..next.len() {
-                next[j] = row[j] || next[j - 1];
-            }
-        } else {
-            for j in 1..next.len() {
-                next[j] = row[j - 1] && (byte == b'?' || byte == name[j - 1]);
-            }
-        }
-        row = next;
-    }
-    row[name.len()]
-}
-
+// Use the ecosystem's regular glob grammar, including character classes,
+// rather than an incomplete independent wildcard implementation.
 fn expand(root: &Path, pattern: &str, output: &mut BTreeSet<PathBuf>) -> Result<()> {
-    fn walk(root: &Path, parts: &[&str], out: &mut BTreeSet<PathBuf>) -> Result<()> {
-        let Some((head, tail)) = parts.split_first() else {
-            if root.join("Cargo.toml").is_file() {
-                out.insert(root.canonicalize()?);
-            }
-            return Ok(());
-        };
-        if *head == "**" {
-            walk(root, tail, out)?;
-            for entry in fs::read_dir(root)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir()
-                    && !entry.file_name().to_string_lossy().starts_with('.')
-                {
-                    walk(&entry.path(), parts, out)?;
-                }
-            }
-        } else if head.contains(['*', '?']) {
-            for entry in fs::read_dir(root)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir()
-                    && glob(head.as_bytes(), entry.file_name().as_encoded_bytes())
-                {
-                    walk(&entry.path(), tail, out)?;
-                }
-            }
-        } else {
-            walk(&root.join(head), tail, out)?;
+    let root = root.to_str().context("workspace root is not UTF-8")?;
+    let pattern = format!("{}/{}", glob::Pattern::escape(root), pattern);
+    let options = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: true,
+    };
+    for entry in glob::glob_with(&pattern, options)? {
+        let path = entry?;
+        if path.join("Cargo.toml").is_file() {
+            output.insert(path.canonicalize()?);
         }
-        Ok(())
     }
-    walk(
-        root,
-        &pattern
-            .split('/')
-            .filter(|p| !p.is_empty() && *p != ".")
-            .collect::<Vec<_>>(),
-        output,
-    )
+    Ok(())
 }
 
 impl Workspace {
-    pub fn discover(manifest: &Path) -> Result<Self> {
-        let manifest = manifest.canonicalize()?;
-        let local = read(&manifest)?;
-        let member = manifest
-            .parent()
-            .context("manifest has no parent")?
-            .to_path_buf();
-        let explicit = table(&local, "package")?
-            .and_then(|p| p.get("workspace"))
-            .and_then(Value::as_str);
-        let root = if let Some(path) = explicit {
-            member.join(path).canonicalize()?
-        } else if local.contains_key("workspace") {
-            member.clone()
-        } else {
-            let mut found = member.clone();
-            for parent in member.ancestors().skip(1) {
-                let candidate = parent.join("Cargo.toml");
-                if candidate.is_file() && read(&candidate)?.contains_key("workspace") {
-                    found = parent.to_path_buf();
-                    break;
-                }
-            }
-            found
-        };
-        let document = read(&root.join("Cargo.toml"))?;
+    fn standalone(root: PathBuf, document: Table) -> Result<Self> {
+        ensure!(
+            document.contains_key("package"),
+            "manifest has no package or workspace"
+        );
+        Ok(Self {
+            root: root.clone(),
+            members: vec![root.clone()],
+            defaults: vec![root],
+            document,
+        })
+    }
+
+    fn from_root(root: PathBuf, document: Table) -> Result<(Self, BTreeSet<PathBuf>)> {
+        let ws = table(&document, "workspace")?.context("missing [workspace]")?;
         let mut members = BTreeSet::new();
+        let mut excluded = BTreeSet::new();
         let mut defaults = BTreeSet::new();
         if document.contains_key("package") {
             members.insert(root.clone());
         }
-        if let Some(ws) = table(&document, "workspace")? {
-            for pattern in strings(ws.get("members"))? {
-                expand(&root, &pattern, &mut members)?;
-            }
-            let mut excluded = BTreeSet::new();
-            for pattern in strings(ws.get("exclude"))? {
-                expand(&root, &pattern, &mut excluded)?;
-            }
-            members.retain(|p| !excluded.contains(p));
-            for pattern in strings(ws.get("default-members"))? {
-                expand(&root, &pattern, &mut defaults)?;
-            }
+        for pattern in strings(ws.get("exclude"))? {
+            expand(&root, &pattern, &mut excluded)?;
         }
-        if members.is_empty() && local.contains_key("package") {
-            members.insert(member.clone());
+        for pattern in strings(ws.get("members"))? {
+            let mut matching = BTreeSet::new();
+            expand(&root, &pattern, &mut matching)?;
+            ensure!(
+                !matching.is_empty(),
+                "workspace member pattern {pattern:?} matched no manifests"
+            );
+            members.extend(matching);
+        }
+        members.retain(|p| !excluded.contains(p));
+        for pattern in strings(ws.get("default-members"))? {
+            expand(&root, &pattern, &mut defaults)?;
+        }
+        let mut workspace = Self {
+            root: root.clone(),
+            members: Vec::new(),
+            defaults: Vec::new(),
+            document,
+        };
+        // Path dependencies underneath the workspace root are implicit
+        // members. Traverse all declarations, including inactive platforms
+        // and optional features. Never absorb excluded/independent workspaces.
+        let mut pending = members.clone();
+        while let Some(member) = pending.pop_first() {
+            let manifest = Manifest::load(&member, Some(&workspace))?;
+            for dependency in &manifest.dependencies {
+                let Some(path) = dependency.path.as_ref() else {
+                    continue;
+                };
+                let path = path.canonicalize().with_context(|| {
+                    format!(
+                        "resolve path dependency {} of {}",
+                        dependency.alias, manifest.package.name
+                    )
+                })?;
+                if !path.starts_with(&root) || excluded.contains(&path) || members.contains(&path) {
+                    continue;
+                }
+                let candidate = read(&path.join("Cargo.toml"))?;
+                if candidate.contains_key("workspace") {
+                    continue;
+                }
+                let explicit = table(&candidate, "package")?
+                    .and_then(|p| p.get("workspace"))
+                    .and_then(Value::as_str);
+                if let Some(explicit) = explicit
+                    && path.join(explicit).canonicalize()? != root
+                {
+                    continue;
+                }
+                members.insert(path.clone());
+                pending.insert(path);
+            }
         }
         ensure!(!members.is_empty(), "workspace has no packages");
-        if member != root && local.contains_key("package") {
-            defaults.insert(member.clone());
-            members.insert(member);
-        }
         if defaults.is_empty() {
-            if document.contains_key("package") {
-                defaults.insert(root.clone());
+            if workspace.document.contains_key("package") {
+                defaults.insert(root);
             } else {
                 defaults.clone_from(&members);
             }
@@ -254,16 +238,70 @@ impl Workspace {
             defaults.is_subset(&members),
             "default member is not a workspace member"
         );
-        Ok(Self {
-            root,
-            members: members.into_iter().collect(),
-            defaults: defaults.into_iter().collect(),
-            document,
-        })
+        workspace.members = members.into_iter().collect();
+        workspace.defaults = defaults.into_iter().collect();
+        Ok((workspace, excluded))
+    }
+
+    pub fn discover(manifest: &Path) -> Result<Self> {
+        let manifest = manifest.canonicalize()?;
+        let local = read(&manifest)?;
+        let member = manifest
+            .parent()
+            .context("manifest has no parent")?
+            .to_path_buf();
+        if local.contains_key("workspace") {
+            return Ok(Self::from_root(member, local)?.0);
+        }
+        let explicit = table(&local, "package")?
+            .and_then(|p| p.get("workspace"))
+            .and_then(Value::as_str);
+        let root = if let Some(path) = explicit {
+            Some(member.join(path).canonicalize()?)
+        } else {
+            let mut root = None;
+            for parent in member.ancestors().skip(1) {
+                let candidate = parent.join("Cargo.toml");
+                if candidate.is_file() && read(&candidate)?.contains_key("workspace") {
+                    root = Some(parent.to_path_buf());
+                    break;
+                }
+            }
+            root
+        };
+        let Some(root) = root else {
+            return Self::standalone(member, local);
+        };
+        let document = read(&root.join("Cargo.toml"))?;
+        let (mut workspace, excluded) = Self::from_root(root, document)?;
+        if workspace.members.contains(&member) {
+            // A manifest selected from a member is not a request to build
+            // the workspace's root default-members as well.
+            workspace.defaults = vec![member];
+            return Ok(workspace);
+        }
+        ensure!(
+            explicit.is_none(),
+            "package.workspace does not include the package"
+        );
+        if excluded.contains(&member) {
+            return Self::standalone(member, local);
+        }
+        bail!(
+            "package {} is inside but not a member of workspace {}",
+            member.display(),
+            workspace.root.display()
+        )
     }
 
     pub fn package(&self, root: &Path) -> Result<Manifest> {
-        Manifest::load(root, Some(self))
+        let root = root.canonicalize()?;
+        if self.members.contains(&root) {
+            Manifest::load(&root, Some(self))
+        } else {
+            let workspace = Self::discover(&root.join("Cargo.toml"))?;
+            Manifest::load(&root, Some(&workspace))
+        }
     }
 }
 
@@ -332,14 +370,27 @@ fn dependency(
             git_reference = Some((key.to_owned(), value.to_owned()));
         }
     }
+    let path = text(&spec, "path")?.map(|p| base.join(p));
+    let git = text(&spec, "git")?.map(str::to_owned);
+    let registry = text(&spec, "registry")?
+        .or(text(&spec, "registry-index")?)
+        .map(str::to_owned);
+    ensure!(
+        path.is_none() || git.is_none(),
+        "dependency {alias} has both path and git"
+    );
+    ensure!(
+        git.is_none() || registry.is_none(),
+        "dependency {alias} has both git and registry"
+    );
     Ok(Dependency {
         alias: alias.to_owned(),
         name,
         requirement: VersionReq::parse(text(&spec, "version")?.unwrap_or("*"))?,
-        path: text(&spec, "path")?.map(|p| base.join(p)),
-        git: text(&spec, "git")?.map(str::to_owned),
+        path,
+        git,
         git_reference,
-        registry: text(&spec, "registry")?.map(str::to_owned),
+        registry,
         optional: boolean(&spec, "optional", false)?,
         default_features: boolean(&spec, "default-features", true)?,
         features: strings(spec.get("features"))?.into_iter().collect(),
@@ -417,7 +468,76 @@ fn target(
             "doc",
             matches!(kind, TargetKind::Library | TargetKind::Binary),
         )?,
+        edition: text(spec, "edition")?.map(str::to_owned),
     })
+}
+
+fn lint_arguments(document: &Table, workspace: Option<&Workspace>) -> Result<Vec<String>> {
+    let Some(local) = table(document, "lints")? else {
+        return Ok(Vec::new());
+    };
+    let lints = if boolean(local, "workspace", false)? {
+        ensure!(
+            local.len() == 1,
+            "cannot override inherited workspace lints"
+        );
+        workspace
+            .context("workspace lints requested without workspace")?
+            .document
+            .get("workspace")
+            .and_then(Value::as_table)
+            .and_then(|t| t.get("lints"))
+            .and_then(Value::as_table)
+            .context("missing workspace.lints")?
+    } else {
+        local
+    };
+    let mut entries = Vec::new();
+    for (tool, values) in lints {
+        if tool == "workspace" {
+            continue;
+        }
+        let values = values
+            .as_table()
+            .context("lint namespace must be a table")?;
+        for (name, value) in values {
+            let (level, priority, check_cfg) = match value {
+                Value::String(level) => (level.as_str(), 0, Vec::new()),
+                Value::Table(spec) => (
+                    text(spec, "level")?.context("lint level missing")?,
+                    spec.get("priority").map_or(Ok(0), |value| {
+                        value.as_integer().context("invalid lint priority")
+                    })?,
+                    strings(spec.get("check-cfg"))?,
+                ),
+                _ => bail!("invalid lint setting {name}"),
+            };
+            let flag = match level {
+                "allow" => "-A",
+                "warn" => "-W",
+                "deny" => "-D",
+                "forbid" => "-F",
+                "expect" => "--expect",
+                _ => bail!("invalid lint level {level}"),
+            };
+            let name = if tool == "rust" {
+                name.clone()
+            } else {
+                format!("{tool}::{name}")
+            };
+            entries.push((priority, name, flag, check_cfg));
+        }
+    }
+    // Lower priority first: specific lint overrides must follow groups.
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut args = Vec::new();
+    for (_, name, flag, check_cfg) in entries {
+        args.extend([flag.to_owned(), name]);
+        for cfg in check_cfg {
+            args.extend(["--check-cfg".to_owned(), cfg]);
+        }
+    }
+    Ok(args)
 }
 
 impl Manifest {
@@ -595,6 +715,94 @@ impl Manifest {
             dependencies: deps,
             features,
             targets,
+            lint_arguments: lint_arguments(&document, workspace)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_package(root: &Path, name: &str, extra: &str) -> Result<()> {
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/lib.rs"), "")?;
+        fs::write(
+            root.join("Cargo.toml"),
+            format!("[package]\nname={name:?}\nversion=\"1.0.0\"\nedition=\"2024\"\n{extra}"),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_members_exclusions_and_member_default_selection() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"
+[workspace]
+members = ["crates/[ab]"]
+default-members = ["crates/a"]
+exclude = ["excluded"]
+[workspace.dependencies]
+implicit = { path = "implicit" }
+[workspace.lints.rust]
+warnings = { level = "deny", priority = -1 }
+dead_code = "allow"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(native_build)"] }
+[workspace.lints.clippy]
+all = { level = "warn", priority = -2 }
+"#,
+        )?;
+        write_package(
+            &root.join("crates/a"),
+            "a",
+            r#"
+[dependencies]
+implicit = { workspace = true }
+excluded = { path = "../../excluded" }
+[lints]
+workspace = true
+[lib]
+edition = "2021"
+"#,
+        )?;
+        write_package(&root.join("crates/b"), "b", "")?;
+        write_package(
+            &root.join("implicit"),
+            "implicit",
+            "[dependencies]\nleaf={path=\"../leaf\"}\n",
+        )?;
+        write_package(&root.join("leaf"), "leaf", "")?;
+        write_package(&root.join("excluded"), "excluded", "")?;
+        let ws = Workspace::discover(&root.join("Cargo.toml"))?;
+        assert_eq!(ws.members.len(), 4);
+        assert!(ws.members.contains(&root.join("implicit")));
+        assert!(ws.members.contains(&root.join("leaf")));
+        assert!(!ws.members.contains(&root.join("excluded")));
+        assert_eq!(ws.defaults, vec![root.join("crates/a")]);
+        let member = Workspace::discover(&root.join("crates/b/Cargo.toml"))?;
+        assert_eq!(member.defaults, vec![root.join("crates/b")]);
+        let excluded = Workspace::discover(&root.join("excluded/Cargo.toml"))?;
+        assert_eq!(excluded.root, root.join("excluded"));
+        let a = ws.package(&root.join("crates/a"))?;
+        assert_eq!(a.targets[0].edition.as_deref(), Some("2021"));
+        assert_eq!(
+            a.lint_arguments,
+            [
+                "-W",
+                "clippy::all",
+                "-D",
+                "warnings",
+                "-A",
+                "dead_code",
+                "-W",
+                "unexpected_cfgs",
+                "--check-cfg",
+                "cfg(native_build)"
+            ]
+        );
+        Ok(())
     }
 }

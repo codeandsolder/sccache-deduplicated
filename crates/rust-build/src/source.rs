@@ -157,7 +157,7 @@ impl<'a> Sources<'a> {
             let root = path
                 .canonicalize()
                 .with_context(|| format!("resolve path dependency {}", dep.alias))?;
-            let workspace = if root.starts_with(&self.workspace.root) && parent_source.is_none() {
+            let workspace = if self.workspace.members.contains(&root) && parent_source.is_none() {
                 Some(self.workspace)
             } else {
                 None
@@ -235,7 +235,7 @@ impl<'a> Sources<'a> {
             None => self.patched_path(locked)?,
             Some(source) => bail!("unsupported locked source {source}"),
         };
-        let manifest = if root.starts_with(&self.workspace.root) {
+        let manifest = if self.workspace.members.contains(&root) {
             Manifest::load(&root, Some(self.workspace))?
         } else {
             load_discovered(&root)?
@@ -275,7 +275,7 @@ impl<'a> Sources<'a> {
         candidates.extend(self.workspace.members.iter().cloned());
         let mut found = Vec::new();
         for path in candidates {
-            let manifest = Manifest::load(&path, Some(self.workspace))?;
+            let manifest = self.workspace.package(&path)?;
             if manifest.package.name == package.name && manifest.package.version == package.version
             {
                 found.push(path);
