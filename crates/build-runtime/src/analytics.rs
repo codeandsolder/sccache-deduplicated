@@ -146,56 +146,6 @@ fn insert(buckets: &mut Vec<CacheBucket>, upper: Option<u64>, weight: &CacheWeig
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cold_bytes_and_unknown_usage_are_distinct() {
-        let mut report = CacheDistribution::default();
-        report.record(10, None, 1, Some(3), Some(86_400));
-        report.record(20, None, 1, Some(1), Some(604_801));
-        report.record(30, None, 1, Some(0), Some(7_776_001));
-        report.record(40, None, 1, None, None);
-        assert_eq!(report.frequency[0].upper, None);
-        assert_eq!(report.frequency[0].weight.logical_bytes, 40);
-        let sample = CacheAnalyticsSample {
-            sampled_at: 42,
-            report: Some(report),
-            error: None,
-            maximum_bytes: Some(1000),
-        };
-        let bytes = bincode::serialize(&sample).unwrap();
-        let restored: CacheAnalyticsSample = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(restored, sample);
-        let summary = restored.site_summary();
-        assert_eq!(summary.older_than_seven_days, 50);
-        assert_eq!(summary.older_than_thirty_days, 30);
-        assert_eq!(summary.older_than_ninety_days, 30);
-        assert_eq!(summary.unknown_age_bytes, 40);
-    }
-
-    #[test]
-    fn histogram_weights_are_additive_and_unknown_is_distinct() {
-        let mut report = CacheDistribution::default();
-        report.record(10, Some((5, 8)), 3, Some(4), Some(100));
-        report.record(40, None, 1, Some(0), None);
-        assert_eq!(report.total.logical_bytes, 50);
-        assert_eq!(report.total.measured_objects, 1);
-        assert_eq!(report.referenced_bytes, 70);
-        assert_eq!(report.total.byte_touches, 40);
-        assert_eq!(report.age_seconds[0].upper, None);
-        assert_eq!(report.frequency[0].upper, Some(0));
-        for buckets in [&report.age_seconds, &report.size, &report.frequency] {
-            let mut total = CacheWeight::default();
-            for bucket in buckets {
-                total.add(&bucket.weight);
-            }
-            assert_eq!(total, report.total);
-        }
-    }
-}
-
 /// Independent observation; a failure is not an empty cache.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheAnalyticsSample {
@@ -289,4 +239,54 @@ pub fn record_age_bucket(buckets: &mut Vec<CacheBucket>, age: Option<u64>, weigh
             .unwrap_or(u64::MAX)
     });
     insert(buckets, upper, weight);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cold_bytes_and_unknown_usage_are_distinct() {
+        let mut report = CacheDistribution::default();
+        report.record(10, None, 1, Some(3), Some(86_400));
+        report.record(20, None, 1, Some(1), Some(604_801));
+        report.record(30, None, 1, Some(0), Some(7_776_001));
+        report.record(40, None, 1, None, None);
+        assert_eq!(report.frequency[0].upper, None);
+        assert_eq!(report.frequency[0].weight.logical_bytes, 40);
+        let sample = CacheAnalyticsSample {
+            sampled_at: 42,
+            report: Some(report),
+            error: None,
+            maximum_bytes: Some(1000),
+        };
+        let bytes = bincode::serialize(&sample).unwrap();
+        let restored: CacheAnalyticsSample = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(restored, sample);
+        let summary = restored.site_summary();
+        assert_eq!(summary.older_than_seven_days, 50);
+        assert_eq!(summary.older_than_thirty_days, 30);
+        assert_eq!(summary.older_than_ninety_days, 30);
+        assert_eq!(summary.unknown_age_bytes, 40);
+    }
+
+    #[test]
+    fn histogram_weights_are_additive_and_unknown_is_distinct() {
+        let mut report = CacheDistribution::default();
+        report.record(10, Some((5, 8)), 3, Some(4), Some(100));
+        report.record(40, None, 1, Some(0), None);
+        assert_eq!(report.total.logical_bytes, 50);
+        assert_eq!(report.total.measured_objects, 1);
+        assert_eq!(report.referenced_bytes, 70);
+        assert_eq!(report.total.byte_touches, 40);
+        assert_eq!(report.age_seconds[0].upper, None);
+        assert_eq!(report.frequency[0].upper, Some(0));
+        for buckets in [&report.age_seconds, &report.size, &report.frequency] {
+            let mut total = CacheWeight::default();
+            for bucket in buckets {
+                total.add(&bucket.weight);
+            }
+            assert_eq!(total, report.total);
+        }
+    }
 }

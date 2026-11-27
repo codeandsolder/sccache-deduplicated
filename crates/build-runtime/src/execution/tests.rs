@@ -6,6 +6,17 @@ use crate::{
     TreeTimestamp,
 };
 
+fn execute_test(
+    spec: &ExecutionSpec,
+    store: &NativeStore,
+    policy: &ExecutionPolicy,
+    budget: Option<StageBudget>,
+    progress: impl FnMut() -> Result<()>,
+) -> Result<CapturedExecution> {
+    let inputs = acquire_execution_inputs(spec, store)?;
+    execute(spec, store, policy, &inputs, budget, progress)
+}
+
 fn metadata(mode: u32) -> TreeMetadata {
     TreeMetadata {
         mode,
@@ -191,7 +202,7 @@ fn read_shell_output(
     store: &NativeStore,
     policy: &ExecutionPolicy,
 ) -> Result<Vec<u8>> {
-    let execution = execute(spec, store, policy, None, || Ok(()))?;
+    let execution = execute_test(spec, store, policy, None, || Ok(()))?;
     let manifest = execution
         .successful_result()
         .context("shell action failed")?;
@@ -364,7 +375,7 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
         timeout: Duration::from_secs(10),
         max_result_bytes: 1024,
     };
-    let result = execute(&spec, &store, &policy, None, || Ok(()))?;
+    let result = execute_test(&spec, &store, &policy, None, || Ok(()))?;
     let manifest = result.successful_result().context("native shell failed")?;
     spec.action_request()?.validate_result(manifest)?;
     let object = manifest.outputs.get("obj").context("object missing")?;
@@ -384,11 +395,11 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
 
     let mut forged = spec.clone();
     forged.root.id = crate::TreeId([0xA5; 32]);
-    assert!(execute(&forged, &store, &policy, None, || Ok(())).is_err());
+    assert!(execute_test(&forged, &store, &policy, None, || Ok(())).is_err());
 
     // Failures must retain diagnostics without publishing a successful entry.
     spec.command.arguments[1] = b"printf 'failed' >&2; exit 7".to_vec();
-    let result = execute(&spec, &store, &policy, None, || Ok(()))?;
+    let result = execute_test(&spec, &store, &policy, None, || Ok(()))?;
     assert_eq!(result.status().code(), Some(7));
     assert!(result.successful_result().is_none());
     assert_eq!(
@@ -435,7 +446,7 @@ fn verify_writable_mounts_and_invalid_outputs(
         ),
     ]);
     spec.command.arguments[1] = br#"printf new > object; test ! -e /other/object || exit 8; IFS= read -r word < /other/input; printf '%s' "$word" > /tmp/result"#.to_vec();
-    let result = execute(spec, store, policy, None, || Ok(()))?;
+    let result = execute_test(spec, store, policy, None, || Ok(()))?;
     let manifest = result
         .successful_result()
         .context("in-place output execution failed")?;
@@ -463,7 +474,7 @@ fn verify_writable_mounts_and_invalid_outputs(
         },
     )]);
     spec.command.arguments[1] = b"printf generated > /src/first.o; printf second > /src/second.o; printf changed > /src/input".to_vec();
-    let result = execute(&spec, &store, &policy, None, || Ok(()))?;
+    let result = execute_test(spec, store, policy, None, || Ok(()))?;
     let manifest = result
         .successful_result()
         .context("tree output execution failed")?;
@@ -496,7 +507,7 @@ fn verify_writable_mounts_and_invalid_outputs(
     spec.outputs.get_mut("codegen").context("output")?.kind = crate::OutputKind::GeneratedTree;
     spec.command.arguments[1] =
         b"printf generated > /src/first.o; printf second > /src/second.o".to_vec();
-    let result = execute(&spec, &store, &policy, None, || Ok(()))?;
+    let result = execute_test(spec, store, policy, None, || Ok(()))?;
     let manifest = result
         .successful_result()
         .context("generated output execution failed")?;
@@ -523,7 +534,7 @@ fn verify_writable_mounts_and_invalid_outputs(
         assert!(result.open_blob(blob.id).is_ok());
     }
     spec.command.arguments[1] = b"printf replaced > /src/input".to_vec();
-    assert!(execute(&spec, &store, &policy, None, || Ok(())).is_err());
+    assert!(execute_test(spec, store, policy, None, || Ok(())).is_err());
 
     spec.outputs = file_outputs;
     spec.command.arguments[1] = b"printf new > object".to_vec();
@@ -531,14 +542,14 @@ fn verify_writable_mounts_and_invalid_outputs(
     // A preexisting input cannot silently serve as a compiler output.
     spec.outputs.get_mut("object").context("output")?.path =
         BuildPath::new(b"/src/input".to_vec())?;
-    assert!(execute(spec, store, policy, None, || Ok(())).is_err());
+    assert!(execute_test(spec, store, policy, None, || Ok(())).is_err());
     spec.outputs.get_mut("object").context("output")?.path =
         BuildPath::new(b"/src/missing/object".to_vec())?;
-    assert!(execute(spec, store, policy, None, || Ok(())).is_err());
+    assert!(execute_test(spec, store, policy, None, || Ok(())).is_err());
     // A symlink must never make host bytes a cached output.
     spec.command.arguments[1] = b"printf ok > /out/nested/object".to_vec();
     spec.platform = ContentId::of(b"incorrect");
-    assert!(execute(spec, store, policy, None, || Ok(())).is_err());
+    assert!(execute_test(spec, store, policy, None, || Ok(())).is_err());
     Ok(())
 }
 
@@ -634,6 +645,7 @@ async fn captured_output_publication_reuses_original_inode() -> Result<()> {
     assert_eq!(capture.staged.len(), 1);
     let mut result = CapturedExecution {
         status: ExitStatus::from_raw(0),
+        timings: ExecutionTimings::default(),
         manifest: ResultManifest {
             outputs: BTreeMap::from([("obj".into(), Artifact::File { blob, mode: None })]),
             stdout: None,
@@ -668,5 +680,74 @@ async fn captured_output_publication_reuses_original_inode() -> Result<()> {
     assert_eq!(decoded, bytes);
     assert_eq!(store.space_status()?.reserved_bytes, Some(0));
     assert_eq!(fs::read_dir(dir.path().join("staging"))?.count(), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Linux Bubblewrap and ldd"]
+fn resident_execution_isolates_concurrent_writable_state() -> Result<()> {
+    for directory in [
+        tempfile::tempdir()?,
+        tempfile::tempdir_in(std::env::current_dir()?)?,
+    ] {
+        let store = NativeStore::open(&directory.path().join("store"))?;
+        let id = shell_root(&store)?;
+        let (spec, policy) = shell_output_fixture(
+            directory.path(),
+            id,
+            ContentId::of(b"resident concurrency"),
+            b"",
+        )?;
+        let inputs = acquire_execution_inputs(&spec, &store)?;
+        assert!(admitted_inputs(&spec, &store, &[]).is_err());
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| -> Result<()> {
+            let handles = (0..8).map(|index| {
+                let (store, policy, inputs, barrier) = (&store, &policy, &inputs, &barrier);
+                let mut spec = spec.clone();
+                scope.spawn(move || -> Result<()> {
+                    let script = format!("test ! -e /tmp/marker && test ! -e /out/nested/object || exit 9; printf '{index}' > /tmp/marker; printf '{index}' > /out/nested/object");
+                    spec.command.arguments[1] = script.into_bytes();
+                    barrier.wait();
+                    let captured = execute(&spec, store, policy, inputs, None, || Ok(()))?;
+                    let result = captured.successful_result().context("isolated job failed")?;
+                    let mut output = Vec::new();
+                    captured.open_blob(result.outputs["object"].test_file_blob().id)?.read_to_end(&mut output)?;
+                    assert_eq!(output, index.to_string().as_bytes());
+                    Ok(())
+                })
+            }).collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().expect("execution worker")?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn pidfd_wait_reaps_completed_and_cancelled_children() -> Result<()> {
+    let mut child = RunningChild(Command::new("/bin/sh").args(["-c", "exit 17"]).spawn()?);
+    assert_eq!(
+        child.wait(Duration::from_secs(5), || Ok(()))?.code(),
+        Some(17)
+    );
+    for timeout in [true, false] {
+        let mut child = RunningChild(Command::new("/bin/sleep").arg("30").spawn()?);
+        let pidfd = pidfd_open(Pid::from_child(&child.0), PidfdFlags::empty())?;
+        let result = if timeout {
+            child.wait(Duration::from_millis(10), || Ok(()))
+        } else {
+            child.wait(Duration::from_secs(5), || anyhow::bail!("cancelled"))
+        };
+        assert!(result.is_err());
+        drop(child);
+        let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
+        assert_eq!(
+            poll(&mut fds, Some(&Timespec::try_from(Duration::ZERO)?))?,
+            1
+        );
+    }
     Ok(())
 }

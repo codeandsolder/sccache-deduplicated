@@ -28,13 +28,13 @@ mod linux {
     use sccache_build::{
         BuildPath, CommandSpec, ContentId, ExecutionPolicy, ExecutionRoot, ExecutionSpec,
         NativeStore, OutputSpec, TreeEntry, TreeManifest, TreeMetadata, TreePath, TreeRecipe,
-        TreeTimestamp, execute,
+        TreeTimestamp, acquire_execution_inputs, execute,
     };
 
     const HEADER_COUNT: usize = 384;
     const REPETITIONS: usize = 7;
 
-    fn make_input(root: &Path, compiler: &Path) -> Result<()> {
+    fn make_input(root: &Path, compiler: &Path, short: bool) -> Result<()> {
         for name in ["bin", "dev", "proc", "tmp", "src", "out"] {
             fs::create_dir_all(root.join(name))?;
         }
@@ -88,6 +88,13 @@ mod linux {
             writeln!(source, "v = mix_{index}(v);")?;
         }
         source.push_str("return v; }\n");
+        if short {
+            source = concat!(
+                "#include \"aux/selected.h\"\n",
+                "unsigned compiled_kernel(unsigned seed) { return seed * 3u + 1u; }\n"
+            )
+            .into();
+        }
         fs::write(root.join("src/input.c"), source)?;
         println!(
             "corpus=clang-cc1-c-headers headers={HEADER_COUNT} dynamic_libs={} code={}",
@@ -488,8 +495,18 @@ mod linux {
     ) -> Result<()> {
         let before = arc()?;
         let started = Instant::now();
-        let execution = execute(spec, store, policy, None, || Ok(()))?;
+        let inputs = acquire_execution_inputs(spec, store)?;
+        let admission = started.elapsed();
+        let execution = execute(spec, store, policy, &inputs, None, || Ok(()))?;
         let elapsed = started.elapsed();
+        let timing = execution.timings();
+        println!(
+            "PHASE backend={backend} iteration={index} admission_us={} preparation_us={} process_us={} capture_us={}",
+            admission.as_micros(),
+            timing.preparation.as_micros(),
+            timing.process.as_micros(),
+            timing.capture.as_micros()
+        );
         if !execution.status().success() {
             let mut diagnostic = String::new();
             if let Some(stderr) = execution.diagnostics().1 {
@@ -522,13 +539,17 @@ mod linux {
     }
 
     pub fn run() -> Result<()> {
-        let usage =
-            "usage: native_realbuild_arc ZFS_PARENT NONZFS_PARENT CLANG_BINARY BWRAP_BINARY";
+        let usage = "usage: native_realbuild_arc ZFS_PARENT NONZFS_PARENT CLANG_BINARY BWRAP_BINARY [--short]";
         let mut arguments = std::env::args_os().skip(1);
         let zfs_parent = PathBuf::from(arguments.next().context(usage)?);
         let non_zfs_parent = PathBuf::from(arguments.next().context(usage)?);
         let compiler = PathBuf::from(arguments.next().context(usage)?);
         let bubblewrap = PathBuf::from(arguments.next().context(usage)?);
+        let short = match arguments.next() {
+            None => false,
+            Some(flag) if flag == "--short" => true,
+            Some(_) => anyhow::bail!("{usage}"),
+        };
         ensure!(arguments.next().is_none(), "{usage}");
         ensure!(
             zfs_parent.is_absolute()
@@ -547,7 +568,7 @@ mod linux {
             .prefix("bench-nonzfs-")
             .tempdir_in(&non_zfs_parent)?;
         let root = zfs.path().join("input");
-        make_input(&root, &compiler)?;
+        make_input(&root, &compiler, short)?;
         let expected = run_host(&root, &compiler)?;
         println!(
             "REFERENCE object_bytes={} blake3={}",

@@ -2410,12 +2410,6 @@ struct LocalAssignment {
     accepted_at: Instant,
 }
 
-#[cfg(target_os = "linux")]
-struct NativeInputPins {
-    _trees: Vec<sccache::build_runtime::TreeLease>,
-    blobs: sccache::build_runtime::UploadReservation,
-}
-
 struct ArchiveWorker {
     builder: Box<dyn BuilderIncoming>,
     cache: Mutex<TcCache>,

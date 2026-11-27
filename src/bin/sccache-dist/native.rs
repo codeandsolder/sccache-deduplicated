@@ -11,7 +11,7 @@ use anyhow::{Result, ensure};
 use sccache::{
     build_runtime::{
         BlobResidency, CapturedExecution, ContentId, ExecutionPolicy, NativeStore,
-        PackageImportLimits, PackageTransferCost, wire::WorkerTiming,
+        PackageImportLimits, PackageTransferCost, ResidentInputs, wire::WorkerTiming,
     },
     config::server::NativeWorkerConfig,
     dist::{
@@ -140,23 +140,15 @@ impl NativeWorker {
 
     pub(super) fn pin_resident_inputs(
         &self,
-        assignment: &NativeAssignment,
-    ) -> Result<super::NativeInputPins> {
+        assignment: &mut NativeAssignment,
+    ) -> Result<ResidentInputs> {
         ensure!(
             self.policy.platform == assignment.spec.platform,
             "native worker platform unavailable"
         );
-        let blobs = self.store.reserve_blobs(&assignment.input_blobs)?;
-        let mut trees = Vec::new();
-        for tree in assignment.spec.action_request()?.input_trees {
-            if let Some(pin) = self.store.lookup_tree(tree)? {
-                trees.push(pin);
-            }
-        }
-        Ok(super::NativeInputPins {
-            _trees: trees,
-            blobs,
-        })
+        let trees = assignment.spec.action_request()?.input_trees;
+        self.store
+            .reserve_resident_inputs(trees, std::mem::take(&mut assignment.input_blobs))
     }
 
     pub(super) fn open_blob(
