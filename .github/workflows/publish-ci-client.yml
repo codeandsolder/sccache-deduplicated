@@ -121,6 +121,11 @@ jobs:
 
           install -D -m 0755 "$target_dir/release/sccache" dist/sccache-linux-x86_64-v2
           install -D -m 0755 "$target_dir/release/sccache-dist" dist/sccache-dist-linux-x86_64-v2
+          for binary in dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2; do
+            version="$("$binary" --version)"
+            printf '%s\n' "$version"
+            [[ "$version" == *"(${{ steps.rev.outputs.sha }})" ]]
+          done
           sha256sum dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2 > dist/SHA256SUMS
           {
             echo "source_sha=${{ steps.rev.outputs.sha }}"

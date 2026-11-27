@@ -294,6 +294,15 @@ impl NativeCompilerClient {
         }
     }
 
+    pub(crate) async fn report_live_traces(
+        self: &Arc<Self>,
+        report: &crate::build_runtime::wire::LiveTraceBatch,
+    ) -> Result<()> {
+        let client = Arc::clone(self);
+        let transport = tokio::task::spawn_blocking(move || client.connect_http()).await??;
+        transport.report_live_traces(report).await
+    }
+
     fn allows_automatic_toolchain(&self, executable: &Path) -> bool {
         !self.toolchains.iter().any(|configured| match configured {
             DistToolchainConfig::NoDist {
@@ -1177,6 +1186,7 @@ mod tests {
             &leases,
             None,
             || Ok(()),
+            |_| {},
         )?;
         if !result.status().success() {
             let mut stderr = Vec::new();

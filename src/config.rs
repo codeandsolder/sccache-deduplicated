@@ -1097,6 +1097,7 @@ pub struct FileConfig {
     pub shared_daemon: Option<SharedDaemonConfig>,
     pub compiler_aliases: CompilerAliases,
     pub compile_limits: crate::server::activity::CompileLimits,
+    pub traces: Option<crate::latency_trace::TraceConfig>,
 }
 
 // If the file doesn't exist or we can't read it, log the issue and proceed. If the
@@ -1762,6 +1763,7 @@ pub struct Config {
     pub shared_daemon: Option<SharedDaemonConfig>,
     pub compiler_aliases: CompilerAliases,
     pub compile_limits: crate::server::activity::CompileLimits,
+    pub traces: Option<crate::latency_trace::TraceConfig>,
 }
 
 impl Config {
@@ -1808,6 +1810,7 @@ impl Config {
             shared_daemon,
             compiler_aliases,
             compile_limits,
+            traces,
         } = file_conf;
         compile_limits.validate()?;
         conf_caches.merge(cache);
@@ -1905,6 +1908,7 @@ impl Config {
             shared_daemon,
             compiler_aliases,
             compile_limits,
+            traces,
         })
     }
 }
@@ -2225,6 +2229,7 @@ pub mod scheduler {
         pub assets: PathBuf,
         pub metrics_url: Option<String>,
         pub metrics_ingress_host: Option<String>,
+        pub traces_url: Option<String>,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -2241,6 +2246,7 @@ pub mod scheduler {
         pub native_cache: Option<NativeCacheConfig>,
         /// Native worker sharing this scheduler's store and process.
         pub local_worker: Option<Box<super::server::Config>>,
+        pub traces: Option<crate::latency_trace::TraceConfig>,
     }
 
     /// Load and validate scheduler configuration.
@@ -2466,6 +2472,7 @@ pub mod server {
         #[serde(default)]
         pub toolchain_archive_sources: Vec<PathBuf>,
         pub native_worker: Option<NativeWorkerConfig>,
+        pub traces: Option<crate::latency_trace::TraceConfig>,
     }
 
     impl Config {
@@ -2670,6 +2677,7 @@ fn config_overrides() {
         shared_daemon: None,
         compiler_aliases: Default::default(),
         compile_limits: Default::default(),
+        traces: None,
     };
 
     assert_eq!(
@@ -2730,6 +2738,7 @@ fn config_overrides() {
             shared_daemon: None,
             compiler_aliases: Default::default(),
             compile_limits: Default::default(),
+            traces: None,
         }
     );
 }
@@ -3881,6 +3890,7 @@ key_prefix = "cosprefix"
             shared_daemon: None,
             compiler_aliases: Default::default(),
             compile_limits: Default::default(),
+            traces: None,
         }
     );
 }
@@ -3927,6 +3937,7 @@ fn server_toml_parse() {
     assert_eq!(
         server_config,
         server::Config {
+            traces: None,
             cluster: sccache_peer_identity::PeerConfig {
                 directory: "/tmp/worker-identity".into(),
                 ca_certificate: "/tmp/ca.pem".into(),
@@ -3991,6 +4002,7 @@ size = "7g"
             shared_daemon: None,
             compiler_aliases: Default::default(),
             compile_limits: Default::default(),
+            traces: None,
         }
     );
 }

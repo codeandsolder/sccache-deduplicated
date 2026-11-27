@@ -1,7 +1,7 @@
 //! Scheduler-side admission for one compilation per complete action identity.
 
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     sync::{Arc, Mutex},
 };
 
@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow};
 
 use crate::{
     ActionFingerprint, ActionKey, ActionMode, NativeStore, Published, ResultLease, ResultManifest,
-    StagedBlob,
+    StagedBlob, wire::TraceContext,
 };
 
 /// The scheduler owns both durable cache data and in-flight compilation keys.
@@ -24,7 +24,7 @@ pub struct BuildCoordinator {
 
 struct Inner {
     store: NativeStore,
-    running: Mutex<BTreeSet<ActionKey>>,
+    running: Mutex<BTreeMap<ActionKey, Option<TraceContext>>>,
 }
 
 /// The outcome of an action admission request.
@@ -32,7 +32,7 @@ pub enum Admission {
     /// Already published result, pinned for delivery.
     Cached(ResultLease),
     /// Another job is producing this exact action. Retry after its completion.
-    InFlight,
+    InFlight(Option<TraceContext>),
     /// Exclusive authorization to assign a build for this action.
     Compile(CompilePermit),
 }
@@ -43,7 +43,7 @@ impl BuildCoordinator {
         Self {
             inner: Arc::new(Inner {
                 store,
-                running: Mutex::new(BTreeSet::new()),
+                running: Mutex::new(BTreeMap::new()),
             }),
         }
     }
@@ -59,7 +59,12 @@ impl BuildCoordinator {
     ///
     /// # Errors
     /// Returns an error for an invalid fingerprint or storage failure.
-    pub fn admit(&self, fingerprint: ActionFingerprint, mode: ActionMode) -> Result<Admission> {
+    pub fn admit(
+        &self,
+        trace: Option<TraceContext>,
+        fingerprint: ActionFingerprint,
+        mode: ActionMode,
+    ) -> Result<Admission> {
         let key = fingerprint.key()?;
         if mode == ActionMode::Reuse
             && let Some(result) = self.store().lookup(key)?
@@ -72,8 +77,13 @@ impl BuildCoordinator {
                 .running
                 .lock()
                 .map_err(|_| anyhow!("native action admission lock poisoned"))?;
-            if !running.insert(key) {
-                return Ok(Admission::InFlight);
+            match running.entry(key) {
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    return Ok(Admission::InFlight(*entry.get()));
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(trace);
+                }
             }
         }
         let permit = CompilePermit {
@@ -109,6 +119,21 @@ impl CompilePermit {
     #[must_use = "the key identifies the reserved compilation"]
     pub const fn key(&self) -> ActionKey {
         self.key
+    }
+
+    /// Recovery work is not a compiler request; do not link waiters to the
+    /// request that happened to trigger recovery.
+    pub(crate) fn clear_trace(&self) -> Result<()> {
+        let mut running = self
+            .inner
+            .running
+            .lock()
+            .map_err(|_| anyhow!("native action admission lock poisoned"))?;
+        *running
+            .get_mut(&self.key)
+            .ok_or_else(|| anyhow!("native compilation permit lost its reservation"))? = None;
+        drop(running);
+        Ok(())
     }
 
     /// Publish a successful result under precisely the reserved action key.
@@ -160,7 +185,7 @@ impl Drop for CompilePermit {
     fn drop(&mut self) {
         match self.inner.running.lock() {
             Ok(mut running) => {
-                if !running.remove(&self.key) {
+                if running.remove(&self.key).is_none() {
                     log::error!("native compilation permit lost its reservation");
                 }
             }
@@ -185,19 +210,53 @@ mod tests {
     }
 
     #[test]
+    fn in_flight_context_follows_permit_lifetime_and_not_the_action_key() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let coordinator = BuildCoordinator::new(NativeStore::open(dir.path())?);
+        let producer = TraceContext::request("producer");
+        let waiter = TraceContext::request("waiter");
+        let Admission::Compile(permit) =
+            coordinator.admit(Some(producer), fingerprint(), ActionMode::Reuse)?
+        else {
+            anyhow::bail!("expected producer");
+        };
+        assert!(
+            matches!(coordinator.admit(Some(waiter), fingerprint(), ActionMode::Reuse)?, Admission::InFlight(Some(context)) if context == producer)
+        );
+        permit.clear_trace()?;
+        assert!(matches!(
+            coordinator.admit(Some(waiter), fingerprint(), ActionMode::Reuse)?,
+            Admission::InFlight(None)
+        ));
+        drop(permit);
+        let Admission::Compile(replacement) =
+            coordinator.admit(Some(waiter), fingerprint(), ActionMode::Reuse)?
+        else {
+            anyhow::bail!("expected new owner");
+        };
+        assert_eq!(replacement.key(), fingerprint().key()?);
+        assert!(
+            matches!(coordinator.admit(Some(producer), fingerprint(), ActionMode::Reuse)?, Admission::InFlight(Some(context)) if context == waiter)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn admission_reuses_committed_results_and_releases_cancelled_jobs() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let coordinator = BuildCoordinator::new(NativeStore::open(dir.path())?);
-        let Admission::Compile(permit) = coordinator.admit(fingerprint(), ActionMode::Reuse)?
+        let Admission::Compile(permit) =
+            coordinator.admit(None, fingerprint(), ActionMode::Reuse)?
         else {
             anyhow::bail!("expected new compilation");
         };
         assert!(matches!(
-            coordinator.admit(fingerprint(), ActionMode::Reuse)?,
-            Admission::InFlight
+            coordinator.admit(None, fingerprint(), ActionMode::Reuse)?,
+            Admission::InFlight(None)
         ));
         drop(permit);
-        let Admission::Compile(permit) = coordinator.admit(fingerprint(), ActionMode::Reuse)?
+        let Admission::Compile(permit) =
+            coordinator.admit(None, fingerprint(), ActionMode::Reuse)?
         else {
             anyhow::bail!("cancelled compilation was not released");
         };
@@ -215,7 +274,8 @@ mod tests {
         };
         let key = permit.key();
         assert_eq!(permit.publish(&result, vec![staged])?.action, key);
-        let Admission::Cached(lease) = coordinator.admit(fingerprint(), ActionMode::Reuse)? else {
+        let Admission::Cached(lease) = coordinator.admit(None, fingerprint(), ActionMode::Reuse)?
+        else {
             anyhow::bail!("expected cache hit");
         };
         assert_eq!(lease.manifest(), &result);
@@ -234,7 +294,7 @@ mod tests {
                     let barrier = &barrier;
                     scope.spawn(move || {
                         barrier.wait();
-                        coordinator.admit(fingerprint(), ActionMode::Reuse)
+                        coordinator.admit(None, fingerprint(), ActionMode::Reuse)
                     })
                 })
                 .collect::<Vec<_>>();
@@ -257,13 +317,13 @@ mod tests {
         assert_eq!(
             results
                 .iter()
-                .filter(|item| matches!(item, Admission::InFlight))
+                .filter(|item| matches!(item, Admission::InFlight(_)))
                 .count(),
             7
         );
         drop(results);
         assert!(matches!(
-            coordinator.admit(fingerprint(), ActionMode::Reuse)?,
+            coordinator.admit(None, fingerprint(), ActionMode::Reuse)?,
             Admission::Compile(_)
         ));
         Ok(())
@@ -273,7 +333,8 @@ mod tests {
     fn invalid_publication_releases_admission() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let coordinator = BuildCoordinator::new(NativeStore::open(dir.path())?);
-        let Admission::Compile(permit) = coordinator.admit(fingerprint(), ActionMode::Reuse)?
+        let Admission::Compile(permit) =
+            coordinator.admit(None, fingerprint(), ActionMode::Reuse)?
         else {
             anyhow::bail!("expected compilation");
         };
@@ -287,7 +348,7 @@ mod tests {
         let key = fingerprint().key()?;
         assert!(coordinator.store().lookup(key)?.is_none());
         assert!(matches!(
-            coordinator.admit(fingerprint(), ActionMode::Reuse)?,
+            coordinator.admit(None, fingerprint(), ActionMode::Reuse)?,
             Admission::Compile(_)
         ));
         drop(staged);

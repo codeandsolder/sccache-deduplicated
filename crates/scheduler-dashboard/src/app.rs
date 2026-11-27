@@ -29,6 +29,7 @@ mod native;
 #[cfg(target_arch = "wasm32")]
 mod sse;
 mod topology;
+mod traces;
 
 fn keyed_index<T: Clone + PartialEq + Send + Sync + 'static>(
     rows: Memo<Vec<T>>,
@@ -228,10 +229,11 @@ enum Tab {
     Topology,
     Network,
     Fleet,
+    Traces,
 }
 
 impl Tab {
-    const ALL: [(Self, &'static str); 9] = [
+    const ALL: [(Self, &'static str); 10] = [
         (Self::Overview, "Overview"),
         (Self::Workers, "Workers"),
         (Self::Jobs, "Jobs"),
@@ -241,6 +243,7 @@ impl Tab {
         (Self::Topology, "Topology"),
         (Self::Network, "Network"),
         (Self::Fleet, "Fleet metrics"),
+        (Self::Traces, "Traces"),
     ];
 
     const fn metric_group(self) -> Option<MetricGroup> {

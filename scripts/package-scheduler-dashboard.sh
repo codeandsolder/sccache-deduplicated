@@ -12,6 +12,8 @@ output="$(realpath -m "$3")"
 cd "$(dirname "$0")/.."
 source_sha="$(git rev-parse HEAD)"
 source_epoch="$(git show -s --format=%ct "$source_sha")"
+version="$("$binary" --version)"
+[[ "$version" == *"($source_sha)" ]] || { echo "dashboard scheduler revision mismatch" >&2; exit 1; }
 stage="$(mktemp -d "$(dirname "$output")/.dashboard-package.XXXXXXXX")"
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/bundle/pkg"

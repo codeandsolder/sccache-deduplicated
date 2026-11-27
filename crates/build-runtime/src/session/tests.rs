@@ -21,7 +21,7 @@ async fn cancelled_async_commit_finishes_session_and_can_be_replayed() -> Result
         job: 42,
     };
     let NativeAdmission::Compile { ticket } =
-        service.admit(request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+        service.admit(None, request()?, worker, ActionMode::Reuse, BTreeMap::new())?
     else {
         bail!("expected compilation")
     };
@@ -166,7 +166,7 @@ fn concurrent_result_negotiation_keeps_one_reservation_and_rejects_changes() -> 
         job: 42,
     };
     let NativeAdmission::Compile { ticket } =
-        service.admit(request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+        service.admit(None, request()?, worker, ActionMode::Reuse, BTreeMap::new())?
     else {
         bail!("expected compilation")
     };
@@ -219,7 +219,7 @@ fn result_upload_saturation_is_retryable_and_does_not_consume_admission() -> Res
         job: 42,
     };
     let NativeAdmission::Compile { ticket } =
-        service.admit(request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+        service.admit(None, request()?, worker, ActionMode::Reuse, BTreeMap::new())?
     else {
         bail!("expected compilation")
     };
@@ -274,8 +274,13 @@ fn semantic_reuse_does_not_weaken_execution_verification() -> Result<()> {
         peer: test_peer(1),
         job: 42,
     };
-    let NativeAdmission::Compile { ticket } =
-        service.admit(first.clone(), worker, ActionMode::Reuse, BTreeMap::new())?
+    let NativeAdmission::Compile { ticket } = service.admit(
+        None,
+        first.clone(),
+        worker,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
     else {
         bail!("expected compilation")
     };
@@ -283,12 +288,13 @@ fn semantic_reuse_does_not_weaken_execution_verification() -> Result<()> {
     assert!(service.verify_execution(ticket, worker, &second).is_err());
     assert_eq!(
         service.admit(
+            None,
             second.clone(),
             Publisher::Client,
             ActionMode::Reuse,
             BTreeMap::new()
         )?,
-        NativeAdmission::InFlight
+        NativeAdmission::InFlight { producer: None }
     );
     let output = manifest(b"object");
     let blob = output.outputs["obj"].test_file_blob();
@@ -299,6 +305,7 @@ fn semantic_reuse_does_not_weaken_execution_verification() -> Result<()> {
         ticket: hit,
         manifest,
     } = service.admit(
+        None,
         second,
         Publisher::Client,
         ActionMode::Reuse,
@@ -326,6 +333,7 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
         job: 42,
     };
     let NativeAdmission::Compile { ticket } = service.admit(
+        None,
         request()?,
         worker,
         ActionMode::Reuse,
@@ -336,12 +344,13 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
     };
     assert_eq!(
         service.admit(
+            None,
             request()?,
             Publisher::Client,
             ActionMode::Reuse,
             std::collections::BTreeMap::new()
         )?,
-        NativeAdmission::InFlight
+        NativeAdmission::InFlight { producer: None }
     );
     let output = manifest(b"object");
     let blob = output.outputs["obj"].test_file_blob();
@@ -372,6 +381,7 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
         ticket: second,
         manifest,
     } = service.admit(
+        None,
         request()?,
         Publisher::Client,
         ActionMode::Reuse,
@@ -400,6 +410,7 @@ fn abandoned_and_failed_sessions_release_exclusive_compilation() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
     let NativeAdmission::Compile { ticket } = service.admit(
+        None,
         request()?,
         Publisher::Client,
         ActionMode::Reuse,
@@ -415,6 +426,7 @@ fn abandoned_and_failed_sessions_release_exclusive_compilation() -> Result<()> {
     assert_eq!(service.reap()?, 1);
     assert!(service.status(ticket).is_err());
     let NativeAdmission::Compile { ticket } = service.admit(
+        None,
         request()?,
         Publisher::Client,
         ActionMode::Reuse,
@@ -427,6 +439,7 @@ fn abandoned_and_failed_sessions_release_exclusive_compilation() -> Result<()> {
     assert_eq!(service.status(ticket)?, NativeStatus::Failed);
     assert!(matches!(
         service.admit(
+            None,
             request()?,
             Publisher::Client,
             ActionMode::Reuse,
@@ -442,6 +455,7 @@ fn result_contract_and_limits_control_publication() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
     let NativeAdmission::Compile { ticket } = service.admit(
+        None,
         request()?,
         Publisher::Client,
         ActionMode::Reuse,
@@ -465,6 +479,7 @@ fn result_contract_and_limits_control_publication() -> Result<()> {
     service.close(ticket, Publisher::Client)?;
     assert!(matches!(
         service.admit(
+            None,
             request()?,
             Publisher::Client,
             ActionMode::Reuse,
@@ -503,6 +518,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
     let NativeAdmission::Compile { ticket } = service.admit(
+        None,
         request()?,
         Publisher::Client,
         ActionMode::Reuse,
@@ -709,6 +725,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
         .components
         .insert("failed".into(), ContentId::of(b"failed"));
     let NativeAdmission::Compile { ticket } = service.admit(
+        None,
         failed.clone(),
         Publisher::Client,
         ActionMode::Reuse,
@@ -768,6 +785,7 @@ fn delegation_is_nonblocking_and_retries_early_worker_verification() -> Result<(
             ContentId::of(&[u8::from(accepted)]),
         );
         let NativeAdmission::Compile { ticket } = service.admit(
+            None,
             action.clone(),
             Publisher::Client,
             ActionMode::Reuse,
@@ -854,6 +872,7 @@ fn closing_during_assignment_cannot_resurrect_the_ticket() -> Result<()> {
     let service = service(dir.path())?;
     let action = request()?;
     let NativeAdmission::Compile { ticket } = service.admit(
+        None,
         action.clone(),
         Publisher::Client,
         ActionMode::Reuse,
@@ -904,6 +923,7 @@ fn closing_during_assignment_cannot_resurrect_the_ticket() -> Result<()> {
     assert!(service.status(ticket).is_err());
     assert!(matches!(
         service.admit(
+            None,
             action,
             Publisher::Client,
             ActionMode::Reuse,
@@ -920,6 +940,7 @@ fn failed_assignment_releases_intent_for_retry() -> Result<()> {
     let service = service(dir.path())?;
     let action = request()?;
     let NativeAdmission::Compile { ticket } = service.admit(
+        None,
         action.clone(),
         Publisher::Client,
         ActionMode::Reuse,
@@ -1053,6 +1074,7 @@ fn input_manifest_survives_scheduler_eviction_and_worker_fetch_is_scoped() -> Re
         job: 42,
     };
     let NativeAdmission::Compile { ticket } = service.admit(
+        None,
         request.clone(),
         worker,
         ActionMode::Reuse,
@@ -1141,6 +1163,7 @@ fn input_manifest_survives_scheduler_eviction_and_worker_fetch_is_scoped() -> Re
     );
     assert!(matches!(
         service.admit(
+            None,
             request,
             Publisher::Client,
             ActionMode::Reuse,
@@ -1156,6 +1179,7 @@ fn expiry_releases_action_even_when_a_transfer_retains_the_session() -> Result<(
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
     let NativeAdmission::Compile { ticket } = service.admit(
+        None,
         request()?,
         Publisher::Client,
         ActionMode::Reuse,
@@ -1170,6 +1194,7 @@ fn expiry_releases_action_even_when_a_transfer_retains_the_session() -> Result<(
     assert!(matches!(NativeSessions::lock(&held)?.phase, Phase::Failed));
     assert!(matches!(
         service.admit(
+            None,
             request()?,
             Publisher::Client,
             ActionMode::Reuse,
@@ -1190,6 +1215,7 @@ fn tree_result_contract_rejects_wrong_kinds_and_duplicate_logical_overflow() -> 
         .required_outputs
         .insert("obj".into(), OutputKind::Tree);
     let NativeAdmission::Compile { ticket } = service.admit(
+        None,
         request.clone(),
         Publisher::Client,
         ActionMode::Reuse,
@@ -1254,6 +1280,7 @@ fn tree_result_contract_rejects_wrong_kinds_and_duplicate_logical_overflow() -> 
     assert_eq!(service.commit(ticket, Publisher::Client)?, result);
     service.close(ticket, Publisher::Client)?;
     let NativeAdmission::Hit { ticket, manifest } = service.admit(
+        None,
         request,
         Publisher::Client,
         ActionMode::Reuse,
@@ -1364,6 +1391,7 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
     let service = service(dir.path())?;
     let client = Publisher::Client;
     let NativeAdmission::Compile { ticket: first } = service.admit(
+        None,
         request()?,
         client,
         ActionMode::Reuse,
@@ -1379,6 +1407,7 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
     service.commit(first, client)?;
 
     let NativeAdmission::Compile { ticket: failed } = service.admit(
+        None,
         request()?,
         client,
         ActionMode::Refresh,
@@ -1389,17 +1418,19 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
     };
     assert_eq!(
         service.admit(
+            None,
             request()?,
             client,
             ActionMode::Refresh,
             std::collections::BTreeMap::new()
         )?,
-        NativeAdmission::InFlight
+        NativeAdmission::InFlight { producer: None }
     );
     let NativeAdmission::Hit {
         ticket: reader,
         manifest: current,
     } = service.admit(
+        None,
         request()?,
         client,
         ActionMode::Reuse,
@@ -1413,6 +1444,7 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
     service.close(failed, client)?;
 
     let NativeAdmission::Compile { ticket: next } = service.admit(
+        None,
         request()?,
         client,
         ActionMode::Refresh,
@@ -1432,6 +1464,7 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
         ticket: latest,
         manifest: current,
     } = service.admit(
+        None,
         request()?,
         client,
         ActionMode::Reuse,
@@ -1516,12 +1549,19 @@ fn lazy_manifest_admission_and_cross_action_backfill_are_single_flight() -> Resu
         job: 2,
     };
     assert_eq!(
-        service.admit(first.clone(), worker1, ActionMode::Reuse, BTreeMap::new())?,
+        service.admit(
+            None,
+            first.clone(),
+            worker1,
+            ActionMode::Reuse,
+            BTreeMap::new()
+        )?,
         NativeAdmission::MissingInputs {
             trees: BTreeSet::from([id])
         }
     );
     let NativeAdmission::Compile { ticket: a } = service.admit(
+        None,
         first,
         worker1,
         ActionMode::Reuse,
@@ -1531,7 +1571,7 @@ fn lazy_manifest_admission_and_cross_action_backfill_are_single_flight() -> Resu
         bail!("metadata-only admission failed");
     };
     let NativeAdmission::Compile { ticket: b } =
-        service.admit(second, worker2, ActionMode::Reuse, BTreeMap::new())?
+        service.admit(None, second, worker2, ActionMode::Reuse, BTreeMap::new())?
     else {
         bail!("cached manifest admission failed");
     };
@@ -1648,6 +1688,7 @@ fn exercise_source_release(staged: bool) -> Result<()> {
         job: 1,
     };
     let NativeAdmission::Compile { ticket: a } = service.admit(
+        None,
         spec.clone(),
         worker,
         ActionMode::Reuse,
@@ -1660,7 +1701,7 @@ fn exercise_source_release(staged: bool) -> Result<()> {
         .components
         .insert("other".into(), ContentId::of(b"other"));
     let NativeAdmission::Compile { ticket: b } =
-        service.admit(spec, worker, ActionMode::Reuse, BTreeMap::new())?
+        service.admit(None, spec, worker, ActionMode::Reuse, BTreeMap::new())?
     else {
         bail!("second admission failed")
     };
@@ -1757,6 +1798,7 @@ async fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()>
     let peer = test_peer(1);
     let worker = Publisher::Worker { peer, job: 1 };
     let NativeAdmission::Compile { ticket } = service.admit(
+        None,
         spec,
         worker,
         ActionMode::Reuse,
@@ -1931,12 +1973,13 @@ async fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Resul
     for _ in 0..2 {
         assert_eq!(
             service.admit(
+                None,
                 req.clone(),
                 Publisher::Client,
                 ActionMode::Reuse,
                 BTreeMap::new()
             )?,
-            NativeAdmission::InFlight
+            NativeAdmission::InFlight { producer: None }
         );
     }
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1959,8 +2002,13 @@ async fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Resul
             .recover_next_result(Duration::ZERO, |_, _, _| async { unreachable!() })
             .await?
     );
-    let NativeAdmission::Hit { ticket, manifest } =
-        service.admit(req, Publisher::Client, ActionMode::Reuse, BTreeMap::new())?
+    let NativeAdmission::Hit { ticket, manifest } = service.admit(
+        None,
+        req,
+        Publisher::Client,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
     else {
         bail!("recovered result should be a hit");
     };
@@ -2009,12 +2057,13 @@ async fn failed_result_recovery_preserves_partial_content_and_allows_compilation
     store.collect_garbage(32)?;
     assert_eq!(
         service.admit(
+            None,
             req.clone(),
             Publisher::Client,
             ActionMode::Reuse,
             BTreeMap::new()
         )?,
-        NativeAdmission::InFlight
+        NativeAdmission::InFlight { producer: None }
     );
     assert!(
         service
@@ -2032,6 +2081,7 @@ async fn failed_result_recovery_preserves_partial_content_and_allows_compilation
     assert!(store.open_available_blob(missing)?.is_none());
     assert!(store.lookup(key)?.is_none());
     let NativeAdmission::Compile { ticket } = service.admit(
+        None,
         req.clone(),
         Publisher::Client,
         ActionMode::Reuse,
@@ -2041,8 +2091,13 @@ async fn failed_result_recovery_preserves_partial_content_and_allows_compilation
         bail!("failed recovery must permit a fresh build");
     };
     service.close(ticket, Publisher::Client)?;
-    let NativeAdmission::Compile { ticket } =
-        service.admit(req, Publisher::Client, ActionMode::Refresh, BTreeMap::new())?
+    let NativeAdmission::Compile { ticket } = service.admit(
+        None,
+        req,
+        Publisher::Client,
+        ActionMode::Refresh,
+        BTreeMap::new(),
+    )?
     else {
         bail!("explicit refresh must never use recovery");
     };
@@ -2129,6 +2184,7 @@ fn retention_group_survives_action_close_refresh_and_exceeds_action_slots() -> R
         let result = manifest(&bytes);
         let blob = result.outputs["obj"].test_file_blob();
         let NativeAdmission::Compile { ticket } = service.admit(
+            None,
             request()?,
             Publisher::Client,
             ActionMode::Refresh,
@@ -2193,7 +2249,7 @@ fn interrupted_incremental_upload_releases_claim_and_rejects_failed_finish() -> 
         job: 42,
     };
     let NativeAdmission::Compile { ticket } =
-        service.admit(request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+        service.admit(None, request()?, worker, ActionMode::Reuse, BTreeMap::new())?
     else {
         bail!("expected compilation")
     };

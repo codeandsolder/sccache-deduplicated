@@ -193,6 +193,21 @@ js 'window.routeRow=document.querySelector("#topology tbody tr"); window.routeCe
 control phase 6
 await_js 'return routeRow===document.querySelector("#topology tbody tr") && routeCell===routeRow.cells[3] && routePath===document.querySelector("#topology svg path[marker-end]") && routeCell.innerText!==oldRoute'
 
+select_tab Traces
+await_js 'return document.querySelector("#traces")?.innerText.includes("1 reported active") && document.querySelector("#traces")?.innerText.includes("fixture-traced-crate") && document.querySelector("#traces")?.innerText.includes("Fleet-wide phase latency")'
+js 'window.traceRow=document.querySelector("#traces tbody tr"); window.tracePhase=traceRow.cells[2]; return tracePhase.innerText==="hash_inputs"' | jq -e '.value==true' >/dev/null
+control phase 7
+await_js 'return traceRow===document.querySelector("#traces tbody tr") && tracePhase===traceRow.cells[2] && tracePhase.innerText==="wait_for_producer"'
+js 'traceRow.querySelector("a").click(); return true' >/dev/null
+await_js 'const detail=document.querySelector("#trace-detail"); return detail?.innerText.includes("fixture-traced-crate") && detail.innerText.includes("Action key:") && detail.innerText.includes("Latency attribution") && [...detail.querySelectorAll(".trace-breakdown tbody tr")].some(row=>row.innerText.includes("wait_for_producer")&&row.innerText.includes("60.000 ms")&&row.innerText.includes("60.0%")) && [...detail.querySelectorAll(".trace-breakdown tbody tr")].some(row=>row.innerText.includes("Unobserved")&&row.innerText.includes("10.000 ms")) && detail.querySelectorAll(".trace-waterfall tbody tr").length===4'
+js 'document.querySelector("#trace-detail .trace-waterfall a").click(); return true' >/dev/null
+await_js 'const detail=document.querySelector("#trace-detail"); return detail?.innerText.includes("fixture-producer") && detail.innerText.includes("clock skew or asynchronous completion") && detail.querySelectorAll(".trace-breakdown").length===2 && [...detail.querySelectorAll(".trace-breakdown tbody tr")].some(row=>row.innerText.includes("compiler_process")&&row.innerText.includes("50.000 ms")&&row.innerText.includes("62.5%"))'
+js 'const input=[...document.querySelectorAll("#traces label")].find(l=>l.textContent.includes("Revision (full SHA)")).querySelector("input"); input.value="wrong-revision"; input.dispatchEvent(new Event("input",{bubbles:true})); [...document.querySelectorAll("#traces button")].find(b=>b.textContent.includes("Search / refresh")).click(); return true' >/dev/null
+await_js 'return ![...document.querySelectorAll("#traces table")].some(t=>t.querySelector("thead")?.innerText.includes("Outcome")&&t.querySelector("tbody tr")) && document.querySelector("#traces").innerText.includes("Fleet-wide phase latency")'
+js 'const input=[...document.querySelectorAll("#traces label")].find(l=>l.textContent.includes("Revision (full SHA)")).querySelector("input"); input.value="0123456789abcdef0123456789abcdef01234567"; input.dispatchEvent(new Event("input",{bubbles:true})); [...document.querySelectorAll("#traces button")].find(b=>b.textContent.includes("Search / refresh")).click(); return true' >/dev/null
+await_js 'return [...document.querySelectorAll("#traces table")].some(t=>t.querySelector("thead")?.innerText.includes("Outcome")&&t.querySelector("tbody tr")?.innerText.includes("fixture-traced-crate"))'
+
+control phase 6
 select_tab "Cache hits"
 await_js 'return document.querySelector("#admission")?.innerText.includes("80.0%") && document.querySelectorAll("#metrics article").length===20 && [...document.querySelectorAll("#metrics article")].some(a=>a.querySelector("h3").textContent==="Cache hit rate (rolling)"&&a.innerText.includes("80.0%"))'
 await_js 'return [...document.querySelectorAll("#metrics select")[1].options].some(o=>o.value==="fixture-client")'

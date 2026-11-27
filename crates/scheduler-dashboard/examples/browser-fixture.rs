@@ -3,10 +3,16 @@
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, Query, State},
+    http::StatusCode,
     routing::{get, post},
 };
-use sccache_build::analytics::CacheDistribution;
+use sccache_build::{
+    PeerId,
+    analytics::CacheDistribution,
+    wire::{LiveTraceRequest, LiveTraceRow, LiveTraceSnapshot, TraceContext},
+};
 use sccache_dashboard::{
     AdmissionCounts, AnalyticsObservation, Cache, CacheSpace, HostInterface, HostRole, Job,
     JobDescription, NativeTelemetry, NativeWorker, NetworkGraph, NetworkHost, NetworkLink,
@@ -54,6 +60,16 @@ fn analytics() -> AnalyticsObservation {
     }
 }
 
+const REQUEST: TraceContext = TraceContext {
+    trace_id: [0x11; 16],
+    span_id: [0x33; 8],
+};
+const PRODUCER: TraceContext = TraceContext {
+    trace_id: [0x22; 16],
+    span_id: [0x44; 8],
+};
+const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+
 fn job(index: usize, phase: u64) -> Job {
     let status = match (index, phase) {
         (0, 0) => "Queued",
@@ -68,6 +84,7 @@ fn job(index: usize, phase: u64) -> Job {
         _ => 0,
     };
     Job {
+        trace_id: Some(PRODUCER.hex_id()),
         id: format!("fixture-job-{index}"),
         description: Some(JobDescription {
             executable: "rustc".into(),
@@ -200,6 +217,29 @@ fn snapshot(phase: u64) -> Snapshot {
 
 fn telemetry(phase: u64) -> NativeTelemetry {
     NativeTelemetry {
+        live_traces: Some(LiveTraceSnapshot {
+            active: 1,
+            rows: vec![LiveTraceRow {
+                peer: PeerId::from_digest([0x55; 32]),
+                instance: "fixture-client".into(),
+                observation_age_ms: 20,
+                request: LiveTraceRequest {
+                    trace: REQUEST,
+                    compiler: "rustc".into(),
+                    output: "fixture-traced-crate".into(),
+                    phase: if phase.is_multiple_of(2) {
+                        "hash_inputs".into()
+                    } else {
+                        "wait_for_producer".into()
+                    },
+                    elapsed_ms: 100 + phase,
+                    phase_age_ms: 60,
+                    worker: "fixture-worker".into(),
+                    job: None,
+                    producer: Some(PRODUCER),
+                },
+            }],
+        }),
         admission: Some(AdmissionCounts {
             hits: 80 + phase * 4,
             misses: 20 + phase,
@@ -281,6 +321,170 @@ fn metrics(State(fixture): State<Fixture>, Query(range): Query<Range>) -> Ready<
     ))
 }
 
+// A LogsQL-shaped fixture exercises the actual typed proxy, server functions,
+// SSR hydration and browser query/filter handling without a running database.
+const START: u64 = 1_795_788_000_000_000_000;
+
+fn trace_root(context: TraceContext) -> Value {
+    let output = if context == REQUEST {
+        "fixture-traced-crate"
+    } else {
+        "fixture-producer"
+    };
+    let span = if context == REQUEST {
+        "3333333333333333"
+    } else {
+        "4444444444444444"
+    };
+    json!({
+        "trace_id":context.hex_id(),"span_id":span,"name":"compile",
+        "duration":"100000000","start_time_unix_nano":START.to_string(),
+        "resource_attr:host.name":"fixture-client",
+        "resource_attr:service.name":"sccache-client",
+        "resource_attr:service.version":REVISION,
+        "span_attr:sccache.compiler":"rustc","span_attr:sccache.output":output,
+        "span_attr:sccache.outcome":"worker","span_attr:sccache.worker":"fixture-worker",
+        "span_attr:sccache.action_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    })
+}
+
+fn fixture_span(
+    id: &str,
+    parent: &str,
+    name: &str,
+    offset_ms: u64,
+    duration_ms: u64,
+    kind: &str,
+    worker: bool,
+) -> Value {
+    let (host, service) = if worker {
+        ("fixture-worker", "sccache-worker")
+    } else {
+        ("fixture-client", "sccache-client")
+    };
+    json!({
+        "span_id":id,"parent_span_id":parent,"name":name,
+        "duration":(duration_ms*1_000_000).to_string(),
+        "start_time_unix_nano":(START+offset_ms*1_000_000).to_string(),
+        "resource_attr:host.name":host,"resource_attr:service.name":service,
+        "resource_attr:service.version":REVISION,"span_attr:sccache.span_kind":kind,
+    })
+}
+
+fn trace_children(context: TraceContext) -> Vec<Value> {
+    let mut children = vec![trace_root(context)];
+    if context == REQUEST {
+        let parent = "3333333333333333";
+        let mut wait = fixture_span(
+            "6666666666666666",
+            parent,
+            "wait_for_producer",
+            30,
+            60,
+            "phase",
+            false,
+        );
+        wait["span_attr:sccache.producer_trace_id"] = json!(PRODUCER.hex_id());
+        children.extend([
+            fixture_span(
+                "5555555555555555",
+                parent,
+                "hash_inputs",
+                0,
+                30,
+                "phase",
+                false,
+            ),
+            wait,
+            fixture_span(
+                "7777777777777777",
+                parent,
+                "jobserver_wait",
+                0,
+                50,
+                "interval",
+                false,
+            ),
+        ]);
+    } else {
+        let parent = "4444444444444444";
+        let worker = "9999999999999999";
+        children.extend([
+            fixture_span(
+                "8888888888888888",
+                parent,
+                "run_distributed",
+                0,
+                100,
+                "phase",
+                false,
+            ),
+            fixture_span(worker, parent, "worker_job", 250, 80, "", true),
+            fixture_span(
+                "aaaaaaaaaaaaaaaa",
+                worker,
+                "prepare_sandbox",
+                250,
+                30,
+                "phase",
+                true,
+            ),
+            fixture_span(
+                "bbbbbbbbbbbbbbbb",
+                worker,
+                "compiler_process",
+                280,
+                50,
+                "phase",
+                true,
+            ),
+        ]);
+    }
+    children
+}
+
+fn trace_query(body: Bytes) -> Ready<(StatusCode, String)> {
+    let body: Vec<u8> = body.into();
+    let Some(query) = url::form_urlencoded::parse(&body)
+        .find_map(|(name, value)| (name == "query").then(|| value.into_owned()))
+    else {
+        return ready((StatusCode::BAD_REQUEST, "missing query".into()));
+    };
+    if query.ends_with(" | stats count() as count") {
+        return ready((StatusCode::OK, "{\"count\":\"1\"}\n".into()));
+    }
+    if !query.contains(" | uniq by (") {
+        return ready((
+            StatusCode::BAD_REQUEST,
+            "query must deduplicate replay".into(),
+        ));
+    }
+    let rows = if query.contains(" | stats by (") {
+        vec![
+            json!({"name":"hash_inputs","resource_attr:service.name":"sccache-client","resource_attr:host.name":"fixture-client","resource_attr:service.version":REVISION,"count":"1","bins":r#"[{"vmrange":"27830000...31620000","hits":1}]"#,"minimum":"30000000","maximum":"30000000","total":"30000000"}),
+        ]
+    } else if query.contains("trace_id:=") {
+        if query.contains(&REQUEST.hex_id()) {
+            trace_children(REQUEST)
+        } else if query.contains(&PRODUCER.hex_id()) {
+            trace_children(PRODUCER)
+        } else {
+            Vec::new()
+        }
+    } else if query.contains(r#""resource_attr:service.version":="#) && !query.contains(REVISION) {
+        Vec::new()
+    } else {
+        vec![trace_root(REQUEST)]
+    };
+    let mut body = rows
+        .into_iter()
+        .map(|row| row.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    body.push('\n');
+    ready((StatusCode::OK, body))
+}
+
 fn phase(State(fixture): State<Fixture>, Path(value): Path<u64>) -> Ready<()> {
     fixture.phase.store(value, Ordering::Relaxed);
     let _ = fixture.wake.try_send(());
@@ -318,6 +522,7 @@ async fn main() -> Result<()> {
     let api = Router::new()
         .route("/api/v1/label/instance/values", get(labels))
         .route("/api/v1/query_range", get(metrics))
+        .route("/select/logsql/query", post(trace_query))
         .route("/fixture/phase/{value}", post(phase))
         .route("/fixture/mode/{value}", post(mode))
         .route("/fixture/count", get(count))
@@ -331,8 +536,11 @@ async fn main() -> Result<()> {
     let dashboard = sccache_dashboard::server::spawn(
         SocketAddr::from(([127, 0, 0, 1], 0)),
         &assets,
-        Some(&base),
-        Some("fixture.example"),
+        sccache_dashboard::server::TelemetrySources {
+            metrics_url: Some(&base),
+            metrics_ingress_host: Some("fixture.example"),
+            traces_url: Some(&base),
+        },
         move || Ok(snapshot(snapshot_state.load(Ordering::Relaxed))),
         move || Some(telemetry(telemetry_state.load(Ordering::Relaxed))),
         receiver,

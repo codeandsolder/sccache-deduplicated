@@ -39,7 +39,7 @@ impl AdmissionCounters {
             Ok(NativeAdmission::Hit { .. }) => &self.hits,
             Ok(NativeAdmission::Compile { .. }) if mode == ActionMode::Refresh => &self.refreshes,
             Ok(NativeAdmission::Compile { .. }) => &self.misses,
-            Ok(NativeAdmission::InFlight) => &self.in_flight,
+            Ok(NativeAdmission::InFlight { .. }) => &self.in_flight,
             Ok(NativeAdmission::MissingInputs { .. }) => &self.missing_inputs,
             Err(error) if error.is::<super::NativeServiceBusy>() => &self.busy,
             Err(_) => &self.errors,
@@ -190,7 +190,7 @@ mod tests {
                     ticket: Ticket([0; 32]),
                 }),
             );
-            counters.record(mode, &Ok(NativeAdmission::InFlight));
+            counters.record(mode, &Ok(NativeAdmission::InFlight { producer: None }));
             counters.record(
                 mode,
                 &Ok(NativeAdmission::MissingInputs {

@@ -7,6 +7,7 @@ use std::{
 };
 
 pub const INPUTS: &[&str] = &[
+    "build.rs",
     "Cargo.toml",
     "Cargo.lock",
     "rust-toolchain.toml",

@@ -979,6 +979,7 @@ type ExtResult<T, E> = ::std::result::Result<T, E>;
 #[cfg(feature = "dist-server")]
 #[derive(Clone, Serialize, Deserialize)]
 pub struct NativeAssignment {
+    pub trace: Option<crate::latency_trace::TraceContext>,
     pub ticket: crate::build_runtime::wire::Ticket,
     pub spec: crate::build_runtime::ExecutionSpec,
     pub input_blobs: NativeInputBlobs,

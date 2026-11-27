@@ -37,8 +37,8 @@ pub struct NativeBuildPolicy {
     pub max_result_bytes: u64,
 }
 
-use crate::protocol::NativeBuildSource;
 use crate::server::activity::{self, Phase};
+use crate::{latency_trace::TraceContext, protocol::NativeBuildSource};
 
 /// Native compiler response after all declared results have been delivered.
 pub struct NativeBuildResult {
@@ -88,6 +88,7 @@ impl Read for InputBlob {
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) enum NativeProgress {
     Phase(Phase),
+    WaitForProducer(Option<TraceContext>),
     Assigned {
         job: u64,
         worker: crate::build_runtime::PeerId,
@@ -98,6 +99,7 @@ impl NativeProgress {
     pub(super) fn apply(self) {
         match self {
             Self::Phase(phase) => activity::phase(phase),
+            Self::WaitForProducer(producer) => activity::wait_for_producer(producer),
             Self::Assigned { job, worker } => {
                 activity::job(job, worker.to_string());
                 activity::phase(Phase::StageInputs);
@@ -107,6 +109,10 @@ impl NativeProgress {
 }
 
 pub(super) trait InputProvider {
+    fn trace_context(&self) -> Option<TraceContext> {
+        activity::trace_context()
+    }
+
     fn progress(&mut self, progress: NativeProgress) -> Result<()> {
         progress.apply();
         Ok(())
@@ -190,6 +196,7 @@ impl StagedOutput {
 pub(super) struct Pin<'a> {
     client: &'a NativeCacheClient,
     pub(super) ticket: Ticket,
+    trace: Option<TraceContext>,
     assigned: bool,
     selected: BTreeSet<String>,
     delivery: Option<ClientDeliveryObservation>,
@@ -211,7 +218,7 @@ impl Drop for Pin<'_> {
 /// lease, or returned compiler failure diagnostics without a cache entry.
 pub(super) enum Outcome<'a> {
     Ready {
-        delivery: Delivery<'a>,
+        delivery: Box<Delivery<'a>>,
         source: NativeBuildSource,
         manifest: ResultManifest,
     },
@@ -473,28 +480,42 @@ impl NativeCacheClient {
         inputs.progress(NativeProgress::Phase(Phase::CacheLookup))?;
         let start = Instant::now();
         let mut declared = BTreeMap::new();
+        let trace = inputs.trace_context();
+        let mut waiting = None;
 
         loop {
             ensure!(
                 start.elapsed() < policy.timeout,
                 "native admission timed out"
             );
-            match self.admit(spec, policy.mode, &declared)? {
+            let admission = self.admit(trace, spec, policy.mode, &declared)?;
+            if !matches!(admission, NativeAdmission::InFlight { .. }) && waiting.take().is_some() {
+                inputs.progress(NativeProgress::Phase(Phase::CacheLookup))?;
+            }
+            match admission {
                 NativeAdmission::Hit { ticket, manifest } => {
                     let pin = Pin {
                         client: self,
                         ticket,
+                        trace,
                         assigned: false,
                         selected: selected.clone(),
                         delivery: None,
                     };
                     return Ok(Outcome::Ready {
-                        delivery: Delivery::Scheduler(pin, None),
+                        delivery: Box::new(Delivery::Scheduler(pin, None)),
                         source: NativeBuildSource::Hit,
                         manifest,
                     });
                 }
-                NativeAdmission::InFlight => {
+                NativeAdmission::InFlight { producer } => {
+                    let producer = producer.filter(|producer| {
+                        trace.is_none_or(|own| own.trace_id != producer.trace_id)
+                    });
+                    if waiting != Some(producer) {
+                        inputs.progress(NativeProgress::WaitForProducer(producer))?;
+                        waiting = Some(producer);
+                    }
                     // No speculative duplicate compilation.
                     thread::sleep(
                         Duration::from_millis(50)
@@ -524,6 +545,7 @@ impl NativeCacheClient {
                     let pin = Pin {
                         client: self,
                         ticket,
+                        trace,
                         assigned: false,
                         selected: selected.clone(),
                         delivery: None,
@@ -545,7 +567,8 @@ impl NativeCacheClient {
         loop {
             let remaining = timeout.saturating_sub(start.elapsed());
             ensure!(!remaining.is_zero(), "native allocation deadline exceeded");
-            match self.schedule_selected(pin.ticket, spec.clone(), pin.selected.clone()) {
+            match self.schedule_selected(pin.trace, pin.ticket, spec.clone(), pin.selected.clone())
+            {
                 Ok(reply) => return Ok(reply),
                 Err(error) if retryable_transport_error(&error) => {
                     debug!("retrying native allocation: {error:#}");
@@ -645,7 +668,7 @@ impl NativeCacheClient {
                     max_result_bytes: policy.max_result_bytes,
                 };
                 return Ok(Outcome::Ready {
-                    delivery: Delivery::Scheduler(pin, Some(Box::new(publication))),
+                    delivery: Box::new(Delivery::Scheduler(pin, Some(Box::new(publication)))),
                     source,
                     manifest,
                 });
@@ -682,7 +705,7 @@ impl NativeCacheClient {
         // terminal response was lost, expired, or the worker restarted.
         match (self.status(pin.ticket), error) {
             (Ok(NativeStatus::Ready(manifest)), _) => Ok(Outcome::Ready {
-                delivery: Delivery::Scheduler(pin, None),
+                delivery: Box::new(Delivery::Scheduler(pin, None)),
                 source,
                 manifest,
             }),
@@ -802,7 +825,7 @@ impl NativeCacheClient {
             Ok(Outcome::Ready {
                 manifest: manifest.clone(),
                 source,
-                delivery: Delivery::Local(Box::new(captured), pin),
+                delivery: Box::new(Delivery::Local(Box::new(captured), pin)),
             })
         } else {
             Ok(Outcome::Failed {

@@ -194,6 +194,7 @@ mod tests {
 
     fn job(id: &str) -> Job {
         Job {
+            trace_id: None,
             id: id.into(),
             description: None,
             worker: "worker".into(),

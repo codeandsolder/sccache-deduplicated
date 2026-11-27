@@ -632,6 +632,7 @@ fn bind_server(
     storage: Arc<dyn Storage>,
     config: &Config,
 ) -> io::Result<(crate::net::SocketAddr, StartupRunner)> {
+    crate::latency_trace::configure(config.traces.as_ref()).map_err(io::Error::other)?;
     let compiler_aliases = config.compiler_aliases.clone();
     let compile_limits = config.compile_limits;
     #[cfg(target_os = "linux")]
@@ -784,7 +785,9 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     addr: bound_addr.to_string(),
                 },
             )?;
-            run(future::pending())?;
+            let result = run(future::pending());
+            crate::latency_trace::flush();
+            result?;
             Ok(())
         }
         Err(error) => {
@@ -938,6 +941,14 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             shared,
         } = self;
         let storage = Arc::clone(&service.storage);
+        #[cfg(all(target_os = "linux", feature = "dist-client"))]
+        let _live_traces = crate::latency_trace::instance()
+            .zip(service.dist_client.native.as_ref())
+            .map(|(instance, client)| {
+                tokio_util::task::AbortOnDropHandle::new(runtime.spawn(
+                    Arc::clone(&service.activities).report_live(Arc::clone(client), instance),
+                ))
+            });
         #[cfg(feature = "direct-metrics")]
         let telemetry_task = crate::telemetry::spawn(runtime.handle(), service.clone());
 
@@ -1574,7 +1585,7 @@ where
             let Message::WithoutBody(Request::ObservePhase(sample)) = request else {
                 bail!("unexpected request on compile observation connection");
             };
-            activity.observe(sample)?;
+            activity.observe(*sample)?;
             if let Some(reason) = activity.snapshot().deadline_error(self.compile_limits) {
                 send_ipc_frame(
                     sink,
@@ -1611,6 +1622,7 @@ where
                 .await?
             {
                 Message::WithoutBody(message) => {
+                    activity.outcome(activity::TraceOutcome::Uncacheable);
                     activity.phase(Phase::SendReply);
                     send_ipc_frame(sink, Frame::Message { message }).await?;
                 }
@@ -1620,6 +1632,9 @@ where
                         util::spawn(activity::inherit(body)).await?
                     });
                     let message = self.monitor_compile(activity, sink, body).await?;
+                    if let Response::CompileFinished(finished) = &message {
+                        activity.finished(finished);
+                    }
                     activity.phase(Phase::SendReply);
                     send_ipc_frame(sink, Frame::Body { chunk: message }).await?;
                 }
@@ -1628,6 +1643,7 @@ where
         }
         .await;
         if let Err(error) = result {
+            activity.outcome(activity::TraceOutcome::Abandoned);
             // The monitored future has been dropped. Some blocking I/O
             // may still finish, so the outcome is explicitly ambiguous.
             if !error.is::<IpcSendFailure>() {
@@ -1786,9 +1802,13 @@ where
                     bail!("unexpected body response from compile_direct")
                 };
                 self.storage.validate_session()?;
+                activity::finished(&finished);
                 Ok((resp, Some(finished)))
             }
-            Message::WithoutBody(Response::Compile(resp)) => Ok((resp, None)),
+            Message::WithoutBody(Response::Compile(resp)) => {
+                activity::outcome(activity::TraceOutcome::Uncacheable);
+                Ok((resp, None))
+            }
             _ => bail!("unexpected response from handle_compile in compile_direct"),
         }
     }
@@ -2112,12 +2132,14 @@ where
                             stats.cache_errors.increment(&kind, lang);
                         }
                         CompileResult::CacheHit(duration) => {
+                            activity::outcome(activity::TraceOutcome::Hit);
                             debug!("[{out_pretty}]: compile result: cache hit");
 
                             stats.cache_hits.increment(&kind, lang);
                             stats.cache_read_hit_duration += duration;
                         }
                         CompileResult::CacheMiss(miss_type, dt, duration, future) => {
+                            activity::outcome(activity::TraceOutcome::Miss);
                             debug!("[{out_pretty}]: compile result: cache miss");
                             dist_type = dt;
 
@@ -3308,7 +3330,7 @@ mod tests {
         time::advance(Duration::from_secs(15)).await;
         client
             .send(Bytes::from(bincode::serialize(&Request::ObservePhase(
-                local.snapshot(),
+                Box::new(local.snapshot()),
             ))?))
             .await?;
         let frame = client.next().await.context("observer update missing")??;
@@ -3328,7 +3350,7 @@ mod tests {
         assert!(service.activities.cancel(&id));
         client
             .send(Bytes::from(bincode::serialize(&Request::ObservePhase(
-                local.snapshot(),
+                Box::new(local.snapshot()),
             ))?))
             .await?;
         let frame = client

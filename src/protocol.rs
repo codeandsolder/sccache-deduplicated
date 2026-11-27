@@ -36,7 +36,7 @@ pub enum Request {
     /// Open a dedicated observation connection for a caller-owned compile.
     ObserveCompile(CompileIdentity),
     /// Report caller-monotonic phase ages on that connection.
-    ObservePhase(crate::server::activity::CompileActivity),
+    ObservePhase(Box<crate::server::activity::CompileActivity>),
 }
 
 /// A server response.

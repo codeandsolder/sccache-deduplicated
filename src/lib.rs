@@ -46,6 +46,7 @@ pub mod dist;
 #[cfg(feature = "http-client")]
 pub mod http_client;
 mod jobserver;
+pub mod latency_trace;
 pub mod lru_disk_cache;
 mod mock_command;
 mod net;
@@ -75,6 +76,13 @@ use std::env;
 /// This version is safe to be used in cache services to indicate the version
 /// that sccache ie.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Git commit embedded by the build script. Modified source trees are marked
+/// dirty; archives without Git provenance report unknown.
+pub const BUILD_REVISION: &str = include_str!(concat!(env!("OUT_DIR"), "/source-revision"));
+
+/// Human-readable package version and embedded source revision.
+pub const BUILD_VERSION: &str = include_str!(concat!(env!("OUT_DIR"), "/build-version"));
 
 /// Used to denote the environment variable that controls
 /// logging for sccache, and sccache-dist.

@@ -278,28 +278,47 @@ impl CompileObserver {
     }
 
     pub async fn run<T>(self, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let mut report = std::pin::pin!(self.report(finished));
         tokio::select! {
             biased;
-            result = self.report() => result.and_then(|()| Err(anyhow!("namespace observation ended prematurely"))),
-            result = crate::server::activity::scope(&self.activity, work) => result,
+            result = &mut report => result.and_then(|()| Err(anyhow!("namespace observation ended prematurely"))),
+            result = crate::server::activity::scope(&self.activity, work) => {
+                // Short invocations finish before the first heartbeat. Send
+                // the complete timeline, not just its last observed phase.
+                if result.is_err() {
+                    self.activity.outcome(crate::server::activity::TraceOutcome::Failed);
+                }
+                let _ = finish.send(());
+                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(1), report).await, Ok(Ok(()))) {
+                    log::warn!("final namespace compile observation unavailable");
+                }
+                result
+            },
         }
     }
 
-    async fn report(&self) -> Result<()> {
+    async fn report(&self, mut finished: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
         let interval = crate::server::activity::HEARTBEAT_INTERVAL;
         let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            ticker.tick().await;
+            let done = tokio::select! {
+                _ = ticker.tick() => false,
+                _ = &mut finished => true,
+            };
             let observation = self.activity.snapshot();
             let response = connection_task(Arc::clone(&self.connection), move |connection| {
-                connection.request(Request::ObservePhase(observation))
+                connection.request(Request::ObservePhase(Box::new(observation)))
             })
             .await?;
             ensure!(
                 matches!(response, Response::ObservationAccepted),
                 "unexpected namespace compile observation reply"
             );
+            if done {
+                return Ok(());
+            }
         }
     }
 }
@@ -361,6 +380,7 @@ mod test {
             compiler_children: 0,
             distributed_job: Some(42),
             worker: Some("worker".into()),
+            trace: crate::server::activity::TraceHistory::new(),
         };
         util::write_length_prefixed_bincode(
             &mut server,

@@ -286,6 +286,9 @@ fn project_job(
         },
     );
     Job {
+        trace_id: detail
+            .and_then(|detail| detail.trace)
+            .map(sccache::latency_trace::TraceContext::hex_id),
         id: job_id.to_string(),
         description: details
             .jobs_assigned
