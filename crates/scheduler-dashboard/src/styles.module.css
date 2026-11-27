@@ -129,3 +129,29 @@ html { scrollbar-gutter: stable; }
 #admission th:first-child { width: 21%; }
 #admission td { height: 3.8rem; }
 .input_progress { width: 100%; height: .55rem; margin-top: .35rem; accent-color: var(--accent); }
+
+/* Each trace view owns its scrollport. Streaming live rows must never
+   reposition history, the selected trace, or surrounding controls. */
+.trace_tabs { display: flex; gap: .35rem; overflow-x: auto; margin-bottom: .8rem; }
+.trace_pane {
+    height: clamp(18rem, 65vh, 60rem);
+    min-width: 0;
+    overflow: auto;
+    scrollbar-gutter: stable;
+    overscroll-behavior: contain;
+}
+#trace-active-requests table, #trace-active-jobs table, #trace-completed table, #trace-phases table {
+    table-layout: fixed;
+    min-width: 1050px;
+}
+#trace-active-jobs table { min-width: 800px; }
+#trace-active-requests th:nth-child(2), #trace-completed th:nth-child(4) { width: 20%; }
+#trace-active-jobs th:first-child { width: 26%; }
+#trace-active-requests td, #trace-active-jobs td, #trace-completed td, #trace-phases td {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+#trace-active-requests td a + a { margin-left: .5rem; }
+.trace_pane thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+#trace-active-requests th:last-child { width: 10rem; }

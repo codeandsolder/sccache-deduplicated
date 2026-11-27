@@ -45,12 +45,70 @@ fn revision_label(revision: &str) -> String {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TraceView {
+    Completed,
+    Clients,
+    Jobs,
+    Phases,
+    Detail,
+}
+
+impl TraceView {
+    const ALL: [Self; 5] = [
+        Self::Completed,
+        Self::Clients,
+        Self::Jobs,
+        Self::Phases,
+        Self::Detail,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Completed => "Completed requests",
+            Self::Clients => "Active requests",
+            Self::Jobs => "Active jobs",
+            Self::Phases => "Phase latency",
+            Self::Detail => "Request detail",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TraceNavigation {
+    view: RwSignal<TraceView>,
+    previous: RwSignal<TraceView>,
+    selected: RwSignal<String>,
+    lookup: RwSignal<String>,
+}
+
+impl TraceNavigation {
+    fn open(self, id: String) {
+        let current = self.view.get_untracked();
+        if current != TraceView::Detail {
+            self.previous.set(current);
+        }
+        self.lookup.set(id.clone());
+        self.selected.set(id);
+        self.view.set(TraceView::Detail);
+    }
+
+    fn select(self, view: TraceView) {
+        if view == TraceView::Detail {
+            let current = self.view.get_untracked();
+            if current != TraceView::Detail {
+                self.previous.set(current);
+            }
+        }
+        self.view.set(view);
+    }
+}
+
 fn span_row(
     span: TraceSpan,
     start: u64,
     extent: u64,
-    selected: RwSignal<String>,
-    lookup: RwSignal<String>,
+    navigation: TraceNavigation,
 ) -> impl IntoView {
     let offset = span.start_ns.saturating_sub(start);
     let x = u128::from(offset) * 100_000 / u128::from(extent);
@@ -80,7 +138,7 @@ fn span_row(
     view! {
         <tr>
             <td>{span.host}" / "{span.name}
-                {span.producer.map(|id| view!{<a href="#trace-detail" on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Producer"</a>})}
+                {span.producer.map(|id| view!{<a href="#trace-detail" on:click=move |ev| {ev.prevent_default(); navigation.open(id.clone());}>"Producer"</a>})}
             </td>
             <td>{kind}</td>
             <td>{ms(span.duration_ns)}</td>
@@ -122,11 +180,7 @@ fn breakdown_view(part: PhaseBreakdown) -> impl IntoView {
 }
 
 #[component]
-fn Timeline(
-    detail: TraceDetail,
-    selected: RwSignal<String>,
-    lookup: RwSignal<String>,
-) -> impl IntoView {
+fn Timeline(detail: TraceDetail, navigation: TraceNavigation) -> impl IntoView {
     let start = detail
         .spans
         .iter()
@@ -169,18 +223,14 @@ fn Timeline(
             {detail.truncated.then(|| view!{<p class=styles::warning>"Span limit reached."</p>})}
             {skew.then(|| view!{<p class=styles::warning>"Spans extend outside the client interval: clock skew or asynchronous completion."</p>})}
             <table class="trace-waterfall"><thead><tr><th>"Host / phase"</th><th>"Kind"</th><th>"Elapsed"</th><th>"Timeline"</th></tr></thead>
-                <tbody>{detail.spans.into_iter().map(|span| span_row(span,start,extent,selected,lookup)).collect_view()}</tbody>
+                <tbody>{detail.spans.into_iter().map(|span| span_row(span,start,extent,navigation)).collect_view()}</tbody>
             </table>
         </article>
     }
 }
 
 #[component]
-fn LiveRequests(
-    data: super::DashboardSource,
-    lookup: RwSignal<String>,
-    selected: RwSignal<String>,
-) -> impl IntoView {
+fn LiveRequests(data: super::DashboardSource, navigation: TraceNavigation) -> impl IntoView {
     let report = data.project(super::Projection::Telemetry, |data| {
         data.and_then(|data| data.telemetry.as_ref())
             .and_then(|telemetry| telemetry.live_traces.clone())
@@ -207,45 +257,26 @@ fn LiveRequests(
                 let row=Memo::new(move |_| rows.with(|rows| rows.get(&key).cloned()));
                 view! {<tr>
                     <td>{move || row.with(|row| row.as_ref().map(|row|row.instance.clone()))}</td>
-                    <td>{move || row.with(|row| row.as_ref().map(|row|format!("{} / {}",row.request.compiler,row.request.output)))}</td>
+                    <td title=move || row.with(|row| row.as_ref().map(|row|format!("{} / {}",row.request.compiler,row.request.output)))>{move || row.with(|row| row.as_ref().map(|row|format!("{} / {}",row.request.compiler,row.request.output)))}</td>
                     <td>{move || row.with(|row| row.as_ref().map(|row|row.request.phase.clone()))}</td>
                     <td>{move || row.with(|row| row.as_ref().map(|row|format!("{} ms",row.request.phase_age_ms)))}</td>
                     <td>{move || row.with(|row| row.as_ref().map(|row|format!("{} ms",row.request.elapsed_ms)))}</td>
                     <td>{move || row.with(|row| row.as_ref().map(|row|row.request.worker.clone()))}</td>
                     <td>{move || row.with(|row| row.as_ref().map(|row|format!("{} ms",row.observation_age_ms)))}</td>
-                    <td><a href="#trace-detail" on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Inspect"</a>
+                    <td><a href="#trace-detail" on:click=move |ev| {ev.prevent_default(); navigation.open(id.clone());}>"Inspect"</a>
                         {move || row.with(|row| row.as_ref().and_then(|row|row.request.producer)).map(|producer| {
                             let id=producer.hex_id();
-                            view!{<a href="#trace-detail" on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Producer"</a>}
+                            view!{<a href="#trace-detail" on:click=move |ev| {ev.prevent_default(); navigation.open(id.clone());}>"Producer"</a>}
                         })}
                     </td>
                 </tr>}
             }/></tbody>
         </table>
-    }
+    }.into_any()
 }
 
 #[component]
-pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
-    let filters = RwSignal::new(TraceSearch::default());
-    let applied = RwSignal::new(TraceSearch::default());
-    let revision = RwSignal::new(0_u64);
-    let selected = RwSignal::new(String::new());
-    let lookup = RwSignal::new(String::new());
-    let overview = Resource::new(
-        move || (applied.get(), revision.get()),
-        |(query, _)| load_trace_search(query),
-    );
-    let detail = Resource::new(
-        move || (selected.get(), revision.get()),
-        |(id, _)| async move {
-            if id.is_empty() {
-                Ok(None)
-            } else {
-                load_trace_detail(id).await.map(Some)
-            }
-        },
-    );
+fn LiveJobs(data: super::DashboardSource, navigation: TraceNavigation) -> impl IntoView {
     let jobs = data.project(super::Projection::Jobs, |data| {
         data.and_then(|data| data.snapshot.as_ref())
             .map_or_else(Vec::new, |snapshot| snapshot.jobs.clone())
@@ -253,9 +284,6 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
     let job_rows = super::keyed_index(jobs, |job| &job.id);
     let job_keys = super::index_keys(job_rows);
     view! {
-        <section id="traces">
-            <h2>"Request traces"</h2>
-            <LiveRequests data=data lookup=lookup selected=selected/>
             <h3>"Active distributed jobs"</h3>
             <p class=styles::muted>"Live scheduler state; worker jobs may outlive the client request. Completed spans become available in trace storage."</p>
             <table><thead><tr><th>"Job"</th><th>"Worker"</th><th>"Phase"</th><th>"Phase elapsed"</th><th>"Trace"</th></tr></thead>
@@ -266,10 +294,22 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
                         <td>{move || row.with(|job| job.as_ref().map(|job| job.worker.clone()))}</td>
                         <td>{move || row.with(|job| job.as_ref().map(|job| job.native_phase.clone().unwrap_or_else(|| job.state.clone())))}</td>
                         <td>{move || row.with(|job| job.as_ref().and_then(|job| job.native_phase_observed_ns).map_or_else(|| "—".into(), ms))}</td>
-                        <td>{move || row.with(|job| job.as_ref().and_then(|job| job.trace_id.clone())).map(|id| view!{<a href="#trace-detail" on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Inspect"</a>})}</td>
+                        <td>{move || row.with(|job| job.as_ref().and_then(|job| job.trace_id.clone())).map(|id| view!{<a href="#trace-detail" on:click=move |ev| {ev.prevent_default(); navigation.open(id.clone());}>"Inspect"</a>})}</td>
                     </tr>}
                 }/></tbody>
             </table>
+    }.into_any()
+}
+
+#[component]
+fn TraceSearchControls(
+    filters: RwSignal<TraceSearch>,
+    applied: RwSignal<TraceSearch>,
+    revision: RwSignal<u64>,
+    navigation: TraceNavigation,
+) -> impl IntoView {
+    view! {
+            <div hidden=move || !matches!(navigation.view.get(), TraceView::Completed | TraceView::Phases)>
             <div class=styles::controls>
                 <label>"Range"<select on:change=move |ev| filters.update(|f| f.lookback_secs = event_target_value(&ev).parse().unwrap_or(3600))>
                     <option value="300">"5 minutes"</option><option value="3600" selected=true>"1 hour"</option><option value="86400">"1 day"</option><option value="604800">"7 days"</option>
@@ -282,31 +322,84 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
                 <label>"Order"<select on:change=move |ev| filters.update(|f| f.slowest=event_target_value(&ev)=="slow")><option value="slow">"Slowest"</option><option value="recent">"Recent"</option></select></label>
                 <button on:click=move |_| { applied.set(filters.get()); revision.update(|n| *n=n.wrapping_add(1)); }>"Search / refresh"</button>
             </div>
-            <div class=styles::controls><label>"Trace ID"<input prop:value=move || lookup.get() on:input=move |ev| lookup.set(event_target_value(&ev))/></label>
-                <button on:click=move |_| selected.set(lookup.get())>"Open"</button>
             </div>
-            <div id="trace-detail">
+    }.into_any()
+}
+
+#[component]
+pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
+    let filters = RwSignal::new(TraceSearch::default());
+    let applied = RwSignal::new(TraceSearch::default());
+    let revision = RwSignal::new(0_u64);
+    let navigation = TraceNavigation {
+        view: RwSignal::new(TraceView::Completed),
+        previous: RwSignal::new(TraceView::Completed),
+        selected: RwSignal::new(String::new()),
+        lookup: RwSignal::new(String::new()),
+    };
+    let detail_revision = RwSignal::new(0_u64);
+    let overview = Resource::new(
+        move || (applied.get(), revision.get()),
+        |(query, _)| load_trace_search(query),
+    );
+    let detail = Resource::new(
+        move || (navigation.selected.get(), detail_revision.get()),
+        |(id, _)| async move {
+            if id.is_empty() {
+                Ok(None)
+            } else {
+                load_trace_detail(id).await.map(Some)
+            }
+        },
+    );
+    view! {
+        <section id="traces">
+            <h2>"Request traces"</h2>
+            <div class=styles::trace_tabs role="group" aria-label="Trace views">
+                {TraceView::ALL.into_iter().map(|tab| view! {
+                    <button class=styles::tab aria-pressed=move || (navigation.view.get() == tab).to_string()
+                        on:click=move |_| navigation.select(tab)>{tab.label()}</button>
+                }).collect_view()}
+            </div>
+            <TraceSearchControls filters=filters applied=applied revision=revision navigation=navigation/>
+            <div class=styles::controls><label>"Trace ID"<input prop:value=move || navigation.lookup.get() on:input=move |ev| navigation.lookup.set(event_target_value(&ev))/></label>
+                <button on:click=move |_| navigation.open(navigation.lookup.get_untracked())>"Open"</button>
+                <button hidden=move || navigation.view.get() != TraceView::Detail on:click=move |_| navigation.select(navigation.previous.get_untracked())>"Back to list"</button>
+                <button hidden=move || navigation.view.get() != TraceView::Detail on:click=move |_| detail_revision.update(|n| *n=n.wrapping_add(1))>"Refresh detail"</button>
+            </div>
+            <div class=styles::trace_pane id="trace-active-requests" hidden=move || navigation.view.get() != TraceView::Clients>
+                <LiveRequests data=data navigation=navigation/>
+            </div>
+            <div class=styles::trace_pane id="trace-active-jobs" hidden=move || navigation.view.get() != TraceView::Jobs>
+                <LiveJobs data=data navigation=navigation/>
+            </div>
+            {view!{<div id="trace-detail" class=styles::trace_pane hidden=move || navigation.view.get() != TraceView::Detail>
             <Suspense fallback=|| view!{<p>"Loading timeline…"</p>}>
                 {move || detail.get().map(|result| match result {
-                    Ok(Some(detail)) => view!{<Timeline detail=detail selected=selected lookup=lookup/>}.into_any(),
-                    Ok(None) => ().into_any(),
+                    Ok(Some(detail)) => view!{<Timeline detail=detail navigation=navigation/>}.into_any(),
+                    Ok(None) => view!{<p class=styles::muted>"Select a request or open a trace ID."</p>}.into_any(),
                     Err(error) => view!{<p class=styles::warning>{error.to_string()}</p>}.into_any(),
                 })}
             </Suspense>
-            </div>
-            <Suspense fallback=|| view!{<p>"Loading traces…"</p>}>
+            </div>}.into_any()}
+            <Suspense fallback=move || view!{<p hidden=move || !matches!(navigation.view.get(), TraceView::Completed | TraceView::Phases)>"Loading traces…"</p>}>
                 {move || overview.get().map(|result| match result {
-                    Err(error) => view!{<p class=styles::warning>{error.to_string()}</p>}.into_any(),
+                    Err(error) => view!{<p hidden=move || !matches!(navigation.view.get(), TraceView::Completed | TraceView::Phases) class=styles::warning>{error.to_string()}</p>}.into_any(),
                     Ok(data) => view!{
+                        <div id="trace-completed" class=styles::trace_pane hidden=move || navigation.view.get() != TraceView::Completed>
                         <p class=styles::muted>"At most 100 completed requests. New spans may take a few seconds to appear."</p>
                         {data.trace_error.map(|error| view!{<p class=styles::warning>{error}</p>})}
                         <table><thead><tr><th>"Host"</th><th>"Revision"</th><th>"Compiler"</th><th>"Output"</th><th>"Outcome"</th><th>"Elapsed"</th><th>"Worker"</th><th>"Trace"</th></tr></thead>
                             <tbody>{data.traces.into_iter().map(|row| {
                                 let id=row.id.clone();
-                                view!{<tr><td>{row.host}</td><td title=row.revision.clone()>{revision_label(&row.revision)}</td><td>{row.compiler}</td><td>{row.output}</td><td>{row.outcome}</td><td>{ms(row.duration_ns)}</td><td>{row.worker}</td>
-                                    <td><a href="#trace-detail" on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Inspect"</a></td></tr>}
+                                let output_title=row.output.clone();
+                                let worker_title=row.worker.clone();
+                                view!{<tr><td>{row.host}</td><td title=row.revision.clone()>{revision_label(&row.revision)}</td><td>{row.compiler}</td><td title=output_title>{row.output}</td><td>{row.outcome}</td><td>{ms(row.duration_ns)}</td><td title=worker_title>{row.worker}</td>
+                                    <td><a href="#trace-detail" on:click=move |ev| {ev.prevent_default(); navigation.open(id.clone());}>"Inspect"</a></td></tr>}
                             }).collect_view()}</tbody>
                         </table>
+                        </div>
+                        <div id="trace-phases" class=styles::trace_pane hidden=move || navigation.view.get() != TraceView::Phases>
                         <h3>"Fleet-wide phase latency"</h3>
                         <p class=styles::muted>"Grouped by phase, service, host and version over the selected range. Other filters apply only to the request list. Percentiles are histogram estimates; counts and cumulative elapsed time use deduplicated observations."</p>
                         {data.phase_error.map(|error| view!{<p class=styles::warning>{error}</p>})}
@@ -316,6 +409,7 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
                                 <td>{format!("{:.3}",row.p50_ns/1e6)}</td><td>{format!("{:.3}",row.p95_ns/1e6)}</td><td>{format!("{:.3}",row.p99_ns/1e6)}</td><td>{format!("{:.3}",row.total_ns/1e9)}</td></tr>
                             }).collect_view()}</tbody>
                         </table>
+                        </div>
                     }.into_any(),
                 })}
             </Suspense>
