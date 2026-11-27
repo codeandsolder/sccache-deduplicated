@@ -523,15 +523,7 @@ impl StageBudget {
             .size
             .checked_add(1)
             .context("blob length overflow")?;
-        ensure!(
-            expected.size <= self.reserved,
-            "blob exceeds reserved staging headroom"
-        );
-        self.reserved -= expected.size;
-        let child = Self {
-            store: self.store.clone(),
-            reserved: expected.size,
-        };
+        let child = self.split(expected.size)?;
         let staged =
             self.store
                 .stage_local_inner(reader.take(limit), Some(expected.size), child)?;
@@ -545,6 +537,67 @@ impl StageBudget {
         );
         ensure!(actual.id == expected.id, super::BlobIntegrityError::Digest);
         Ok(staged)
+    }
+
+    fn split(&mut self, size: u64) -> Result<Self> {
+        ensure!(
+            size <= self.reserved,
+            "blob exceeds reserved staging headroom"
+        );
+        self.reserved -= size;
+        Ok(Self {
+            store: self.store.clone(),
+            reserved: size,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn belongs_to(&self, store: &NativeStore) -> bool {
+        Arc::ptr_eq(&self.store.inner, &store.inner)
+    }
+
+    /// Encode and hash a private compiler output straight into its CAS inode.
+    /// Durability is deferred until publication, outside compiler admission.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn stage_capture(
+        &mut self,
+        size: u64,
+        reader: impl std::io::Read,
+    ) -> Result<super::CapturedStage> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let budget = self.split(size)?;
+        let limit = size.checked_add(1).context("blob length overflow")?;
+        let mut file = tempfile::NamedTempFile::new_in(self.store.inner.root.join("staging"))?;
+        let encoding = self.store.physical_encoding();
+        let reader = reader.take(limit);
+        let reference = match encoding {
+            crate::BlobEncoding::Raw => {
+                crate::encode_native_raw_blob(reader, file.as_file_mut(), Some(size))?
+            }
+            crate::BlobEncoding::ZstdChunks => {
+                crate::encode_native_blob(reader, file.as_file_mut(), Some(size))?
+            }
+        };
+        ensure!(
+            reference.size == size,
+            super::BlobIntegrityError::Length {
+                expected: size,
+                actual: reference.size
+            }
+        );
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o400))?;
+        let metadata = file.as_file().metadata()?;
+        let stage = super::StagedBlob {
+            path: file.into_temp_path(),
+            metadata,
+            reference,
+            encoding,
+            owner: Arc::clone(&self.store.inner),
+            _reservation: budget.finish(size)?,
+        };
+        let file = Arc::new(stage.open_file()?);
+        Ok(super::CapturedStage { stage, file })
     }
 
     pub(super) fn grow_to(&mut self, size: u64) -> Result<()> {

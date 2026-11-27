@@ -228,6 +228,45 @@ pub struct StagedBlob {
     _reservation: space::StagingReservation,
 }
 
+/// A captured compiler output in its final physical representation.
+/// Publication cannot consume the staged blob until its bytes are durable.
+#[cfg(target_os = "linux")]
+pub(crate) struct CapturedStage {
+    stage: StagedBlob,
+    file: Arc<File>,
+}
+
+#[cfg(target_os = "linux")]
+impl CapturedStage {
+    pub(crate) const fn reference(&self) -> BlobRef {
+        self.stage.reference()
+    }
+
+    pub(crate) fn file(&self) -> Arc<File> {
+        Arc::clone(&self.file)
+    }
+
+    pub(crate) async fn seal(self) -> Result<StagedBlob> {
+        let Self { stage, file } = self;
+        #[cfg(feature = "async-io")]
+        {
+            crate::disk::run(move || async move {
+                crate::disk::sync_all(file).await?;
+                Ok(stage)
+            })
+            .await
+        }
+        #[cfg(not(feature = "async-io"))]
+        {
+            tokio::task::spawn_blocking(move || {
+                file.sync_all()?;
+                Ok(stage)
+            })
+            .await?
+        }
+    }
+}
+
 /// An admitted staging file and its incremental verifier. No I/O is
 /// performed until the caller supplies bytes, so asynchronous transports
 /// can move it between short blocking-pool operations.
