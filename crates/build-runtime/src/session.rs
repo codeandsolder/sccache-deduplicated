@@ -773,6 +773,7 @@ impl ScheduleReservation {
 /// Independent uploads stream without holding their session lock.
 pub struct NativeSessions {
     coordinator: BuildCoordinator,
+    admission_counters: telemetry::AdmissionCounters,
     limits: SessionLimits,
     sessions: Mutex<HashMap<Ticket, SharedSession>>,
     retained: retention::RetentionGroups,
@@ -832,6 +833,7 @@ impl NativeSessions {
         store.enable_result_history(u64::try_from(limits.max_manifest_cache_bytes)?)?;
         Ok(Self {
             coordinator: BuildCoordinator::new(store),
+            admission_counters: telemetry::AdmissionCounters::default(),
             limits,
             sessions: Mutex::new(HashMap::new()),
             retained: retention::RetentionGroups::default(),
@@ -1094,6 +1096,18 @@ impl NativeSessions {
     pub fn admit(
         &self,
         trace: Option<crate::wire::TraceContext>,
+        request: ActionRequest,
+        publisher: Publisher,
+        mode: ActionMode,
+        declared: BTreeMap<TreeId, TreeManifest>,
+    ) -> Result<NativeAdmission> {
+        let result = self.admit_inner(request, publisher, mode, declared);
+        self.admission_counters.record(mode, &result);
+        result
+    }
+
+    fn admit_inner(
+        &self,
         request: ActionRequest,
         publisher: Publisher,
         mode: ActionMode,
@@ -2645,7 +2659,7 @@ mod live;
 mod recovery;
 mod retention;
 mod telemetry;
-pub use telemetry::{ManifestStatus, RecoveryStatus, SessionStatus, TicketStatus};
+pub use telemetry::{AdmissionStats, ManifestStatus, RecoveryStatus, SessionStatus, TicketStatus};
 
 #[cfg(test)]
 mod tests;

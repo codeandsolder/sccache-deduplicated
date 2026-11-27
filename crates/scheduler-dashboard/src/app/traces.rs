@@ -111,16 +111,13 @@ fn Timeline(
 
 #[component]
 fn LiveRequests(
-    data: Memo<Option<crate::DashboardData>>,
+    data: super::DashboardSource,
     lookup: RwSignal<String>,
     selected: RwSignal<String>,
 ) -> impl IntoView {
-    let report = Memo::new(move |_| {
-        data.with(|data| {
-            data.as_ref()
-                .and_then(|data| data.telemetry.as_ref())
-                .and_then(|telemetry| telemetry.live_traces.clone())
-        })
+    let report = data.project(super::Projection::Telemetry, |data| {
+        data.and_then(|data| data.telemetry.as_ref())
+            .and_then(|telemetry| telemetry.live_traces.clone())
     });
     let rows = Memo::new(move |_| {
         report.with(|report| {
@@ -163,7 +160,7 @@ fn LiveRequests(
 }
 
 #[component]
-pub(super) fn TracePanel(data: Memo<Option<crate::DashboardData>>) -> impl IntoView {
+pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
     let filters = RwSignal::new(TraceSearch::default());
     let applied = RwSignal::new(TraceSearch::default());
     let revision = RwSignal::new(0_u64);
@@ -183,6 +180,12 @@ pub(super) fn TracePanel(data: Memo<Option<crate::DashboardData>>) -> impl IntoV
             }
         },
     );
+    let jobs = data.project(super::Projection::Jobs, |data| {
+        data.and_then(|data| data.snapshot.as_ref())
+            .map_or_else(Vec::new, |snapshot| snapshot.jobs.clone())
+    });
+    let job_rows = super::keyed_index(jobs, |job| &job.id);
+    let job_keys = super::index_keys(job_rows);
     view! {
         <section id="traces">
             <h2>"Request traces"</h2>
@@ -190,13 +193,16 @@ pub(super) fn TracePanel(data: Memo<Option<crate::DashboardData>>) -> impl IntoV
             <h3>"Active distributed jobs"</h3>
             <p class=styles::muted>"Live scheduler state; worker jobs may outlive the client request. Completed spans become available in trace storage."</p>
             <table><thead><tr><th>"Job"</th><th>"Worker"</th><th>"Phase"</th><th>"Phase elapsed"</th><th>"Trace"</th></tr></thead>
-                <tbody>{move || data.get().and_then(|data| data.snapshot).map(|snapshot| snapshot.jobs.into_iter().map(|job| {
-                    let trace = job.trace_id;
-                    view!{<tr><td>{job.id}</td><td>{job.worker}</td>
-                        <td>{job.native_phase.unwrap_or(job.state)}</td>
-                        <td>{job.native_phase_observed_ns.map_or_else(|| "—".into(), ms)}</td>
-                        <td>{trace.map(|id| view!{<button on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Inspect"</button>})}</td></tr>}
-                }).collect_view())}</tbody>
+                <tbody><For each=move || job_keys.get() key=Clone::clone children=move |id| {
+                    let key=id.clone();
+                    let row=Memo::new(move |_| job_rows.with(|rows| rows.get(&key).cloned()));
+                    view!{<tr><td>{id}</td>
+                        <td>{move || row.with(|job| job.as_ref().map(|job| job.worker.clone()))}</td>
+                        <td>{move || row.with(|job| job.as_ref().map(|job| job.native_phase.clone().unwrap_or_else(|| job.state.clone())))}</td>
+                        <td>{move || row.with(|job| job.as_ref().and_then(|job| job.native_phase_observed_ns).map_or_else(|| "—".into(), ms))}</td>
+                        <td>{move || row.with(|job| job.as_ref().and_then(|job| job.trace_id.clone())).map(|id| view!{<button on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Inspect"</button>})}</td>
+                    </tr>}
+                }/></tbody>
             </table>
             <div class=styles::controls>
                 <label>"Range"<select on:change=move |ev| filters.update(|f| f.lookback_secs = event_target_value(&ev).parse().unwrap_or(3600))>

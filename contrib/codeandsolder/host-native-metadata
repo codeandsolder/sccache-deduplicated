@@ -84,6 +84,29 @@ dashboard_check() {
     [[ "$expected" == "$(sed -n '/^[0-9a-f]\{64\}  pkg\//p' "$manifest")" ]]
 }
 
+# Ask the actual executable to validate every asset and return its identity.
+dashboard_generation() {
+    local binary="$1" assets="$2" generation
+    generation="$("$binary" verify-dashboard --assets "$assets")" || return 1
+    [[ "$generation" =~ ^sccache-dashboard-generation-v1:[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$generation"
+}
+
+# Readiness is an exact-generation check, not just HTTP reachability. Verify
+# all three entry assets, including JS and CSS, against the installed package.
+dashboard_ready() {
+    local binary="$1" assets="$2" base="$3" generation html name expected served
+    generation="$(dashboard_generation "$binary" "$assets")" || return 1
+    local -a fetch=(curl --noproxy '*' --fail --silent --show-error --max-time 5)
+    html="$("${fetch[@]}" "$base/")" || return 1
+    [[ "$html" == *"/pkg/$generation/sccache-dashboard.css"* ]] || return 1
+    for name in sccache-dashboard.js sccache-dashboard_bg.wasm sccache-dashboard.css; do
+        expected="$(sha256sum "$assets/$name" | cut -d ' ' -f1)" || return 1
+        served="$("${fetch[@]}" "$base/pkg/$generation/$name" | sha256sum | cut -d ' ' -f1)" || return 1
+        [[ "$expected" == "$served" ]] || return 1
+    done
+}
+
 verify() {
     local directory="$1" published="$2" dashboard="${3:-0}" field native official file expected
     for file in sccache sccache-dist build.txt SHA256SUMS; do
@@ -112,7 +135,10 @@ verify() {
             return 1
         }
     done
-    [[ -x "$directory/sccache" && -x "$directory/sccache-dist" ]]
+    [[ -x "$directory/sccache" && -x "$directory/sccache-dist" ]] || return 1
+    if (( dashboard )); then
+        dashboard_generation "$directory/sccache-dist" "$directory/pkg" >/dev/null || return 1
+    fi
 }
 
 # Atomic generation selection. Call only after verified bundle admission and
@@ -166,7 +192,8 @@ case "${1:-}" in
         ;;
     dashboard-select) [[ $# == 3 ]]; dashboard_select "$2" "$3" ;;
     dashboard-check) [[ $# == 4 ]]; dashboard_check "$2" "$3" "$4" ;;
+    dashboard-ready) [[ $# == 4 ]]; dashboard_ready "$2" "$3" "$4" ;;
     state-publish) [[ $# == 7 ]]; state_publish "$2" "$3" "$4" "$5" "$6" "$7" ;;
-    *) echo "usage: $0 fingerprint | verify ABSOLUTE_BUNDLE_DIRECTORY PUBLISHED_BUILD_TXT [--scheduler-dashboard] | dashboard-select BUNDLE_DIRECTORY ASSET_LINK | dashboard-check BUNDLE_DIRECTORY ASSET_LINK MANIFEST | state-publish STATE BUNDLE TAG PUBLISHED_AT CLIENT_HASH DIST_HASH" >&2; exit 2 ;;
+    *) echo "usage: $0 fingerprint | verify ABSOLUTE_BUNDLE_DIRECTORY PUBLISHED_BUILD_TXT [--scheduler-dashboard] | dashboard-select BUNDLE_DIRECTORY ASSET_LINK | dashboard-check BUNDLE_DIRECTORY ASSET_LINK MANIFEST | dashboard-ready BINARY ASSETS BASE_URL | state-publish STATE BUNDLE TAG PUBLISHED_AT CLIENT_HASH DIST_HASH" >&2; exit 2 ;;
 esac
 

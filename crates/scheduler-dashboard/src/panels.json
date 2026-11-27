@@ -8,7 +8,8 @@
         "expr": "sccache_cache_tier_size_bytes{instance=~\"$client\",resolution=\"raw\"}",
         "legend": "{{instance}} L{{level}} {{backend}} {{kind}}"
       }
-    ]
+    ],
+    "group": "cache_storage"
   },
   {
     "title": "Legacy serialized object sizes (bytes per bucket)",
@@ -20,7 +21,8 @@
         "legend": "{{instance}} L{{level}} {{backend}} {{upper}}"
       }
     ],
-    "requires_client": true
+    "requires_client": true,
+    "group": "cache_storage"
   },
   {
     "title": "Legacy serialized object sizes (objects per bucket)",
@@ -32,7 +34,8 @@
         "legend": "{{instance}} L{{level}} {{backend}} {{upper}}"
       }
     ],
-    "requires_client": true
+    "requires_client": true,
+    "group": "cache_storage"
   },
   {
     "title": "Legacy last-access age (bytes per bucket)",
@@ -44,7 +47,8 @@
         "legend": "{{instance}} L{{level}} {{backend}} {{upper}}"
       }
     ],
-    "requires_client": true
+    "requires_client": true,
+    "group": "cache_storage"
   },
   {
     "title": "Managed decayed heat, milli-hits (bytes per bucket)",
@@ -56,7 +60,8 @@
         "legend": "{{instance}} L{{level}} {{backend}} {{upper}}"
       }
     ],
-    "requires_client": true
+    "requires_client": true,
+    "group": "cache_storage"
   },
   {
     "title": "Managed eviction-adjusted age (bytes per bucket)",
@@ -68,7 +73,8 @@
         "legend": "{{instance}} L{{level}} {{backend}} {{upper}}"
       }
     ],
-    "requires_client": true
+    "requires_client": true,
+    "group": "cache_storage"
   },
   {
     "title": "Managed heat percentile storage share (bounds)",
@@ -80,7 +86,8 @@
         "legend": "{{instance}} L{{level}} {{backend}} p{{percentile}} {{bound}}"
       }
     ],
-    "requires_client": true
+    "requires_client": true,
+    "group": "cache_storage"
   },
   {
     "title": "Legacy analytics snapshot age (seconds)",
@@ -91,7 +98,8 @@
         "expr": "time()-sccache_cache_tier_snapshot_timestamp_seconds{instance=~\"$client\",resolution=\"raw\"}",
         "legend": "{{instance}} L{{level}} {{backend}}"
       }
-    ]
+    ],
+    "group": "cache_storage"
   },
   {
     "title": "Reported cache size by client (shared tiers may repeat)",
@@ -102,10 +110,11 @@
         "expr": "sccache_cache_size_bytes{instance=~\"$client\",resolution=\"raw\"}",
         "legend": "{{instance}} {{kind}}"
       }
-    ]
+    ],
+    "group": "cache_storage"
   },
   {
-    "title": "Workers",
+    "title": "Reported workers (max across clients)",
     "kind": "stat",
     "unit": "short",
     "queries": [
@@ -116,7 +125,7 @@
     ]
   },
   {
-    "title": "Advertised CPUs",
+    "title": "Reported advertised cpus (max across clients)",
     "kind": "stat",
     "unit": "short",
     "queries": [
@@ -127,7 +136,7 @@
     ]
   },
   {
-    "title": "Jobs in progress",
+    "title": "Reported jobs in progress (max across clients)",
     "kind": "stat",
     "unit": "short",
     "queries": [
@@ -138,12 +147,12 @@
     ]
   },
   {
-    "title": "Cluster occupancy",
+    "title": "Reported admission occupancy (max across clients)",
     "kind": "stat",
     "unit": "percent",
     "queries": [
       {
-        "expr": "100*max(sccache_dist_status{resolution=\"raw\",kind=\"in_progress\"})/clamp_min(max(sccache_dist_status{resolution=\"raw\",kind=\"cpus\"}),1)",
+        "expr": "max((100*max by(instance)(sccache_dist_status{resolution=\"raw\",kind=\"in_progress\"})/max by(instance)(sccache_dist_status{resolution=\"raw\",kind=\"max_jobs\"})) and (max by(instance)(sccache_dist_status{resolution=\"raw\",kind=\"max_jobs\"})>0))",
         "legend": ""
       }
     ]
@@ -165,18 +174,27 @@
     "unit": "percent",
     "queries": [
       {
-        "expr": "(100*sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[5m]))/clamp_min(sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[5m])),1)) and (sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[5m])) > 0)",
-        "legend": "5m"
+        "expr": "((100*(sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[5m])) or (0*sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[5m]))))/sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[5m]))) and (sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[5m]))>0))",
+        "legend": "5 min"
       },
       {
-        "expr": "(100*sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[15m]))/clamp_min(sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[15m])),1)) and (sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[15m])) > 0)",
-        "legend": "15m"
+        "expr": "((100*(sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[15m])) or (0*sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[15m]))))/sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[15m]))) and (sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[15m]))>0))",
+        "legend": "15 min"
       },
       {
-        "expr": "100*sum(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"})/clamp_min(sum(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}),1)",
-        "legend": "since restart"
+        "expr": "((100*(sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[1h])) or (0*sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[1h]))))/sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[1h]))) and (sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[1h]))>0))",
+        "legend": "1 hour"
+      },
+      {
+        "expr": "((100*(sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[24h])) or (0*sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[24h]))))/sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[24h]))) and (sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[24h]))>0))",
+        "legend": "24 hours"
+      },
+      {
+        "expr": "((100*(sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__range])) or (0*sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__range]))))/sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__range]))) and (sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__range]))>0))",
+        "legend": "Selected range"
       }
-    ]
+    ],
+    "group": "cache_hits"
   },
   {
     "title": "Distributed share (range)",
@@ -184,7 +202,7 @@
     "unit": "percent",
     "queries": [
       {
-        "expr": "100*sum(increase(sccache_dist_compiles_total{instance=~\"$client\",resolution=\"raw\"}[$__range]))/clamp_min(sum(increase(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__range])),1)",
+        "expr": "((100*(sum(increase(sccache_dist_compiles_total{instance=~\"$client\",resolution=\"raw\"}[$__range])) or (0*sum(increase(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__range]))))/sum(increase(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__range]))) and (sum(increase(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__range]))>0))",
         "legend": ""
       }
     ]
@@ -224,7 +242,8 @@
         "expr": "sum by(instance,result)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\"}[$__rate_interval]))",
         "legend": "{{instance}} {{result}}"
       }
-    ]
+    ],
+    "group": "cache_hits"
   },
   {
     "title": "Distributed compiles by worker",
@@ -243,10 +262,11 @@
     "unit": "percent",
     "queries": [
       {
-        "expr": "100*sum by(language)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__rate_interval]))/sum by(language)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))",
+        "expr": "((100*(sum by(language)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__rate_interval])) or (0*sum by(language)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))))/sum by(language)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))) and (sum by(language)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))>0))",
         "legend": "{{language}}"
       }
-    ]
+    ],
+    "group": "cache_hits"
   },
   {
     "title": "Non-cacheable reasons",
@@ -261,7 +281,8 @@
         "expr": "sum by(crate_type)(rate(sccache_not_cached_crate_types_total{instance=~\"$client\",resolution=\"raw\"}[$__rate_interval]))",
         "legend": "crate-type: {{crate_type}}"
       }
-    ]
+    ],
+    "group": "cache_hits"
   },
   {
     "title": "Request disposition",
@@ -272,7 +293,8 @@
         "expr": "sum by(instance,result)(rate(sccache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"executed|not_cacheable|unsupported_compiler|not_compile\"}[$__rate_interval]))",
         "legend": "{{instance}} {{result}}"
       }
-    ]
+    ],
+    "group": "cache_hits"
   },
   {
     "title": "Average compile time",
@@ -280,10 +302,11 @@
     "unit": "s",
     "queries": [
       {
-        "expr": "sum by(instance)(rate(sccache_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"compile\"}[$__rate_interval]))/clamp_min(sum by(instance)(rate(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__rate_interval])),1e-9)",
+        "expr": "((sum by(instance)(rate(sccache_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"compile\"}[$__rate_interval]))/sum by(instance)(rate(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__rate_interval]))) and (sum by(instance)(rate(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__rate_interval]))>0))",
         "legend": "{{instance}}"
       }
-    ]
+    ],
+    "group": "cache_hits"
   },
   {
     "title": "Cache operation latency",
@@ -291,40 +314,43 @@
     "unit": "s",
     "queries": [
       {
-        "expr": "sum by(instance)(rate(sccache_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"cache_write\"}[$__rate_interval]))/clamp_min(sum by(instance)(rate(sccache_cache_events_total{instance=~\"$client\",resolution=\"raw\",event=\"write\"}[$__rate_interval])),1e-9)",
+        "expr": "((sum by(instance)(rate(sccache_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"cache_write\"}[$__rate_interval]))/sum by(instance)(rate(sccache_cache_events_total{instance=~\"$client\",resolution=\"raw\",event=\"write\"}[$__rate_interval]))) and (sum by(instance)(rate(sccache_cache_events_total{instance=~\"$client\",resolution=\"raw\",event=\"write\"}[$__rate_interval]))>0))",
         "legend": "{{instance}} write"
       },
       {
-        "expr": "sum by(instance)(rate(sccache_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"cache_read_hit\"}[$__rate_interval]))/clamp_min(sum by(instance)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__rate_interval])),1e-9)",
+        "expr": "((sum by(instance)(rate(sccache_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"cache_read_hit\"}[$__rate_interval]))/sum by(instance)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__rate_interval]))) and (sum by(instance)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__rate_interval]))>0))",
         "legend": "{{instance}} read hit"
       }
-    ]
+    ],
+    "group": "cache_hits"
   },
   {
-    "title": "L0 cache latency",
+    "title": "Legacy cache-tier latency",
     "kind": "timeseries",
     "unit": "s",
     "queries": [
       {
-        "expr": "sum by(instance,name)(rate(sccache_cache_level_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"write\"}[$__rate_interval]))/clamp_min(sum by(instance,name)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\",operation=\"write\"}[$__rate_interval])),1e-9)",
-        "legend": "{{instance}} {{name}} write"
+        "expr": "((sum by(instance,level,name)(rate(sccache_cache_level_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"write\"}[$__rate_interval]))/sum by(instance,level,name)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\",operation=\"write\"}[$__rate_interval]))) and (sum by(instance,level,name)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\",operation=\"write\"}[$__rate_interval]))>0))",
+        "legend": "{{instance}} L{{level}} {{name}} write"
       },
       {
-        "expr": "sum by(instance,name)(rate(sccache_cache_level_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"hit\"}[$__rate_interval]))/clamp_min(sum by(instance,name)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\",operation=\"hit\"}[$__rate_interval])),1e-9)",
-        "legend": "{{instance}} {{name}} hit"
+        "expr": "((sum by(instance,level,name)(rate(sccache_cache_level_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"hit\"}[$__rate_interval]))/sum by(instance,level,name)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\",operation=\"hit\"}[$__rate_interval]))) and (sum by(instance,level,name)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\",operation=\"hit\"}[$__rate_interval]))>0))",
+        "legend": "{{instance}} L{{level}} {{name}} hit"
       }
-    ]
+    ],
+    "group": "cache_hits"
   },
   {
-    "title": "Cache-level operations",
+    "title": "Legacy cache-tier operations",
     "kind": "timeseries",
     "unit": "ops",
     "queries": [
       {
-        "expr": "sum by(instance,name,operation)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\"}[$__rate_interval]))",
-        "legend": "{{instance}} {{name}} {{operation}}"
+        "expr": "sum by(instance,level,name,operation)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\"}[$__rate_interval]))",
+        "legend": "{{instance}} L{{level}} {{name}} {{operation}}"
       }
-    ]
+    ],
+    "group": "cache_hits"
   },
   {
     "title": "Cache errors / unusual events",
@@ -335,7 +361,8 @@
         "expr": "sum by(instance,event)(rate(sccache_cache_events_total{instance=~\"$client\",resolution=\"raw\",event=~\"timeout|read_error|write_error|forced_recache|non_cacheable_compilation\"}[$__rate_interval]))",
         "legend": "{{instance}} {{event}}"
       }
-    ]
+    ],
+    "group": "cache_hits"
   },
   {
     "title": "Compile & distributed failures",
@@ -402,8 +429,8 @@
     "unit": "bool",
     "queries": [
       {
-        "expr": "max(sccache_preprocessor_cache_mode{instance=~\"$client\",resolution=\"raw\"})",
-        "legend": ""
+        "expr": "max by(instance)(sccache_preprocessor_cache_mode{instance=~\"$client\",resolution=\"raw\"})",
+        "legend": "{{instance}}"
       }
     ]
   },
@@ -413,10 +440,11 @@
     "unit": "short",
     "queries": [
       {
-        "expr": "max(sccache_cache_levels{instance=~\"$client\",resolution=\"raw\"})",
-        "legend": ""
+        "expr": "max by(instance)(sccache_cache_levels{instance=~\"$client\",resolution=\"raw\"})",
+        "legend": "{{instance}}"
       }
-    ]
+    ],
+    "group": "cache_storage"
   },
   {
     "title": "Basedirs",
@@ -424,8 +452,8 @@
     "unit": "short",
     "queries": [
       {
-        "expr": "max(sccache_basedirs{instance=~\"$client\",resolution=\"raw\"})",
-        "legend": ""
+        "expr": "max by(instance)(sccache_basedirs{instance=~\"$client\",resolution=\"raw\"})",
+        "legend": "{{instance}}"
       }
     ]
   },
@@ -446,7 +474,7 @@
     "unit": "percent",
     "queries": [
       {
-        "expr": "100*sum by(instance)(rate(cpu_seconds_total{instance=~\".+\",resolution=\"raw\",cpu=\"total\",mode!~\"idle|iowait\"}[$__rate_interval]))/clamp_min(sum by(instance)(rate(cpu_seconds_total{instance=~\".+\",resolution=\"raw\",cpu=\"total\"}[$__rate_interval])),1e-9)",
+        "expr": "((100*sum by(instance)(rate(cpu_seconds_total{instance=~\".+\",resolution=\"raw\",cpu=\"total\",mode!~\"idle|iowait\"}[$__rate_interval]))/sum by(instance)(rate(cpu_seconds_total{instance=~\".+\",resolution=\"raw\",cpu=\"total\"}[$__rate_interval]))) and (sum by(instance)(rate(cpu_seconds_total{instance=~\".+\",resolution=\"raw\",cpu=\"total\"}[$__rate_interval]))>0))",
         "legend": "{{instance}}"
       }
     ]
@@ -479,10 +507,11 @@
     "unit": "percent",
     "queries": [
       {
-        "expr": "100*sum by(compiler_language)(rate(sccache_cache_requests_advanced_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__rate_interval]))/sum by(compiler_language)(rate(sccache_cache_requests_advanced_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))",
+        "expr": "((100*(sum by(compiler_language)(rate(sccache_cache_requests_advanced_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__rate_interval])) or (0*sum by(compiler_language)(rate(sccache_cache_requests_advanced_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))))/sum by(compiler_language)(rate(sccache_cache_requests_advanced_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))) and (sum by(compiler_language)(rate(sccache_cache_requests_advanced_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))>0))",
         "legend": "{{compiler_language}}"
       }
-    ]
+    ],
+    "group": "cache_hits"
   },
   {
     "title": "Compiler/language cache requests",
@@ -493,6 +522,107 @@
         "expr": "sum by(compiler_language,result)(rate(sccache_cache_requests_advanced_total{instance=~\"$client\",resolution=\"raw\"}[$__rate_interval]))",
         "legend": "{{compiler_language}} {{result}}"
       }
-    ]
+    ],
+    "group": "cache_hits"
+  },
+  {
+    "title": "Completed cache results · selected range",
+    "kind": "stat",
+    "unit": "short",
+    "queries": [
+      {
+        "expr": "sum by(result)(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss|error\"}[$__range]))",
+        "legend": "{{result}}"
+      }
+    ],
+    "group": "cache_hits"
+  },
+  {
+    "title": "Completed cache hit rate · client history",
+    "kind": "timeseries",
+    "unit": "percent",
+    "queries": [
+      {
+        "expr": "((100*(sum by(instance)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__rate_interval])) or (0*sum by(instance)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))))/sum by(instance)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))) and (sum by(instance)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))>0))",
+        "legend": "{{instance}}"
+      }
+    ],
+    "group": "cache_hits"
+  },
+  {
+    "title": "Completed cache hit rate · selected range by client",
+    "kind": "stat",
+    "unit": "percent",
+    "queries": [
+      {
+        "expr": "((100*(sum by(instance)(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__range])) or (0*sum by(instance)(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__range]))))/sum by(instance)(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__range]))) and (sum by(instance)(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__range]))>0))",
+        "legend": "{{instance}}"
+      }
+    ],
+    "group": "cache_hits"
+  },
+  {
+    "title": "Completed results by client · selected range",
+    "kind": "stat",
+    "unit": "short",
+    "queries": [
+      {
+        "expr": "sum by(instance,result)(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\"}[$__range]))",
+        "legend": "{{instance}} {{result}}"
+      }
+    ],
+    "group": "cache_hits"
+  },
+  {
+    "title": "Completed results by compiler · selected range",
+    "kind": "stat",
+    "unit": "short",
+    "queries": [
+      {
+        "expr": "sum by(compiler_language,result)(increase(sccache_cache_requests_advanced_total{instance=~\"$client\",resolution=\"raw\"}[$__range]))",
+        "legend": "{{compiler_language}} {{result}}"
+      }
+    ],
+    "group": "cache_hits"
+  },
+  {
+    "title": "Legacy tier lookups · selected range",
+    "kind": "stat",
+    "unit": "short",
+    "queries": [
+      {
+        "expr": "sum by(instance,level,name,operation)(increase(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\",operation=~\"hit|miss|read_error\"}[$__range]))",
+        "legend": "{{instance}} L{{level}} {{name}} {{operation}}"
+      }
+    ],
+    "group": "cache_hits"
+  },
+  {
+    "title": "Cache bypasses and errors · selected range",
+    "kind": "stat",
+    "unit": "short",
+    "queries": [
+      {
+        "expr": "sum by(event)(increase(sccache_cache_events_total{instance=~\"$client\",resolution=\"raw\",event=~\"timeout|read_error|write_error|forced_recache|non_cacheable_compilation\"}[$__range]))",
+        "legend": "{{event}}"
+      },
+      {
+        "expr": "sum by(reason)(increase(sccache_not_cached_total{instance=~\"$client\",resolution=\"raw\"}[$__range]))",
+        "legend": "{{reason}}"
+      }
+    ],
+    "group": "cache_hits"
+  },
+  {
+    "title": "Completed cache hit rate · fleet history",
+    "kind": "timeseries",
+    "unit": "percent",
+    "queries": [
+      {
+        "expr": "((100*(sum(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__rate_interval])) or (0*sum(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))))/sum(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))) and (sum(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))>0))",
+        "legend": "All selected clients"
+      }
+    ],
+    "group": "cache_hits"
   }
 ]

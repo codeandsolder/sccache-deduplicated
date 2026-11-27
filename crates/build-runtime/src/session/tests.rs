@@ -1474,6 +1474,12 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
         bail!("expected refreshed hit");
     };
     assert_eq!(current, new);
+    let counts = service.admission_stats();
+    assert_eq!(counts.hits, 2);
+    assert_eq!(counts.misses, 1);
+    assert_eq!(counts.refreshes, 2);
+    assert_eq!(counts.in_flight, 1);
+    assert_eq!(counts.errors, 0);
     assert_eq!(service.store().stats()?.actions, 1);
     assert_eq!(service.store().stats()?.results, 1);
     assert_eq!(service.store().collect_garbage(8)?.blobs, 0);

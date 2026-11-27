@@ -21,14 +21,33 @@ struct Connection {
     _message: EventListener,
     _error: EventListener,
     timer: RetryTimer,
+    watchdog: RetryTimer,
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
         self.source.close();
-        if let Some(timer) = self.timer.borrow_mut().take() {
-            timer.clear();
-        }
+        clear_timer(&self.timer);
+        clear_timer(&self.watchdog);
+    }
+}
+
+fn clear_timer(timer: &RetryTimer) {
+    if let Some(handle) = timer.borrow_mut().take() {
+        handle.clear();
+    }
+}
+
+fn arm_watchdog(timer: &RetryTimer, status: RwSignal<ConnectionStatus>, timeout: Option<Duration>) {
+    clear_timer(timer);
+    if let Some(timeout) = timeout {
+        *timer.borrow_mut() = set_timeout_with_handle(
+            move || {
+                let _ = status.try_set(ConnectionStatus::Stalled);
+            },
+            timeout,
+        )
+        .ok();
     }
 }
 
@@ -52,6 +71,7 @@ pub(super) fn connect<T: DeserializeOwned + 'static>(
     url: &str,
     status: RwSignal<ConnectionStatus>,
     retry: RwSignal<u64>,
+    stale_after: impl Fn() -> Option<Duration> + 'static,
     apply: impl Fn(T) -> bool + 'static,
 ) {
     status.set(ConnectionStatus::Connecting);
@@ -60,9 +80,13 @@ pub(super) fn connect<T: DeserializeOwned + 'static>(
         return;
     };
     let timer = RetryTimer::default();
+    let watchdog = RetryTimer::default();
+    arm_watchdog(&watchdog, status, stale_after());
+    let error_watchdog = Rc::clone(&watchdog);
     let error_timer = Rc::clone(&timer);
     let error_source = source.clone();
     let error = EventListener::new(&source, "error", move |_| {
+        clear_timer(&error_watchdog);
         status.set(ConnectionStatus::Reconnecting);
         // EventSource automatically retries transient network failures, but
         // some HTTP failures permanently close it (e.g. a full view registry).
@@ -71,6 +95,7 @@ pub(super) fn connect<T: DeserializeOwned + 'static>(
         }
     });
     let close = source.clone();
+    let message_watchdog = Rc::clone(&watchdog);
     let message_timer = Rc::clone(&timer);
     let message = EventListener::new(&source, "message", move |event| {
         let parsed = event
@@ -79,7 +104,9 @@ pub(super) fn connect<T: DeserializeOwned + 'static>(
             .and_then(|data| serde_json::from_str::<T>(&data).ok());
         if parsed.is_some_and(&apply) {
             status.set(ConnectionStatus::Connected);
+            arm_watchdog(&message_watchdog, status, stale_after());
         } else {
+            clear_timer(&message_watchdog);
             close.close();
             status.set(ConnectionStatus::ProtocolError);
             schedule_retry(&message_timer, retry);
@@ -90,6 +117,7 @@ pub(super) fn connect<T: DeserializeOwned + 'static>(
         _message: message,
         _error: error,
         timer,
+        watchdog,
     });
     on_cleanup(move || drop(connection));
 }

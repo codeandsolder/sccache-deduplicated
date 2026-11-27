@@ -76,6 +76,8 @@ impl ActionCost {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignedNative {
+    #[cfg(feature = "scheduler-dashboard")]
+    pub dashboard: Option<sccache_dashboard::JobDescription>,
     pub packages: std::sync::Arc<sccache::build_runtime::PackageCatalog>,
     pub inputs: NativeInputBlobs,
     pub class: Option<ActionClass>,

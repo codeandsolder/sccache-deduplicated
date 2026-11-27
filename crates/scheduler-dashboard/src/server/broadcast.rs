@@ -35,6 +35,10 @@ impl<T: Serialize> Feed<T> {
         }
     }
 
+    pub(super) fn has_subscribers(&self) -> bool {
+        self.changes.receiver_count() != 0
+    }
+
     pub(super) fn inspect<R>(&self, read: impl FnOnce(&T) -> R) -> R {
         let state = self
             .state
@@ -112,7 +116,11 @@ mod tests {
     #[test]
     fn reset_is_shared_per_revision_and_invalidated_on_publish() -> Result<()> {
         let feed = Feed::new(1_u64, 4);
-        let (first, _) = feed.subscribe()?;
+        assert!(!feed.has_subscribers());
+        let (first, receiver) = feed.subscribe()?;
+        assert!(feed.has_subscribers());
+        drop(receiver);
+        assert!(!feed.has_subscribers());
         let (second, _) = feed.subscribe()?;
         assert!(Arc::ptr_eq(&first, &second));
         feed.publish(|_| Ok(None))?;

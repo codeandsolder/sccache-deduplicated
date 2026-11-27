@@ -80,6 +80,19 @@ verify
 # Scheduler bundle is a separate, explicit role profile. Every asset is
 # checksummed; the ordinary worker verifier must refuse it.
 sed -i 's/^features=.*/&,scheduler-dashboard/' "$bundle/build.txt"
+# The fixture implements the new command contract, refusing mismatched
+# assets independently of the outer bundle checksum.
+cp "$bundle/sccache-dist" "$work/ordinary-dist"
+cat > "$bundle/sccache-dist" <<'DASHBOARD_FIXTURE'
+#!/bin/bash
+set -euo pipefail
+[[ "$1" == verify-dashboard && "$2" == --assets && $# == 3 ]]
+for asset in sccache-dashboard.js sccache-dashboard_bg.wasm sccache-dashboard.css; do
+    cmp -s "$3/$asset" <(printf 'fixture %s\n' "$asset") || exit 1
+done
+printf 'sccache-dashboard-generation-v1:%064d\n' 0
+DASHBOARD_FIXTURE
+chmod 0755 "$bundle/sccache-dist"
 mkdir -m 0755 "$bundle/pkg"
 for asset in sccache-dashboard.js sccache-dashboard_bg.wasm sccache-dashboard.css; do
     printf 'fixture %s\n' "$asset" > "$bundle/pkg/$asset"
@@ -104,11 +117,34 @@ if "$here/host-native-metadata" dashboard-check "$bundle" "$work/selected/curren
     echo 'accepted corrupted selected asset generation' >&2; exit 1
 fi
 refresh_dashboard_hashes
+if verify_dashboard >/dev/null 2>&1; then echo 'accepted mixed generation with recomputed checksums' >&2; exit 1; fi
+printf 'fixture sccache-dashboard_bg.wasm\n' > "$bundle/pkg/sccache-dashboard_bg.wasm"
+refresh_dashboard_hashes
 verify_dashboard
+# The new readiness probe must fetch generation-scoped paths and compare
+# the real responses, including JS and CSS. No live service or network.
+cat > "$work/mock-bin/curl" <<'CURL_FIXTURE'
+#!/bin/bash
+set -euo pipefail
+generation="sccache-dashboard-generation-v1:$(printf '%064d' 0)"
+case "${!#}" in
+    http://127.0.0.1:10604/) printf '<link href="/pkg/%s/sccache-dashboard.css">\n' "$generation" ;;
+    http://127.0.0.1:10604/pkg/"$generation"/*)
+        asset="${!#}"; asset="${asset##*/}"
+        if [[ "$asset" == "${FIXTURE_CORRUPT:-}" ]]; then printf 'wrong generation'; else printf 'fixture %s\n' "$asset"; fi ;;
+    *) exit 1 ;;
+esac
+CURL_FIXTURE
+chmod 0755 "$work/mock-bin/curl"
+PATH="$work/mock-bin:$PATH" "$here/host-native-metadata" dashboard-ready "$bundle/sccache-dist" "$bundle/pkg" http://127.0.0.1:10604
+if FIXTURE_CORRUPT=sccache-dashboard.js PATH="$work/mock-bin:$PATH" "$here/host-native-metadata" dashboard-ready "$bundle/sccache-dist" "$bundle/pkg" http://127.0.0.1:10604; then
+    echo 'accepted wrong served JS generation' >&2; exit 1
+fi
 ln -s /etc/passwd "$bundle/pkg/untrusted"
 if verify_dashboard >/dev/null 2>&1; then echo 'accepted dashboard symlink' >&2; exit 1; fi
 rm "$bundle/pkg/untrusted"
 rm -rf "$bundle/pkg"
+cp "$work/ordinary-dist" "$bundle/sccache-dist"
 cp "$work/valid-build.txt" "$bundle/build.txt"
 refresh_hashes
 verify

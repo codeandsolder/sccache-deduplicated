@@ -99,9 +99,7 @@ impl Graph {
                 .logical_bytes_per_second
                 .or(prior.logical_bytes_per_second);
             link.remaining_bytes = link.remaining_bytes.or(prior.remaining_bytes);
-            if prior.evidence == RouteEvidence::Transferring {
-                link.evidence = prior.evidence;
-            }
+            link.evidence = link.evidence.max(prior.evidence);
         }
         self.links.insert(link.id.clone(), link);
     }

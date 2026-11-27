@@ -83,3 +83,49 @@ td small { margin-top: .2rem; }
 .topology_measured { stroke: var(--accent); }
 .topology_active { stroke: var(--good); stroke-width: 3; }
 .topology_details { margin: .7rem 0; overflow-wrap: anywhere; }
+
+/* Live values must not change the geometry of surrounding controls or columns. */
+html { scrollbar-gutter: stable; }
+[hidden] { display: none !important; }
+.top { position: sticky; top: 0; z-index: 2; }
+.top nav { gap: .35rem; }
+.tab {
+    font: inherit; color: var(--muted); background: transparent;
+    border: 1px solid transparent; border-radius: 4px; padding: .5rem .65rem;
+    cursor: pointer; white-space: nowrap;
+}
+.tab:hover, .tab:focus-visible { color: var(--fg); border-color: var(--line); }
+.tab[aria-pressed="true"] { color: var(--accent); background: var(--bg); border-color: var(--accent); }
+.subhead { min-height: 2.5rem; }
+.stat { min-width: 0; }
+.stat strong { font-size: clamp(1rem, 1.6vw, 1.65rem); overflow-wrap: anywhere; }
+.tablewrap { scrollbar-gutter: stable; }
+#workers table, #jobs table { table-layout: fixed; }
+#workers table { min-width: 1550px; }
+#workers th:first-child { width: 14%; }
+#workers th:nth-child(2) { width: 9%; }
+#workers th:last-child { width: 17%; }
+#workers th, #jobs th { white-space: normal; }
+#workers td, #jobs td { overflow-wrap: anywhere; }
+#workers td small, #jobs td small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#jobs table { min-width: 1250px; }
+#jobs th:first-child { width: 24%; }
+#jobs th:nth-child(2) { width: 15%; }
+#jobs th:last-child { width: 12%; }
+.panels { align-items: start; grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr)); }
+.panels article { overflow-wrap: anywhere; min-height: 8rem; }
+.legend > div { min-height: 1.8rem; }
+@media (max-width: 640px) {
+    .top { position: static; }
+    .top nav { flex-wrap: nowrap; overflow-x: auto; width: 100%; }
+}
+.clamped { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+#workers tbody td { height: 8rem; }
+#jobs tbody td { height: 6rem; }
+#jobs .page_count { min-width: 20ch; }
+#jobs input { width: min(28rem, 55vw); }
+#admission table { table-layout: fixed; min-width: 900px; }
+#admission th { white-space: normal; }
+#admission th:first-child { width: 21%; }
+#admission td { height: 3.8rem; }
+.input_progress { width: 100%; height: .55rem; margin-top: .35rem; accent-color: var(--accent); }

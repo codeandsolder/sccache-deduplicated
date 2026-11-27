@@ -291,6 +291,12 @@ fn package_report(
 
 fn run(command: Command) -> Result<i32> {
     match command {
+        #[cfg(feature = "scheduler-dashboard")]
+        Command::VerifyDashboard { assets, source } => {
+            sccache_dashboard::server::verify_assets(&assets, source.as_deref())?;
+            println!("{}", sccache_dashboard::GENERATION);
+            Ok(0)
+        }
         Command::NativeDecodePackage {
             compression,
             max_tar_bytes,
@@ -1295,6 +1301,25 @@ struct CandidateSet {
     predictions: BTreeMap<ServerId, placement::PlacementEstimate>,
 }
 
+fn trace_native_assignment(
+    job_id: JobId,
+    server_id: ServerId,
+    class: Option<placement::ActionClass>,
+    candidates: &CandidateSet,
+    estimated_result_bytes: Option<u64>,
+    server_details: &ServerDetails,
+) {
+    if let Some(class) = class {
+        trace!(target: "native_placement_replay", "{}", serde_json::json!({
+            "kind": "assigned", "job": job_id.0, "worker": server_id, "class": class,
+            "candidates": candidates.predictions,
+            "estimated_result_bytes": estimated_result_bytes,
+            "host_prior": server_details.capabilities.native_placement.as_ref().map(placement::ActionCost::baseline),
+            "healthy": candidates.healthy.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        }));
+    }
+}
+
 impl CandidateSet {
     const fn no_capacity(&self, servers: usize) -> NoCapacity {
         NoCapacity {
@@ -1438,6 +1463,8 @@ impl Scheduler {
         let class = native
             .map(|assignment| placement::ActionClass::from_spec(&assignment.spec))
             .transpose()?;
+        #[cfg(feature = "scheduler-dashboard")]
+        let description = native.map(dashboard::describe_native);
         // LOCKS
         let mut servers = self
             .servers
@@ -1490,11 +1517,6 @@ impl Scheduler {
         let Some(server_id) = selected else {
             return Ok(Err(candidates.no_capacity(servers.len())));
         };
-        let CandidateSet {
-            healthy,
-            predictions,
-            ..
-        } = candidates;
         let server_details = servers.get_mut(&server_id).ok_or_else(|| {
             anyhow::anyhow!("selected worker disappeared while scheduler lock held")
         })?;
@@ -1507,21 +1529,25 @@ impl Scheduler {
             .job_authorizer
             .generate_token(job_id)
             .context("Could not create an auth token for this job")?;
-        let prediction = predictions.get(&server_id).copied();
-        if let Some(class) = class {
-            trace!(target: "native_placement_replay", "{}", serde_json::json!({
-                "kind": "assigned", "job": job_id.0, "worker": server_id, "class": class,
-                "candidates": predictions,
-                "estimated_result_bytes": estimated_result_bytes,
-                "host_prior": server_details.capabilities.native_placement.as_ref().map(placement::ActionCost::baseline),
-                "healthy": healthy.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            }));
-        }
+        let prediction = candidates.predictions.get(&server_id).copied();
+        trace_native_assignment(
+            job_id,
+            server_id,
+            class,
+            &candidates,
+            estimated_result_bytes,
+            server_details,
+        );
         let assigned = native_inputs.map(|inputs| placement::AssignedNative {
+            #[cfg(feature = "scheduler-dashboard")]
+            dashboard: description,
             packages: std::sync::Arc::clone(packages),
             inputs: inputs.clone(),
             class,
-            cost: predictions.get(&server_id).map(|estimate| estimate.cost),
+            cost: candidates
+                .predictions
+                .get(&server_id)
+                .map(|estimate| estimate.cost),
             milestone: None,
         });
         server_details.reserve(job_id, assigned);
@@ -3024,6 +3050,8 @@ mod scheduler_tests {
             (
                 JobId(1),
                 Some(placement::AssignedNative {
+                    #[cfg(feature = "scheduler-dashboard")]
+                    dashboard: None,
                     packages: Default::default(),
                     inputs: inputs.clone(),
                     class: None,
@@ -3034,6 +3062,8 @@ mod scheduler_tests {
             (
                 JobId(2),
                 Some(placement::AssignedNative {
+                    #[cfg(feature = "scheduler-dashboard")]
+                    dashboard: None,
                     packages: Default::default(),
                     inputs: inputs.clone(),
                     class: None,
@@ -3606,8 +3636,13 @@ mod scheduler_tests {
                 native_placement: Some(dist::NativePlacement::default()),
             },
         )?;
-        let assignment =
+        let mut assignment =
             native_test_assignment(platform, BTreeMap::from([(ContentId([1; 32]), 10)]))?;
+        assignment.spec.command.arguments = vec![
+            b"--crate-name".to_vec(),
+            b"example_crate".to_vec(),
+            b"--target=x86_64-unknown-linux-gnu".to_vec(),
+        ];
         let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
             .handle_alloc_native_job(
                 &AcceptAssign,
@@ -3626,6 +3661,23 @@ mod scheduler_tests {
                 .map(|job| &job.inputs),
             Some(&BTreeMap::from([(ContentId([1; 32]), 10)]))
         );
+        #[cfg(feature = "scheduler-dashboard")]
+        {
+            let snapshot = scheduler.handle_dashboard_snapshot()?;
+            let job = &snapshot.jobs[0];
+            let description = job
+                .description
+                .as_ref()
+                .context("missing job description")?;
+            assert_eq!(description.executable, "tool");
+            assert_eq!(description.subject.as_deref(), Some("example_crate"));
+            assert_eq!(
+                description.target.as_deref(),
+                Some("x86_64-unknown-linux-gnu")
+            );
+            assert_eq!(description.input_bytes, 10);
+            assert_eq!(description.input_blobs, 1);
+        }
         let saturated = Arc::clone(&scheduler)
             .handle_alloc_native_job(
                 &AcceptAssign,
@@ -3672,6 +3724,25 @@ mod scheduler_tests {
         };
         assert_eq!(job_alloc.server_id, b);
         Ok(())
+    }
+
+    #[cfg(feature = "scheduler-dashboard")]
+    #[test]
+    fn scheduler_status_does_not_wait_for_busy_scheduling_locks() {
+        let scheduler = Scheduler::new_with_job_slack(JobSlackConfig {
+            static_jobs: 0,
+            percent: 200.0,
+        });
+        {
+            let _servers = scheduler.servers.lock().unwrap();
+            assert!(scheduler.handle_dashboard_snapshot().is_err());
+            assert!(scheduler.jobs.try_lock().is_ok());
+        }
+        {
+            let _jobs = scheduler.jobs.lock().unwrap();
+            assert!(scheduler.handle_dashboard_snapshot().is_err());
+        }
+        assert!(scheduler.handle_dashboard_snapshot().is_ok());
     }
 
     #[tokio::test]

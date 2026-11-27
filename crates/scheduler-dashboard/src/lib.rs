@@ -9,6 +9,21 @@ pub mod server;
 mod styles;
 pub mod traces;
 
+/// Content-derived compatibility identity, independent of host architecture.
+pub const GENERATION: &str = include_str!(concat!(env!("OUT_DIR"), "/dashboard-generation"));
+
+#[cfg(feature = "ssr")]
+mod fingerprint;
+
+/// Keep the generation marker in the actual optimized WASM data, not in an
+/// unrelated sidecar. The native asset loader checks this embedded marker.
+#[cfg(all(feature = "hydrate", target_arch = "wasm32"))]
+#[wasm_bindgen::prelude::wasm_bindgen]
+#[must_use = "the embedded identity is consumed by generation verification"]
+pub fn dashboard_generation() -> String {
+    GENERATION.to_owned()
+}
+
 #[cfg(all(feature = "hydrate", target_arch = "wasm32"))]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn hydrate() {
@@ -65,10 +80,22 @@ pub struct NativeWorker {
     pub residency_reported: bool,
 }
 
+/// Bounded display metadata projected from an admitted execution declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobDescription {
+    pub executable: String,
+    pub subject: Option<String>,
+    pub target: Option<String>,
+    pub requester: Option<String>,
+    pub input_bytes: u64,
+    pub input_blobs: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Job {
     pub trace_id: Option<String>,
     pub id: String,
+    pub description: Option<JobDescription>,
     pub worker: String,
     pub worker_id: String,
     pub state: String,
@@ -147,7 +174,7 @@ pub struct NetworkHost {
     pub interfaces: Vec<HostInterface>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteEvidence {
     Advertised,
@@ -232,10 +259,38 @@ pub struct NativeService {
 
 pub use sccache_build::analytics::CacheAnalyticsSample as AnalyticsObservation;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionCounts {
+    pub hits: u64,
+    pub misses: u64,
+    pub refreshes: u64,
+    pub in_flight: u64,
+    pub missing_inputs: u64,
+    pub busy: u64,
+    pub errors: u64,
+}
+
+impl AdmissionCounts {
+    #[must_use = "Counter deltas are unavailable if any counter regressed."]
+    pub fn since(self, baseline: Self) -> Option<Self> {
+        Some(Self {
+            hits: self.hits.checked_sub(baseline.hits)?,
+            misses: self.misses.checked_sub(baseline.misses)?,
+            refreshes: self.refreshes.checked_sub(baseline.refreshes)?,
+            in_flight: self.in_flight.checked_sub(baseline.in_flight)?,
+            missing_inputs: self.missing_inputs.checked_sub(baseline.missing_inputs)?,
+            busy: self.busy.checked_sub(baseline.busy)?,
+            errors: self.errors.checked_sub(baseline.errors)?,
+        })
+    }
+}
+
 /// Independent, periodically collected CAS and network observations.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NativeTelemetry {
     pub live_traces: Option<sccache_build::wire::LiveTraceSnapshot>,
+    pub cache_sampled_at: Option<u64>,
+    pub admission: Option<AdmissionCounts>,
     pub analytics: Option<AnalyticsObservation>,
     pub sampled_at: u64,
     pub cache: Option<Cache>,
@@ -251,8 +306,9 @@ pub struct NativeTelemetry {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
+    pub admission: Option<AdmissionCounts>,
     pub unix_secs: u64,
-    pub totals: Totals,
+    pub totals: Option<Totals>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -281,9 +337,22 @@ pub enum PanelKind {
     Table,
 }
 
+/// Server-selected query category. Only the active tab's panels are queried.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricGroup {
+    #[default]
+    Fleet,
+    CacheHits,
+    CacheStorage,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricPanel {
     pub key: usize,
+    pub group: MetricGroup,
     pub kind: PanelKind,
     pub title: String,
     pub unit: String,
@@ -374,6 +443,7 @@ impl TimeRange {
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetricsView {
+    pub group: MetricGroup,
     pub range: TimeRange,
     /// Exact instance label, not a regular expression or arbitrary query.
     pub client: String,
@@ -432,6 +502,7 @@ pub struct MetricsPatch {
     pub error: Option<String>,
     pub clients: Option<Vec<String>>,
     pub panels: Vec<PanelPatch>,
+    pub removed: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
