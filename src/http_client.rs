@@ -33,7 +33,7 @@ pub fn io_runtime() -> Result<&'static tokio::runtime::Runtime> {
     RUNTIME
         .get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
+                .worker_threads(crate::util::num_cpus())
                 .thread_name("sccache-http-io")
                 .enable_all()
                 .build()

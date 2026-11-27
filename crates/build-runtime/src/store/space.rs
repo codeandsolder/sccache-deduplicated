@@ -591,6 +591,17 @@ pub struct StageBudget {
     reserved: u64,
 }
 
+#[derive(Debug)]
+struct StageSpaceExhausted;
+
+impl std::fmt::Display for StageSpaceExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native store has insufficient allocatable space or resident budget after bounded reclamation")
+    }
+}
+
+impl std::error::Error for StageSpaceExhausted {}
+
 impl StageBudget {
     pub(super) fn new(store: &NativeStore) -> Self {
         Self {
@@ -646,13 +657,22 @@ impl StageBudget {
 
     /// Encode and hash a private compiler output straight into its CAS inode.
     /// Durability is deferred until publication, outside compiler admission.
+    /// Returns None when the optional local CAS has insufficient headroom.
+    ///
+    /// # Errors
+    /// Returns an error for failed I/O, encoding, or invalid content.
     #[cfg(target_os = "linux")]
-    pub(crate) fn stage_capture(
+    pub(crate) fn try_stage_capture(
         &mut self,
         size: u64,
         reader: impl std::io::Read,
-    ) -> Result<super::CapturedStage> {
+    ) -> Result<Option<super::CapturedStage>> {
         use std::os::unix::fs::PermissionsExt as _;
+        match self.grow_to(size) {
+            Ok(()) => (),
+            Err(error) if error.is::<StageSpaceExhausted>() => return Ok(None),
+            Err(error) => return Err(error),
+        }
         let budget = self.split(size)?;
         let limit = size.checked_add(1).context("blob length overflow")?;
         let mut file = tempfile::NamedTempFile::new_in(self.store.inner.root.join("staging"))?;
@@ -685,7 +705,7 @@ impl StageBudget {
             _reservation: budget.finish(size)?,
         };
         let file = Arc::new(stage.open_file()?);
-        Ok(super::CapturedStage { stage, file })
+        Ok(Some(super::CapturedStage { stage, file }))
     }
 
     pub(super) fn grow_to(&mut self, size: u64) -> Result<()> {
@@ -721,10 +741,7 @@ impl StageBudget {
             let report = self.store.reclaim(policy, state.reserved, extra, || {
                 self.store.available_bytes()
             })?;
-            ensure!(
-                report.minimum_satisfied,
-                "native store has insufficient allocatable space or resident budget after bounded reclamation"
-            );
+            ensure!(report.minimum_satisfied, StageSpaceExhausted);
         }
         state.reserved = need;
         self.reserved = size;

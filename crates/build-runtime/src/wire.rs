@@ -290,7 +290,7 @@ pub struct BlobSourcePlan {
     pub sources: Vec<BlobSource>,
 }
 
-pub const MAX_SOURCE_BATCH: usize = 32;
+pub const MAX_SOURCE_BATCH: usize = 256;
 pub const MAX_BLOB_SOURCES: usize = 4;
 
 /// Fixed header of an upload. Physical bytes follow in the declared encoding.

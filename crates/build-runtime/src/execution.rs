@@ -150,6 +150,12 @@ impl CapturedExecution {
         Ok(file)
     }
 
+    /// Whether all captured content can be committed locally without copying.
+    #[must_use = "optional retention requires CAS-backed captures"]
+    pub fn can_retain(&self) -> bool {
+        self.files.keys().all(|id| self.staged.contains_key(id))
+    }
+
     /// Return the original captured inodes required for local publication,
     /// syncing them on the asynchronous disk executor when available.
     /// Already resident outputs need no writeback.
@@ -857,13 +863,23 @@ impl Capture {
         let size = metadata.len();
         ensure!(size <= self.remaining, "native result byte limit exceeded");
         file.seek(SeekFrom::Start(0))?;
-        let (reference, physical) = if let Some(budget) = &mut self.budget {
-            let stage = budget.stage_capture(size, &mut file)?;
+        let stage = self
+            .budget
+            .as_mut()
+            .map(|budget| budget.try_stage_capture(size, &mut file))
+            .transpose()?
+            .flatten();
+        let (reference, physical) = if let Some(stage) = stage {
             let reference = stage.reference();
             let physical = stage.file();
             self.staged.entry(reference.id).or_insert(stage);
             (reference, physical)
         } else {
+            // Local CAS retention is optional. Exact output bytes are still
+            // captured and verified for authoritative scheduler publication.
+            // Keep earlier staged descriptors and their accounting until the
+            // result has been delivered.
+            self.budget = None;
             let mut physical = tempfile::tempfile_in(&self.scratch)?;
             let reference = match self.encoding {
                 BlobEncoding::Raw => {

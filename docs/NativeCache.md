@@ -223,9 +223,9 @@ max_result_bytes = 1073741824
 max_result_blobs = 1024
 max_tree_bytes = 21474836480
 max_tree_blobs = 200000
-max_concurrent_uploads = 4
-max_total_uploads = 16
-http_threads = 32
+max_concurrent_uploads = 64
+max_total_uploads = 128
+http_threads = 256
 max_metadata_bytes = 67108864
 
 [native_cache.space]
@@ -741,7 +741,7 @@ measured reconstruction time before updating the codec's decode rate. Override i
 download_bytes_per_second = 20971520
 archive_download_bytes_per_second = 20971520
 raw_request_nanoseconds = 2000000
-raw_parallelism = 4
+raw_parallelism = 64
 decode_tar_bytes_per_second = 536870912
 decode_gzip_bytes_per_second = 134217728
 decode_xz_bytes_per_second = 25165824
@@ -910,8 +910,9 @@ files. The catalog alone does not place a package in the scheduler.
 The native dispatcher owns independent bounded staging, compiler and
 publication pools. Compiler capacity is shared with legacy execution, derived
 from available logical CPUs; a full ready queue waits with cancellation
-rather than failing a build. The staging and publication pools each have
-the smaller of the configured transfer parallelism and compiler width.
+rather than failing a build. All admitted jobs may progress through staging and publication independently;
+waiting for a tree, storage or another producer consumes no extra admission
+slot. Resource-specific transfer semaphores and store admission bound the actual work.
 The optional native worker setting `max_inflight_jobs` (default four times
 compiler width) bounds reservations across assignments, staging, ready jobs,
 execution, publication and unacknowledged terminal responses.
@@ -923,9 +924,10 @@ The staging pool verifies its immutable execution declaration against the
 scheduler's delegated session before reporting Started or acquiring missing
 inputs. This verification waits for the scheduler to finish allocation and
 delegate the publisher; a rejected or cancelled allocation cannot start
-compilation. The prepared job owns its verified input leases, output headroom,
-grace reservation and lease renewal through the ready queue and execution;
-publication retains ownership until completion or cancellation. Successful
+compilation. The prepared job owns its verified input leases and lease renewal through
+the ready queue and execution. Input pins are released after output capture,
+before remote publication; captured descriptors and the lease remain owned
+until completion or cancellation. Successful
 and failed compiler outcomes leave the compiler pool before publication or
 remote cleanup.
 
@@ -953,15 +955,15 @@ and a separate logical byte budget. The default budget is the larger of twice
 the maximum result size and 25% of the worker resident budget, capped by that resident
 budget. Shared output content is charged only once. Expiry releases the
 lease, not the content itself; ordinary eviction can then reclaim it.
-Before staging a build, the worker reserves its configured maximum result size
-in both the grace and CAS staging budgets. A full grace tier delays admission
-without consuming compiler slots, up to the execution timeout. Insufficient
-CAS headroom rejects the build before staging. Output publication converts
-reserved bytes directly into verified staged content and then actual unique
-resident bytes; no second capacity charge or silent retention bypass occurs.
-Failed or cancelled jobs release reservations. Grace expiry never releases
-independent consumer leases. The maximum-result bound is deliberately
-conservative until output sizes can be predicted with a reliable upper bound.
+Compilation does not reserve speculative result bytes. Output capture
+reserves actual bytes in the managed CAS as they are captured, and can use
+private temporary descriptors for authoritative scheduler delivery if optional
+local retention cannot fit. A full grace tier declines new unique content
+immediately; it never parks an input-staging or publication task until expiry.
+Existing protected results keep their full grace period. Output delivery to the
+scheduler remains mandatory and verified, and the worker only advertises a
+grace deadline for content actually retained. Failed or cancelled jobs release
+their temporary descriptors and staging reservations.
 
 ### Measured worker placement
 
@@ -1087,16 +1089,11 @@ through the staging, compiler and publication forecasts, rather than applying
 a candidate's cost to unrelated queued work. Unseen commands use the host
 prior. Upload size here means negotiated missing payload. Separately, the scheduler
 records the peak verified unique logical result size for each fresh command
-family across compatible workers. The assignment carries an advisory
-reservation of peak plus 25% and 64 KiB, clamped to the worker hard limit;
-unknown families retain the maximum-result forecast. Grace admission uses
-this forecast, but exact publication supersedes all outstanding forecasts.
-The worker maintains the full configured CAS staging headroom and execution
-result limit. Publication pins its local result, then atomically charges only
-additional unique bytes into the grace pool; if actual capacity is exhausted,
-it waits outside the compiler slot with cancellation and lease checks. Existing
-grace leases never expire early. New forecast admission pauses while exact
-publishers are waiting. The persistent history format is version 6.
+family across compatible workers. The assignment's peak estimate remains advisory, not a reservation or
+admission gate. Actual captured bytes drive CAS admission and the optional
+grace tier charges only the unique union of committed content. Existing grace
+leases never expire early; new content that does not fit is delivered to the
+scheduler without a grace claim. The persistent history format is version 6.
 
 The opt-in `native_placement_replay` trace target logs JSON assignment records
 with job ID, hashed command family, selected worker, all eligible workers'
@@ -1146,9 +1143,9 @@ The phase error is a forecast residual, not a pure decoder or network rate.
 
 Successful worker observations also report warm staging service (including
 authorization, input pinning and staged notification, but only if every tree
-was immediately resident and no grace admission wait occurred) and local
+was immediately resident) and local
 publication setup (result verification, retention and negotiation, excluding
-known grace-capacity waits and newly written local result blobs). The scheduler maintains independently expiring
+newly written local result blobs). The scheduler maintains independently expiring
 worker-local quarter-weight EWMAs, persisted in action-cost checkpoint v3.
 Every action pays the warm preparation baseline even if it adds no network
 bytes. Publication setup consumes a publication slot and delays upload arrival

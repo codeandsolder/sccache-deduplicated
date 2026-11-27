@@ -753,3 +753,43 @@ fn pidfd_wait_reaps_completed_and_cancelled_children() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn capture_without_resident_headroom_still_has_verified_delivery_bytes() -> Result<()> {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open_managed(
+        &dir.path().join("store"),
+        crate::SpacePolicy {
+            min_available_bytes: 1,
+            target_available_bytes: 1,
+            max_resident_bytes: 8,
+            target_resident_bytes: 8,
+            max_evictions_per_pass: 4,
+            gc_batch: 16,
+        },
+    )?;
+    let mut capture = Capture {
+        files: BTreeMap::new(),
+        staged: BTreeMap::new(),
+        budget: Some(store.reserve_staging(0)?),
+        remaining: 4096,
+        scratch: dir.path().to_path_buf(),
+        encoding: store.physical_encoding(),
+    };
+    let bytes = b"valid compiler result larger than local resident headroom";
+    let mut file = tempfile::tempfile_in(dir.path())?;
+    file.write_all(bytes)?;
+    let blob = capture.file(file)?;
+    assert_eq!(blob.id, ContentId::of(bytes));
+    assert_eq!(blob.size, bytes.len() as u64);
+    assert!(capture.budget.is_none());
+    assert!(capture.staged.is_empty());
+    assert_eq!(store.space_status()?.reserved_bytes, Some(0));
+    let mut reader =
+        crate::BlobReader::open(capture.files[&blob.id].try_clone()?, capture.encoding)?;
+    let mut decoded = Vec::new();
+    reader.read_to_end(&mut decoded)?;
+    assert_eq!(decoded, bytes);
+    Ok(())
+}

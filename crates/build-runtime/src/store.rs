@@ -2269,6 +2269,28 @@ pub struct UploadReservation {
 }
 
 impl UploadReservation {
+    // Preserve all resident pins across disjoint or replayed prefetch batches,
+    // with at most one pin per content ID in this delivery.
+    pub(crate) fn merge_pins(&mut self, mut other: Self) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.inner, &other.inner),
+            "reservation store mismatch"
+        );
+        let mut pins = self.inner.lock_pins()?;
+        self.reserved.append(&mut other.reserved);
+        self.reserved.sort_unstable();
+        self.reserved.dedup_by(|a, b| {
+            if a == b {
+                release_pin(&mut pins.blobs, a);
+                true
+            } else {
+                false
+            }
+        });
+        self.missing.clear();
+        Ok(())
+    }
+
     #[must_use = "missing blobs must be uploaded before publication"]
     pub fn missing(&self) -> &[BlobRef] {
         &self.missing

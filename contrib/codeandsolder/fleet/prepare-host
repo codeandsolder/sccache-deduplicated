@@ -277,9 +277,9 @@ max_result_bytes = 1073741824
 max_result_blobs = 4096
 max_tree_bytes = 21474836480
 max_tree_blobs = 200000
-max_concurrent_uploads = 4
-max_total_uploads = 16
-http_threads = 64
+max_concurrent_uploads = 64
+max_total_uploads = 128
+http_threads = 256
 max_metadata_bytes = 67108864
 
 [native_cache.space]

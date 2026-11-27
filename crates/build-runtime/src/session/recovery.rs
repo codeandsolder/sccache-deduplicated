@@ -29,14 +29,33 @@ struct RecoveryJob {
 struct State {
     jobs: VecDeque<RecoveryJob>,
     queued_bytes: usize,
+    active: usize,
+    active_bytes: usize,
     failed: HashMap<ActionKey, Instant>,
     ready: HashMap<ActionKey, (ResultLease, Instant)>,
 }
 
 #[derive(Default)]
 pub(super) struct RecoveryQueue {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     wake: tokio::sync::Notify,
+}
+
+// Keep running recovery charged to the same budget as queued recovery.
+struct ActiveRecovery {
+    state: Arc<Mutex<State>>,
+    bytes: usize,
+}
+
+impl Drop for ActiveRecovery {
+    fn drop(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active -= 1;
+        state.active_bytes -= self.bytes;
+    }
 }
 
 impl State {
@@ -83,8 +102,9 @@ impl RecoveryQueue {
         let now = Instant::now();
         state.prune(now);
         if state.failed.contains_key(&permit.key())
-            || state.jobs.len() >= max_jobs
-            || bytes > max_bytes.saturating_sub(state.queued_bytes)
+            || state.jobs.len().saturating_add(state.active) >= max_jobs
+            || bytes
+                > max_bytes.saturating_sub(state.queued_bytes.saturating_add(state.active_bytes))
         {
             return Ok(Some(permit));
         }
@@ -101,7 +121,7 @@ impl RecoveryQueue {
         Ok(None)
     }
 
-    async fn take(&self, wait: Duration) -> Result<Option<RecoveryJob>> {
+    async fn take(&self, wait: Duration) -> Result<Option<(RecoveryJob, ActiveRecovery)>> {
         let deadline = Instant::now() + wait;
         loop {
             let mut notified = std::pin::pin!(self.wake.notified());
@@ -113,8 +133,14 @@ impl RecoveryQueue {
                     .map_err(|_| anyhow!("result recovery queue poisoned"))?;
                 if let Some(job) = state.jobs.pop_front() {
                     state.queued_bytes -= job.bytes;
+                    state.active += 1;
+                    state.active_bytes += job.bytes;
+                    let active = ActiveRecovery {
+                        state: Arc::clone(&self.state),
+                        bytes: job.bytes,
+                    };
                     drop(state);
-                    return Ok(Some(job));
+                    return Ok(Some((job, active)));
                 }
             }
             if Instant::now() >= deadline
@@ -191,26 +217,27 @@ impl RecoveryQueue {
 }
 
 impl NativeSessions {
-    /// Process one queued result recovery using exact-content peer fetches.
-    /// Holds the exclusive action permit until a verified result is restored
-    /// or the attempt fails; no compiler slot or ordinary HTTP handler waits.
+    /// Start one queued result recovery using exact-content peer fetches.
+    /// The returned task owns the action permit and metadata budget until
+    /// recovery completes, even if its caller drops the handle.
     ///
     /// # Errors
     /// Returns an error for recovery queue failures.
-    pub async fn recover_next_result<F, Fut>(
+    pub async fn start_result_recovery<F, Fut>(
         self: &Arc<Self>,
         wait: Duration,
         fetch: F,
-    ) -> Result<bool>
+    ) -> Result<Option<tokio::task::JoinHandle<Result<()>>>>
     where
         F: Fn(BlobRef, NativeStore, Instant) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Option<StagedBlob>>> + Send + 'static,
     {
-        let Some(job) = self.recovery.take(wait).await? else {
-            return Ok(false);
+        let Some((job, active)) = self.recovery.take(wait).await? else {
+            return Ok(None);
         };
         let sessions = Arc::clone(self);
-        tokio::spawn(async move {
+        Ok(Some(tokio::spawn(async move {
+            let _active = active;
             let RecoveryJob {
                 permit,
                 manifest,
@@ -230,21 +257,38 @@ impl NativeSessions {
                     .recovery
                     .finish(key, recovered, sessions.limits.max_sessions)?;
                 drop(permit);
-                Ok(true)
+                Ok(())
             })
             .await?
-        })
-        .await?
+        })))
+    }
+
+    #[cfg(test)]
+    pub(super) async fn recover_next_result<F, Fut>(
+        self: &Arc<Self>,
+        wait: Duration,
+        fetch: F,
+    ) -> Result<bool>
+    where
+        F: Fn(BlobRef, NativeStore, Instant) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<StagedBlob>>> + Send + 'static,
+    {
+        if let Some(task) = self.start_result_recovery(wait, fetch).await? {
+            task.await??;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     async fn recover_result_blobs<Fut>(
-        &self,
+        self: &Arc<Self>,
         manifest: &ResultManifest,
         deadline: Instant,
-        fetch: impl Fn(BlobRef, NativeStore, Instant) -> Fut + Send + Sync,
+        fetch: impl Fn(BlobRef, NativeStore, Instant) -> Fut + Send + Sync + 'static,
     ) -> Result<(UploadReservation, Vec<Arc<TreeLease>>)>
     where
-        Fut: Future<Output = Result<Option<StagedBlob>>> + Send,
+        Fut: Future<Output = Result<Option<StagedBlob>>> + Send + 'static,
     {
         let check = || {
             ensure!(
@@ -264,33 +308,72 @@ impl NativeSessions {
         })
         .await??;
         let mut acquired = Vec::with_capacity(missing.len());
-        for blob in missing {
-            let _slot = loop {
-                check()?;
-                let mut notified = std::pin::pin!(self.peer_wake.notified());
-                notified.as_mut().enable();
-                match self.upload_slot(UploadSource::Peer) {
-                    Ok(slot) => break slot,
-                    Err(error) if error.is::<NativeServiceBusy>() => {
-                        tokio::time::timeout_at(deadline.into(), notified)
-                            .await
-                            .context("native result recovery deadline exceeded")?;
-                    }
-                    Err(error) => return Err(error),
-                }
+        let fetch = Arc::new(fetch);
+        let mut missing = missing.into_iter();
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut failure = None;
+        loop {
+            // Bound logical acquisitions by a metadata window, not by the
+            // transport permit count. Followers do not consume transfer slots.
+            while failure.is_none() && tasks.len() < crate::wire::MAX_SOURCE_BATCH {
+                let Some(blob) = missing.next() else {
+                    break;
+                };
+                let sessions = Arc::clone(self);
+                let fetch = Arc::clone(&fetch);
+                tasks.spawn(async move {
+                    sessions
+                        .acquire_peer_blob(blob, deadline, true, &*fetch)
+                        .await
+                });
+            }
+            let Some(result) = tasks.join_next().await else {
+                break;
             };
-            acquired.push(self.acquire_peer_blob(blob, deadline, &fetch).await?);
+            match result {
+                Ok(Ok(lease)) => acquired.push(lease),
+                Ok(Err(error)) => {
+                    failure.get_or_insert(error);
+                }
+                Err(error) => {
+                    failure.get_or_insert_with(|| error.into());
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         check()?;
         Ok((reserved, acquired))
     }
 
-    // Caller owns a bounded upload slot before entering the shared tree
-    // flight, so an active producer never waits on slots held by followers.
+    async fn await_peer_upload_slot(&self, deadline: Instant) -> Result<super::UploadSlot> {
+        loop {
+            ensure!(
+                Instant::now() < deadline,
+                "native peer acquisition deadline exceeded"
+            );
+            let mut notified = std::pin::pin!(self.peer_wake.notified());
+            notified.as_mut().enable();
+            match self.upload_slot(UploadSource::Peer) {
+                Ok(slot) => return Ok(slot),
+                Err(error) if error.is::<NativeServiceBusy>() => {
+                    tokio::time::timeout_at(deadline.into(), notified)
+                        .await
+                        .context("native peer acquisition deadline exceeded")?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    // Only the producer of missing content needs a transfer slot. Cached
+    // content and followers of an existing acquisition consume none.
     pub(super) async fn acquire_peer_blob<Fut>(
         &self,
         blob: BlobRef,
         deadline: Instant,
+        wait_for_slot: bool,
         fetch: &(impl Fn(BlobRef, NativeStore, Instant) -> Fut + Sync),
     ) -> Result<Arc<TreeLease>>
     where
@@ -309,7 +392,16 @@ impl NativeSessions {
                     let reservation =
                         tokio::task::spawn_blocking(move || owned.reserve_tree_upload(&manifest))
                             .await??;
-                    let staged = if reservation.missing().is_empty() {
+                    let slot = if reservation.missing().is_empty() {
+                        None
+                    } else if wait_for_slot {
+                        Some(self.await_peer_upload_slot(deadline).await?)
+                    } else {
+                        // This speculative peer lookup must not monopolize
+                        // the demand while the originating client could send it.
+                        Some(self.upload_slot(UploadSource::Peer)?)
+                    };
+                    let staged = if slot.is_none() {
                         Vec::new()
                     } else {
                         let staged = fetch(blob, store.clone(), deadline)

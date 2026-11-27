@@ -137,10 +137,9 @@ impl Drop for Renewals {
     }
 }
 
-// A finite number of concurrent requests per lease set is enough to prevent
-// a stalled route from delaying every other ticket. Server admission remains
-// authoritative; busy replies are retried within the same renewal period.
-const MAX_CONCURRENT_RENEWALS: usize = 4;
+// Renewals are deadline-critical. Bound fanout independently of blob I/O;
+// the server reserves a dedicated control lane.
+const MAX_CONCURRENT_RENEWALS: usize = 64;
 
 async fn renewal_loop<F, Fut>(state: &Mutex<State>, interval: Duration, renew: F) -> Result<()>
 where
