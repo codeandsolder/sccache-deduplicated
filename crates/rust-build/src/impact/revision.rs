@@ -253,7 +253,8 @@ fn capture(root: &Path, depth: usize) -> Result<RevisionSnapshot> {
             Command::new("git")
                 .current_dir(root)
                 .args(["symbolic-ref", "-q", "HEAD"])
-                .status()?
+                .output()?
+                .status
                 .success(),
             "cannot resolve Git HEAD"
         );
@@ -332,6 +333,110 @@ impl RevisionSnapshot {
     }
 }
 
+/// Compare committed source revisions in old-side coordinates. This is
+/// advisory until the caller supplies the complete static and runtime input
+/// closure. No Git index timestamps or worktree stat cache participate.
+pub fn committed_changes(
+    root: &Path,
+    old: &str,
+    new: &str,
+    known_sources: &BTreeSet<String>,
+) -> Result<super::selection::RevisionChanges> {
+    use super::selection::{LineRange, RevisionChanges};
+    // Accept only full object identities, not arbitrary revision arguments.
+    for revision in [old, new] {
+        ensure!(
+            (revision.len() == 40 || revision.len() == 64)
+                && revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid Git revision"
+        );
+    }
+    let raw = git(
+        root,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--name-status",
+            "-z",
+            old,
+            new,
+            "--",
+        ],
+    )?;
+    let mut fields = raw.split(|byte| *byte == 0);
+    let mut changes = RevisionChanges::default();
+    while let Some(status) = fields.next() {
+        if status.is_empty() {
+            ensure!(fields.next().is_none(), "malformed Git name-status output");
+            break;
+        }
+        let path = name(fields.next().context("missing changed path")?)?;
+        // Added, deleted, type-changed, mode-only and unknown-input changes
+        // require static invalidation, not an empty set of line ranges.
+        if status != b"M" || !path.ends_with(".rs") || !known_sources.contains(&path) {
+            changes.global.insert(path);
+            continue;
+        }
+        let diff = git(
+            root,
+            &[
+                "--literal-pathspecs",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--no-color",
+                "--no-indent-heuristic",
+                "--diff-algorithm=myers",
+                "--unified=0",
+                old,
+                new,
+                "--",
+                &path,
+            ],
+        )?;
+        let mut ranges = Vec::new();
+        let mut structural = false;
+        for line in diff.split(|byte| *byte == b'\n') {
+            if line.starts_with(b"old mode ")
+                || line.starts_with(b"new mode ")
+                || line.starts_with(b"Binary files ")
+                || line.starts_with(b"GIT binary patch")
+            {
+                structural = true;
+            }
+            if let Some(header) = line.strip_prefix(b"@@ -") {
+                let old_range = header
+                    .split(|byte| *byte == b' ')
+                    .next()
+                    .context("missing old hunk")?;
+                let old_range = std::str::from_utf8(old_range)?;
+                let (start, count) = old_range.split_once(',').unwrap_or((old_range, "1"));
+                let start: i64 = start.parse()?;
+                let count: i64 = count.parse()?;
+                ensure!(start >= 0 && count >= 0, "invalid old hunk");
+                // An insertion is between two old lines, so include both
+                // neighbors rather than guessing which region owns it.
+                let end = if count == 0 {
+                    start.checked_add(1)
+                } else {
+                    start.checked_add(count - 1)
+                }
+                .context("Git hunk range overflow")?;
+                ranges.push(LineRange { start, end });
+            }
+        }
+        if structural || ranges.is_empty() {
+            changes.global.insert(path);
+        } else {
+            changes.lines.insert(path, ranges);
+        }
+    }
+    Ok(changes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +467,40 @@ mod tests {
         let added = RevisionSnapshot::capture(&root)?;
         assert!(!added.clean);
         assert_eq!(added.files.len(), 2);
+        Ok(())
+    }
+    #[test]
+    fn committed_diff_uses_old_lines_and_invalidates_uncovered_inputs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        git(root, &["init", "-q"])?;
+        git(root, &["config", "user.email", "test@example.invalid"])?;
+        git(root, &["config", "user.name", "test"])?;
+        fs::write(root.join("lib.rs"), "one\ntwo\nthree\nfour\n")?;
+        git(root, &["add", "."])?;
+        git(root, &["commit", "-qm", "base"])?;
+        let old = String::from_utf8(git(root, &["rev-parse", "HEAD"])?)?
+            .trim()
+            .to_owned();
+        fs::write(root.join("lib.rs"), "zero\none\ntwo\nTHREE\nfour\n")?;
+        fs::write(root.join("fixture.txt"), "new input")?;
+        git(root, &["add", "."])?;
+        git(root, &["commit", "-qm", "change"])?;
+        let new = String::from_utf8(git(root, &["rev-parse", "HEAD"])?)?
+            .trim()
+            .to_owned();
+        let changes = committed_changes(root, &old, &new, &BTreeSet::from(["lib.rs".to_owned()]))?;
+        assert_eq!(
+            changes.lines["lib.rs"],
+            vec![
+                super::super::selection::LineRange { start: 0, end: 1 },
+                super::super::selection::LineRange { start: 3, end: 3 },
+            ]
+        );
+        assert_eq!(changes.global, BTreeSet::from(["fixture.txt".to_owned()]));
+        let uncovered = committed_changes(root, &old, &new, &BTreeSet::new())?;
+        assert!(uncovered.lines.is_empty());
+        assert_eq!(uncovered.global.len(), 2);
         Ok(())
     }
 }
