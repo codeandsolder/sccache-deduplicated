@@ -1058,7 +1058,7 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
         let mut spec = action(root.manifest())?;
         spec.mounts
             .insert(BuildPath::new(b"/src".to_vec())?, source.id());
-        spec.command.arguments = vec![b"-c".to_vec(), b"IFS= read -r data < /src/input; printf '%s' \"$data\" > /out/obj; printf diagnostic >&2".to_vec()];
+        spec.command.arguments = vec![b"-c".to_vec(), b"IFS= read -r data < /src/input; printf '%s' \"$data\" > /out/obj; printf diagnostic >&2; printf stdout".to_vec()];
         let NativeAdmission::Compile { ticket } = client.admit(
             &spec,
             crate::build_runtime::ActionMode::Reuse,
@@ -1139,6 +1139,13 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
             &mut bytes,
         )?;
         assert_eq!(bytes, b"diagnostic");
+        bytes.clear();
+        client.download(
+            ticket,
+            manifest.stdout.context("missing stdout")?,
+            &mut bytes,
+        )?;
+        assert_eq!(bytes, b"stdout");
         assert_eq!(worker_store.stats()?.actions, 1);
         let key = spec.action_request()?.action_fingerprint()?.key()?;
         assert_eq!(
