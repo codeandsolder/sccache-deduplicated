@@ -501,7 +501,7 @@ fn merge_window(
     Ok(merged.into_values().collect())
 }
 
-fn current_only(kind: PanelKind) -> bool {
+const fn current_only(kind: PanelKind) -> bool {
     matches!(kind, PanelKind::Stat | PanelKind::Bargauge)
 }
 

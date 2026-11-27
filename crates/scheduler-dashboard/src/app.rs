@@ -174,6 +174,8 @@ enum ConnectionStatus {
     #[cfg(target_arch = "wasm32")]
     Reconnecting,
     #[cfg(target_arch = "wasm32")]
+    Stalled,
+    #[cfg(target_arch = "wasm32")]
     ProtocolError,
     #[cfg(target_arch = "wasm32")]
     Unavailable,
@@ -186,6 +188,8 @@ impl ConnectionStatus {
             Self::Connected => "Live",
             #[cfg(target_arch = "wasm32")]
             Self::Reconnecting => "Disconnected — reconnecting",
+            #[cfg(target_arch = "wasm32")]
+            Self::Stalled => "No recent samples",
             #[cfg(target_arch = "wasm32")]
             Self::ProtocolError => "Resynchronizing",
             #[cfg(target_arch = "wasm32")]
@@ -258,9 +262,13 @@ pub fn App() -> impl IntoView {
     #[cfg(target_arch = "wasm32")]
     Effect::new(move |_| {
         let _ = retry.get();
-        sse::connect::<crate::NativeEvent>("/api/events", status, retry, move |event| {
-            data.apply(event)
-        });
+        sse::connect::<crate::NativeEvent>(
+            "/api/events",
+            status,
+            retry,
+            Some(std::time::Duration::from_secs(10)),
+            move |event| data.apply(event),
+        );
     });
     view! {
         <Title text="sccache | Scheduler status"/>
@@ -315,17 +323,35 @@ fn FleetMetrics(tab: RwSignal<Tab>) -> impl IntoView {
             &format!("/api/metrics/events?{query}"),
             status,
             retry,
+            None,
             move |event| {
+                if matches!(&event, crate::MetricsEvent::Reset(reset) if reset.view != selected) {
+                    return false;
+                }
                 let mut valid = false;
+                let mut discovered = None;
                 data.update(|data| {
                     valid = crate::apply_metrics_event(data, event);
-                    if valid && !data.clients.is_empty() {
-                        clients.set(data.clients.clone());
+                    if valid && data.sampled_at.is_some() && data.error.is_none() {
+                        discovered = Some(data.clients.clone());
                     }
                 });
+                if let Some(discovered) = discovered {
+                    clients.set(discovered);
+                }
                 valid
             },
         );
+    });
+    let client_options = Memo::new(move |_| {
+        let mut available = clients.get();
+        let selected = view.with(|view| view.client.clone());
+        if !selected.is_empty() && !available.contains(&selected) {
+            available.push(selected);
+        }
+        available.sort_unstable();
+        available.dedup();
+        available
     });
     let panels = Memo::new(move |_| {
         data.with(|data| {
@@ -374,7 +400,7 @@ fn FleetMetrics(tab: RwSignal<Tab>) -> impl IntoView {
                 <label>"Client"
                     <select prop:value=move || view.with(|view| view.client.clone()) on:change=move |event| view.update(|view| view.client = event_target_value(&event))>
                         <option value="">"All clients"</option>
-                        <For each=move || clients.get() key=Clone::clone children=|client| { let value = client.clone(); view!{<option value=value>{client}</option>} }/>
+                        <For each=move || client_options.get() key=Clone::clone children=move |client| { let value = client.clone(); view!{<option value=value>{move || if clients.with(|clients| clients.contains(&client)) {client.clone()} else {format!("{client} (not observed in range)")}}</option>} }/>
                     </select>
                 </label>
                 <span class=styles::muted>{move || format!("{} s resolution · missing samples are not zero",view.with(|view| view.range.step()))}</span>

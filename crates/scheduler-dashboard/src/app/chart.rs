@@ -169,7 +169,7 @@ fn reconcile_styles(
     changed |= before != styles.len();
     let mut used = styles.values().copied().collect::<BTreeSet<_>>();
     for key in keys {
-        if !styles.contains_key(key) {
+        if let std::collections::btree_map::Entry::Vacant(entry) = styles.entry(key.clone()) {
             let index = (0..COLORS.len() * PATTERNS.len())
                 .find(|index| !used.contains(index))
                 .unwrap_or_else(|| {
@@ -177,7 +177,7 @@ fn reconcile_styles(
                         hash.wrapping_mul(31).wrapping_add(usize::from(byte))
                     }) % (COLORS.len() * PATTERNS.len())
                 });
-            styles.insert(key.clone(), index);
+            entry.insert(index);
             used.insert(index);
             changed = true;
         }

@@ -363,6 +363,14 @@ fn CasPanel(telemetry: Memo<Option<NativeTelemetry>>) -> impl IntoView {
     }.into_any()
 }
 
+fn observed_rate(value: u64) -> String {
+    if value == 0 {
+        "—".into()
+    } else {
+        rate(value)
+    }
+}
+
 #[component]
 fn NetworkPanel(telemetry: Memo<Option<NativeTelemetry>>) -> impl IntoView {
     let network = Memo::new(move |_| {
@@ -378,11 +386,11 @@ fn NetworkPanel(telemetry: Memo<Option<NativeTelemetry>>) -> impl IntoView {
     });
     view! {
         <section id="network"><h2>"Native transport"</h2>
-            <p class=styles::muted>"Effective HTTP-body throughput estimates, not physical link rates."</p>
+            <p class=styles::muted>"Recent sustained HTTP-body peak and isolated service estimates, not instantaneous throughput or physical link rates. Wire/logical ratio is an estimate; 100% is the initial default."</p>
             {move || network.get().map(|(peers,groups,independent)| view!{
-                <div class=styles::tablewrap><table><thead><tr><th>"Peer"</th><th>"Direction"</th><th>"Observed"</th><th>"Isolated"</th><th>"Wire / logical"</th><th>"Remaining"</th><th>"Body bytes"</th></tr></thead><tbody>
+                <div class=styles::tablewrap><table><thead><tr><th>"Peer"</th><th>"Direction"</th><th>"Observed peak"</th><th>"Isolated estimate"</th><th>"Wire / logical estimate"</th><th>"Remaining"</th><th>"Body bytes"</th></tr></thead><tbody>
                     {peers.into_iter().map(|peer| view!{
-                        <tr><td>{peer.peer}</td><td>{peer.direction}</td><td>{rate(peer.observed_bytes_per_second)}</td><td>{rate(peer.isolated_bytes_per_second)}</td><td>{format!("{:.1}%", display_count(peer.wire_per_mille) / 10.0)}</td><td>{bytes(peer.remaining_bytes)}</td><td>{bytes(peer.body_bytes)}</td></tr>
+                        <tr><td>{peer.peer}</td><td>{peer.direction}</td><td>{observed_rate(peer.observed_bytes_per_second)}</td><td>{observed_rate(peer.isolated_bytes_per_second)}</td><td>{format!("{:.1}%", display_count(peer.wire_per_mille) / 10.0)}</td><td>{bytes(peer.remaining_bytes)}</td><td>{bytes(peer.body_bytes)}</td></tr>
                     }).collect_view()}
                 </tbody></table></div>
                 <h3>"Shared capacity observations"</h3>
@@ -429,7 +437,7 @@ const fn execution_protocols(archive: bool, native: bool) -> &'static str {
 
 // Keep cell elements alive as the keyed row changes. Reactive text updates
 // do not reset table layout, horizontal scroll or the browser's selection.
-fn row_text<T, F>(
+pub(super) fn row_text<T, F>(
     row: Memo<Option<T>>,
     format: F,
 ) -> impl Fn() -> String + Send + Sync + Copy + 'static

@@ -3718,7 +3718,7 @@ mod scheduler_tests {
 
     #[cfg(feature = "scheduler-dashboard")]
     #[test]
-    fn scheduler_status_does_not_wait_for_busy_scheduling_locks() -> Result<()> {
+    fn scheduler_status_does_not_wait_for_busy_scheduling_locks() {
         let scheduler = Scheduler::new_with_job_slack(JobSlackConfig {
             static_jobs: 0,
             percent: 200.0,
@@ -3733,7 +3733,6 @@ mod scheduler_tests {
             assert!(scheduler.handle_dashboard_snapshot().is_err());
         }
         assert!(scheduler.handle_dashboard_snapshot().is_ok());
-        Ok(())
     }
 
     #[tokio::test]

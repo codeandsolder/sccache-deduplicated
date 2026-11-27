@@ -157,7 +157,7 @@ pub struct NetworkHost {
     pub interfaces: Vec<HostInterface>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteEvidence {
     Advertised,
@@ -484,6 +484,7 @@ pub struct MetricsPatch {
     pub error: Option<String>,
     pub clients: Option<Vec<String>>,
     pub panels: Vec<PanelPatch>,
+    pub removed: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

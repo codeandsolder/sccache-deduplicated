@@ -123,7 +123,15 @@ pub(super) fn Topology(graph: Memo<NetworkGraph>, selected: RwSignal<String>) ->
                 .collect::<BTreeMap<_, _>>()
         })
     });
-    let ids = Memo::new(move |_| hosts.with(|hosts| hosts.keys().cloned().collect::<Vec<_>>()));
+    let ids = Memo::new(move |_| {
+        let mut ids = hosts.with(|hosts| hosts.keys().cloned().collect::<Vec<_>>());
+        let chosen = selected.get();
+        if !chosen.is_empty() && !ids.contains(&chosen) {
+            ids.push(chosen);
+        }
+        ids.sort_unstable();
+        ids
+    });
     let selected_host =
         Memo::new(move |_| selected.with(|id| hosts.with(|hosts| hosts.get(id).cloned())));
     let links = Memo::new(move |_| {
@@ -149,7 +157,7 @@ pub(super) fn Topology(graph: Memo<NetworkGraph>, selected: RwSignal<String>) ->
                         <option value="">"All hosts"</option>
                         <For each=move || ids.get() key=Clone::clone children=move |id| {
                             let key = id.clone();
-                            view!{<option value=id>{move || hosts.with(|hosts| hosts.get(&key).map_or_else(|| key.clone(), |host| format!("{} · {}",host.name,role(host.role))))}</option>}
+                            view!{<option value=id>{move || hosts.with(|hosts| hosts.get(&key).map_or_else(|| format!("{key} · not observed"), |host| format!("{} · {}",host.name,role(host.role))))}</option>}
                         }/>
                     </select>
                 </label>
@@ -157,6 +165,7 @@ pub(super) fn Topology(graph: Memo<NetworkGraph>, selected: RwSignal<String>) ->
                 <span class=styles::muted>{move || graph.with(|graph| format!("{} identities · {} directional paths",graph.hosts.len(),graph.links.len()))}</span>
             </div>
             <GraphCanvas graph=graph hosts=hosts selected=selected/>
+            <Show when=move || !selected.with(String::is_empty) && selected_host.with(Option::is_none)><p class=styles::warning>"Selected host is no longer observed. Show all to clear the filter."</p></Show>
             {move || selected_host.get().map(|host|view!{<HostDetails host=host/>})}
             <RouteTable links=links hosts=hosts/>
         </section>
@@ -235,7 +244,7 @@ fn RouteTable(links: Memo<Vec<NetworkLink>>, hosts: Memo<Hosts>) -> impl IntoVie
             <tbody>
                 <For each=move ||keys.get() key=Clone::clone children=move |id| {
                     let link = Memo::new(move |_| indexed.with(|links|links.get(&id).cloned()));
-                    view! { <tr>{move ||link.get().map(|link|view!{<RouteCells link=link hosts=hosts/>})}</tr> }
+                    view! { <tr><RouteCells link=link hosts=hosts/></tr> }
                 }/>
             </tbody>
         </table></div>
@@ -243,9 +252,7 @@ fn RouteTable(links: Memo<Vec<NetworkLink>>, hosts: Memo<Hosts>) -> impl IntoVie
 }
 
 #[component]
-fn RouteCells(link: NetworkLink, hosts: Memo<Hosts>) -> impl IntoView {
-    let source = link.source;
-    let target = link.target;
+fn RouteCells(link: Memo<Option<NetworkLink>>, hosts: Memo<Hosts>) -> impl IntoView {
     let name = move |id: &str| {
         hosts.with(|hosts| {
             hosts
@@ -253,11 +260,14 @@ fn RouteCells(link: NetworkLink, hosts: Memo<Hosts>) -> impl IntoView {
                 .map_or_else(|| short(id, 16), |host| host.name.clone())
         })
     };
+    use super::native::row_text;
     view! {
-        <td><b>{move ||name(&source)}</b><small>{link.source_address.unwrap_or_else(||"Unknown source".into())}</small></td>
-        <td><b>{move ||name(&target)}</b><small>{link.target_address.unwrap_or_else(||"Unknown endpoint".into())}</small></td>
-        <td>{evidence(link.evidence)}</td><td>{optional_rate(link.wire_bytes_per_second)}</td><td>{optional_rate(link.logical_bytes_per_second)}</td>
-        <td>{link.remaining_bytes.map_or_else(||"—".into(),super::bytes)}</td>
+        <td><b>{row_text(link, move |link|name(&link.source))}</b><small>{row_text(link, |link|link.source_address.clone().unwrap_or_else(||"Unknown source".into()))}</small></td>
+        <td><b>{row_text(link, move |link|name(&link.target))}</b><small>{row_text(link, |link|link.target_address.clone().unwrap_or_else(||"Unknown endpoint".into()))}</small></td>
+        <td>{row_text(link, |link| evidence(link.evidence).into())}</td>
+        <td>{row_text(link, |link|optional_rate(link.wire_bytes_per_second))}</td>
+        <td>{row_text(link, |link|optional_rate(link.logical_bytes_per_second))}</td>
+        <td>{row_text(link, |link|link.remaining_bytes.map_or_else(||"—".into(),super::bytes))}</td>
     }.into_any()
 }
 
@@ -265,15 +275,13 @@ fn edge_path(a: Point, b: Point) -> String {
     // Opposite directions bow in opposite ways; terminate at the node boundary.
     if a.x == b.x {
         let sign = if b.y > a.y { 1 } else { -1 };
+        let edge = a.x + sign * 128;
+        let control = (a.x + sign * 176).clamp(8, 952);
         return format!(
-            "M {} {} C {} {}, {} {}, {} {}",
-            a.x + 128,
+            "M {edge} {} C {control} {}, {control} {}, {edge} {}",
             a.y,
-            a.x + 176,
             a.y + sign * 24,
-            b.x + 176,
             b.y - sign * 24,
-            b.x + 128,
             b.y
         );
     }

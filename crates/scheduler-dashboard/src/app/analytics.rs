@@ -55,7 +55,11 @@ fn ratio(numerator: u128, denominator: u128) -> String {
 }
 
 fn share(part: u64, total: u64) -> String {
-    format!("{:.1}%", percent(part.into(), total.into()))
+    if total == 0 {
+        "—".into()
+    } else {
+        format!("{:.1}%", percent(part.into(), total.into()))
+    }
 }
 
 fn age_label(bound: u64) -> String {
@@ -296,32 +300,44 @@ mod tests {
 
 #[component]
 fn FleetStorage(workers: Memo<Vec<Worker>>) -> impl IntoView {
+    let storage = Memo::new(move |_| {
+        workers.with(|workers| {
+            workers
+                .iter()
+                .filter_map(|worker| {
+                    worker
+                        .native
+                        .as_ref()
+                        .map(|native| (worker.name.clone(), native.cache_analytics.clone()))
+                })
+                .collect::<Vec<_>>()
+        })
+    });
     view! {
         <h3>"Worker native CAS storage"</h3>
         <p class=styles::muted>"Per-host local snapshots. Replicated content is counted separately on each host; these rows cannot be summed to obtain globally unique content."</p>
         <div class=styles::tablewrap><table>
             <thead><tr><th>"Worker"</th><th>"Sample"</th><th>"Objects"</th><th>"Logical / budget"</th><th>"Stored"</th><th>"Allocated"</th><th>"Dedup"</th><th>">7d"</th><th>">30d"</th><th>">90d"</th><th>"Unknown age"</th></tr></thead>
-            <tbody>{move || workers.get().into_iter().filter_map(|worker| {
-                let native = worker.native?;
-                Some(match native.cache_analytics {
+            <tbody>{move || storage.get().into_iter().map(|(name, analytics)| {
+                match analytics {
                     Some(summary) => {
                         let sampled_at = timestamp(Some(summary.sampled_at));
                         match summary.total {
                             Some(total) => view!{
                                 <tr>
-                                    <td>{worker.name}</td><td>{sampled_at}</td><td>{total.objects}</td>
+                                    <td>{name}</td><td>{sampled_at}</td><td>{total.objects}</td>
                                     <td>{format!("{} / {}",bytes(total.logical_bytes),summary.maximum_bytes.map_or_else(||"—".into(),bytes))}</td>
-                                    <td>{format!("{} ({})",bytes(total.stored_bytes),share(total.measured_objects,total.objects))}</td>
-                                    <td>{bytes(total.allocated_bytes)}</td>
+                                    <td>{format!("{} ({})",if total.measured_objects == 0 && total.objects != 0 {"—".into()} else {bytes(total.stored_bytes)},share(total.measured_objects,total.objects))}</td>
+                                    <td>{if total.measured_objects == 0 && total.objects != 0 {"—".into()} else {bytes(total.allocated_bytes)}}</td>
                                     <td>{ratio(summary.referenced_bytes,total.logical_bytes.into())}</td>
                                     <td>{bytes(summary.older_than_seven_days)}</td><td>{bytes(summary.older_than_thirty_days)}</td><td>{bytes(summary.older_than_ninety_days)}</td><td>{bytes(summary.unknown_age_bytes)}</td>
                                 </tr>
                             }.into_any(),
-                            None => view!{<tr><td>{worker.name}</td><td>{sampled_at}</td><td colspan="9">"Snapshot failed"</td></tr>}.into_any(),
+                            None => view!{<tr><td>{name}</td><td>{sampled_at}</td><td colspan="9">"Snapshot failed"</td></tr>}.into_any(),
                         }
                     }
-                    None => view!{<tr><td>{worker.name}</td><td colspan="10">"Waiting for snapshot"</td></tr>}.into_any(),
-                })
+                    None => view!{<tr><td>{name}</td><td colspan="10">"Waiting for snapshot"</td></tr>}.into_any(),
+                }
             }).collect_view()}</tbody>
         </table></div>
     }.into_any()

@@ -1,6 +1,6 @@
 //! Shared deterministic delta protocol; neither a browser nor a slow SSE
 //! consumer can silently continue with a missing revision.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{DashboardData, HISTORY_CAPACITY, NativeEvent, NativePatch, Rows, Sample, Snapshot};
 
@@ -13,6 +13,10 @@ fn diff_rows<T: Clone + PartialEq>(old: &[T], new: &[T], key: impl Fn(&T) -> &st
         .collect();
     let remove = previous.into_keys().map(str::to_owned).collect();
     Rows { upsert, remove }
+}
+
+fn has_rows<T>(rows: &Rows<T>) -> bool {
+    !rows.upsert.is_empty() || !rows.remove.is_empty()
 }
 
 fn apply_rows<T>(rows: &mut Vec<T>, delta: Rows<T>, key: impl Fn(&T) -> &str) {
@@ -69,7 +73,14 @@ pub fn apply_event(state: &mut DashboardData, event: NativeEvent) -> bool {
         }
         NativeEvent::Patch(patch) => *patch,
     };
-    if patch.revision != state.revision.saturating_add(1) {
+    if patch.revision != state.revision.saturating_add(1)
+        || (patch.sampled_at.is_none()
+            && (patch.totals.is_some()
+                || has_rows(&patch.workers)
+                || has_rows(&patch.jobs)
+                || has_rows(&patch.hosts)
+                || has_rows(&patch.links)))
+    {
         return false;
     }
     state.revision = patch.revision;
@@ -433,7 +444,7 @@ fn panel_patch(old: &MetricPanel, new: &MetricPanel) -> Option<PanelPatch> {
 
 #[must_use = "the patch advances the metrics feed revision"]
 pub fn make_metrics_patch(old: &MetricsData, new: &MetricsData) -> MetricsPatch {
-    let previous: BTreeMap<_, _> = old.panels.iter().map(|panel| (panel.key, panel)).collect();
+    let mut previous: BTreeMap<_, _> = old.panels.iter().map(|panel| (panel.key, panel)).collect();
     MetricsPatch {
         revision: old.revision.saturating_add(1),
         sampled_at: new.sampled_at,
@@ -443,12 +454,13 @@ pub fn make_metrics_patch(old: &MetricsData, new: &MetricsData) -> MetricsPatch 
             .panels
             .iter()
             .filter_map(|panel| {
-                previous.get(&panel.key).map_or_else(
+                previous.remove(&panel.key).map_or_else(
                     || Some(PanelPatch::Replace(panel.clone())),
                     |old| panel_patch(old, panel),
                 )
             })
             .collect(),
+        removed: previous.into_keys().collect(),
     }
 }
 
@@ -488,6 +500,47 @@ fn apply_series_patch(panel: &mut MetricPanel, patch: SeriesPatch) -> bool {
     true
 }
 
+fn valid_metrics_patch(state: &MetricsData, patch: &MetricsPatch) -> bool {
+    let mut keys = BTreeSet::new();
+    if !patch
+        .removed
+        .iter()
+        .all(|key| keys.insert(*key) && state.panels.iter().any(|panel| panel.key == *key))
+    {
+        return false;
+    }
+    patch.panels.iter().all(|change| match change {
+        PanelPatch::Replace(panel) => keys.insert(panel.key),
+        PanelPatch::Update {
+            key,
+            series,
+            removed,
+            ..
+        } => {
+            if !keys.insert(*key) {
+                return false;
+            }
+            let Some(panel) = state.panels.iter().find(|panel| panel.key == *key) else {
+                return false;
+            };
+            let mut series_keys = BTreeSet::new();
+            if !removed.iter().all(|key| {
+                series_keys.insert(key.as_str())
+                    && panel.series.iter().any(|series| series.key == *key)
+            }) {
+                return false;
+            }
+            series.iter().all(|change| match change {
+                SeriesPatch::Replace(series) => series_keys.insert(series.key.as_str()),
+                SeriesPatch::Update { key, .. } => {
+                    series_keys.insert(key.as_str())
+                        && panel.series.iter().any(|series| series.key == *key)
+                }
+            })
+        }
+    })
+}
+
 pub fn apply_metrics_event(state: &mut MetricsData, event: MetricsEvent) -> bool {
     let patch = match event {
         MetricsEvent::Reset(data) => {
@@ -496,7 +549,7 @@ pub fn apply_metrics_event(state: &mut MetricsData, event: MetricsEvent) -> bool
         }
         MetricsEvent::Patch(patch) => patch,
     };
-    if patch.revision != state.revision.saturating_add(1) {
+    if patch.revision != state.revision.saturating_add(1) || !valid_metrics_patch(state, &patch) {
         return false;
     }
     state.revision = patch.revision;
@@ -505,6 +558,9 @@ pub fn apply_metrics_event(state: &mut MetricsData, event: MetricsEvent) -> bool
     if let Some(clients) = patch.clients {
         state.clients = clients;
     }
+    state
+        .panels
+        .retain(|panel| !patch.removed.contains(&panel.key));
     for patch in patch.panels {
         match patch {
             PanelPatch::Replace(panel) => {
@@ -541,6 +597,42 @@ pub fn apply_metrics_event(state: &mut MetricsData, event: MetricsEvent) -> bool
 #[cfg(test)]
 mod metrics_tests {
     use super::*;
+    #[test]
+    fn removed_panels_and_invalid_patches_are_atomic() {
+        let panel = MetricPanel {
+            key: 1,
+            group: crate::MetricGroup::Fleet,
+            kind: crate::PanelKind::Stat,
+            title: "Test".into(),
+            unit: "s".into(),
+            series: Vec::new(),
+            error: None,
+        };
+        let mut state = MetricsData {
+            panels: vec![panel],
+            ..Default::default()
+        };
+        let mut next = state.clone();
+        next.revision = 1;
+        next.panels.clear();
+        let patch = make_metrics_patch(&state, &next);
+        assert!(apply_metrics_event(&mut state, MetricsEvent::Patch(patch)));
+        assert_eq!(state, next);
+        let mut invalid = make_metrics_patch(&state, &next);
+        invalid.error = Some("must not mutate".into());
+        invalid.panels.push(PanelPatch::Update {
+            key: 99,
+            error: None,
+            series: Vec::new(),
+            removed: Vec::new(),
+        });
+        assert!(!apply_metrics_event(
+            &mut state,
+            MetricsEvent::Patch(invalid)
+        ));
+        assert_eq!(state, next);
+    }
+
     #[test]
     fn rolling_range_and_late_correction_reconstruct_exact_data() {
         let panel = MetricPanel {
