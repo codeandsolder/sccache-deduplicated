@@ -688,9 +688,12 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
             stdout: None,
             stderr: None,
         };
+        let (begin, width) = crate::http_client::io_runtime()?
+            .block_on(worker_client.begin_result_upload(ticket, output.clone()))?;
+        assert_eq!(begin.missing, vec![blob]);
         assert_eq!(
-            worker_client.begin(ticket, output.clone())?.missing,
-            vec![blob]
+            width.map(std::num::NonZeroUsize::get),
+            Some(limits().max_concurrent_uploads)
         );
         assert_eq!(client.status(ticket)?, NativeStatus::Compiling);
         assert_eq!(

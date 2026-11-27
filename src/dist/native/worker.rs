@@ -786,29 +786,6 @@ impl NativeCacheClient {
         })
     }
 
-    async fn begin_result_upload(
-        &self,
-        ticket: Ticket,
-        manifest: crate::build_runtime::ResultManifest,
-    ) -> Result<(
-        crate::build_runtime::wire::BeginResult,
-        Option<NonZeroUsize>,
-    )> {
-        self.control_with_metadata_async(
-            "begin",
-            &super::ManifestRequest { ticket, manifest },
-            self.timeout,
-            |response| {
-                response
-                    .headers()
-                    .get(super::UPLOAD_PARALLELISM_HEADER)
-                    .map(|value| Ok(value.to_str()?.parse::<NonZeroUsize>()?))
-                    .transpose()
-            },
-        )
-        .await
-    }
-
     async fn upload_result_blobs(
         &self,
         ticket: Ticket,

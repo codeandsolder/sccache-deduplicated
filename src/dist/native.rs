@@ -39,6 +39,10 @@ pub use package::{
     validate_upstream_name,
 };
 
+#[cfg(any(
+    feature = "dist-server",
+    all(target_os = "linux", feature = "native-store")
+))]
 pub(super) const UPLOAD_PARALLELISM_HEADER: &str = "x-sccache-upload-parallelism";
 
 type LeaseCheck<'a> = dyn Fn() -> Result<()> + Sync + 'a;
@@ -1186,6 +1190,30 @@ impl NativeCacheClient {
             };
             store.publish_tree_pinned_async(manifest, staged, reservation).await
         })).await.map(|(lease, _)| lease)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-store"))]
+    pub(super) async fn begin_result_upload(
+        &self,
+        ticket: Ticket,
+        manifest: crate::build_runtime::ResultManifest,
+    ) -> Result<(
+        crate::build_runtime::wire::BeginResult,
+        Option<std::num::NonZeroUsize>,
+    )> {
+        self.control_with_metadata_async(
+            "begin",
+            &ManifestRequest { ticket, manifest },
+            self.timeout,
+            |response| {
+                response
+                    .headers()
+                    .get(UPLOAD_PARALLELISM_HEADER)
+                    .map(|value| Ok(value.to_str()?.parse::<std::num::NonZeroUsize>()?))
+                    .transpose()
+            },
+        )
+        .await
     }
 
     /// Negotiate missing content for a successful result.
