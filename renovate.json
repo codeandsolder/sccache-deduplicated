@@ -70,6 +70,21 @@
       "groupName": "native transport stack",
       "groupSlug": "native-transport-stack",
       "automerge": false
+    },
+    {
+      "description": "BTLS git-source identity is selected by the pinned Wreq workspace. Update these three direct pins together with Wreq and its Reqsign/Lurkmoar consumers; never advance the provider merely because its default branch changed.",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchDepNames": [
+        "btls",
+        "tokio-btls",
+        "jsonwebtoken-btls"
+      ],
+      "matchUpdateTypes": [
+        "digest"
+      ],
+      "enabled": false
     }
   ]
 }
