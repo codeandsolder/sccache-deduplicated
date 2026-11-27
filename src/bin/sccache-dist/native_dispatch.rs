@@ -98,7 +98,7 @@ impl RemainingInputs {
     }
 }
 
-fn trace_phase(phase: NativeJobPhase) -> &'static str {
+const fn trace_phase(phase: NativeJobPhase) -> &'static str {
     match phase {
         NativeJobPhase::Assigned => "assigned",
         NativeJobPhase::Queued => "staging_queue",

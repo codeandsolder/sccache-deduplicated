@@ -901,6 +901,7 @@ const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Copy, Clone)]
 struct JobDetail {
+    #[cfg(feature = "scheduler-dashboard")]
     trace: Option<sccache::latency_trace::TraceContext>,
     server_id: ServerId,
     state: JobState,
@@ -1259,6 +1260,7 @@ fn weighted_server(candidates: &[(ServerId, f64)], draw: f64) -> Option<ServerId
 }
 
 struct Reservation {
+    #[cfg(feature = "scheduler-dashboard")]
     trace: Option<sccache::latency_trace::TraceContext>,
     job_id: JobId,
     server_id: ServerId,
@@ -1544,16 +1546,14 @@ impl Scheduler {
             packages: std::sync::Arc::clone(packages),
             inputs: inputs.clone(),
             class,
-            cost: candidates
-                .predictions
-                .get(&server_id)
-                .map(|estimate| estimate.cost),
+            cost: prediction.map(|estimate| estimate.cost),
             milestone: None,
         });
         server_details.reserve(job_id, assigned);
         drop(servers);
         info!("Job {job_id} created and will be assigned to server {server_id:?}");
         Ok(Ok(Reservation {
+            #[cfg(feature = "scheduler-dashboard")]
             trace: native.and_then(|assignment| assignment.trace),
             job_id,
             server_id,
@@ -1636,6 +1636,7 @@ impl Scheduler {
         assigned_at: Instant,
     ) -> Result<AllocJobResult> {
         let Reservation {
+            #[cfg(feature = "scheduler-dashboard")]
             trace,
             job_id,
             server_id,
@@ -1679,6 +1680,7 @@ impl Scheduler {
                 jobs.insert(
                     job_id,
                     JobDetail {
+                        #[cfg(feature = "scheduler-dashboard")]
                         trace,
                         server_id,
                         state,
