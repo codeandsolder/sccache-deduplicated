@@ -51,6 +51,25 @@
         ".github/workflows/publish-ci-client.yml"
       ],
       "enabled": false
+    },
+    {
+      "description": "Wreq, BTLS, lurkmoar and Reqsign must agree on one Cargo git source identity for the native TLS provider",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchDepNames": [
+        "wreq",
+        "btls",
+        "tokio-btls",
+        "jsonwebtoken-btls",
+        "lurkmoar",
+        "reqsign-core",
+        "reqsign-azure-storage",
+        "reqsign-google"
+      ],
+      "groupName": "native transport stack",
+      "groupSlug": "native-transport-stack",
+      "automerge": false
     }
   ]
 }
