@@ -1945,9 +1945,13 @@ mod tests {
             },
         )?;
         let final_root = temp.path().join("target");
-        let run = |mode: Mode, iteration: usize| -> Result<()> {
+        let run = |mode: Mode,
+                   iteration: usize,
+                   coverage: Option<crate::impact::CoverageMode>|
+         -> Result<()> {
             let options = PlanOptions {
                 mode,
+                coverage,
                 no_doc: true,
                 test_targets: if mode == Mode::Test {
                     vec!["executable".into()]
@@ -1963,7 +1967,11 @@ mod tests {
                 &toolchain,
                 &options,
                 temp.path().join(format!("intermediate-{iteration}")),
-                final_root.clone(),
+                if coverage.is_some() {
+                    temp.path().join("coverage-target")
+                } else {
+                    final_root.clone()
+                },
             )?;
             let mut ready = planner.graph()?;
             while let Some(index) = ready.take_ready() {
@@ -1997,6 +2005,137 @@ mod tests {
                         if let Some(path) = stderr {
                             process.stderr(Stdio::from(fs::File::create(BuildPlan::path(path))?));
                         }
+                        if let Some(harness) = planner.test_harness(index, &node)?
+                            && coverage.is_some()
+                        {
+                            use crate::impact::{
+                                coverage::{
+                                    BinaryFunctionMap, ExecutableIndex, ExecutableMap,
+                                    build_function_map_with, executed_functions,
+                                },
+                                harness::{HarnessOptions, inventory, verify_single_success},
+                            };
+                            let sources = planner
+                                .coverage_sources()
+                                .context("missing coverage sources")?;
+                            let scratch = tempfile::tempdir_in(temp.path())?;
+                            let options = HarnessOptions::from_arguments(&[])
+                                .context("invalid harness options")?;
+                            let listing = command_for(&harness.command, None)
+                                .args(options.listing())
+                                .env("LLVM_PROFILE_FILE", scratch.path().join("listing.profraw"))
+                                .output()?;
+                            ensure!(
+                                listing.status.success(),
+                                "libtest inventory: {}",
+                                String::from_utf8_lossy(&listing.stderr)
+                            );
+                            let tests = inventory(&listing.stdout)?;
+                            assert_eq!(tests.len(), 1);
+                            let raw_dir = scratch.path().join("raw");
+                            fs::create_dir(&raw_dir)?;
+                            let output = command_for(&harness.command, None)
+                                .args(options.exact(&tests[0].name))
+                                .env("LLVM_PROFILE_FILE", raw_dir.join("%p-%m.profraw"))
+                                .output()?;
+                            ensure!(
+                                output.status.success(),
+                                "exact test: {}",
+                                String::from_utf8_lossy(&output.stderr)
+                            );
+                            verify_single_success(&output.stdout, &tests[0].name)?;
+                            let raw = fs::read_dir(raw_dir)?
+                                .map(|entry| entry.map(|entry| entry.path()))
+                                .collect::<std::io::Result<Vec<_>>>()?;
+                            assert_eq!(
+                                raw.len(),
+                                2,
+                                "one profile from test and one from spawned executable"
+                            );
+                            let profile = scratch.path().join("profile.txt");
+                            let result = Command::new("llvm-profdata")
+                                .args(["merge", "--text", "--sparse"])
+                                .args(&raw)
+                                .arg("-o")
+                                .arg(&profile)
+                                .output()?;
+                            ensure!(
+                                result.status.success(),
+                                "profdata merge: {}",
+                                String::from_utf8_lossy(&result.stderr)
+                            );
+                            let empty = scratch.path().join("empty.txt");
+                            let empty_profile = scratch.path().join("empty.profdata");
+                            fs::write(&empty, b"")?;
+                            let result = Command::new("llvm-profdata")
+                                .arg("merge")
+                                .arg(&empty)
+                                .arg("-o")
+                                .arg(&empty_profile)
+                                .output()?;
+                            ensure!(
+                                result.status.success(),
+                                "empty profile: {}",
+                                String::from_utf8_lossy(&result.stderr)
+                            );
+                            let map = |path: &Path| -> Result<BinaryFunctionMap> {
+                                let result = Command::new("llvm-cov")
+                                    .arg("export")
+                                    .arg(path)
+                                    .arg("--instr-profile")
+                                    .arg(&empty_profile)
+                                    .output()?;
+                                ensure!(
+                                    result.status.success(),
+                                    "coverage export: {}",
+                                    String::from_utf8_lossy(&result.stderr)
+                                );
+                                Ok(BinaryFunctionMap {
+                                    binary: crate::content_file(path)?,
+                                    functions: build_function_map_with(
+                                        std::str::from_utf8(&result.stdout)?,
+                                        |path| sources.key(path, &fixture),
+                                    )?,
+                                })
+                            };
+                            let primary = map(&harness.binary.path)?;
+                            let executables = harness
+                                .subprocesses
+                                .iter()
+                                .map(|executable| {
+                                    Ok(ExecutableMap {
+                                        path: executable.path.clone(),
+                                        map: std::sync::Arc::new(map(&executable.path)?),
+                                        sentinels: sources
+                                            .sentinel(&executable.source, &fixture)?
+                                            .into_iter()
+                                            .collect(),
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            let executable_index =
+                                ExecutableIndex::with_identity(&executables, crate::content_file)?;
+                            let text = fs::read_to_string(profile)?;
+                            let functions = executed_functions(&text)?;
+                            let ranges = executable_index.ranges(
+                                &functions,
+                                &primary.functions,
+                                raw.len(),
+                            )?;
+                            for expected in [
+                                "tests/executable.rs",
+                                "src/main.rs",
+                                "native-lib/src/lib.rs",
+                            ] {
+                                assert!(
+                                    ranges.iter().any(|range| range.file == expected),
+                                    "missing {expected} in {ranges:?}"
+                                );
+                            }
+                            planner.complete(index)?;
+                            ready.complete(index)?;
+                            continue;
+                        }
                         let output = process.output()?;
                         ensure!(
                             output.status.success(),
@@ -2026,13 +2165,14 @@ mod tests {
             ensure!(ready.is_complete(), "unfinished action graph");
             Ok(())
         };
-        run(Mode::Build, 0)?;
+        run(Mode::Build, 0, None)?;
         let binary = final_root.join("native-plan-fixture");
         let output = Command::new(&binary).output()?;
         assert!(output.status.success());
         assert_eq!(output.stdout, b"native-plan-ok\n");
-        run(Mode::Check, 1)?;
-        run(Mode::Test, 2)?;
+        run(Mode::Check, 1, None)?;
+        run(Mode::Test, 2, None)?;
+        run(Mode::Test, 4, Some(crate::impact::CoverageMode::Exit))?;
         let main = fixture.join("src/main.rs");
         let modified = fs::metadata(&main)?.modified()?;
         let previous = fs::read_to_string(&main)?;
@@ -2040,7 +2180,7 @@ mod tests {
         assert_eq!(changed.len(), previous.len());
         fs::write(&main, changed)?;
         fs::File::open(&main)?.set_times(fs::FileTimes::new().set_modified(modified))?;
-        run(Mode::Build, 3)?;
+        run(Mode::Build, 3, None)?;
         let output = Command::new(binary).output()?;
         assert!(output.status.success());
         assert_eq!(output.stdout, b"native-plan-OK\n");
