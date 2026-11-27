@@ -1,0 +1,13 @@
+# Build once; select and distribute the resulting content ID, never a floating tag.
+ARG BASE=debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+FROM ${BASE}
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    ca-certificates build-essential clang lld cmake ninja-build pkg-config git \
+    bubblewrap fuse3 rustup \
+ && mkdir -p /usr/share/sccache-runtime \
+ && dpkg-query -W -f='${binary:Package}=${Version}\n' | sort > /usr/share/sccache-runtime/packages.txt \
+ && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# No service or compiler cache inside the runtime.

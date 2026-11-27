@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# Execute one build session in an already resident, immutable runtime image.
+set -euo pipefail
+
+usage() {
+    echo 'Usage: sccache-runtime [--image SHA256_IMAGE_ID] [--bind DIR]... [--offline] [--leased-intermediates] [--report-actions] -- COMMAND [ARG...]' >&2
+    exit 64
+}
+
+image=
+if [[ ${1:-} == --image ]]; then
+    (($# >= 3)) || usage
+    image=$2
+    shift 2
+else
+    [[ -r /etc/sccache/runtime-image ]] || {
+        echo 'Specify --image or install /etc/sccache/runtime-image' >&2
+        exit 64
+    }
+    read -r image < /etc/sccache/runtime-image
+fi
+[[ $image =~ ^sha256:[0-9a-f]{64}$ ]] || usage
+(($#)) || usage
+cwd=$(pwd -P)
+workspace=$(git rev-parse --show-toplevel 2>/dev/null || printf '%s\n' "$cwd")
+home=$(realpath -e -- "$HOME")
+cargo_home=$(realpath -e -- "${CARGO_HOME:-$home/.cargo}")
+mounts=()
+seen=()
+bind_dir() {
+    local path
+    path=$(realpath -e -- "$1")
+    [[ -d $path && $path != / && $path != *,* ]] || {
+        printf 'Invalid runtime bind directory: %s\n' "$path" >&2
+        exit 64
+    }
+    local protected
+    for protected in /usr /bin /sbin /lib /lib64 /etc /opt/sccache-rustup /run /dev /proc /sys /var/lib /var/cache; do
+        if [[ $path == "$protected" || $path == "$protected/"* || $protected == "$path/"* ]]; then
+            printf 'Runtime bind overlaps immutable/system path: %s\n' "$path" >&2
+            exit 64
+        fi
+    done
+    [[ $path != /tmp ]] || { echo 'Cannot replace private runtime /tmp' >&2; exit 64; }
+    local existing
+    for existing in "${seen[@]}"; do
+        [[ $path == "$existing" ]] && return 0
+    done
+    seen+=("$path")
+    mounts+=(--mount "type=bind,src=$path,dst=$path")
+}
+bind_dir "$workspace"
+bind_dir "$cargo_home"
+network=()
+leased=()
+report=()
+separator=false
+while (($#)); do
+    case "$1" in
+        --bind)
+            (($# >= 2)) || usage
+            bind_dir "$2"
+            shift 2 ;;
+        --offline)
+            network=(--network none)
+            shift ;;
+        --report-actions)
+            report=(--env SCCACHE_LOG=sccache::native_action=info)
+            shift ;;
+        --leased-intermediates)
+            # fusermount3 is setuid in the image. A nonroot build receives
+            # no effective CAP_SYS_ADMIN, but the mount helper requires
+            # the capability in its bounding set and access to /dev/fuse.
+            [[ -c /dev/fuse ]] || { echo '/dev/fuse is unavailable' >&2; exit 69; }
+            leased=(--device /dev/fuse --cap-add SYS_ADMIN)
+            shift ;;
+        --)
+            separator=true
+            shift
+            break ;;
+        *) usage ;;
+    esac
+done
+if [[ $separator != true ]] || (($# == 0)); then usage; fi
+
+# Refuse mutable tags, remote pulls and incompatible images. A rootless
+# engine cannot preserve the host user namespace required by the daemon.
+security=$(docker info --format '{{json .SecurityOptions}}')
+if [[ $security == *name=rootless* ]]; then
+    echo 'Rootful Docker is required by the managed shared daemon' >&2
+    exit 69
+fi
+[[ $(docker image inspect --format '{{.Id}}' "$image") == "$image" ]] || {
+    echo 'Runtime image ID mismatch' >&2
+    exit 65
+}
+[[ $(docker image inspect --format '{{index .Config.Labels "org.codeandsolder.sccache-runtime.version"}}' "$image") == 1 ]] || {
+    echo 'Incompatible runtime image' >&2
+    exit 65
+}
+[[ -S /run/sccache-shared/sccache.sock ]] || {
+    echo 'Managed shared sccache socket is unavailable' >&2
+    exit 69
+}
+
+# Mount the existing, release-matched client and site wrappers. The actual
+# binary must retain its sccache basename (other names are compiler aliases).
+for path in /usr/local/libexec/sccache-bin/sccache \
+    /usr/local/libexec/sccache-client /usr/local/libexec/sccache-cmake-launcher \
+    /usr/local/libexec/sccache-strict-wrappers /usr/local/bin/sccache \
+    /usr/local/bin/cargo /usr/local/bin/rustup; do
+    [[ -e $path ]] || { printf 'Missing managed component: %s\n' "$path" >&2; exit 69; }
+    mounts+=(--mount "type=bind,src=$path,dst=$path,readonly")
+done
+mounts+=(--mount "type=bind,src=/run/sccache-shared,dst=/run/sccache-shared,readonly")
+
+# Private session scratch, not a second cache or image overlay. Use the
+# host's configured scratch filesystem rather than forcing large builds into RAM.
+scratch=$(realpath -e -- "${TMPDIR:-/tmp}")
+[[ $scratch != *,* ]] || { echo 'Runtime scratch path contains a comma' >&2; exit 64; }
+session=$(mktemp -d -- "$scratch/sccache-runtime.XXXXXXXX")
+mkdir "$session/tmp"
+session_label=${session##*/}
+cleanup() {
+    local status=$?
+    if [[ -f $session/container.cid ]]; then
+        local cid
+        read -r cid < "$session/container.cid" || true
+        if [[ $cid =~ ^[0-9a-f]{64}$ ]] &&
+            [[ $(docker container inspect --format '{{index .Config.Labels "org.codeandsolder.sccache-runtime.session"}}' "$cid" 2>/dev/null || true) == "$session_label" ]]; then
+            if ! docker container rm -f "$cid" >/dev/null; then
+                printf 'Runtime container %s still exists; retaining session %s\n' "$cid" "$session" >&2
+                exit 1
+            fi
+        fi
+    fi
+    rm -rf -- "$session"
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+mounts+=(--mount "type=bind,src=$session/tmp,dst=/tmp")
+# FUSE resolves the authenticated UID through NSS. Do not mount the
+# host's account database or invent a different effective identity.
+uid=$(id -u)
+gid=$(id -g)
+user=$(id -un)
+printf 'root:x:0:0:root:/root:/bin/bash\n' > "$session/passwd"
+printf 'root:x:0:\n' > "$session/group"
+if [[ $uid != 0 ]]; then
+    printf '%s:x:%s:%s::%s:/bin/bash\n' "$user" "$uid" "$gid" "$home" >> "$session/passwd"
+fi
+if [[ $uid != 65534 ]]; then
+    printf 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n' >> "$session/passwd"
+fi
+groups=()
+for group in $(id -G); do
+    groups+=(--group-add "$group")
+    if [[ $group != 0 ]]; then
+        name=$(getent group "$group" | cut -d: -f1 || true)
+        name=${name:-gid-$group}
+        printf '%s:x:%s:%s\n' "$name" "$group" "$user" >> "$session/group"
+    fi
+done
+if ! rg -q '^[^:]+:x:65534:' "$session/group"; then
+    printf 'nogroup:x:65534:\n' >> "$session/group"
+fi
+mounts+=(--mount "type=bind,src=$session/passwd,dst=/etc/passwd,readonly"
+         --mount "type=bind,src=$session/group,dst=/etc/group,readonly")
+terminal=()
+if [[ -t 0 && -t 1 ]]; then terminal=(--tty); fi
+
+# The daemon authenticates the real host UID and joins this mount/PID
+# namespace for compiler discovery, preprocessing and fallback.
+# The container runs no independent sccache server.
+docker run --rm --init --interactive "${terminal[@]}" --pull never --read-only \
+    --cidfile "$session/container.cid" --label "org.codeandsolder.sccache-runtime.session=$session_label" \
+    --user "$uid:$gid" --userns host \
+    "${groups[@]}" "${network[@]}" "${leased[@]}" "${mounts[@]}" \
+    --hostname sccache-build --workdir "$cwd" \
+    --env "HOME=$home" --env "CARGO_HOME=$cargo_home" \
+    --env LANG=C.UTF-8 --env TZ=UTC \
+    --env SCCACHE_CONF=/dev/null --env SCCACHE_SERVER_UDS=/run/sccache-shared/sccache.sock \
+    --env SCCACHE_START_SERVER=0 --env SCCACHE_NO_AUTO_START_SERVER=1 \
+    "${report[@]}" \
+    --env RUSTC_WRAPPER=/usr/local/libexec/sccache-client \
+    "$image" /bin/bash -c 'umask "$1"; shift; exec "$@"' _ "$(umask)" "$@"
