@@ -146,6 +146,23 @@ struct Node {
     label: String,
 }
 
+/// An executable known to be available before a test action, with the
+/// source crate root needed for structural impact invalidation.
+#[derive(Debug, Clone)]
+pub struct PlannedExecutable {
+    pub path: PathBuf,
+    pub source: PathBuf,
+}
+
+/// A ready libtest action, independent of the selected runner.
+#[derive(Debug, Clone)]
+pub struct PlannedHarness {
+    pub unit: String,
+    pub binary: PlannedExecutable,
+    pub subprocesses: Vec<PlannedExecutable>,
+    pub command: PlanCommand,
+}
+
 pub struct Planner<'a> {
     graph: &'a Graph,
     workspace: &'a Workspace,
@@ -710,7 +727,9 @@ impl<'a> Planner<'a> {
                         }
                     }
                     if !script {
-                        if self.target(unit, target).kind == TargetKind::Test {
+                        if self.target(unit, target).kind == TargetKind::Test
+                            || (test && self.options.coverage.is_some())
+                        {
                             deps.extend(self.binary_publications[unit].iter().copied());
                         }
                         if let Some(script) = self.scripts[unit] {
@@ -1514,6 +1533,87 @@ impl<'a> Planner<'a> {
             stderr: Some(path(stderr)?),
             inherit_stdin: false,
         })
+    }
+
+    pub fn coverage_sources(&self) -> Option<&crate::impact::sources::CoverageSources> {
+        self.coverage_sources.as_ref()
+    }
+
+    /// Return the exact runnable harness for a prepared test node. Custom
+    /// harnesses and non-test processes retain their native Process action.
+    pub fn test_harness(
+        &self,
+        index: usize,
+        prepared: &PlanNode,
+    ) -> Result<Option<PlannedHarness>> {
+        if self.options.mode != Mode::Test {
+            return Ok(None);
+        }
+        let Action::Run { unit, compiler } = self.nodes[index].action else {
+            return Ok(None);
+        };
+        let Action::Compile { target, test, .. } = self.nodes[compiler].action else {
+            bail!("invalid run prerequisite");
+        };
+        let spec = self.target(unit, target);
+        if !test || !spec.harness {
+            return Ok(None);
+        }
+        let PlanAction::Process { command, .. } = &prepared.action else {
+            bail!("test run did not prepare a process");
+        };
+        let mut command = command.clone();
+        let prefix = command
+            .arguments
+            .len()
+            .checked_sub(self.options.trailing.len())
+            .context("missing test runner prefix")?;
+        command.arguments.truncate(prefix);
+        let package = self.graph.units[unit].package;
+        let manifest = self.unit_manifest(unit);
+        let source = self.graph.sources[package]
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                manifest
+                    .root
+                    .strip_prefix(&self.workspace.root)
+                    .unwrap_or(&manifest.root)
+                    .to_string_lossy()
+                    .into_owned()
+            });
+        let unit_id = serde_json::to_string(&(
+            source,
+            &manifest.package.name,
+            &manifest.package.version,
+            format!("{:?}", spec.kind),
+            &spec.name,
+            format!("{:?}", self.graph.units[unit].domain),
+        ))?;
+        let binary = PlannedExecutable {
+            path: self.nodes[compiler]
+                .outputs
+                .first()
+                .context("missing test executable")?
+                .clone(),
+            source: spec.source.clone(),
+        };
+        let mut subprocesses = Vec::new();
+        for (compiler, published) in self.binaries[unit].values() {
+            let Action::Compile { target, .. } = self.nodes[*compiler].action else {
+                bail!("invalid executable prerequisite");
+            };
+            subprocesses.push(PlannedExecutable {
+                path: published.clone(),
+                source: self.target(unit, target).source.clone(),
+            });
+        }
+        Ok(Some(PlannedHarness {
+            unit: unit_id,
+            binary,
+            subprocesses,
+            command,
+        }))
     }
 
     pub fn prepare(&self, index: usize) -> Result<PlanNode> {

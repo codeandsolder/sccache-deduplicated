@@ -33,3 +33,5 @@ impl CoverageMode {
         }
     }
 }
+
+pub mod harness;

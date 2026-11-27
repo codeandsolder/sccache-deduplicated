@@ -6,7 +6,7 @@ mod options;
 mod planner;
 pub mod settings;
 pub use options::{BuildMode, PlanOptions};
-pub use planner::Planner;
+pub use planner::{PlannedExecutable, PlannedHarness, Planner};
 pub use settings::{Settings, Toolchain};
 mod manifest;
 mod metadata;
