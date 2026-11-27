@@ -380,8 +380,8 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
                         <table><thead><tr><th>"Host"</th><th>"Revision"</th><th>"Compiler"</th><th>"Output"</th><th>"Outcome"</th><th>"Elapsed"</th><th>"Worker"</th><th>"Trace"</th></tr></thead>
                             <tbody>{data.traces.into_iter().map(|row| {
                                 let id=row.id.clone();
-                                let output_title=output_title;
-                                let worker_title=worker_title;
+                                let output_title=row.output.clone();
+                                let worker_title=row.worker.clone();
                                 view!{<tr><td>{row.host}</td><td title=row.revision.clone()>{revision_label(&row.revision)}</td><td>{row.compiler}</td><td title=output_title>{row.output}</td><td>{row.outcome}</td><td>{ms(row.duration_ns)}</td><td title=worker_title>{row.worker}</td>
                                     <td><a href="#trace-detail" on:click=move |ev| {ev.prevent_default(); navigation.open(id.clone());}>"Inspect"</a></td></tr>}
                             }).collect_view()}</tbody>
