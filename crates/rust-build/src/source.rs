@@ -97,6 +97,7 @@ pub struct Sources<'a> {
     pub scratch: PathBuf,
     /// Stream a verified registry archive to the provided staging file.
     pub download: Option<&'a dyn Fn(&str, &mut fs::File) -> Result<()>>,
+    pub archive: Option<&'a dyn Fn(&LockedPackage, &mut fs::File) -> Result<bool>>,
     materialized: BTreeMap<String, PathBuf>,
 }
 
@@ -139,6 +140,7 @@ impl<'a> Sources<'a> {
             import_root,
             scratch,
             download: None,
+            archive: None,
             materialized: BTreeMap::new(),
         }
     }
@@ -334,6 +336,21 @@ impl<'a> Sources<'a> {
                     }
                 }
             }
+        }
+        if !found && let Some(archive) = self.archive {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            found = archive(package, &mut file)?;
+            if found {
+                ensure!(
+                    verify(&mut file, checksum)?,
+                    "scheduler archive checksum mismatch for {stem}"
+                );
+            }
+            ensure!(
+                found,
+                "registry package {stem} not present in the shared CAS"
+            );
         }
         if !found {
             let download = self

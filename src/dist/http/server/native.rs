@@ -41,8 +41,8 @@ use crate::{
     dist::native::{
         BlobSourceRequest, CloseRequest, CommitRequest, DownloadRequest, ExecutionRequest,
         InputPrefetchRequest, ManifestRequest, OpenTreeRequest, PackageAcquisition, PackageLocator,
-        PackagePlanRequest, RetainRequest, RetainedDownloadRequest, ScheduleRequest, StatusRequest,
-        codec,
+        PackageOriginalRequest, PackagePlanRequest, RetainRequest, RetainedDownloadRequest,
+        ScheduleRequest, StatusRequest, codec,
         ingress::{receive_blob, receive_package, stage_blob},
     },
 };
@@ -205,6 +205,55 @@ async fn package_response(
         return *response;
     }
     let result = async {
+        if operation == "package_original" {
+            let bytes = request
+                .read_bounded(limit)
+                .await
+                .map_err(|error| anyhow::anyhow!("package original request: {error:?}"))?;
+            let PackageOriginalRequest { locator, offline } = codec()
+                .with_limit(u64::try_from(limit)?)
+                .deserialize(&bytes)?;
+            locator.validate()?;
+            let policy = routes.service.limits.policy()?;
+            ensure!(
+                policy.retain_original,
+                "scheduler must retain original packages"
+            );
+            let identity = locator.identity;
+            let sessions = Arc::clone(&routes.sessions);
+            let cached = tokio::task::spawn_blocking(move || {
+                sessions.store().lookup_package_archive(identity, policy)
+            })
+            .await??;
+            let archive = if let Some(archive) = cached {
+                archive
+            } else if offline {
+                return Ok(StatusCode::NOT_FOUND.into_response());
+            } else {
+                // Keep the verified package tree pinned through archive open.
+                let (package, _) = routes
+                    .service
+                    .acquire(Arc::clone(&routes.sessions), locator, &routes.network)
+                    .await?;
+                let sessions = Arc::clone(&routes.sessions);
+                tokio::task::spawn_blocking(move || {
+                    let archive = sessions
+                        .store()
+                        .lookup_package_archive(identity, policy)?
+                        .context("verified original archive unavailable")?;
+                    drop(package);
+                    Ok::<_, anyhow::Error>(archive)
+                })
+                .await??
+            };
+            let size = archive.archive().blob.size;
+            let file = tokio::task::spawn_blocking(move || archive.open_file()).await??;
+            let peer = Peer::Client(request.id()).on_path(request.path());
+            let meter = routes
+                .network
+                .transfer(Direction::Send, peer, size, Some(size));
+            return Ok(request.file_body(file, size, Some(meter)));
+        }
         let rust = operation.starts_with("rust_");
         let acquire = operation.ends_with("_acquire");
         let (package, reused) = if acquire {
@@ -599,6 +648,7 @@ where
                 "rust_package_import",
             ),
             ("/api/v5/native/client/package_acquire", "package_acquire"),
+            ("/api/v5/native/client/package_original", "package_original"),
             (
                 "/api/v5/native/client/rust_package_acquire",
                 "rust_package_acquire",

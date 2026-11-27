@@ -74,6 +74,45 @@ impl IntermediateContent for Content {
     }
 }
 
+pub fn package(
+    session: Ticket,
+    identity: crate::build_runtime::PackageIdentity,
+    name: &str,
+    version: &str,
+    offline: bool,
+    destination: &mut File,
+) -> Result<bool> {
+    let mut connection = connection()?;
+    let TransferReply::ReadStarted(length) =
+        connection.transfer(TransferRequest::IntermediatePackage {
+            session,
+            identity,
+            name: name.into(),
+            version: version.into(),
+            offline,
+        })?
+    else {
+        anyhow::bail!("unexpected package delivery reply");
+    };
+    let Some(mut remaining) = length else {
+        return Ok(false);
+    };
+    while remaining > 0 {
+        let TransferReply::Chunk(chunk) =
+            connection.transfer(TransferRequest::IntermediateChunk)?
+        else {
+            anyhow::bail!("unexpected package chunk reply");
+        };
+        ensure!(
+            !chunk.is_empty() && chunk.len() as u64 <= remaining,
+            "invalid package chunk size"
+        );
+        destination.write_all(&chunk)?;
+        remaining -= chunk.len() as u64;
+    }
+    Ok(true)
+}
+
 pub fn open() -> Result<(Ticket, ServerConnection)> {
     let mut conn = connection()?;
     let TransferReply::IntermediateOpened(token) =

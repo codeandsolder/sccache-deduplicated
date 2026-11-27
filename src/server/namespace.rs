@@ -267,6 +267,31 @@ impl TransferSession {
                 }
                 Ok(TransferReply::ReadStarted(Some(blob.size)))
             }
+            TransferRequest::IntermediatePackage {
+                session,
+                identity,
+                name,
+                version,
+                offline,
+            } => {
+                ensure!(
+                    self.intermediate_read.is_none(),
+                    "intermediate read already active"
+                );
+                let group = client.intermediate(uid, session)?;
+                let file = tokio::task::spawn_blocking(move || {
+                    group.original_package(identity, name, version, offline)
+                })
+                .await??;
+                let Some(file) = file else {
+                    return Ok(TransferReply::ReadStarted(None));
+                };
+                let size = file.metadata()?.len();
+                if size != 0 {
+                    self.intermediate_read = Some((tokio::fs::File::from_std(file), size));
+                }
+                Ok(TransferReply::ReadStarted(Some(size)))
+            }
             TransferRequest::IntermediateChunk => {
                 let (file, remaining) = self
                     .intermediate_read

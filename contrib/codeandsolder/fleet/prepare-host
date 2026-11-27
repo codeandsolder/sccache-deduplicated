@@ -304,6 +304,10 @@ decoder_timeout_secs = 600
 [native_cache.package_upstreams.rust]
 origin = "https://static.rust-lang.org/"
 timeout_secs = 180
+
+[native_cache.package_upstreams.crates]
+origin = "https://static.crates.io/"
+timeout_secs = 180
 EOF
 fi
 # Provision only the exact release/CI toolchains and stable smoke toolchain

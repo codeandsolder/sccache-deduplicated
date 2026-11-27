@@ -66,6 +66,23 @@ impl NativeResultSession {
         Ok(())
     }
 
+    pub fn original_package(
+        &self,
+        identity: crate::build_runtime::PackageIdentity,
+        name: String,
+        version: String,
+        offline: bool,
+    ) -> Result<Option<File>> {
+        self.check()?;
+        let locator = super::PackageLocator {
+            identity,
+            expected_size: None,
+            upstream: "crates".into(),
+            path: format!("crates/{name}/{name}-{version}.crate"),
+        };
+        self.client.original_package(&locator, offline)
+    }
+
     pub fn read(&self, blob: BlobRef) -> Result<File> {
         self.authorize(blob)?;
         self.client.download_retained(self.group, blob)

@@ -382,10 +382,38 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
         "--locked requires an existing lockfile"
     );
     let config = Config::load()?;
-    crate::build_lease::with_build_intermediates(|lease, intermediate| {
+    crate::build_lease::with_build_intermediates(|lease, intermediate, token| {
         let sources_root = lease.root().join("sources");
         fs::create_dir_all(&sources_root)?;
+        let archive = |package: &sccache_rust_build::LockedPackage, file: &mut fs::File| {
+            ensure!(
+                matches!(
+                    package.source.as_deref(),
+                    Some(
+                        "registry+https://github.com/rust-lang/crates.io-index"
+                            | "sparse+https://index.crates.io/"
+                    )
+                ),
+                "shared archive acquisition requires a configured registry"
+            );
+            let identity = crate::build_runtime::PackageIdentity::from_sha256_hex(
+                package
+                    .checksum
+                    .as_deref()
+                    .context("missing package checksum")?,
+                crate::build_runtime::PackageCompression::Gzip,
+            )?;
+            crate::dist::native::intermediate::package(
+                token,
+                identity,
+                &package.name,
+                &package.version.to_string(),
+                args.offline,
+                file,
+            )
+        };
         let mut sources = Sources::new(&workspace, lock, import, sources_root);
+        sources.archive = Some(&archive);
         if !args.offline {
             sources.download = Some(&download);
         }

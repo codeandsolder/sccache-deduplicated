@@ -81,7 +81,7 @@ pub enum Response {
 /// Maximum application payload in a transfer frame. The framing envelope
 /// stays well below the default 8 MiB IPC frame limit.
 pub const TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
-pub const NAMESPACE_PROTOCOL_VERSION: u32 = 7;
+pub const NAMESPACE_PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum StorageBlob {
@@ -143,6 +143,13 @@ pub enum TransferRequest {
     FinishWrite,
     ReadChunk,
     Abort,
+    IntermediatePackage {
+        session: crate::build_runtime::wire::Ticket,
+        identity: crate::build_runtime::PackageIdentity,
+        name: String,
+        version: String,
+        offline: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -172,6 +179,7 @@ impl TransferRequest {
                 | Self::IntermediateAuthorize { .. }
                 | Self::IntermediateRead { .. }
                 | Self::IntermediateChunk
+                | Self::IntermediatePackage { .. }
         )
     }
 }
@@ -198,6 +206,7 @@ impl std::fmt::Debug for TransferRequest {
             Self::IntermediateAuthorize { .. } => "IntermediateAuthorize",
             Self::IntermediateRead { .. } => "IntermediateRead",
             Self::IntermediateChunk => "IntermediateChunk",
+            Self::IntermediatePackage { .. } => "IntermediatePackage",
             Self::WriteChunk(_) => "WriteChunk",
             Self::FinishWrite => "FinishWrite",
             Self::ReadChunk => "ReadChunk",

@@ -367,6 +367,29 @@ impl NativeStore {
         })
     }
 
+    /// Open an exact original archive under the same package root pin.
+    /// This does not enumerate other packages or rely on a filename.
+    pub fn lookup_package_archive(
+        &self,
+        identity: PackageIdentity,
+        policy: PackagePolicy,
+    ) -> Result<Option<PackageArchiveLease>> {
+        let key = package_key(identity, policy)?;
+        let Some((record, tree)) = self.lookup_indexed_package(key, |record| {
+            ensure!(
+                record.source.identity == identity,
+                "inconsistent package identity"
+            );
+            Ok(record.archive().is_some())
+        })?
+        else {
+            return Ok(None);
+        };
+        let archive = record.archive().context("missing indexed original")?;
+        self.inner.check_blob(archive.blob.id, archive.blob.size)?;
+        Ok(Some(PackageArchiveLease { archive, tree }))
+    }
+
     fn lookup_indexed_package(
         &self,
         key: ContentId,

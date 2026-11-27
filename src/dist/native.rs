@@ -48,6 +48,12 @@ pub(super) const UPLOAD_PARALLELISM_HEADER: &str = "x-sccache-upload-parallelism
 type LeaseCheck<'a> = dyn Fn() -> Result<()> + Sync + 'a;
 
 #[derive(Serialize, Deserialize)]
+pub(super) struct PackageOriginalRequest {
+    pub locator: PackageLocator,
+    pub offline: bool,
+}
+
+#[derive(Serialize, Deserialize)]
 pub(super) struct ExecutionRequest {
     pub ticket: Ticket,
     pub spec: ExecutionSpec,
@@ -608,6 +614,52 @@ impl NativeCacheClient {
             );
         }
         Ok(receipt)
+    }
+
+    /// Retrieve the verified original from the scheduler-owned package store.
+    /// An offline request cannot cause an upstream fetch.
+    pub(crate) fn original_package(
+        &self,
+        locator: &PackageLocator,
+        offline: bool,
+    ) -> Result<Option<File>> {
+        locator.validate()?;
+        let data = codec()
+            .with_limit(self.metadata_limit)
+            .serialize(&PackageOriginalRequest {
+                locator: locator.clone(),
+                offline,
+            })?;
+        let start = Instant::now();
+        let response = loop {
+            let remaining = self
+                .timeout
+                .checked_sub(start.elapsed())
+                .context("package delivery deadline expired")?;
+            let response = self.send_replayable("package_original", data.clone(), remaining)?;
+            if response.status() == http::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            if response.status() != http::StatusCode::SERVICE_UNAVAILABLE {
+                break response.error_for_status()?;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        let length = response
+            .content_length()
+            .context("missing original archive length")?;
+        ensure!(
+            locator.expected_size.is_none_or(|size| size == length),
+            "incorrect archive length"
+        );
+        let mut reader = crate::http_client::ResponseReader::new(response)?;
+        let mut file = tempfile::tempfile()?;
+        ensure!(
+            io::copy(&mut reader, &mut file)? == length,
+            "truncated original archive"
+        );
+        file.rewind()?;
+        Ok(Some(file))
     }
 
     /// Upload the exact original archive for generic compressed transport.
