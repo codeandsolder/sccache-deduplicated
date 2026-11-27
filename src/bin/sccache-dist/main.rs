@@ -1289,6 +1289,25 @@ struct CandidateSet {
     predictions: BTreeMap<ServerId, placement::PlacementEstimate>,
 }
 
+fn trace_native_assignment(
+    job_id: JobId,
+    server_id: ServerId,
+    class: Option<placement::ActionClass>,
+    candidates: &CandidateSet,
+    estimated_result_bytes: Option<u64>,
+    server_details: &ServerDetails,
+) {
+    if let Some(class) = class {
+        trace!(target: "native_placement_replay", "{}", serde_json::json!({
+            "kind": "assigned", "job": job_id.0, "worker": server_id, "class": class,
+            "candidates": candidates.predictions,
+            "estimated_result_bytes": estimated_result_bytes,
+            "host_prior": server_details.capabilities.native_placement.as_ref().map(placement::ActionCost::baseline),
+            "healthy": candidates.healthy.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        }));
+    }
+}
+
 impl CandidateSet {
     const fn no_capacity(&self, servers: usize) -> NoCapacity {
         NoCapacity {
@@ -1499,15 +1518,14 @@ impl Scheduler {
             .generate_token(job_id)
             .context("Could not create an auth token for this job")?;
         let prediction = candidates.predictions.get(&server_id).copied();
-        if let Some(class) = class {
-            trace!(target: "native_placement_replay", "{}", serde_json::json!({
-                "kind": "assigned", "job": job_id.0, "worker": server_id, "class": class,
-                "candidates": candidates.predictions,
-                "estimated_result_bytes": estimated_result_bytes,
-                "host_prior": server_details.capabilities.native_placement.as_ref().map(placement::ActionCost::baseline),
-                "healthy": candidates.healthy.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            }));
-        }
+        trace_native_assignment(
+            job_id,
+            server_id,
+            class,
+            &candidates,
+            estimated_result_bytes,
+            server_details,
+        );
         let assigned = native_inputs.map(|inputs| placement::AssignedNative {
             #[cfg(feature = "scheduler-dashboard")]
             dashboard: description,

@@ -258,7 +258,7 @@ fn accumulate_worker(snapshot: &mut Snapshot, worker: &Worker) {
 }
 
 fn project_job(
-    job_id: &JobId,
+    job_id: JobId,
     details: &ServerDetails,
     worker: &Worker,
     detail: Option<&JobDetail>,
@@ -267,10 +267,10 @@ fn project_job(
         .capabilities
         .native_placement
         .as_ref()
-        .and_then(|placement| placement.queue.jobs.get(job_id));
+        .and_then(|placement| placement.queue.jobs.get(&job_id));
     let (state, assigned_at, state_since, prediction) = detail.map_or_else(
         || {
-            details.jobs_assigning.get(job_id).map_or_else(
+            details.jobs_assigning.get(&job_id).map_or_else(
                 // Preserve the reservation in the count, but never invent a timestamp.
                 || ("Missing scheduler state".into(), None, None, None),
                 |&since| ("Assigning".into(), Some(since), Some(since), None),
@@ -289,7 +289,7 @@ fn project_job(
         id: job_id.to_string(),
         description: details
             .jobs_assigned
-            .get(job_id)
+            .get(&job_id)
             .and_then(Option::as_ref)
             .and_then(|native| native.dashboard.clone()),
         worker: worker.name.clone(),
@@ -344,7 +344,7 @@ pub fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
             peer_links(&mut snapshot, id, &placement.peer_download_rates);
         }
         accumulate_worker(&mut snapshot, &worker);
-        for job_id in details.jobs_assigned.keys() {
+        for &job_id in details.jobs_assigned.keys() {
             snapshot
                 .jobs
                 .push(project_job(job_id, details, &worker, jobs.get(job_id)));
