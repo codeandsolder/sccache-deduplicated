@@ -119,12 +119,8 @@ impl CoverageSources {
         })
     }
 
-    /// The compiler gets the original source path. Existing canonical-path
-    /// translation rewrites the FROM side to the matching sandbox mount.
-    /// Coverage-only remapping leaves file!(), diagnostics and debug paths
-    /// unchanged. Specific source roots must follow the generated-root map,
-    /// since rustc applies the last matching prefix.
-    pub fn flags(&self, package: usize, user_flags: &[OsString]) -> Result<Vec<OsString>> {
+    /// Check compatibility before selecting the instrumented build graph.
+    pub fn validate_flags(user_flags: &[OsString]) -> Result<()> {
         ensure!(
             !user_flags.iter().any(|flag| {
                 let flag = flag.as_encoded_bytes();
@@ -135,6 +131,16 @@ impl CoverageSources {
             }),
             "coverage mode requires control of coverage path remapping"
         );
+        Ok(())
+    }
+
+    /// The compiler gets the original source path. Existing canonical-path
+    /// translation rewrites the FROM side to the matching sandbox mount.
+    /// Coverage-only remapping leaves file!(), diagnostics and debug paths
+    /// unchanged. Specific source roots must follow the generated-root map,
+    /// since rustc applies the last matching prefix.
+    pub fn flags(&self, package: usize, user_flags: &[OsString]) -> Result<Vec<OsString>> {
+        Self::validate_flags(user_flags)?;
         let prefix = self
             .packages
             .get(package)

@@ -1630,7 +1630,11 @@ impl<'a> Planner<'a> {
     /// The stable project/profile slot is separate from changing input
     /// fingerprints, allowing a changed configuration to be reported as
     /// an invalidation rather than silently losing its previous baseline.
-    pub fn impact_slot(&self, project: &str, git_root: &Path) -> Result<sccache_build::ContentId> {
+    pub fn impact_slot(
+        &self,
+        project: sccache_build::ContentId,
+        git_root: &Path,
+    ) -> Result<sccache_build::ContentId> {
         let path = self
             .workspace
             .root

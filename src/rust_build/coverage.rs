@@ -12,7 +12,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use sccache_rust_build::{
-    PlannedExecutable, PlannedHarness, Planner, Toolchain, Workspace, content_file,
+    PlannedExecutable, PlannedHarness, Planner, Settings, Toolchain, Workspace, content_file,
     impact::{
         CoverageMode,
         coverage::{
@@ -20,7 +20,7 @@ use sccache_rust_build::{
             executed_functions,
         },
         harness::{DiscoveredTest, HarnessOptions, inventory, verify_single_success},
-        revision::{RevisionSnapshot, committed_changes, git_root},
+        revision::{RevisionSnapshot, committed_changes, git_root, project_identity},
         selection::{Baseline, TestId, select},
         sources::CoverageSources,
     },
@@ -41,12 +41,8 @@ use std::{
 use tempfile::{NamedTempFile, TempDir};
 
 pub(crate) struct Options<'a> {
-    pub report: &'a Path,
-    pub impact_project: Option<&'a str>,
-    pub impact_shadow: bool,
+    pub report: Option<&'a Path>,
     pub aggregate: Option<&'a Path>,
-    pub mode: CoverageMode,
-    pub tools_dir: Option<&'a Path>,
     pub jobs: NonZeroUsize,
     pub trailing: &'a [OsString],
     pub verbose: bool,
@@ -110,7 +106,7 @@ impl LlvmTools {
             } else if bundled.join(&filename).is_file() {
                 bundled.join(&filename)
             } else {
-                which::which(&filename).with_context(||format!("install llvm-tools for the selected Rust toolchain or specify --llvm-tools-dir ({name})"))?
+                which::which(&filename).with_context(||format!("install llvm-tools for the selected Rust toolchain or configure test.llvm-tools-dir ({name})"))?
             }.canonicalize()?;
             let version = command_output(Command::new(&path).arg("--version"))?;
             let version = llvm_version(&version)
@@ -144,6 +140,83 @@ impl LlvmTools {
             "LLVM tools changed during collection"
         );
         Ok(())
+    }
+}
+
+pub(crate) struct Preparation {
+    root: PathBuf,
+    before: RevisionSnapshot,
+    project: ContentId,
+    tools: LlvmTools,
+    mode: CoverageMode,
+}
+
+impl Preparation {
+    pub(crate) const fn mode(&self) -> CoverageMode {
+        self.mode
+    }
+}
+
+/// Decide once before constructing compiler arguments. Ordinary invocations
+/// require no flags or configuration. Tool/target/repository limitations
+/// choose the normal test path, not a second build or a failed test command.
+pub(crate) fn prepare(
+    workspace: &Workspace,
+    toolchain: &Toolchain,
+    settings: &Settings,
+    trailing: &[OsString],
+    explicit: bool,
+) -> Result<Option<Preparation>> {
+    let prepared = (|| -> Result<Preparation> {
+        ensure!(
+            explicit || HarnessOptions::from_arguments(trailing).is_some(),
+            "test arguments require whole-harness execution"
+        );
+        ensure!(
+            toolchain.host.triple == toolchain.target.triple,
+            "automatic profiling requires a native target"
+        );
+        let root = git_root(&workspace.root)?;
+        let project = project_identity(&root)?;
+        let test_config = settings
+            .document
+            .get("test")
+            .and_then(toml::Value::as_table);
+        let configured = test_config
+            .and_then(|table| table.get("llvm-tools-dir"))
+            .and_then(toml::Value::as_str)
+            .map(Path::new);
+        let tools = LlvmTools::discover(toolchain, &workspace.root, configured)?;
+        // Do not change the meaning of explicitly requested remapping flags.
+        for (platform, host) in [(&toolchain.host, true), (&toolchain.target, false)] {
+            let flags = settings.rustflags(platform, host, toolchain.explicit_target.is_some())?;
+            CoverageSources::validate_flags(&flags)?;
+        }
+        let before = RevisionSnapshot::capture(&root)?;
+        let mode = if test_config
+            .and_then(|table| table.get("continuous-coverage"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+        {
+            CoverageMode::Continuous
+        } else {
+            CoverageMode::Exit
+        };
+        Ok(Preparation {
+            root,
+            before,
+            project,
+            tools,
+            mode,
+        })
+    })();
+    match prepared {
+        Ok(prepared) => Ok(Some(prepared)),
+        Err(error) if !explicit => {
+            debug!("automatic test impact unavailable: {error:#}");
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -764,13 +837,9 @@ impl ImpactContext {
         toolchain: &Toolchain,
         tools: &LlvmTools,
         git_root: &Path,
-        project: &str,
+        project: ContentId,
         shadow: bool,
     ) -> Result<Self> {
-        ensure!(
-            !project.trim().is_empty(),
-            "impact project must be nonempty"
-        );
         let slot = planner.impact_slot(project, git_root)?;
         let rustc = content_file(&toolchain.rustc)?;
         let rustdoc = toolchain.rustdoc.as_deref().map(content_file).transpose()?;
@@ -804,6 +873,25 @@ impl ImpactContext {
             lookup_error,
             shadow,
         })
+    }
+
+    /// Collection is reusable evidence, not proof of test-result freshness.
+    /// On an unchanged clean revision with matching configuration, run the
+    /// existing instrumented harnesses normally, without listing, per-test
+    /// processes, function-map export, profile merges or another CAS write.
+    fn collection_current(&self, before: &RevisionSnapshot) -> bool {
+        before.clean
+            && self.previous.as_ref().is_some_and(|(_, record)| {
+                record.scope == self.scope
+                    && before.head.as_ref() == Some(&record.revision)
+                    && record.tree == before.tree
+                    && !record.baselines.is_empty()
+                    && record.baselines.iter().all(|(_, baseline)| {
+                        baseline.scope == self.scope
+                            && baseline.revision == record.revision
+                            && !baseline.ranges.is_empty()
+                    })
+            })
     }
 
     fn finish(
@@ -1004,24 +1092,103 @@ fn publish_aggregate(collector: &Collector<'_>, destination: &Path) -> Result<bo
     Ok(true)
 }
 
+fn run_without_collection(
+    session: &CompileSession<'_>,
+    planner: &Planner<'_>,
+    scratch: &Path,
+    mode: CoverageMode,
+    max_in_flight: NonZeroUsize,
+    verbose: bool,
+) -> Result<i32> {
+    build_plan::dispatch(planner.graph()?, max_in_flight, |index| {
+        let mut node = planner.prepare(index)?;
+        if verbose {
+            eprintln!("{}", node.label);
+        }
+        if planner.is_test_execution(index)
+            && let PlanAction::Process { command, .. } = &mut node.action
+        {
+            // Keep the same instrumentation cache keys, but direct profiles
+            // into this lease. No map export, merging or publication follows.
+            command
+                .environment
+                .retain(|entry| entry.name != b"LLVM_PROFILE_FILE");
+            command
+                .environment
+                .push(crate::build_runtime::EnvironmentChange {
+                    name: b"LLVM_PROFILE_FILE".to_vec(),
+                    value: Some(
+                        scratch
+                            .join(mode.profile_name())
+                            .as_os_str()
+                            .as_encoded_bytes()
+                            .to_vec(),
+                    ),
+                });
+        }
+        build_plan::execute_node(session, &node, &node.action)
+            .with_context(|| node.label.clone())?;
+        planner.complete(index)
+    })?;
+    Ok(0)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute(
     session: &CompileSession<'_>,
     content: &Content,
     planner: &Planner<'_>,
     toolchain: &Toolchain,
-    workspace: &Workspace,
+    preparation: Preparation,
     lease_root: &Path,
     max_in_flight: NonZeroUsize,
     options: Options<'_>,
 ) -> Result<i32> {
-    let git_root = git_root(&workspace.root)?;
-    let before = RevisionSnapshot::capture(&git_root)?;
-    let tools = LlvmTools::discover(toolchain, &workspace.root, options.tools_dir)?;
+    let Preparation {
+        root: git_root,
+        before,
+        project,
+        tools,
+        mode,
+    } = preparation;
+    let explicit = options.report.is_some() || options.aggregate.is_some();
     let scratch: TempDir = tempfile::Builder::new()
         .prefix("test-coverage-")
         .tempdir_in(lease_root)?;
-    if options.mode == CoverageMode::Continuous {
+    let impact = ImpactContext::new(
+        content, planner, toolchain, &tools, &git_root, project, true,
+    );
+    let impact = match impact {
+        Ok(impact) => Some(impact),
+        Err(error) if !explicit => {
+            debug!("automatic impact scope unavailable: {error:#}");
+            return run_without_collection(
+                session,
+                planner,
+                scratch.path(),
+                mode,
+                max_in_flight,
+                options.verbose,
+            );
+        }
+        Err(error) => return Err(error),
+    };
+    if !explicit
+        && (!before.clean
+            || impact.as_ref().is_some_and(|impact| {
+                impact.lookup_error.is_some() || impact.collection_current(&before)
+            }))
+    {
+        return run_without_collection(
+            session,
+            planner,
+            scratch.path(),
+            mode,
+            max_in_flight,
+            options.verbose,
+        );
+    }
+    if mode == CoverageMode::Continuous {
         verify_continuous(session, toolchain, scratch.path(), &tools)?;
     }
     let empty_text = scratch.path().join("empty.proftext");
@@ -1034,24 +1201,22 @@ pub(crate) fn execute(
         .arg("-o")
         .arg(&empty_profile)
         .stdin(Stdio::null());
-    successful(
-        capture(session, scratch.path(), &mut command)?,
-        "empty LLVM profile",
-    )?;
-    let impact = options
-        .impact_project
-        .map(|project| {
-            ImpactContext::new(
-                content,
-                planner,
-                toolchain,
-                &tools,
-                &git_root,
-                project,
-                options.impact_shadow,
-            )
-        })
-        .transpose()?;
+    let empty = capture(session, scratch.path(), &mut command)
+        .and_then(|output| successful(output, "empty LLVM profile"));
+    if let Err(error) = empty {
+        if explicit {
+            return Err(error);
+        }
+        debug!("automatic profiling unavailable: {error:#}");
+        return run_without_collection(
+            session,
+            planner,
+            scratch.path(),
+            mode,
+            max_in_flight,
+            options.verbose,
+        );
+    }
     let collector = Collector {
         session,
         content,
@@ -1061,7 +1226,7 @@ pub(crate) fn execute(
         git_root,
         scratch: scratch.path().to_path_buf(),
         tools,
-        mode: options.mode,
+        mode,
         empty_profile,
         maps: Mutex::default(),
         suites: Mutex::default(),
@@ -1110,8 +1275,18 @@ pub(crate) fn execute(
         drop(sender);
         result
     })?;
-    collector.tools.validate()?;
-    let stable = before == RevisionSnapshot::capture(&collector.git_root)?;
+    let stable = match collector
+        .tools
+        .validate()
+        .and_then(|()| RevisionSnapshot::capture(&collector.git_root))
+    {
+        Ok(after) => before == after,
+        Err(error) if !explicit => {
+            debug!("automatic coverage evidence invalidated: {error:#}");
+            false
+        }
+        Err(error) => return Err(error),
+    };
     let mut suites = std::mem::take(&mut *locked(&collector.suites)?);
     suites.sort_by(|a, b| (&a.unit, &a.label).cmp(&(&b.unit, &b.label)));
     let passed = suites.iter().all(|suite| suite.passed);
@@ -1137,12 +1312,20 @@ pub(crate) fn execute(
     } else {
         false
     };
-    let impact = impact
+    let impact = match impact
         .map(|impact| impact.finish(&collector, &before, stable, passed, incomplete, &suites))
-        .transpose()?;
+        .transpose()
+    {
+        Ok(impact) => impact,
+        Err(error) if !explicit => {
+            debug!("automatic impact evidence unavailable: {error:#}");
+            None
+        }
+        Err(error) => return Err(error),
+    };
     let report = Report {
         schema: 1,
-        mode: options.mode,
+        mode,
         rustc_version: &toolchain.version,
         llvm_cov: &collector.tools.cov_identity,
         llvm_profdata: &collector.tools.profdata_identity,
@@ -1153,15 +1336,36 @@ pub(crate) fn execute(
         aggregate_error,
         impact,
     };
-    atomic_json(options.report, &report)?;
-    eprintln!(
-        "native coverage: {collected} tests with mapped coverage; report {}",
-        options.report.display()
-    );
+    if let Some(path) = options.report {
+        atomic_json(path, &report)?;
+        eprintln!(
+            "native coverage: {collected} tests with mapped coverage; report {}",
+            path.display()
+        );
+    } else {
+        if let Some(impact) = &report.impact {
+            if let Some(comparison) = &impact.comparison {
+                eprintln!(
+                    "native test impact: {} of {} predicted affected; {} missed failures",
+                    comparison.predicted,
+                    comparison.total,
+                    comparison.missed_failures.len()
+                );
+            }
+            if let Some(error) = &impact.publication_error {
+                debug!("impact evidence publication failed: {error}");
+            }
+        }
+        eprintln!("native coverage: {collected} tests with mapped coverage");
+    }
     if !stable {
         eprintln!("source contents changed during coverage collection");
     }
     Ok(i32::from(
-        !passed || !stable || incomplete || (options.aggregate.is_some() && !aggregate_published),
+        !passed
+            || (explicit
+                && (!stable
+                    || incomplete
+                    || (options.aggregate.is_some() && !aggregate_published))),
     ))
 }

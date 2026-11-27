@@ -56,6 +56,48 @@ the development branch still uses the installed Rust build toolchain.
   publication uses the declared binary name and an atomic replacement;
   competing publishers of the same target directory are serialized.
 
+## Automatic test execution and impact evidence
+
+Normal wrapper invocations are the interface: `cargo test` and
+`sccache test` resolve to the same native frontend. The frontend chooses
+the test execution strategy automatically; a project name, shadow-mode
+flag, job count, coverage mode or LLVM tool path is not a prerequisite.
+
+For supported native libtest suites, matching LLVM tools are discovered
+from the selected Rust installation or PATH. Git origin and workspace
+relative path identify the shared scheduler record. Local repositories
+without an origin use their common Git directory. A missing baseline or
+a changed committed revision triggers collection in the same execution
+that runs tests. A current baseline is reused: no per-test discovery,
+coverage-map export, profile merging or baseline upload occurs. The
+instrumented compiler arguments remain stable so warm runs do not
+compile a second variant. Dirty or unsupported invocations run the
+normal harness path; no partial evidence is published.
+
+This is currently automatic **advisory** impact evidence. All tests are
+still authoritative until their complete compile-time, runtime and
+dynamic-library input contracts have been validated. Collection errors
+do not turn successful normal test invocations into failures.
+
+The only optional CLI coverage arguments request output artifacts:
+
+```sh
+cargo test --collect-coverage /path/to/coverage.json
+cargo test --aggregate-profile /path/to/coverage.profdata
+```
+
+If necessary, a nonstandard LLVM installation can be selected in the
+workspace's existing configuration:
+
+```toml
+[test]
+llvm-tools-dir = "/path/to/llvm/bin"
+```
+
+No separate client database, coverage cache directory, or persistent
+raw profile files are created. Intermediate profiles and instrumented
+binaries are held under the existing build lease.
+
 ## Content identities
 
 Compiler cache identity uses file contents, arguments, relevant environment,

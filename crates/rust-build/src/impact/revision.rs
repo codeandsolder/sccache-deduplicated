@@ -70,6 +70,85 @@ pub fn git_root(cwd: &Path) -> Result<PathBuf> {
     Ok(path.canonicalize()?)
 }
 
+/// Stable project identity without requiring a caller-provided name.
+/// Network clones share a slot across SSH and HTTPS spellings; local-only
+/// repositories use the common Git directory (including linked worktrees).
+/// The raw remote URL is never stored in the coverage record.
+pub fn project_identity(root: &Path) -> Result<ContentId> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()?;
+    if output.status.success() {
+        let remote = std::str::from_utf8(&output.stdout)?.trim_end_matches(['\r', '\n']);
+        ensure!(!remote.is_empty(), "empty Git origin");
+        let identity = normalize_remote(root, remote)?;
+        return Ok(ContentId::of(&identity));
+    }
+    ensure!(output.status.code() == Some(1), "cannot read Git origin");
+    let mut common = git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    ensure!(common.pop() == Some(b'\n'), "unterminated Git directory");
+    let common = os_path(common)?.canonicalize()?;
+    Ok(ContentId::of(&serde_json::to_vec(&(
+        "local-git-v1",
+        common.as_os_str().as_encoded_bytes(),
+    ))?))
+}
+
+fn normalize_remote(root: &Path, remote: &str) -> Result<Vec<u8>> {
+    let network = |host: &str, port: Option<u16>, path: &str| {
+        let path = path.trim_start_matches('/').trim_end_matches('/');
+        let path = path.strip_suffix(".git").unwrap_or(path);
+        ensure!(!host.is_empty() && !path.is_empty(), "invalid Git remote");
+        Ok(serde_json::to_vec(&(
+            "network-git-v1",
+            host.to_ascii_lowercase(),
+            port,
+            path,
+        ))?)
+    };
+    if remote.contains("://") {
+        let url = url::Url::parse(remote)?;
+        if url.scheme() == "file" {
+            let path = url
+                .to_file_path()
+                .map_err(|()| anyhow::anyhow!("invalid local Git URL"))?;
+            return Ok(serde_json::to_vec(&(
+                "local-origin-v1",
+                path.canonicalize()?.as_os_str().as_encoded_bytes(),
+            ))?);
+        }
+        let host = url.host_str().context("missing Git remote host")?;
+        // Only well-known protocols on their default ports share identity.
+        let port = match (url.scheme(), url.port()) {
+            ("http", None | Some(80))
+            | ("https", None | Some(443))
+            | ("ssh", None | Some(22))
+            | ("git", None | Some(9418)) => None,
+            (_, port) => port,
+        };
+        return network(host, port, url.path());
+    }
+    if let Some((host, path)) = remote.split_once(':')
+        && !host.contains('/')
+        && !host.is_empty()
+    {
+        return network(
+            host.rsplit('@').next().context("missing Git remote host")?,
+            None,
+            path,
+        );
+    }
+    let path = root.join(remote).canonicalize()?;
+    Ok(serde_json::to_vec(&(
+        "local-origin-v1",
+        path.as_os_str().as_encoded_bytes(),
+    ))?)
+}
+
 fn name(bytes: &[u8]) -> Result<String> {
     // Coverage filenames and JSON reports use UTF-8. Refuse rather than
     // silently dropping a repository file which might be an input.
@@ -501,6 +580,39 @@ mod tests {
         let uncovered = committed_changes(root, &old, &new, &BTreeSet::new())?;
         assert!(uncovered.lines.is_empty());
         assert_eq!(uncovered.global.len(), 2);
+        Ok(())
+    }
+    #[test]
+    fn project_identity_matches_network_clone_spellings_and_linked_worktrees() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path();
+        let https = normalize_remote(root, "https://github.com/example/project.git")?;
+        assert_eq!(
+            https,
+            normalize_remote(root, "git@github.com:example/project.git")?
+        );
+        assert_eq!(
+            https,
+            normalize_remote(root, "ssh://git@github.com/example/project")?
+        );
+        assert_ne!(
+            https,
+            normalize_remote(root, "ssh://git@github.com:2222/example/project")?
+        );
+        assert_ne!(
+            https,
+            normalize_remote(root, "https://github.com/example/other.git")?
+        );
+        git(root, &["init", "-q"])?;
+        git(
+            root,
+            &[
+                "config",
+                "remote.origin.url",
+                "git@github.com:example/project.git",
+            ],
+        )?;
+        assert_eq!(project_identity(root)?, ContentId::of(&https));
         Ok(())
     }
 }

@@ -96,23 +96,12 @@ pub struct RustBuildArgs {
     benches: bool,
     #[arg(long)]
     pub no_run: bool,
-    /// Execute instrumented tests and write native coverage evidence.
+    /// Optionally export the coverage evidence collected by native tests.
     #[arg(long, value_name = "REPORT", conflicts_with = "no_run")]
     collect_coverage: Option<PathBuf>,
-    /// Persist complete advisory coverage evidence in the shared scheduler CAS.
-    #[arg(long, requires = "collect_coverage", value_name = "PROJECT")]
-    impact_project: Option<String>,
-    /// Compare predicted affected tests with an authoritative full run.
-    #[arg(long, requires = "impact_project")]
-    impact_shadow: bool,
-    #[arg(long, requires = "collect_coverage")]
+    /// Optionally export the aggregate LLVM profile.
+    #[arg(long, value_name = "PROFILE", conflicts_with = "no_run")]
     aggregate_profile: Option<PathBuf>,
-    #[arg(long, requires = "collect_coverage")]
-    continuous_coverage: bool,
-    #[arg(long, requires = "collect_coverage")]
-    llvm_tools_dir: Option<PathBuf>,
-    #[arg(long, requires = "collect_coverage")]
-    test_jobs: Option<NonZeroUsize>,
     #[arg(long)]
     target: Option<OsString>,
     #[arg(long)]
@@ -171,13 +160,7 @@ impl RustBuildArgs {
             bench: self.bench.clone(),
             benches: self.benches,
             no_run: self.no_run,
-            coverage: self.collect_coverage.as_ref().map(|_| {
-                if self.continuous_coverage {
-                    sccache_rust_build::impact::CoverageMode::Continuous
-                } else {
-                    sccache_rust_build::impact::CoverageMode::Exit
-                }
-            }),
+            coverage: None,
             doc: self.doc,
             no_doc: self.no_doc,
             no_deps: self.no_deps,
@@ -287,8 +270,9 @@ fn absolute(path: &Path, cwd: &Path) -> Result<PathBuf> {
 fn execute(mut args: RustBuildArgs) -> Result<i32> {
     let cwd = std::env::current_dir()?;
     ensure!(
-        args.collect_coverage.is_none() || args.mode == Mode::Test,
-        "--collect-coverage requires test mode"
+        (args.collect_coverage.is_none() && args.aggregate_profile.is_none())
+            || args.mode == Mode::Test,
+        "coverage export requires test mode"
     );
     if let (Some(report), Some(profile)) = (&args.collect_coverage, &args.aggregate_profile) {
         ensure!(
@@ -534,7 +518,32 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
         // Keep the output lock alive across dispatch.
         let _target_lock = target_lock;
         args.validate_targets(&graph)?;
-        let plan_options = args.plan_options()?;
+        let mut plan_options = args.plan_options()?;
+        let explicit_coverage = args.collect_coverage.is_some() || args.aggregate_profile.is_some();
+        let runnable_harness = graph.roots.iter().any(|&unit| {
+            let unit = &graph.units[unit];
+            graph.packages[unit.package].targets.iter().any(|target| {
+                target.harness
+                    && plan_options.selects(target)
+                    && target.required_features.is_subset(&unit.features)
+                    && (target.test || matches!(target.kind, TargetKind::Test | TargetKind::Bench))
+            })
+        });
+        let coverage = if args.mode == Mode::Test
+            && !args.no_run
+            && (explicit_coverage || (!args.doc && runnable_harness))
+        {
+            coverage::prepare(
+                &workspace,
+                &toolchain,
+                &settings,
+                &args.trailing,
+                explicit_coverage,
+            )?
+        } else {
+            None
+        };
+        plan_options.coverage = coverage.as_ref().map(coverage::Preparation::mode);
         // Never replace ordinary build products with instrumented binaries.
         let final_root = if plan_options.coverage.is_some() {
             lease.root().join("coverage-target")
@@ -556,25 +565,19 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
             graph.packages.len(),
             planner.len()
         );
-        if let Some(report) = args.collect_coverage.as_deref() {
+        if let Some(preparation) = coverage {
             return coverage::execute(
                 &session,
                 content,
                 &planner,
                 &toolchain,
-                &workspace,
+                preparation,
                 lease.root(),
                 args.max_in_flight,
                 coverage::Options {
-                    report,
-                    impact_project: args.impact_project.as_deref(),
-                    impact_shadow: args.impact_shadow,
+                    report: args.collect_coverage.as_deref(),
                     aggregate: args.aggregate_profile.as_deref(),
-                    mode: plan_options.coverage.context("missing coverage mode")?,
-                    tools_dir: args.llvm_tools_dir.as_deref(),
-                    jobs: args
-                        .test_jobs
-                        .unwrap_or(std::thread::available_parallelism()?),
+                    jobs: std::thread::available_parallelism()?,
                     trailing: &args.trailing,
                     verbose: args.verbose > 0,
                 },
