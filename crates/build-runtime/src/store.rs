@@ -1166,6 +1166,18 @@ impl NativeStore {
         Self::open_inner(root, None)
     }
 
+    fn load_usage(db: &Database) -> Result<Pins> {
+        let mut pins = Pins::default();
+        let read = db.begin_read()?;
+        for entry in read.open_table(USAGE)?.iter()? {
+            let (key, value) = entry?;
+            let root = space::Root::from_key(*key.value())?;
+            let record: space::UsageRecord = encoding().deserialize(value.value())?;
+            pins.usage.insert(root, record);
+        }
+        Ok(pins)
+    }
+
     fn open_inner(root: &Path, space_policy: Option<SpacePolicy>) -> Result<Self> {
         fs::create_dir_all(root)?;
         let root = fs::canonicalize(root)?;
@@ -1228,16 +1240,7 @@ impl NativeStore {
             }
         }
         write.commit()?;
-        let mut pins = Pins::default();
-        {
-            let read = db.begin_read()?;
-            for entry in read.open_table(USAGE)?.iter()? {
-                let (key, value) = entry?;
-                let root = space::Root::from_key(*key.value())?;
-                let record: space::UsageRecord = encoding().deserialize(value.value())?;
-                pins.usage.insert(root, record);
-            }
-        }
+        let pins = Self::load_usage(&db)?;
         let result_history_limit = history::configured_limit(&db)?;
         let physical_encoding = if is_native_zfs(&root.join("staging"))? {
             BlobEncoding::Raw

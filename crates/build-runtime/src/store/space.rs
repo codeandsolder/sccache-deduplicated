@@ -308,7 +308,9 @@ impl NativeStore {
                     .lock()
                     .map_err(|_| anyhow!("native space lock poisoned"))?;
                 self.apply_releases(&mut state)?;
-                Ok(state.reserved)
+                let reserved = state.reserved;
+                drop(state);
+                Ok(reserved)
             },
             incoming,
             || self.available_bytes(),

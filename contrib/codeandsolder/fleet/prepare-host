@@ -17,10 +17,10 @@ if [[ "$role" == asus ]]; then
 fi
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 case "$role" in
-  acer) user=jan; source=/etc/sccache/client.conf; worker_gib=12; worker_target=8; minimum=16; target=24 ;;
-  asus) user=jan; source=/etc/sccache/client.conf; worker_gib=32; worker_target=28; minimum=32; target=48 ;;
+  acer) user=jan; source=/etc/sccache/client.conf; worker_gib=12; worker_target=8; minimum=16; target=20 ;;
+  asus) user=jan; source=/etc/sccache/client.conf; worker_gib=32; worker_target=28; minimum=32; target=36 ;;
   cold-storage) user=sentinelx; source=/etc/sccache/client.conf; worker_gib=0 ;;
-  wsl) user=jan; source=/etc/sccache/config; worker_gib=12; worker_target=8; minimum=32; target=48 ;;
+  wsl) user=jan; source=/etc/sccache/config; worker_gib=12; worker_target=8; minimum=32; target=36 ;;
   *) exit 2 ;;
 esac
 [[ "$(systemctl show sccache-local.service -p User --value)" == "$user" ]]
@@ -284,7 +284,7 @@ max_metadata_bytes = 67108864
 
 [native_cache.space]
 min_available_bytes = $((32*gib))
-target_available_bytes = $((48*gib))
+target_available_bytes = $((36*gib))
 max_resident_bytes = $((32*gib))
 target_resident_bytes = $((28*gib))
 max_evictions_per_pass = 128
