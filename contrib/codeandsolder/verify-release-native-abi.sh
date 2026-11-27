@@ -48,7 +48,15 @@ for binary in "$@"; do
                 fi
                 required="$version"
                 ;;
-            GLIBC_*|GLIBCXX_*|CXXABI_*)
+            # Exact public libgcc_s version definitions common to all four
+            # managed x86-64 hosts. Numeric ordering is insufficient because
+            # version nodes are sparse (e.g. there is no GCC_11.0.0).
+            GCC_3.0|GCC_3.3|GCC_3.3.1|GCC_3.4|GCC_3.4.2|GCC_3.4.4|\
+            GCC_4.0.0|GCC_4.2.0|GCC_4.3.0|GCC_4.7.0|GCC_4.8.0|\
+            GCC_7.0.0|GCC_12.0.0|GCC_13.0.0|GCC_14.0.0)
+                continue
+                ;;
+            GLIBC_*|GLIBCXX_*|CXXABI_*|GCC_*)
                 echo "::error::$binary requires unsupported versioned ABI $version" >&2
                 exit 1
                 ;;

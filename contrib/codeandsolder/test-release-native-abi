@@ -68,6 +68,12 @@ link_versioned GLIBC_ABI_DT_RELR libc.so.6 relr
 accept relr
 link_versioned GLIBC_2.3 ld-linux-x86-64.so.2 loader-import
 accept loader-import
+link_versioned GCC_14.0.0 libgcc_s.so.1 gcc-supported
+accept gcc-supported
+link_versioned GCC_15.0.0 libgcc_s.so.1 gcc-too-new
+reject gcc-too-new 'unsupported versioned ABI GCC_15.0.0'
+link_versioned GCC_11.0.0 libgcc_s.so.1 gcc-unknown
+reject gcc-unknown 'unsupported versioned ABI GCC_11.0.0'
 link_versioned GLIBC_2.40 libc.so.6 too-new
 reject too-new 'newer than GLIBC_2.39'
 link_versioned GLIBC_2.39.1 libc.so.6 patch-too-new
