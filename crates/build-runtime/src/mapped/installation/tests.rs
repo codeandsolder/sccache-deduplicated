@@ -3,6 +3,7 @@ use crate::{
     ContentId, MappedMetadata, MappedTree, SourceDigestCache, TreeEntry, TreeId, TreeManifest,
     TreeMetadata, TreePath, TreeTimestamp,
 };
+use std::fs;
 
 #[test]
 fn mutable_installation_is_reverified_and_rejects_mutation() -> Result<()> {
