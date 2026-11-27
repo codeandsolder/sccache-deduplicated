@@ -22,7 +22,7 @@ use std::{
 const PREFIX: &str = "lease-";
 const READY: &str = ".ready";
 
-struct ScratchLease {
+pub(crate) struct ScratchLease {
     path: PathBuf,
     lock: Option<File>,
 }
@@ -125,20 +125,12 @@ impl ScratchLease {
         Ok(())
     }
 
-    fn configure(&self, command: &mut Command) -> Result<()> {
+    pub(crate) fn inherit(&self, command: &mut Command) -> Result<()> {
         let fd = self
             .lock
             .as_ref()
             .context("closed Cargo scratch lease")?
             .as_raw_fd();
-        // Preserve Cargo's workspace separation for external and nested
-        // subcommands using Cargo's own build-dir template expansion.
-        command.env(
-            "CARGO_BUILD_BUILD_DIR",
-            self.path
-                .join("intermediates")
-                .join("{workspace-path-hash}"),
-        );
         // SAFETY: the child hook performs only an async-signal-safe fcntl
         // on a live descriptor inherited from the parent; no allocations.
         unsafe {
@@ -150,6 +142,21 @@ impl ScratchLease {
             });
         }
         Ok(())
+    }
+    fn configure(&self, command: &mut Command) -> Result<()> {
+        // Preserve Cargo's workspace separation for external and nested
+        // subcommands using Cargo's own build-dir template expansion.
+        command.env(
+            "CARGO_BUILD_BUILD_DIR",
+            self.path
+                .join("intermediates")
+                .join("{workspace-path-hash}"),
+        );
+        self.inherit(command)
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -236,9 +243,8 @@ fn exit_code(status: ExitStatus) -> Result<i32> {
 /// Retain all intermediate artifacts in the existing daemon-owned content
 /// store for the duration of a command or a whole native planning session.
 #[cfg(feature = "dist-client")]
-pub(crate) fn with_intermediates<T>(
-    command: &mut Command,
-    execute: impl FnOnce(&mut Command) -> Result<T>,
+pub(crate) fn with_build_intermediates<T>(
+    execute: impl FnOnce(&ScratchLease, &Path) -> Result<T>,
 ) -> Result<T> {
     // The launcher owns the mount and one connection-owned retention
     // lease. It is not a compiler or another cache daemon.
@@ -271,13 +277,23 @@ pub(crate) fn with_intermediates<T>(
         crate::dist::native::intermediate::content(),
     )
     .context("mount leased Cargo intermediates")?;
-    scratch.configure(command)?;
-    let result = execute(command);
+    let result = execute(&scratch, &mount);
     scratch.wait_for_descendants()?;
     drop(filesystem);
     drop(connection);
     drop(scratch);
     result
+}
+
+#[cfg(feature = "dist-client")]
+pub(crate) fn with_intermediates<T>(
+    command: &mut Command,
+    execute: impl FnOnce(&mut Command) -> Result<T>,
+) -> Result<T> {
+    with_build_intermediates(|scratch, _| {
+        scratch.configure(command)?;
+        execute(command)
+    })
 }
 
 fn run(final_only: bool, args: Vec<OsString>) -> Result<i32> {

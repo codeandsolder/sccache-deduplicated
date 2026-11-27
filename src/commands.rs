@@ -1039,6 +1039,8 @@ pub(crate) struct CompileSession<'a> {
     runtime: Runtime,
     jobserver: Client,
     existing_only: bool,
+    #[cfg(all(target_os = "linux", feature = "dist-client"))]
+    lease: Option<&'a crate::cargo_launcher::ScratchLease>,
 }
 
 impl<'a> CompileSession<'a> {
@@ -1056,7 +1058,15 @@ impl<'a> CompileSession<'a> {
             runtime,
             jobserver: Client::new(),
             existing_only: concurrent,
+            #[cfg(all(target_os = "linux", feature = "dist-client"))]
+            lease: None,
         })
+    }
+
+    #[cfg(all(target_os = "linux", feature = "dist-client"))]
+    pub(crate) fn with_lease(mut self, lease: &'a crate::cargo_launcher::ScratchLease) -> Self {
+        self.lease = Some(lease);
+        self
     }
 
     pub(crate) fn execute(
@@ -1133,6 +1143,10 @@ impl<'a> CompileSession<'a> {
         // Only local, non-compiler actions acquire a local process slot here.
         // Compiler requests go through their normal admission/placement path.
         let _token = self.runtime.block_on(self.jobserver.acquire())?;
+        #[cfg(all(target_os = "linux", feature = "dist-client"))]
+        if let Some(lease) = self.lease {
+            lease.inherit(command)?;
+        }
         self.jobserver.configure(command);
         command.status().context("execute local build action")
     }

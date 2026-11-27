@@ -35,6 +35,8 @@ mod client;
 mod cmdline;
 mod commands;
 mod compiler;
+#[cfg(all(target_os = "linux", feature = "dist-client"))]
+mod rust_build;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub use compiler::rust_link;
@@ -101,6 +103,17 @@ pub fn main() {
     }
 
     init_logging();
+
+    #[cfg(all(target_os = "linux", feature = "dist-client"))]
+    if let Some(result) = rust_build::run_if_requested() {
+        std::process::exit(match result {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!("sccache native build: {error:#}");
+                1
+            }
+        });
+    }
 
     #[cfg(target_os = "linux")]
     if let Some(result) = cargo_launcher::run_if_requested() {

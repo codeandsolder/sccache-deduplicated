@@ -3,8 +3,12 @@
 mod fingerprint;
 mod manifest;
 mod platform;
+mod profile;
 mod resolve;
+mod script;
 mod source;
+pub use profile::Profile;
+pub use script::{LinkDirective, LinkScope, ScriptOutput};
 
 pub use fingerprint::{content_file, content_tree};
 pub use manifest::{Dependency, DependencyKind, Manifest, Package, Target, TargetKind, Workspace};

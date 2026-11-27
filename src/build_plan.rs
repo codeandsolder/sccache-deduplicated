@@ -106,7 +106,11 @@ fn render_diagnostics(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn execute_node(session: &CompileSession<'_>, node: &PlanNode, action: &PlanAction) -> Result<()> {
+pub(crate) fn execute_node(
+    session: &CompileSession<'_>,
+    node: &PlanNode,
+    action: &PlanAction,
+) -> Result<()> {
     node.validate_action(action)?;
     for directory in &node.directories {
         fs::create_dir_all(BuildPlan::path(directory))?;
@@ -190,7 +194,7 @@ fn execute_node(session: &CompileSession<'_>, node: &PlanNode, action: &PlanActi
 /// Dispatch the ready frontier with a bound on outstanding requests, not a
 /// CPU quota. Do not send dependent actions until their artifacts are ready.
 /// After a failure, drain already submitted requests before returning.
-fn dispatch(
+pub(crate) fn dispatch(
     mut graph: BuildGraph,
     max_in_flight: NonZeroUsize,
     execute: impl Fn(usize) -> Result<()> + Sync,

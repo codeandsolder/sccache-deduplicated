@@ -5,7 +5,7 @@ use sha2::{Digest as _, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{self, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -500,7 +500,19 @@ fn validate_dependency(manifest: &Manifest, dep: &Dependency) -> Result<()> {
 fn verify(file: &mut fs::File, checksum: &str) -> Result<bool> {
     file.seek(SeekFrom::Start(0))?;
     let mut sha = Sha256::new();
-    io::copy(file, &mut sha)?;
+    let mut buffer = vec![0u8; 128 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        sha.update(&buffer[..read]);
+    }
     file.seek(SeekFrom::Start(0))?;
-    Ok(format!("{:x}", sha.finalize()) == checksum)
+    let actual = sha
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(actual == checksum)
 }
