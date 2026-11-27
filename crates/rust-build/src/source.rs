@@ -141,7 +141,7 @@ impl<'a> Sources<'a> {
             let root = path
                 .canonicalize()
                 .with_context(|| format!("resolve path dependency {}", dep.alias))?;
-            let workspace = if root.starts_with(&self.workspace.root) {
+            let workspace = if root.starts_with(&self.workspace.root) && parent_source.is_none() {
                 Some(self.workspace)
             } else {
                 None
@@ -297,23 +297,29 @@ impl<'a> Sources<'a> {
             .join("registry")
             .join(blake3::hash(key.as_bytes()).to_hex().as_str());
         fs::create_dir_all(&root)?;
-        let mut archive = None;
+        // A verified, private descriptor is the only archive passed to
+        // the decoder. Never verify one mutable path and subsequently
+        // decode different bytes from it.
+        let mut file = tempfile::tempfile_in(&root)?;
+        let mut found = false;
         if let Some(import) = &self.import_root {
             let cache = import.join("registry/cache");
             if cache.is_dir() {
                 for entry in fs::read_dir(cache)? {
                     let path = entry?.path().join(&filename);
                     if path.is_file() {
-                        let mut file = fs::File::open(path)?;
+                        file.set_len(0)?;
+                        file.seek(SeekFrom::Start(0))?;
+                        std::io::copy(&mut fs::File::open(path)?, &mut file)?;
                         if verify(&mut file, checksum)? {
-                            archive = Some(file);
+                            found = true;
                             break;
                         }
                     }
                 }
             }
         }
-        if archive.is_none() {
+        if !found {
             let download = self
                 .download
                 .context("locked crate archive not available offline")?;
@@ -325,12 +331,8 @@ impl<'a> Sources<'a> {
                 ),
                 "download configuration missing for {source}"
             );
-            let path = root.join("download.crate");
-            let mut file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)?;
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
             download(
                 &format!("https://static.crates.io/crates/{name}/{filename}"),
                 &mut file,
@@ -339,11 +341,7 @@ impl<'a> Sources<'a> {
                 verify(&mut file, checksum)?,
                 "download checksum mismatch for {stem}"
             );
-            archive = Some(file);
-            // The open descriptor keeps the bytes alive until extraction ends.
-            fs::remove_file(path)?;
         }
-        let file = archive.context("missing registry archive")?;
         let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
         tar.set_preserve_mtime(false);
         for entry in tar.entries()? {
@@ -438,32 +436,88 @@ impl<'a> Sources<'a> {
                 repository = Some(repo);
             }
             let repo = repository.context("missing git object database")?;
+            // Use an actual isolated checkout rather than git archive:
+            // export-ignore and export-subst must not change source inputs,
+            // and build scripts must be able to query the pinned commit.
+            ensure!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["init", "--quiet"])
+                    .status()?
+                    .success(),
+                "git init failed"
+            );
+            ensure!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["fetch", "--no-tags", "--depth=1", "--"])
+                    .arg(&repo)
+                    .arg(commit)
+                    .status()?
+                    .success(),
+                "cannot import locked git objects"
+            );
+            ensure!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["remote", "add", "origin", url])
+                    .status()?
+                    .success(),
+                "cannot configure source origin"
+            );
+            ensure!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args([
+                        "-c",
+                        "core.autocrlf=false",
+                        "-c",
+                        "core.symlinks=true",
+                        "checkout",
+                        "--detach",
+                        "--force",
+                        commit
+                    ])
+                    .status()?
+                    .success(),
+                "cannot check out locked git commit"
+            );
             let listing = Command::new("git")
-                .arg("--git-dir")
-                .arg(&repo)
-                .args(["ls-tree", "-r", commit])
+                .arg("-C")
+                .arg(&root)
+                .args(["ls-tree", "-r", "-z", commit])
                 .output()?;
             ensure!(listing.status.success(), "git tree inspection failed");
-            ensure!(
-                !listing
-                    .stdout
-                    .split(|b| *b == b'\n')
-                    .any(|line| line.starts_with(b"160000 ")),
-                "git submodule checkout requires explicit source resolution"
-            );
-            let mut child = Command::new("git")
-                .arg("--git-dir")
-                .arg(repo)
-                .args(["archive", "--format=tar", commit])
-                .stdout(Stdio::piped())
-                .spawn()?;
-            let mut tar = tar::Archive::new(child.stdout.take().context("git archive stdout")?);
-            tar.set_preserve_mtime(false);
-            let result = tar.unpack(&root);
-            drop(tar);
-            let status = child.wait()?;
-            result?;
-            ensure!(status.success(), "git archive failed");
+            if listing
+                .stdout
+                .split(|b| *b == 0)
+                .any(|line| line.starts_with(b"160000 "))
+            {
+                ensure!(
+                    self.download.is_some(),
+                    "locked git submodules require online acquisition"
+                );
+                ensure!(
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(&root)
+                        .args([
+                            "submodule",
+                            "update",
+                            "--init",
+                            "--recursive",
+                            "--checkout",
+                            "--depth=1"
+                        ])
+                        .status()?
+                        .success(),
+                    "cannot acquire pinned git submodules"
+                );
+            }
         }
         fn find(
             root: &Path,

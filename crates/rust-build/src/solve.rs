@@ -556,3 +556,136 @@ impl Sources<'_> {
         .solve()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Workspace;
+    use serde_json::json;
+
+    fn package(root: &Path, name: &str, body: &str) -> Result<()> {
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/lib.rs"), "")?;
+        fs::write(
+            root.join("Cargo.toml"),
+            format!("[package]\nname={name:?}\nversion=\"0.1.0\"\nedition=\"2024\"\n{body}"),
+        )?;
+        Ok(())
+    }
+
+    fn index(root: &Path, name: &str, entries: &[serde_json::Value]) -> Result<()> {
+        let path = root
+            .join("registry/index/index.crates.io-fixture/.cache")
+            .join(index_path(name)?);
+        fs::create_dir_all(path.parent().context("missing index parent")?)?;
+        let mut bytes = vec![3, 2, 0, 0, 0];
+        bytes.extend_from_slice(b"etag: fixture\0");
+        for entry in entries {
+            bytes.extend_from_slice(
+                entry["vers"]
+                    .as_str()
+                    .context("version missing")?
+                    .as_bytes(),
+            );
+            bytes.push(0);
+            bytes.extend_from_slice(&serde_json::to_vec(entry)?);
+            bytes.push(0);
+        }
+        fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    fn release(
+        name: &str,
+        version: &str,
+        deps: serde_json::Value,
+        features: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({"name": name, "vers": version, "deps": deps, "cksum": "0".repeat(64), "features": features, "pubtime": "2020-01-01T00:00:00Z"})
+    }
+
+    #[test]
+    fn backtracks_and_preserves_feature_and_version_constraints() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("workspace");
+        package(&root, "app", "[dependencies]\na = \"1\"\nb = \"1\"\n")?;
+        let import = temp.path().join("import");
+        index(
+            &import,
+            "a",
+            &[
+                release("a", "1.0.0", json!([]), json!({"needed": []})),
+                release("a", "1.1.0", json!([]), json!({})),
+            ],
+        )?;
+        index(
+            &import,
+            "b",
+            &[release(
+                "b",
+                "1.0.0",
+                json!([{"name":"a", "req":"=1.0.0", "features":["needed"], "default_features":true}]),
+                json!({}),
+            )],
+        )?;
+        let workspace = Workspace::discover(&root.join("Cargo.toml"))?;
+        let scratch = temp.path().join("scratch");
+        fs::create_dir_all(&scratch)?;
+        let sources = Sources::new(&workspace, Lockfile::default(), Some(import), scratch);
+        let lock = sources.resolve_lock("release: 1.100.0-nightly")?;
+        assert_eq!(lock.packages.len(), 3);
+        assert!(
+            lock.packages
+                .iter()
+                .any(|p| p.name == "a" && p.version == Version::new(1, 0, 0))
+        );
+        assert!(
+            !lock
+                .packages
+                .iter()
+                .any(|p| p.name == "a" && p.version == Version::new(1, 1, 0))
+        );
+        let file = root.join("Cargo.lock");
+        lock.write(&file)?;
+        let loaded = Lockfile::load(&file)?;
+        assert_eq!(toml::to_string(&loaded)?, toml::to_string(&lock)?);
+        Ok(())
+    }
+
+    #[test]
+    fn selects_two_incompatible_major_versions_and_rejects_new_release() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("workspace");
+        package(
+            &root,
+            "app",
+            "[dependencies]\nold = { package = \"a\", version = \"1\" }\nnew = { package = \"a\", version = \"2\" }\n",
+        )?;
+        let import = temp.path().join("import");
+        let mut future = release("a", "2.1.0", json!([]), json!({}));
+        future["pubtime"] = json!("2100-01-01T00:00:00Z");
+        index(
+            &import,
+            "a",
+            &[
+                release("a", "1.0.0", json!([]), json!({})),
+                release("a", "2.0.0", json!([]), json!({})),
+                future,
+            ],
+        )?;
+        let workspace = Workspace::discover(&root.join("Cargo.toml"))?;
+        let scratch = temp.path().join("scratch");
+        fs::create_dir_all(&scratch)?;
+        let sources = Sources::new(&workspace, Lockfile::default(), Some(import), scratch);
+        let lock = sources.resolve_lock("release: 1.100.0-nightly")?;
+        assert_eq!(
+            lock.packages
+                .iter()
+                .filter(|p| p.name == "a")
+                .map(|p| p.version.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([Version::new(1, 0, 0), Version::new(2, 0, 0)])
+        );
+        Ok(())
+    }
+}
