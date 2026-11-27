@@ -39,6 +39,14 @@ pub(crate) fn native_directory_metadata() -> Result<crate::build_runtime::TreeMe
     })
 }
 
+/// The native planner selects the execution inventory after inspecting
+/// the actual input closure for code that can observe the entire installation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ToolchainScope {
+    Default,
+    RustCompiler,
+}
+
 pub trait ToolchainPackager: Send {
     /// Additional identity of files and search paths used to build this package.
     ///
@@ -74,7 +82,10 @@ pub trait ToolchainPackager: Send {
     /// # Errors
     /// Returns an error if discovery fails or this packager has no native mapping.
     #[cfg(target_os = "linux")]
-    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
+    fn native_mapping(
+        self: Box<Self>,
+        _scope: ToolchainScope,
+    ) -> Result<crate::build_runtime::MappedTree> {
         bail!("native mapping not supported by this toolchain packager")
     }
 }
@@ -89,7 +100,7 @@ pub(crate) trait DiscoverToolchain: Send + Sized {
         Ok(None)
     }
 
-    fn package_builder(self) -> Result<ToolchainPackageBuilder>;
+    fn package_builder(self, scope: ToolchainScope) -> Result<ToolchainPackageBuilder>;
 }
 
 #[cfg(all(
@@ -102,15 +113,20 @@ impl<T: DiscoverToolchain> ToolchainPackager for T {
     }
 
     fn prepare_namespace(self: Box<Self>) -> Result<(String, Box<dyn ToolchainPackager>)> {
-        self.package_builder()?.prepare_namespace()
+        self.package_builder(ToolchainScope::Default)?
+            .prepare_namespace()
     }
 
     fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
-        self.package_builder()?.write_compressed_tar(f)
+        self.package_builder(ToolchainScope::Default)?
+            .write_compressed_tar(f)
     }
 
-    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        self.package_builder()?.into_native_mapping()
+    fn native_mapping(
+        self: Box<Self>,
+        scope: ToolchainScope,
+    ) -> Result<crate::build_runtime::MappedTree> {
+        self.package_builder(scope)?.into_native_mapping()
     }
 }
 
