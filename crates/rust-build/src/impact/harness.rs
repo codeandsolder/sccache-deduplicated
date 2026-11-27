@@ -82,6 +82,12 @@ impl HarnessOptions {
         &self.listing
     }
 
+    /// Ignored-only and include-ignored discovery already constrain the
+    /// inventory. Preserve that policy even if libtest reports ignore=true.
+    pub fn executes(&self, test: &DiscoveredTest) -> bool {
+        !test.ignored || self.include_ignored
+    }
+
     /// The inventory already applied substring filters and skip rules.
     /// Exact invocation must NOT repeat those filters (libtest combines
     /// positional filters by OR, which would execute extra tests).
@@ -274,6 +280,12 @@ mod tests {
             ["a", "b"]
         );
         assert!(inventory[1].ignored);
+        assert!(options.executes(&inventory[1]));
+        assert!(
+            !HarnessOptions::from_arguments(&[])
+                .unwrap()
+                .executes(&inventory[1])
+        );
         Ok(())
     }
 

@@ -646,7 +646,7 @@ impl Collector<'_> {
         let mut ignored = Vec::new();
         let mut expected = 0;
         for test in tests {
-            if test.ignored {
+            if !harness.options.executes(&test) {
                 ignored.push(test.name);
                 continue;
             }
