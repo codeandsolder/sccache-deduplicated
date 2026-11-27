@@ -1,7 +1,15 @@
 use crate::{Dependency, DependencyKind, Manifest, Platform, Sources, TargetKind};
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::PathBuf;
+use std::{
+    num::NonZeroUsize,
+    path::PathBuf,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+};
 
 /// Features for host dependencies and target dependencies are unified
 /// separately, as required by the modern Rust workspace resolver.
@@ -44,6 +52,7 @@ pub struct ResolveOptions {
     pub dev_dependencies: bool,
     pub host: Platform,
     pub target: Platform,
+    pub source_jobs: NonZeroUsize,
 }
 
 #[derive(Default)]
@@ -160,7 +169,7 @@ fn is_proc_macro(manifest: &Manifest) -> bool {
 }
 
 struct Resolver<'a, 'b> {
-    sources: &'a mut Sources<'b>,
+    sources: &'a Sources<'b>,
     options: ResolveOptions,
     graph: Graph,
     packages: BTreeMap<(PathBuf, Option<String>), usize>,
@@ -168,6 +177,18 @@ struct Resolver<'a, 'b> {
     requests: Vec<BTreeSet<String>>,
     work: BTreeSet<usize>,
     resolved_edges: BTreeMap<(usize, usize), usize>,
+    waiting: BTreeMap<(usize, usize), BTreeSet<usize>>,
+}
+
+struct Acquisition {
+    parent: Manifest,
+    source: Option<String>,
+    key: (usize, usize),
+}
+
+struct Acquired {
+    key: (usize, usize),
+    result: Result<(Manifest, Option<String>)>,
 }
 
 impl Resolver<'_, '_> {
@@ -213,21 +234,44 @@ impl Resolver<'_, '_> {
         index
     }
 
-    fn dependency(&mut self, package: usize, index: usize, dep: &Dependency) -> Result<usize> {
-        if let Some(&result) = self.resolved_edges.get(&(package, index)) {
-            return Ok(result);
+    fn dependency(
+        &mut self,
+        unit: usize,
+        package: usize,
+        dep_index: usize,
+        sender: &mpsc::Sender<Acquisition>,
+    ) -> Result<Option<usize>> {
+        let key = (package, dep_index);
+        if let Some(&result) = self.resolved_edges.get(&key) {
+            return Ok(Some(result));
         }
-        let (manifest, source) = self.sources.dependency(
-            &self.graph.packages[package],
-            self.graph.sources[package].as_deref(),
-            dep,
-        )?;
-        let result = self.package(manifest, source);
-        self.resolved_edges.insert((package, index), result);
-        Ok(result)
+        let waiters = self.waiting.entry(key).or_default();
+        if waiters.is_empty() {
+            sender
+                .send(Acquisition {
+                    parent: self.graph.packages[package].clone(),
+                    source: self.graph.sources[package].clone(),
+                    key,
+                })
+                .context("source acquisition pool stopped")?;
+        }
+        waiters.insert(unit);
+        Ok(None)
     }
 
-    fn expand(&mut self, index: usize) -> Result<()> {
+    fn acquired(&mut self, message: Acquired) -> Result<()> {
+        let (manifest, source) = message.result?;
+        let package = self.package(manifest, source);
+        self.resolved_edges.insert(message.key, package);
+        self.work.extend(
+            self.waiting
+                .remove(&message.key)
+                .context("unexpected acquisition reply")?,
+        );
+        Ok(())
+    }
+
+    fn expand(&mut self, index: usize, sender: &mpsc::Sender<Acquisition>) -> Result<()> {
         let unit = &self.graph.units[index];
         let package = unit.package;
         let domain = unit.domain;
@@ -262,7 +306,9 @@ impl Resolver<'_, '_> {
                     continue;
                 }
             }
-            let child = self.dependency(package, dep_index, dep)?;
+            let Some(child) = self.dependency(index, package, dep_index, sender)? else {
+                continue;
+            };
             let child_manifest = &self.graph.packages[child];
             let child_domain = if domain == BuildDomain::Host
                 || dep.kind == DependencyKind::Build
@@ -297,6 +343,103 @@ impl Resolver<'_, '_> {
         self.graph.units[index].edges = edges;
         Ok(())
     }
+    fn resolve_all(&mut self) -> Result<()> {
+        let (requests, receive) = mpsc::channel::<Acquisition>();
+        let (replies, results) = mpsc::channel::<Acquired>();
+        let receive = Mutex::new(receive);
+        let cancelled = AtomicBool::new(false);
+        let sources = self.sources;
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..self.options.source_jobs.get() {
+                let replies = replies.clone();
+                let receive = &receive;
+                let cancelled = &cancelled;
+                let worker =
+                    std::thread::Builder::new().spawn_scoped(scope, move || -> Result<()> {
+                        loop {
+                            let request = receive
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("source queue poisoned"))?
+                                .recv();
+                            let Ok(request) = request else {
+                                break;
+                            };
+                            if cancelled.load(Ordering::Acquire) {
+                                break;
+                            }
+                            let dependency = &request.parent.dependencies[request.key.1];
+                            let result = sources
+                                .dependency(&request.parent, request.source.as_deref(), dependency)
+                                .with_context(|| {
+                                    format!(
+                                        "resolve {} dependency {}",
+                                        request.parent.package.name, dependency.alias
+                                    )
+                                });
+                            if replies
+                                .send(Acquired {
+                                    key: request.key,
+                                    result,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(())
+                    });
+                match worker {
+                    Ok(worker) => workers.push(worker),
+                    Err(error) => {
+                        cancelled.store(true, Ordering::Release);
+                        drop(requests);
+                        for worker in workers {
+                            let _ = worker.join();
+                        }
+                        return Err(error.into());
+                    }
+                }
+            }
+            drop(replies);
+            let resolution = (|| {
+                loop {
+                    // Drain already completed acquisitions first, coalescing
+                    // feature invalidations. No breadth-level barrier.
+                    while let Ok(message) = results.try_recv() {
+                        self.acquired(message)?;
+                    }
+                    while let Some(index) = self.work.pop_first() {
+                        self.expand(index, &requests)?;
+                    }
+                    if self.waiting.is_empty() {
+                        break;
+                    }
+                    self.acquired(
+                        results
+                            .recv()
+                            .context("source acquisition pool ended prematurely")?,
+                    )?;
+                }
+                Ok(())
+            })();
+            cancelled.store(true, Ordering::Release);
+            drop(requests);
+            drop(results);
+            let mut failure = resolution;
+            for worker in workers {
+                match worker.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) if failure.is_ok() => failure = Err(error),
+                    Err(_) if failure.is_ok() => {
+                        failure = Err(anyhow::anyhow!("source worker panicked"))
+                    }
+                    _ => {}
+                }
+            }
+            failure
+        })
+    }
 }
 
 impl Graph {
@@ -316,12 +459,13 @@ impl Graph {
             requests: Vec::new(),
             work: BTreeSet::new(),
             resolved_edges: BTreeMap::new(),
+            waiting: BTreeMap::new(),
         };
         let mut roots = Vec::new();
         for root in resolver.options.selected.clone() {
-            let manifest = resolver.sources.workspace.package(&root)?;
-            if resolver.sources.lock.version.is_some()
-                && resolver.sources.lock.parent(&manifest, None)?.is_none()
+            let manifest = resolver.sources.manifest(&root)?;
+            if resolver.sources.lock().version.is_some()
+                && resolver.sources.locked_parent(&manifest, None)?.is_none()
             {
                 return Err(crate::LockMismatch(format!(
                     "root {} {} is absent",
@@ -362,9 +506,8 @@ impl Graph {
             roots.push(resolver.unit(package, domain, features, true));
         }
         resolver.graph.roots = roots;
-        while let Some(index) = resolver.work.pop_first() {
-            resolver.expand(index)?;
-        }
+        resolver.resolve_all()?;
+        resolver.graph.canonicalize();
         let mut links = BTreeMap::new();
         for unit in &resolver.graph.units {
             let manifest = &resolver.graph.packages[unit.package];
@@ -387,6 +530,70 @@ impl Graph {
             }
         }
         Ok(resolver.graph)
+    }
+
+    fn canonicalize(&mut self) {
+        let mut package_order: Vec<_> = (0..self.packages.len()).collect();
+        package_order.sort_by(|&a, &b| {
+            let a = (
+                &self.packages[a].package.name,
+                &self.packages[a].package.version,
+                &self.sources[a],
+                &self.packages[a].root,
+            );
+            let b = (
+                &self.packages[b].package.name,
+                &self.packages[b].package.version,
+                &self.sources[b],
+                &self.packages[b].root,
+            );
+            a.cmp(&b)
+        });
+        let mut packages: Vec<_> = std::mem::take(&mut self.packages)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let mut sources: Vec<_> = std::mem::take(&mut self.sources)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let mut package_map = vec![0; packages.len()];
+        for (new, old) in package_order.into_iter().enumerate() {
+            package_map[old] = new;
+            if let Some(package) = packages[old].take() {
+                self.packages.push(package);
+            }
+            if let Some(source) = sources[old].take() {
+                self.sources.push(source);
+            }
+        }
+        let mut order: Vec<_> = (0..self.units.len()).collect();
+        order.sort_by_key(|&index| {
+            (
+                package_map[self.units[index].package],
+                self.units[index].domain,
+            )
+        });
+        let mut units: Vec<_> = std::mem::take(&mut self.units)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let mut map = vec![0; units.len()];
+        for (new, old) in order.into_iter().enumerate() {
+            map[old] = new;
+            if let Some(mut unit) = units[old].take() {
+                unit.package = package_map[unit.package];
+                self.units.push(unit);
+            }
+        }
+        for unit in &mut self.units {
+            for edge in &mut unit.edges {
+                edge.unit = map[edge.unit];
+            }
+        }
+        for root in &mut self.roots {
+            *root = map[*root];
+        }
     }
 
     pub fn manifest(&self, unit: usize) -> &Manifest {
@@ -450,6 +657,7 @@ mod tests {
                 dev_dependencies: false,
                 host: platform.clone(),
                 target: platform,
+                source_jobs: std::num::NonZeroUsize::MIN.saturating_add(3),
             },
         )?;
         let unit = graph
@@ -460,6 +668,115 @@ mod tests {
         assert_eq!(
             unit.features,
             BTreeSet::from(["extra".into(), "other".into()])
+        );
+        Ok(())
+    }
+    #[test]
+    fn acquisitions_follow_ready_edges_without_a_level_barrier() -> Result<()> {
+        use sha2::{Digest, Sha256};
+        use std::{io::Write, sync::Condvar, time::Duration};
+        let root = tempfile::tempdir()?;
+        fs::create_dir(root.path().join("src"))?;
+        fs::write(root.path().join("src/lib.rs"), "")?;
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname=\"root\"\nversion=\"1.0.0\"\n[dependencies]\na=\"1\"\nb=\"1\"\n",
+        )?;
+        let ws = Workspace::discover(&root.path().join("Cargo.toml"))?;
+        let mut archives = BTreeMap::new();
+        let mut packages = vec![crate::LockedPackage {
+            name: "root".into(),
+            version: "1.0.0".parse()?,
+            source: None,
+            checksum: None,
+            dependencies: vec!["a".into(), "b".into()],
+        }];
+        for (name, body, deps) in [
+            ("a", "", vec![]),
+            ("b", "[dependencies]\nc=\"1\"\n", vec!["c".into()]),
+            ("c", "", vec![]),
+        ] {
+            let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::fast(),
+            ));
+            let manifest =
+                format!("[package]\nname={name:?}\nversion=\"1.0.0\"\nedition=\"2024\"\n{body}");
+            for (file, contents) in [
+                ("Cargo.toml", manifest.as_bytes()),
+                ("src/lib.rs", &b""[..]),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_mode(0o644);
+                header.set_size(contents.len() as u64);
+                header.set_cksum();
+                builder.append_data(&mut header, format!("{name}-1.0.0/{file}"), contents)?;
+            }
+            let bytes = builder.into_inner()?.finish()?;
+            let checksum = Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            archives.insert(name.to_owned(), bytes);
+            packages.push(crate::LockedPackage {
+                name: name.into(),
+                version: "1.0.0".parse()?,
+                source: Some(crate::registry::CRATES_IO.into()),
+                checksum: Some(checksum),
+                dependencies: deps,
+            });
+        }
+        let signal = (Mutex::new(false), Condvar::new());
+        let archive = |pkg: &crate::LockedPackage,
+                       _: &crate::Registry,
+                       output: &mut fs::File|
+         -> Result<bool> {
+            if pkg.name == "a" {
+                let (ready, _) = signal
+                    .1
+                    .wait_timeout_while(signal.0.lock().unwrap(), Duration::from_secs(5), |ready| {
+                        !*ready
+                    })
+                    .unwrap();
+                ensure!(*ready, "acquisition of c was blocked behind unrelated a");
+            } else if pkg.name == "c" {
+                *signal.0.lock().unwrap() = true;
+                signal.1.notify_all();
+            }
+            output.write_all(&archives[&pkg.name])?;
+            Ok(true)
+        };
+        let mut sources = Sources::new(
+            &ws,
+            Lockfile {
+                version: Some(4),
+                packages,
+            },
+            None,
+            root.path().join("scratch"),
+        );
+        sources.archive = Some(&archive);
+        let platform = Platform::parse("host".into(), "unix")?;
+        let graph = Graph::resolve(
+            &mut sources,
+            ResolveOptions {
+                selected: vec![root.path().to_owned()],
+                features: BTreeSet::new(),
+                default_features: true,
+                all_features: false,
+                dev_dependencies: false,
+                host: platform.clone(),
+                target: platform,
+                source_jobs: NonZeroUsize::new(2).unwrap(),
+            },
+        )?;
+        assert_eq!(
+            graph
+                .packages
+                .iter()
+                .map(|p| p.package.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c", "root"]
         );
         Ok(())
     }

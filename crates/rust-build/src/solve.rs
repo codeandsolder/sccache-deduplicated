@@ -515,7 +515,7 @@ impl Search<'_, '_> {
             let reused = state.chosen.contains_key(&identity(&c.lock));
             let locked = self
                 .sources
-                .lock
+                .lock()
                 .packages
                 .iter()
                 .any(|p| identity(p) == identity(&c.lock));

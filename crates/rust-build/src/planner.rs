@@ -1456,6 +1456,7 @@ mod tests {
                 dev_dependencies: true,
                 host: toolchain.host.clone(),
                 target: toolchain.target.clone(),
+                source_jobs: std::num::NonZeroUsize::MIN.saturating_add(3),
             },
         )?;
         let settings = Settings::default();
@@ -1588,6 +1589,7 @@ mod tests {
                 dev_dependencies: true,
                 host: toolchain.host.clone(),
                 target: toolchain.target.clone(),
+                source_jobs: std::num::NonZeroUsize::MIN.saturating_add(3),
             },
         )?;
         let final_root = temp.path().join("target");

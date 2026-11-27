@@ -109,6 +109,8 @@ pub struct RustBuildArgs {
     locked: bool,
     #[arg(short = 'j', long = "jobs", default_value = "64")]
     max_in_flight: NonZeroUsize,
+    #[arg(long, default_value = "16")]
+    source_jobs: NonZeroUsize,
     #[arg(last = true)]
     pub trailing: Vec<OsString>,
 }
@@ -417,10 +419,12 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
             dev_dependencies: args.dev_dependencies(),
             host: toolchain.host.clone(),
             target: toolchain.target.clone(),
+            source_jobs: args.source_jobs,
         };
-        let mut changed = sources.lock.version.is_none();
+        let mut changed = sources.lock().version.is_none();
         if changed {
-            sources.lock = sources.resolve_lock(&toolchain.version)?;
+            let lock = sources.resolve_lock(&toolchain.version)?;
+            sources.replace_lock(lock);
         }
         let graph = match Graph::resolve(&mut sources, options.clone()) {
             Ok(graph) => graph,
@@ -430,14 +434,15 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
                         .downcast_ref::<sccache_rust_build::LockMismatch>()
                         .is_some() =>
             {
-                sources.lock = sources.resolve_lock(&toolchain.version)?;
+                let lock = sources.resolve_lock(&toolchain.version)?;
+                sources.replace_lock(lock);
                 changed = true;
                 Graph::resolve(&mut sources, options)?
             }
             Err(error) => return Err(error),
         };
         if changed {
-            sources.lock.write(&workspace.root.join("Cargo.lock"))?;
+            sources.lock().write(&workspace.root.join("Cargo.lock"))?;
         }
         args.validate_targets(&graph)?;
         let plan_options = args.plan_options()?;

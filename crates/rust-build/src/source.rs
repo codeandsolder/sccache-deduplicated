@@ -8,6 +8,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Arc, Mutex},
 };
 
 use crate::{Dependency, Manifest, Registries, Registry, Workspace};
@@ -69,37 +70,58 @@ impl Lockfile {
         file.persist(path)?;
         Ok(())
     }
+}
 
-    pub(crate) fn parent(
-        &self,
-        manifest: &Manifest,
-        source: Option<&str>,
-    ) -> Result<Option<&LockedPackage>> {
-        let mut matches = self.packages.iter().filter(|p| {
-            p.name == manifest.package.name
-                && p.version == manifest.package.version
-                && p.source.as_deref() == source
-        });
-        let result = matches.next();
-        ensure!(
-            matches.next().is_none(),
-            "ambiguous lock identity for {}",
-            manifest.package.name
-        );
-        Ok(result)
+// A per-key slot serializes acquisition of the same immutable source while
+// unrelated packages can download, verify and unpack concurrently.
+struct Memo<K, V> {
+    slots: Mutex<BTreeMap<K, Arc<Mutex<Option<V>>>>>,
+}
+
+impl<K, V> Default for Memo<K, V> {
+    fn default() -> Self {
+        Self {
+            slots: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+impl<K: Ord, V: Clone> Memo<K, V> {
+    fn get(&self, key: K, acquire: impl FnOnce() -> Result<V>) -> Result<V> {
+        let slot = {
+            let mut slots = self
+                .slots
+                .lock()
+                .map_err(|_| anyhow::anyhow!("source memo poisoned"))?;
+            Arc::clone(slots.entry(key).or_default())
+        };
+        let mut value = slot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("source acquisition slot poisoned"))?;
+        if let Some(value) = value.as_ref() {
+            return Ok(value.clone());
+        }
+        let acquired = acquire()?;
+        *value = Some(acquired.clone());
+        Ok(acquired)
     }
 }
 
 pub struct Sources<'a> {
     pub workspace: &'a Workspace,
-    pub lock: Lockfile,
+    lock: Lockfile,
+    lock_index: BTreeMap<String, Vec<usize>>,
     pub import_root: Option<PathBuf>,
     pub scratch: PathBuf,
     /// Stream a verified registry archive to the provided staging file.
-    pub download: Option<&'a dyn Fn(&str, &mut fs::File) -> Result<()>>,
-    pub archive: Option<&'a dyn Fn(&LockedPackage, &Registry, &mut fs::File) -> Result<bool>>,
+    pub download: Option<&'a (dyn Fn(&str, &mut fs::File) -> Result<()> + Sync)>,
+    pub archive:
+        Option<&'a (dyn Fn(&LockedPackage, &Registry, &mut fs::File) -> Result<bool> + Sync)>,
     pub registries: Registries,
-    materialized: BTreeMap<String, PathBuf>,
+    materialized: Memo<String, PathBuf>,
+    manifests: Memo<PathBuf, Manifest>,
+    git_checkouts: Memo<String, PathBuf>,
+    git_packages: Memo<String, Vec<Manifest>>,
 }
 
 pub(crate) fn identity(package: &LockedPackage) -> String {
@@ -137,20 +159,77 @@ impl<'a> Sources<'a> {
     ) -> Self {
         Self {
             workspace,
+            lock_index: Self::index(&lock),
             lock,
             import_root,
             scratch,
             download: None,
             archive: None,
             registries: Registries::default(),
-            materialized: BTreeMap::new(),
+            materialized: Memo::default(),
+            manifests: Memo::default(),
+            git_checkouts: Memo::default(),
+            git_packages: Memo::default(),
         }
+    }
+
+    fn index(lock: &Lockfile) -> BTreeMap<String, Vec<usize>> {
+        let mut index = BTreeMap::<String, Vec<usize>>::new();
+        for (i, package) in lock.packages.iter().enumerate() {
+            index.entry(package.name.clone()).or_default().push(i);
+        }
+        index
+    }
+
+    pub fn lock(&self) -> &Lockfile {
+        &self.lock
+    }
+
+    pub fn replace_lock(&mut self, lock: Lockfile) {
+        self.lock_index = Self::index(&lock);
+        self.lock = lock;
+    }
+
+    fn packages_named(&self, name: &str) -> impl Iterator<Item = &LockedPackage> {
+        self.lock_index
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|&i| &self.lock.packages[i])
+    }
+
+    pub(crate) fn locked_parent(
+        &self,
+        manifest: &Manifest,
+        source: Option<&str>,
+    ) -> Result<Option<&LockedPackage>> {
+        let mut matches = self
+            .packages_named(&manifest.package.name)
+            .filter(|p| p.version == manifest.package.version && p.source.as_deref() == source);
+        let result = matches.next();
+        ensure!(
+            matches.next().is_none(),
+            "ambiguous lock identity for {}",
+            manifest.package.name
+        );
+        Ok(result)
+    }
+
+    pub(crate) fn manifest(&self, root: &Path) -> Result<Manifest> {
+        let root = root.canonicalize()?;
+        self.manifests.get(root.clone(), || {
+            if self.workspace.members.contains(&root) {
+                self.workspace.package(&root)
+            } else {
+                load_discovered(&root)
+            }
+        })
     }
 
     /// The lockfile provides the selected exact versions, including duplicate
     /// semver-compatible versions. Never substitute a newer cached package.
     pub fn dependency(
-        &mut self,
+        &self,
         parent: &Manifest,
         parent_source: Option<&str>,
         dep: &Dependency,
@@ -159,27 +238,16 @@ impl<'a> Sources<'a> {
             let root = path
                 .canonicalize()
                 .with_context(|| format!("resolve path dependency {}", dep.alias))?;
-            let workspace = if self.workspace.members.contains(&root) && parent_source.is_none() {
-                Some(self.workspace)
-            } else {
-                None
-            };
-            let manifest = if workspace.is_some() {
-                Manifest::load(&root, workspace)?
-            } else {
-                load_discovered(&root)?
-            };
+            let manifest = self.manifest(&root)?;
             validate_dependency(&manifest, dep)?;
             let mut child_source = parent_source.map(str::to_owned);
             if !self.lock.packages.is_empty() {
                 let locked = self
-                    .lock
-                    .parent(parent, parent_source)?
+                    .locked_parent(parent, parent_source)?
                     .ok_or_else(|| LockMismatch(format!("{} is absent", parent.package.name)))?;
                 let child = self
-                    .lock
-                    .parent(&manifest, parent_source)?
-                    .or(self.lock.parent(&manifest, None)?)
+                    .locked_parent(&manifest, parent_source)?
+                    .or(self.locked_parent(&manifest, None)?)
                     .ok_or_else(|| {
                         LockMismatch(format!("path dependency {} is absent", dep.alias))
                     })?;
@@ -194,16 +262,15 @@ impl<'a> Sources<'a> {
             }
             return Ok((manifest, child_source));
         }
-        let parent_lock = self.lock.parent(parent, parent_source)?.ok_or_else(|| {
+        let parent_lock = self.locked_parent(parent, parent_source)?.ok_or_else(|| {
             LockMismatch(format!(
                 "{} has no locked edge for {}",
                 parent.package.name, dep.alias
             ))
         })?;
         let mut candidates = Vec::new();
-        for package in &self.lock.packages {
-            if package.name == dep.name
-                && dep.requirement.matches(&package.version)
+        for package in self.packages_named(&dep.name) {
+            if dep.requirement.matches(&package.version)
                 && parent_lock
                     .dependencies
                     .iter()
@@ -231,11 +298,7 @@ impl<'a> Sources<'a> {
             None => self.patched_path(dep, locked)?,
             Some(source) => bail!("unsupported locked source {source}"),
         };
-        let manifest = if self.workspace.members.contains(&root) {
-            Manifest::load(&root, Some(self.workspace))?
-        } else {
-            load_discovered(&root)?
-        };
+        let manifest = self.manifest(&root)?;
         validate_dependency(&manifest, dep)?;
         ensure!(
             manifest.package.version == locked.version,
@@ -343,7 +406,7 @@ impl<'a> Sources<'a> {
             }
             if let Some(path) = patch.path {
                 let path = path.canonicalize()?;
-                let manifest = self.workspace.package(&path)?;
+                let manifest = self.manifest(&path)?;
                 if manifest.package.name == package.name
                     && manifest.package.version == package.version
                 {
@@ -361,11 +424,17 @@ impl<'a> Sources<'a> {
         found.pop_first().context("missing path patch")
     }
 
-    fn registry(&mut self, package: &LockedPackage) -> Result<PathBuf> {
-        let key = identity(package);
-        if let Some(root) = self.materialized.get(&key) {
-            return Ok(root.clone());
-        }
+    fn registry(&self, package: &LockedPackage) -> Result<PathBuf> {
+        let checksum = package
+            .checksum
+            .as_deref()
+            .context("registry lock has no checksum")?;
+        let key = format!("{} {checksum}", identity(package));
+        self.materialized
+            .get(key.clone(), || self.registry_uncached(package, &key))
+    }
+
+    fn registry_uncached(&self, package: &LockedPackage, key: &str) -> Result<PathBuf> {
         let source = package
             .source
             .as_deref()
@@ -387,6 +456,9 @@ impl<'a> Sources<'a> {
             .scratch
             .join("registry")
             .join(blake3::hash(key.as_bytes()).to_hex().as_str());
+        if root.exists() {
+            fs::remove_dir_all(&root)?;
+        }
         fs::create_dir_all(&root)?;
         // A verified, private descriptor is the only archive passed to
         // the decoder. Never verify one mutable path and subsequently
@@ -455,29 +527,24 @@ impl<'a> Sources<'a> {
             );
             ensure!(entry.unpack_in(&root)?, "invalid registry archive path");
         }
-        let root = root.join(stem);
-        self.materialized.insert(key, root.clone());
-        Ok(root)
+        Ok(root.join(stem))
     }
 
-    fn git(&mut self, package: &LockedPackage) -> Result<PathBuf> {
+    fn git(&self, package: &LockedPackage) -> Result<PathBuf> {
         let key = identity(package);
-        if let Some(root) = self.materialized.get(&key) {
-            return Ok(root.clone());
-        }
-        let source = package.source.as_deref().context("missing git source")?;
-        let mut found = self
-            .git_manifests(source, &package.name)?
-            .into_iter()
-            .filter(|manifest| manifest.package.version == package.version)
-            .collect::<Vec<_>>();
-        ensure!(
-            found.len() == 1,
-            "cannot locate unique locked git package {key}"
-        );
-        let result = found.remove(0).root;
-        self.materialized.insert(key, result.clone());
-        Ok(result)
+        self.materialized.get(key.clone(), || {
+            let source = package.source.as_deref().context("missing git source")?;
+            let mut found = self
+                .git_manifests(source, &package.name)?
+                .into_iter()
+                .filter(|manifest| manifest.package.version == package.version)
+                .collect::<Vec<_>>();
+            ensure!(
+                found.len() == 1,
+                "cannot locate unique locked git package {key}"
+            );
+            Ok(found.remove(0).root)
+        })
     }
 
     pub(crate) fn git_source(&self, dep: &Dependency) -> Result<String> {
@@ -585,6 +652,11 @@ impl<'a> Sources<'a> {
     }
 
     fn git_checkout(&self, source: &str) -> Result<PathBuf> {
+        self.git_checkouts
+            .get(source.to_owned(), || self.git_checkout_uncached(source))
+    }
+
+    fn git_checkout_uncached(&self, source: &str) -> Result<PathBuf> {
         let (url, commit) = source
             .strip_prefix("git+")
             .context("not a git source")?
@@ -744,27 +816,32 @@ impl<'a> Sources<'a> {
     }
 
     pub(crate) fn git_manifests(&self, source: &str, name: &str) -> Result<Vec<Manifest>> {
-        let root = self.git_checkout(source)?;
-        fn find(root: &Path, name: &str, found: &mut Vec<Manifest>) -> Result<()> {
-            if root.join("Cargo.toml").is_file()
-                && let Ok(manifest) = load_discovered(root)
-                && manifest.package.name == name
-            {
-                found.push(manifest);
-            }
-            for entry in fs::read_dir(root)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir()
-                    && !entry.file_name().to_string_lossy().starts_with('.')
+        let all = self.git_packages.get(source.to_owned(), || {
+            let root = self.git_checkout(source)?;
+            fn find(sources: &Sources<'_>, root: &Path, found: &mut Vec<Manifest>) -> Result<()> {
+                if root.join("Cargo.toml").is_file()
+                    && let Ok(manifest) = sources.manifest(root)
                 {
-                    find(&entry.path(), name, found)?;
+                    found.push(manifest);
                 }
+                for entry in fs::read_dir(root)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir()
+                        && !entry.file_name().to_string_lossy().starts_with('.')
+                    {
+                        find(sources, &entry.path(), found)?;
+                    }
+                }
+                Ok(())
             }
-            Ok(())
-        }
-        let mut found = Vec::new();
-        find(&root, name, &mut found)?;
-        Ok(found)
+            let mut found = Vec::new();
+            find(self, &root, &mut found)?;
+            Ok(found)
+        })?;
+        Ok(all
+            .into_iter()
+            .filter(|manifest| manifest.package.name == name)
+            .collect())
     }
 }
 
@@ -810,7 +887,10 @@ fn verify(file: &mut fs::File, checksum: &str) -> Result<bool> {
     let mut sha = Sha256::new();
     let mut buffer = vec![0u8; 128 * 1024];
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = match file.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
         if read == 0 {
             break;
         }
