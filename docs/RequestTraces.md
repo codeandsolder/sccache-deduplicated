@@ -80,8 +80,18 @@ phase count once; conflicting phases are reported as ambiguous overlap;
 unrecorded gaps and instrumenter omissions remain visible. Parallel
 diagnostic intervals and other hosts are excluded from this accounting.
 A producer link opens its separate trace. The browser regression exercises
-live row identity, trace selection, producer navigation and revision search. The fleet table reports p50/p95/p99 and
+live row identity, trace selection, producer navigation and revision search. The fleet table reports histogram-based estimates of p50/p95/p99 and
 cumulative elapsed time by phase, service, host and exact source revision.
+Searches freeze the requested time range and split it into disjoint windows
+of at most 100,000 raw spans before replay deduplication. The dashboard merges
+bucket counts across windows rather than averaging local percentiles.
+Percentiles are conservative bucket upper bounds, clamped to the observed
+minimum and maximum. Counts and cumulative elapsed time use deduplicated
+observations. Queries are bounded to 128 nonempty windows, 512 count probes,
+2,048 phase groups and 30 seconds; an exhausted budget reports an error
+rather than publishing a partial aggregate. Request and aggregate failures
+are reported separately. As ingestion is concurrent, a search is not a
+transactional snapshot of the database.
 The binary embeds the full Git SHA at build time (including commit-expanded
 Git archives); dirty compilation inputs carry a `-dirty-<SHA256>` fingerprint, archives with
 no provenance report `unknown`. Both binary `--version` and OTLP

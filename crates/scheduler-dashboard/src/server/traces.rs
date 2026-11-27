@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result, ensure};
 use futures::StreamExt as _;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
 use crate::traces::{
@@ -13,6 +13,49 @@ use crate::traces::{
 const LIMIT: usize = 100;
 const SPAN_LIMIT: usize = 4096;
 const MAX_RESPONSE: usize = 8 * 1024 * 1024;
+const PARTITION_ROWS: u64 = 100_000;
+const MAX_PARTITIONS: usize = 128;
+const MAX_PROBES: usize = 512;
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+const FLEET_FILTER: &str =
+    r#""resource_attr:service.name":in(sccache-client,sccache-scheduler,sccache-worker)"#;
+mod histogram;
+use histogram::PhaseGroups;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Window {
+    start: i128,
+    end: i128,
+}
+
+impl Window {
+    fn recent(seconds: u32) -> Self {
+        let end = jiff::Timestamp::now().as_nanosecond();
+        Self {
+            start: end - i128::from(seconds) * 1_000_000_000,
+            end,
+        }
+    }
+
+    fn split(self) -> Result<[Self; 2]> {
+        ensure!(
+            self.end - self.start > 1,
+            "too many spans at one timestamp; narrow the trace range"
+        );
+        let middle = self.start + (self.end - self.start) / 2;
+        Ok([
+            Self {
+                start: self.start,
+                end: middle,
+            },
+            Self {
+                start: middle,
+                end: self.end,
+            },
+        ])
+    }
+}
+
 // Retry delivery preserves all of these fields byte-for-byte. Deduplicate
 // before limits, sorting or aggregates so transport retries cannot bias p99.
 const ROOT_FIELDS: &str = r#"trace_id,span_id,duration,start_time_unix_nano,"resource_attr:host.name","resource_attr:service.version","span_attr:sccache.compiler","span_attr:sccache.output","span_attr:sccache.outcome","span_attr:sccache.worker","span_attr:sccache.action_key""#;
@@ -50,24 +93,37 @@ impl TraceService {
     }
 
     pub(crate) async fn search(&self, search: TraceSearch) -> Result<TraceOverview> {
-        let (query, aggregate) = search_queries(&search)?;
+        let filter = search_filter(&search)?;
         let source = self.source()?;
-        let (roots, phases) =
-            tokio::try_join!(source.rows(&query, LIMIT), source.rows(&aggregate, 200))?;
+        let window = Window::recent(search.lookback_secs);
+        let (roots, phases) = tokio::join!(
+            tokio::time::timeout(
+                SEARCH_TIMEOUT,
+                source.roots(&filter, window, search.slowest)
+            ),
+            tokio::time::timeout(SEARCH_TIMEOUT, source.phases(window)),
+        );
+        let (traces, trace_error) = search_result(roots);
+        let (phases, phase_error) = search_result(phases);
         Ok(TraceOverview {
-            traces: roots.into_iter().map(summary).collect::<Result<_>>()?,
-            phases: phases.into_iter().map(phase).collect::<Result<_>>()?,
+            traces,
+            trace_error,
+            phases,
+            phase_error,
         })
     }
 
     pub(crate) async fn detail(&self, id: String) -> Result<TraceDetail> {
         ensure!(valid_id(&id, 32), "invalid trace ID");
         let query = format!(
-            "_time:7d trace_id:={quoted} | uniq by ({SPAN_FIELDS}) | sort by (start_time_unix_nano) | limit {limit}",
+            "trace_id:={quoted} | uniq by ({SPAN_FIELDS}) | sort by (start_time_unix_nano) | limit {limit}",
             quoted = serde_json::to_string(&id)?,
             limit = SPAN_LIMIT + 1
         );
-        let mut rows = self.source()?.rows(&query, SPAN_LIMIT + 1).await?;
+        let mut rows = self
+            .source()?
+            .rows(&query, SPAN_LIMIT + 1, Window::recent(604_800))
+            .await?;
         let truncated = rows.len() > SPAN_LIMIT;
         rows.truncate(SPAN_LIMIT);
         let root = rows.iter().find(|row| {
@@ -96,16 +152,106 @@ impl TraceService {
     }
 }
 
+fn search_result<T>(
+    result: Result<Result<Vec<T>>, tokio::time::error::Elapsed>,
+) -> (Vec<T>, Option<String>) {
+    match result {
+        Ok(Ok(rows)) => (rows, None),
+        Ok(Err(error)) => (Vec::new(), Some(format!("{error:#}"))),
+        Err(_) => (
+            Vec::new(),
+            Some("Trace query exceeded its time budget; select a shorter range.".into()),
+        ),
+    }
+}
+
 impl Source {
-    async fn rows(&self, query: &str, limit: usize) -> Result<Vec<Row>> {
+    // Immutable replay timestamps belong to exactly one half-open partition.
+    // Count raw rows, not deduplicated IDs, before allocating a backend hash table.
+    async fn partitions(&self, filter: &str, window: Window) -> Result<Vec<Window>> {
+        let query = format!("{filter} | stats count() as count");
+        let mut pending = vec![window];
+        let mut windows = Vec::new();
+        let mut probes = 0;
+        while let Some(window) = pending.pop() {
+            probes += 1;
+            ensure!(
+                probes <= MAX_PROBES,
+                "trace count query budget exhausted; select a shorter range"
+            );
+            let mut rows = self.rows(&query, 1, window).await?;
+            let count = rows
+                .pop()
+                .map_or(Ok(0), |mut row| integer(&mut row, "count"))?;
+            if count > PARTITION_ROWS {
+                pending.extend(window.split()?);
+            } else if count != 0 {
+                ensure!(
+                    windows.len() < MAX_PARTITIONS,
+                    "trace partition budget exhausted; select a shorter range"
+                );
+                windows.push(window);
+            }
+        }
+        Ok(windows)
+    }
+
+    async fn roots(
+        &self,
+        filter: &str,
+        window: Window,
+        slowest: bool,
+    ) -> Result<Vec<TraceSummary>> {
+        let order = if slowest {
+            "duration desc"
+        } else {
+            "start_time_unix_nano desc"
+        };
+        let query = format!(
+            "{filter} | uniq by ({ROOT_FIELDS}) | sort by ({order}, trace_id) | limit {LIMIT}"
+        );
+        let mut roots = Vec::new();
+        for window in self.partitions(filter, window).await? {
+            for row in self.rows(&query, LIMIT, window).await? {
+                roots.push(summary(row)?);
+            }
+            roots.sort_unstable_by(|a, b| {
+                let order = if slowest {
+                    b.duration_ns.cmp(&a.duration_ns)
+                } else {
+                    b.start_ns.cmp(&a.start_ns)
+                };
+                order.then_with(|| a.id.cmp(&b.id))
+            });
+            roots.truncate(LIMIT);
+        }
+        Ok(roots)
+    }
+
+    async fn phases(&self, window: Window) -> Result<Vec<PhaseAggregate>> {
+        let query = format!(
+            r#"{FLEET_FILTER} | uniq by ({AGGREGATE_FIELDS}) | stats by (name,"resource_attr:service.name","resource_attr:host.name","resource_attr:service.version") count() as count, histogram(duration) as bins, sum(duration) as total, min(duration) as minimum, max(duration) as maximum"#
+        );
+        let mut groups = PhaseGroups::default();
+        for window in self.partitions(FLEET_FILTER, window).await? {
+            for row in self.rows(&query, histogram::MAX_GROUPS, window).await? {
+                groups.add(row)?;
+            }
+        }
+        groups.finish()
+    }
+
+    async fn rows(&self, query: &str, limit: usize, window: Window) -> Result<Vec<Row>> {
         let _permit = self
             .queries
             .try_acquire()
             .context("trace query capacity exhausted")?;
+        let start = jiff::Timestamp::from_nanosecond(window.start)?.to_string();
+        let end = jiff::Timestamp::from_nanosecond(window.end)?.to_string();
         let response = self
             .client
             .post(self.base.join("select/logsql/query")?.as_str())
-            .form(&[("query", query)])
+            .form(&[("query", query), ("start", &start), ("end", &end)])
             .send()
             .await?
             .error_for_status()?;
@@ -143,18 +289,13 @@ fn valid_id(id: &str, width: usize) -> bool {
         && id.bytes().any(|byte| byte != b'0')
 }
 
-fn search_queries(search: &TraceSearch) -> Result<(String, String)> {
+fn search_filter(search: &TraceSearch) -> Result<String> {
     use std::fmt::Write as _;
-    let range = match search.lookback_secs {
-        300 => "5m",
-        3600 => "1h",
-        86400 => "1d",
-        604_800 => "7d",
-        _ => anyhow::bail!("unsupported trace time range"),
-    };
-    let mut query = format!(
-        "_time:{range} name:=\"compile\" \"resource_attr:service.name\":=\"sccache-client\""
+    ensure!(
+        matches!(search.lookback_secs, 300 | 3600 | 86400 | 604_800),
+        "unsupported trace time range"
     );
+    let mut query = r#"name:="compile" "resource_attr:service.name":="sccache-client""#.to_owned();
     for (field, value) in [
         ("resource_attr:host.name", &search.host),
         ("resource_attr:service.version", &search.revision),
@@ -170,21 +311,7 @@ fn search_queries(search: &TraceSearch) -> Result<(String, String)> {
             write!(query, " {field:?}:={}", serde_json::to_string(value)?)?;
         }
     }
-    let order = if search.slowest {
-        "duration desc"
-    } else {
-        "start_time_unix_nano desc"
-    };
-    write!(
-        query,
-        " | uniq by ({ROOT_FIELDS}) | sort by ({order}) | limit {LIMIT}"
-    )?;
-    // Aggregates are explicitly fleet-wide, not a sum of the selected roots'
-    // children. Nested and concurrent spans are not additive.
-    let aggregate = format!(
-        "_time:{range} \"resource_attr:service.name\":in(sccache-client,sccache-scheduler,sccache-worker) | uniq by ({AGGREGATE_FIELDS}) | stats by (name,\"resource_attr:service.name\",\"resource_attr:host.name\",\"resource_attr:service.version\") count() as count, quantile(0.5,duration) as p50, quantile(0.95,duration) as p95, quantile(0.99,duration) as p99, sum(duration) as total | sort by (total desc) | limit 200"
-    );
-    Ok((query, aggregate))
+    Ok(query)
 }
 
 fn take(row: &mut Row, key: &str) -> String {
@@ -249,20 +376,6 @@ fn span(mut row: Row) -> Result<TraceSpan> {
     })
 }
 
-fn phase(mut row: Row) -> Result<PhaseAggregate> {
-    Ok(PhaseAggregate {
-        service: take(&mut row, "resource_attr:service.name"),
-        host: take(&mut row, "resource_attr:host.name"),
-        version: take(&mut row, "resource_attr:service.version"),
-        phase: take(&mut row, "name"),
-        count: integer(&mut row, "count")?,
-        p50_ns: number(&mut row, "p50")?,
-        p95_ns: number(&mut row, "p95")?,
-        p99_ns: number(&mut row, "p99")?,
-        total_ns: number(&mut row, "total")?,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,14 +386,15 @@ mod tests {
             output: "a\" | limit 100000".into(),
             ..Default::default()
         };
-        let (query, aggregate) = search_queries(&search)?;
+        let query = search_filter(&search)?;
         assert!(query.contains(r#""span_attr:sccache.output":="a\" | limit 100000""#));
-        assert!(query.contains(" | uniq by (trace_id,span_id,"));
-        assert!(query.ends_with(" | limit 100"));
-        assert!(aggregate.contains(" | uniq by (trace_id,span_id,"));
-        assert!(aggregate.contains("quantile(0.99,duration)"));
+        assert!(!query.contains(" | uniq by ("));
+        let [left, right] = Window { start: 17, end: 22 }.split()?;
+        assert_eq!(left, Window { start: 17, end: 19 });
+        assert_eq!(right, Window { start: 19, end: 22 });
+        assert!(Window { start: 1, end: 2 }.split().is_err());
         search.lookback_secs = 1;
-        assert!(search_queries(&search).is_err());
+        assert!(search_filter(&search).is_err());
         assert!(!valid_id("../metrics", 32));
         Ok(())
     }

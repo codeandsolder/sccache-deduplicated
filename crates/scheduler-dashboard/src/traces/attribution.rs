@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn exclusive_wall_time_counts_gaps_conflicts_and_repeated_phases() {
         let root = span("root", "", "compile", 100, 100, SpanKind::Other);
-        let mut children = vec![
+        let mut children = [
             span("a", "root", "hash", 90, 40, SpanKind::Phase),
             span("b", "root", "hash", 120, 20, SpanKind::Phase),
             span("c", "root", "lookup", 135, 25, SpanKind::Phase),

@@ -88,7 +88,9 @@ pub struct PhaseAggregate {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TraceOverview {
     pub traces: Vec<TraceSummary>,
+    pub trace_error: Option<String>,
     pub phases: Vec<PhaseAggregate>,
+    pub phase_error: Option<String>,
 }
 
 mod attribution;

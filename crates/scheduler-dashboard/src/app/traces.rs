@@ -299,6 +299,7 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
                     Err(error) => view!{<p class=styles::warning>{error.to_string()}</p>}.into_any(),
                     Ok(data) => view!{
                         <p class=styles::muted>"At most 100 completed requests. New spans may take a few seconds to appear."</p>
+                        {data.trace_error.map(|error| view!{<p class=styles::warning>{error}</p>})}
                         <table><thead><tr><th>"Host"</th><th>"Revision"</th><th>"Compiler"</th><th>"Output"</th><th>"Outcome"</th><th>"Elapsed"</th><th>"Worker"</th><th>"Trace"</th></tr></thead>
                             <tbody>{data.traces.into_iter().map(|row| {
                                 let id=row.id.clone();
@@ -307,8 +308,9 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
                             }).collect_view()}</tbody>
                         </table>
                         <h3>"Fleet-wide phase latency"</h3>
-                        <p class=styles::muted>"Grouped by phase, service, host and version over the selected range. Other filters apply only to the request list."</p>
-                        <table><thead><tr><th>"Service"</th><th>"Host"</th><th>"Revision"</th><th>"Phase"</th><th>"Count"</th><th>"p50 ms"</th><th>"p95 ms"</th><th>"p99 ms"</th><th>"Total s"</th></tr></thead>
+                        <p class=styles::muted>"Grouped by phase, service, host and version over the selected range. Other filters apply only to the request list. Percentiles are histogram estimates; counts and cumulative elapsed time use deduplicated observations."</p>
+                        {data.phase_error.map(|error| view!{<p class=styles::warning>{error}</p>})}
+                        <table><thead><tr><th>"Service"</th><th>"Host"</th><th>"Revision"</th><th>"Phase"</th><th>"Count"</th><th>"p50 ≈ ms"</th><th>"p95 ≈ ms"</th><th>"p99 ≈ ms"</th><th>"Total s"</th></tr></thead>
                             <tbody>{data.phases.into_iter().map(|row| view!{
                                 <tr><td>{row.service}</td><td>{row.host}</td><td title=row.version.clone()>{revision_label(&row.version)}</td><td>{row.phase}</td><td>{row.count}</td>
                                 <td>{format!("{:.3}",row.p50_ns/1e6)}</td><td>{format!("{:.3}",row.p95_ns/1e6)}</td><td>{format!("{:.3}",row.p99_ns/1e6)}</td><td>{format!("{:.3}",row.total_ns/1e9)}</td></tr>

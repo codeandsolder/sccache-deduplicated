@@ -444,11 +444,15 @@ fn trace_children(context: TraceContext) -> Vec<Value> {
 }
 
 fn trace_query(body: Bytes) -> Ready<(StatusCode, String)> {
+    let body: Vec<u8> = body.into();
     let Some(query) = url::form_urlencoded::parse(&body)
         .find_map(|(name, value)| (name == "query").then(|| value.into_owned()))
     else {
         return ready((StatusCode::BAD_REQUEST, "missing query".into()));
     };
+    if query.ends_with(" | stats count() as count") {
+        return ready((StatusCode::OK, "{\"count\":\"1\"}\n".into()));
+    }
     if !query.contains(" | uniq by (") {
         return ready((
             StatusCode::BAD_REQUEST,
@@ -457,7 +461,7 @@ fn trace_query(body: Bytes) -> Ready<(StatusCode, String)> {
     }
     let rows = if query.contains(" | stats by (") {
         vec![
-            json!({"name":"hash_inputs","resource_attr:service.name":"sccache-client","resource_attr:host.name":"fixture-client","resource_attr:service.version":REVISION,"count":"1","p50":"30000000","p95":"30000000","p99":"30000000","total":"30000000"}),
+            json!({"name":"hash_inputs","resource_attr:service.name":"sccache-client","resource_attr:host.name":"fixture-client","resource_attr:service.version":REVISION,"count":"1","bins":r#"[{"vmrange":"27830000...31620000","hits":1}]"#,"minimum":"30000000","maximum":"30000000","total":"30000000"}),
         ]
     } else if query.contains("trace_id:=") {
         if query.contains(&REQUEST.hex_id()) {
