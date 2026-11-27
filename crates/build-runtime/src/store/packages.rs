@@ -385,10 +385,12 @@ impl NativeStore {
         if !accept(&record)? {
             return Ok(None);
         }
-        let tree = self
-            .lookup_tree_in(record.tree, &read, pins)?
-            .context("indexed package tree missing")?;
-        Ok(Some((record, tree)))
+        let id = record.tree;
+        Ok(Some((
+            record,
+            self.lookup_tree_in(id, &read, pins)?
+                .context("indexed package tree missing")?,
+        )))
     }
 
     /// Verify the compressed package against its upstream SHA-256 and length,
