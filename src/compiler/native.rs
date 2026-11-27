@@ -186,22 +186,19 @@ impl NativeCompilerClient {
         files: &[PathBuf],
         pool: &tokio::runtime::Handle,
     ) -> Result<Vec<String>> {
-        let jobs = files.iter().map(|path| {
-            let client = Arc::clone(self);
-            let path = path.clone();
-            pool.spawn_blocking(move || {
-                let file = std::fs::File::open(path)?;
-                if let Some((blob, _)) = client.reference(&file)? {
-                    Ok(crate::util::hex(&blob.id.0))
-                } else {
-                    crate::util::Digest::reader_sync(file)
-                }
-            })
-        });
-        futures::future::try_join_all(jobs)
-            .await?
-            .into_iter()
-            .collect()
+        let client = Arc::clone(self);
+        crate::util::hash_path_batch(files, pool, move |path| {
+            let file = std::fs::File::open(path)?;
+            if let Some((blob, _)) = client.reference(&file)? {
+                Ok(crate::util::hex(&blob.id.0))
+            } else {
+                // Check the opened descriptor for mutation while hashing;
+                // do not memoize mutable build inputs by timestamps.
+                let blob = crate::build_runtime::hash_descriptor(&file)?;
+                Ok(crate::util::hex(&blob.id.0))
+            }
+        })
+        .await
     }
 
     pub fn toolchain_digests(&self) -> Arc<SourceDigestCache> {

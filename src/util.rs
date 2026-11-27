@@ -177,55 +177,56 @@ impl Digest {
     /// Calculate the BLAKE3 digest of the contents of `path`, running
     /// the actual hash computation on a background thread in `pool`.
     pub async fn reader(path: PathBuf, pool: &tokio::runtime::Handle) -> Result<String> {
-        pool.spawn_blocking(move || {
-            let is_directory = path.is_dir();
-            // A different BLAKE3 domain keeps a file whose literal bytes
-            // equal a directory serialization from sharing its digest.
-            // Ordinary file digests retain their existing identity.
-            let mut digest = if is_directory {
-                Self {
-                    inner: blake3_Hasher::new_derive_key("sccache tracked directory digest v2"),
-                }
-            } else {
-                Self::new()
-            };
-            if is_directory {
-                // A tracked directory's identity includes its full entry tree,
-                // including empty directories and the targets of symlinks.
-                let mut entries = Vec::new();
-                Self::collect_dir_entries(&path, &mut entries, &mut Vec::new())?;
-                entries.sort_by(|left, right| left.path.cmp(&right.path));
-                digest.delimiter(b"directory-tree-v2");
-                for entry in &entries {
-                    let relative = entry.path.strip_prefix(&path)?;
-                    // Lossy Unicode conversion can alias two distinct Unix
-                    // filenames and silently reuse an incorrect cache result.
-                    digest.delimiter(relative.as_os_str().as_encoded_bytes());
-                    digest.update(&[if entry.is_directory {
-                        b'D'
-                    } else if entry.is_file {
-                        b'F'
-                    } else {
-                        b'S'
-                    }]);
-                    if let Some(target) = &entry.symlink_target {
-                        digest.delimiter(b"symlink-target");
-                        digest.delimiter(target.as_os_str().as_encoded_bytes());
-                    }
-                    if entry.is_file {
-                        // A fixed-size content digest frames each file. Otherwise
-                        // crafted file bytes could impersonate an entry delimiter.
-                        let mut content = Self::new();
-                        content.update_from_file(&entry.path)?;
-                        digest.update(content.inner.finalize().as_bytes());
-                    }
-                }
-            } else {
-                digest.update_from_file(&path)?;
+        pool.spawn_blocking(move || Self::path_sync(&path)).await?
+    }
+
+    fn path_sync(path: &Path) -> Result<String> {
+        let is_directory = path.is_dir();
+        // A different BLAKE3 domain keeps a file whose literal bytes
+        // equal a directory serialization from sharing its digest.
+        // Ordinary file digests retain their existing identity.
+        let mut digest = if is_directory {
+            Self {
+                inner: blake3_Hasher::new_derive_key("sccache tracked directory digest v2"),
             }
-            Ok(digest.finish())
-        })
-        .await?
+        } else {
+            Self::new()
+        };
+        if is_directory {
+            // A tracked directory's identity includes its full entry tree,
+            // including empty directories and the targets of symlinks.
+            let mut entries = Vec::new();
+            Self::collect_dir_entries(path, &mut entries, &mut Vec::new())?;
+            entries.sort_by(|left, right| left.path.cmp(&right.path));
+            digest.delimiter(b"directory-tree-v2");
+            for entry in &entries {
+                let relative = entry.path.strip_prefix(path)?;
+                // Lossy Unicode conversion can alias two distinct Unix
+                // filenames and silently reuse an incorrect cache result.
+                digest.delimiter(relative.as_os_str().as_encoded_bytes());
+                digest.update(&[if entry.is_directory {
+                    b'D'
+                } else if entry.is_file {
+                    b'F'
+                } else {
+                    b'S'
+                }]);
+                if let Some(target) = &entry.symlink_target {
+                    digest.delimiter(b"symlink-target");
+                    digest.delimiter(target.as_os_str().as_encoded_bytes());
+                }
+                if entry.is_file {
+                    // A fixed-size content digest frames each file. Otherwise
+                    // crafted file bytes could impersonate an entry delimiter.
+                    let mut content = Self::new();
+                    content.update_from_file(&entry.path)?;
+                    digest.update(content.inner.finalize().as_bytes());
+                }
+            }
+        } else {
+            digest.update_from_file(path)?;
+        }
+        Ok(digest.finish())
     }
 
     /// Open `path` and stream its contents into `self`.
@@ -442,13 +443,61 @@ pub fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// Execute one ordered blocking batch rather than one task/thread per input.
+/// Concurrent compile requests already provide file-level I/O concurrency.
+/// Keeping one task per independent dependency list also bounds archive
+/// buffers and the number of open descriptors in private executors.
+pub(crate) async fn hash_path_batch<F>(
+    files: &[PathBuf],
+    pool: &tokio::runtime::Handle,
+    mut hash: F,
+) -> Result<Vec<String>>
+where
+    F: FnMut(&Path) -> Result<String> + Send + 'static,
+{
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct CancelBatch(Arc<AtomicBool>);
+    impl Drop for CancelBatch {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    let files = files.to_vec();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    // Dropping an async caller cannot interrupt an in-progress blocking
+    // file read, but must not continue through the rest of the batch.
+    let guard = CancelBatch(Arc::clone(&cancelled));
+    let hashes = pool
+        .spawn_blocking(move || {
+            files
+                .iter()
+                .map(|path| {
+                    anyhow::ensure!(
+                        !cancelled.load(Ordering::Relaxed),
+                        "input hash batch cancelled"
+                    );
+                    hash(path)
+                })
+                .collect()
+        })
+        .await?;
+    drop(guard);
+    hashes
+}
+
 /// Calculate the digest of each file in `files` on background threads in
 /// `pool`.
 pub async fn hash_all(files: &[PathBuf], pool: &tokio::runtime::Handle) -> Result<Vec<String>> {
     let start = time::Instant::now();
     let count = files.len();
-    let iter = files.iter().map(move |f| Digest::file(f, pool));
-    let hashes = futures::future::try_join_all(iter).await?;
+    let hashes = hash_path_batch(files, pool, Digest::path_sync).await?;
     trace!(
         "Hashed {count} files in {}",
         fmt_duration_as_secs(&start.elapsed())
@@ -481,37 +530,31 @@ pub async fn hash_all_archives(
 ) -> Result<Vec<String>> {
     let start = time::Instant::now();
     let count = files.len();
-    let iter = files.iter().map(|path| {
-        let path = path.clone();
-        pool.spawn_blocking(move || -> Result<String> {
-            let mut m = Digest::new();
-            // Read into owned memory rather than mmap the archive. File-backed mappings
-            // cannot prove that another process will not truncate or rewrite the file
-            // while Rust holds a slice into it; an owned buffer removes that unsafe
-            // lifetime/aliasing boundary entirely.
-            let archive = fs::read(&path).with_context(|| {
-                format!("Failed to read file for hashing: {}", debug_display(&path))
-            })?;
+    let hashes = hash_path_batch(files, pool, |path| {
+        let mut m = Digest::new();
+        // Read into owned memory rather than mmap the archive. File-backed mappings
+        // cannot prove that another process will not truncate or rewrite the file
+        // while Rust holds a slice into it; an owned buffer removes that unsafe
+        // lifetime/aliasing boundary entirely.
+        let archive = fs::read(path)
+            .with_context(|| format!("Failed to read file for hashing: {}", debug_display(path)))?;
 
-            if let Ok(fat) = MachOFatFile32::parse(&*archive) {
-                for arch in fat.arches() {
-                    hash_regular_archive(&mut m, arch.data(&*archive)?)?;
-                }
-            } else if let Ok(fat) = MachOFatFile64::parse(&*archive) {
-                for arch in fat.arches() {
-                    hash_regular_archive(&mut m, arch.data(&*archive)?)?;
-                }
-            } else {
-                // Not a FatHeader at all, regular archive.
-                hash_regular_archive(&mut m, &archive)?;
+        if let Ok(fat) = MachOFatFile32::parse(&*archive) {
+            for arch in fat.arches() {
+                hash_regular_archive(&mut m, arch.data(&*archive)?)?;
             }
+        } else if let Ok(fat) = MachOFatFile64::parse(&*archive) {
+            for arch in fat.arches() {
+                hash_regular_archive(&mut m, arch.data(&*archive)?)?;
+            }
+        } else {
+            // Not a FatHeader at all, regular archive.
+            hash_regular_archive(&mut m, &archive)?;
+        }
 
-            Ok(m.finish())
-        })
-    });
-
-    let hashes = futures::future::try_join_all(iter).await?;
-    let hashes = hashes.into_iter().collect::<Result<Vec<_>>>()?;
+        Ok(m.finish())
+    })
+    .await?;
 
     trace!(
         "Hashed {count} files in {}",
@@ -1683,6 +1726,36 @@ mod tests {
     use super::{Digest, OsStrExt, TimeMacroFinder, resolve_compiler_avoiding_wrapper};
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
+
+    #[tokio::test]
+    async fn ordered_hash_batch_matches_individual_file_and_directory_digests() -> anyhow::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let directory = root.join("tree");
+        std::fs::create_dir(&directory)?;
+        std::fs::write(directory.join("child"), b"tree content")?;
+        let files = (0..96)
+            .map(|i| {
+                let path = root.join(format!("input-{i}"));
+                std::fs::write(&path, i.to_string())?;
+                Ok(path)
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let mut files = files;
+        files.insert(17, directory);
+        files.push(files[3].clone());
+        let pool = tokio::runtime::Handle::current();
+        let expected = files
+            .iter()
+            .map(|path| Digest::path_sync(path))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        assert_eq!(super::hash_all(&files, &pool).await?, expected);
+        assert!(super::hash_all(&[], &pool).await?.is_empty());
+        files.push(root.join("absent"));
+        assert!(super::hash_all(&files, &pool).await.is_err());
+        Ok(())
+    }
 
     #[test]
     fn test_reader_sync_across_buffer_sizes() {
