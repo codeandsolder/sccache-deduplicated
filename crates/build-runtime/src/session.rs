@@ -1851,7 +1851,9 @@ impl NativeSessions {
             else {
                 bail!("input prefetch requires an assigned action");
             };
-            (*action, *tree, Arc::clone(input))
+            let target = (*action, *tree, Arc::clone(input));
+            drop(state);
+            target
         };
         let mut blobs = BTreeMap::new();
         for blob in missing {
@@ -1876,7 +1878,9 @@ impl NativeSessions {
                 "input delivery changed during prefetch"
             );
             delivery.requested.extend(absent.iter().map(|blob| blob.id));
-            delivery.reservation.replace(reservation)
+            let previous = delivery.reservation.replace(reservation);
+            drop(state);
+            previous
         };
         drop(previous);
         self.request_backfills(action, reader, tree, &absent)
