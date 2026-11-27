@@ -71,6 +71,7 @@ pub struct Manifest {
     pub features: BTreeMap<String, Vec<String>>,
     pub targets: Vec<Target>,
     pub lint_arguments: Vec<String>,
+    pub metadata: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -716,6 +717,7 @@ impl Manifest {
             features,
             targets,
             lint_arguments: lint_arguments(&document, workspace)?,
+            metadata: package.get("metadata").cloned(),
         })
     }
 }

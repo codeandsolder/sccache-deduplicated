@@ -280,7 +280,12 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".cargo")));
     let settings = Settings::load(&cwd, import.as_deref())?;
     let registries = sccache_rust_build::Registries::from_settings(&settings.document)?;
-    let selected = args.selected(&workspace)?;
+    let selected =
+        if args.mode == Mode::Metadata && args.packages.is_empty() && args.exclude.is_empty() {
+            workspace.members.clone()
+        } else {
+            args.selected(&workspace)?
+        };
     let default_target = workspace.root.join("target");
     let target_root = args
         .target_dir
@@ -288,7 +293,18 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
         .or_else(|| settings.target_dir())
         .unwrap_or(&default_target);
     if args.mode == Mode::Metadata {
-        return metadata::workspace(&workspace, target_root, &cwd, &args);
+        ensure!(
+            args.format_version == 1,
+            "unsupported metadata format version"
+        );
+        if args.no_deps {
+            return metadata::write(&sccache_rust_build::workspace_metadata(
+                &workspace,
+                &cwd.join(target_root),
+                &registries,
+                None,
+            )?);
+        }
     }
     if args.mode == Mode::Clean {
         let path = if target_root.is_absolute() {
@@ -348,19 +364,23 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
         lock.write(&workspace.root.join("Cargo.lock"))?;
         return Ok(0);
     }
-    let target_root = absolute(target_root, &cwd)?;
-    // Serialize publishers sharing the same final output namespace. Other
-    // workspaces and target directories can still run concurrently.
-    let target_lock = fs::File::open(&target_root)?;
-    target_lock.lock()?;
-    let marker = target_root.join("CACHEDIR.TAG");
-    if !marker.exists() {
-        fs::write(
-            &marker,
-            b"Signature: 8a477f597d28d172789f06886806bc55\n# Managed Rust build outputs.\n",
-        )?;
-    }
-    let mut final_root = target_root;
+    // Metadata does not publish artifacts or create an output directory.
+    let (target_lock, target_root) = if args.mode == Mode::Metadata {
+        (None, cwd.join(target_root))
+    } else {
+        let target_root = absolute(target_root, &cwd)?;
+        let lock = fs::File::open(&target_root)?;
+        lock.lock()?;
+        let marker = target_root.join("CACHEDIR.TAG");
+        if !marker.exists() {
+            fs::write(
+                &marker,
+                b"Signature: 8a477f597d28d172789f06886806bc55\n# Managed Rust build outputs.\n",
+            )?;
+        }
+        (Some(lock), target_root)
+    };
+    let mut final_root = target_root.clone();
     if target.is_some() {
         final_root.push(&toolchain.target.triple);
     }
@@ -416,7 +436,7 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
                 .collect(),
             default_features: !args.no_default_features,
             all_features: args.all_features,
-            dev_dependencies: args.dev_dependencies(),
+            dev_dependencies: args.dev_dependencies() || args.mode == Mode::Metadata,
             host: toolchain.host.clone(),
             target: toolchain.target.clone(),
             source_jobs: args.source_jobs,
@@ -444,6 +464,16 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
         if changed {
             sources.lock().write(&workspace.root.join("Cargo.lock"))?;
         }
+        if args.mode == Mode::Metadata {
+            return metadata::write(&sccache_rust_build::workspace_metadata(
+                &workspace,
+                &target_root,
+                &sources.registries,
+                Some((&graph, &sources)),
+            )?);
+        }
+        // Keep the output lock alive across dispatch.
+        let _target_lock = target_lock;
         args.validate_targets(&graph)?;
         let plan_options = args.plan_options()?;
         let planner = Planner::new(

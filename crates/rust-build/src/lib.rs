@@ -8,6 +8,7 @@ pub use options::{BuildMode, PlanOptions};
 pub use planner::Planner;
 pub use settings::{Settings, Toolchain};
 mod manifest;
+mod metadata;
 mod platform;
 mod profile;
 mod registry;
@@ -21,6 +22,7 @@ pub use script::{LinkDirective, LinkScope, ScriptOutput};
 
 pub use fingerprint::{content_file, content_tree};
 pub use manifest::{Dependency, DependencyKind, Manifest, Package, Target, TargetKind, Workspace};
+pub use metadata::workspace_metadata;
 pub use platform::Platform;
 pub use resolve::{BuildDomain, Edge, Graph, ResolveOptions, Unit};
 pub use source::{LockMismatch, LockedPackage, Lockfile, Sources};

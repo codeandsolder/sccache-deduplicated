@@ -118,6 +118,7 @@ impl IndexRecord {
                 features,
                 targets: Vec::new(),
                 lint_arguments: Vec::new(),
+                metadata: None,
             },
             lock,
         })

@@ -226,6 +226,14 @@ impl<'a> Sources<'a> {
         })
     }
 
+    pub(crate) fn source_root(&self, manifest: &Manifest, source: Option<&str>) -> Result<PathBuf> {
+        if let Some(source) = source.filter(|s| s.starts_with("git+")) {
+            self.git_checkout(source)
+        } else {
+            Ok(manifest.root.clone())
+        }
+    }
+
     /// The lockfile provides the selected exact versions, including duplicate
     /// semver-compatible versions. Never substitute a newer cached package.
     pub fn dependency(
