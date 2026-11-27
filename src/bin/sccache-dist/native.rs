@@ -71,8 +71,8 @@ impl NativeWorker {
                 .min(space.max_resident_bytes)
         });
         ensure!(
-            (config.max_result_bytes..=space.max_resident_bytes).contains(&grace_bytes),
-            "artifact grace budget must fit one maximum result and the resident budget"
+            (1..=space.max_resident_bytes).contains(&grace_bytes),
+            "artifact grace budget must fit the resident budget"
         );
         // A shared store must not publish a worker's grace result into the
         // scheduler's action index before its authenticated commit. The
@@ -138,6 +138,23 @@ impl NativeWorker {
         })
     }
 
+    /// Only the standalone store needs its own periodic maintenance.
+    pub(super) fn maintains_local_store(&self) -> bool {
+        self.artifact_grace.is_some()
+    }
+
+    pub(super) fn maintain_local_store(&self) -> Result<()> {
+        if let Some(grace) = &self.artifact_grace {
+            grace.reap();
+            if let Some(report) = self.store.maintain_space()?
+                && !report.minimum_satisfied
+            {
+                debug!("native worker cache space pressure: {report:?}");
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn pin_resident_inputs(
         &self,
         assignment: &mut NativeAssignment,
@@ -181,10 +198,6 @@ impl NativeWorker {
                     parallelism: u32::try_from(limits.max_concurrent_imports.min(32)).unwrap_or(32),
                 });
         placement
-    }
-
-    pub(super) fn transfer_parallelism(&self) -> usize {
-        self.package_transfer.parallelism().get()
     }
 
     const fn delivery<'a>(

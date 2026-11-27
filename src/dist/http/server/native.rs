@@ -337,33 +337,44 @@ where
     };
     let maintenance = Arc::downgrade(&sessions);
     let fetch_peer = Arc::new(fetch_peer);
-    // Keep source acquisition bounded separately from compiler execution
-    // and leave capacity for originating-client uploads.
-    let peer_concurrency = config.max_total_uploads.saturating_sub(1).clamp(1, 4);
+    // One dispatcher scans the pending demands. Logical acquisition
+    // ownership is separate from the actual shared transfer admission.
     let runtime = crate::http_client::io_runtime()?;
-    for _ in 0..peer_concurrency {
+    {
         let sessions = Arc::downgrade(&sessions);
         let fetch_peer = Arc::clone(&fetch_peer);
         runtime.spawn(async move {
+            let mut active = tokio::task::JoinSet::new();
             while let Some(sessions) = sessions.upgrade() {
-                match sessions.claim_peer_input(Duration::from_millis(100)).await {
-                    Ok(Some(claim)) => {
-                        let requester = claim.requester();
-                        let deadline = Instant::now() + limits.idle_timeout;
-                        let fetch = Arc::clone(&fetch_peer);
-                        if let Err(error) = sessions
-                            .recover_peer_input(claim, deadline, move |blob, store, deadline| {
-                                fetch(blob, Some(requester), store, deadline)
-                            })
-                            .await
-                        {
-                            debug!("native peer backfill unavailable: {error:#}");
+                tokio::select! {
+                    result = active.join_next(), if !active.is_empty() => {
+                        if let Some(Err(error)) = result {
+                            warn!("native peer recovery task failed: {error:#}");
                         }
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        warn!("native peer claim failed: {error:#}");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    claim = sessions.claim_peer_input(Duration::from_millis(100)),
+                        if active.len() < limits.max_sessions => {
+                        match claim {
+                            Ok(Some(claim)) => {
+                                let requester = claim.requester();
+                                let deadline = Instant::now() + limits.idle_timeout;
+                                let fetch = Arc::clone(&fetch_peer);
+                                active.spawn(async move {
+                                    if let Err(error) = sessions.recover_peer_input(
+                                        claim, deadline, move |blob, store, deadline| {
+                                            fetch(blob, Some(requester), store, deadline)
+                                        }
+                                    ).await {
+                                        debug!("native peer backfill unavailable: {error:#}");
+                                    }
+                                });
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                warn!("native peer claim failed: {error:#}");
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
                     }
                 }
             }

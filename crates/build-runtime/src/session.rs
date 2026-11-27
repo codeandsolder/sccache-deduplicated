@@ -345,7 +345,6 @@ struct BackfillClaim {
     ticket: Ticket,
     expires: Instant,
     origin: Weak<()>,
-    slot: UploadSlot,
 }
 
 impl BackfillClaim {
@@ -364,7 +363,7 @@ impl Backfill {
 
 struct BackfillUpload {
     flight: Arc<Backfill>,
-    _slot: UploadSlot,
+    _slot: Option<UploadSlot>,
 }
 
 impl BackfillUpload {
@@ -2187,19 +2186,13 @@ impl NativeSessions {
                 pending.peer_until = None;
                 continue;
             }
-            match self.upload_slot(UploadSource::Peer) {
-                Ok(slot) => {
-                    pending.peer_until = None;
-                    pending.uploading = true;
-                    drop(pending);
-                    return Ok(Some(PeerInputClaim(BackfillUpload {
-                        flight,
-                        _slot: slot,
-                    })));
-                }
-                Err(error) if error.is::<NativeServiceBusy>() => break,
-                Err(error) => return Err(error),
-            }
+            pending.peer_until = None;
+            pending.uploading = true;
+            drop(pending);
+            return Ok(Some(PeerInputClaim(BackfillUpload {
+                flight,
+                _slot: None,
+            })));
         }
         drop(flights);
         Ok(None)
@@ -2224,7 +2217,7 @@ impl NativeSessions {
         let sessions = Arc::clone(self);
         tokio::spawn(async move {
             let lease = sessions
-                .acquire_peer_blob(claim.blob(), deadline, &fetch)
+                .acquire_peer_blob(claim.blob(), deadline, false, &fetch)
                 .await?;
             claim.0.complete(lease)
         })
@@ -2318,8 +2311,8 @@ impl NativeSessions {
             return Ok(InputPoll::Complete);
         }
         let now = Instant::now();
-        // A lost poll reply is replayable. At most one reserved upload per
-        // origin keeps sequential namespace streams from hoarding slots.
+        // A lost poll reply is replayable. Each origin has one demand at a
+        // time, but the claim itself does not reserve a transfer slot.
         let mut candidate = None;
         for (tree, flight) in action.demands.values() {
             if action.unavailable.contains(&(*tree, flight.blob.id)) {
@@ -2355,22 +2348,15 @@ impl NativeSessions {
                 && pending.claim.is_none()
                 && pending.peer_until.is_none_or(|until| until <= now)
             {
-                match self.upload_slot(UploadSource::Direct) {
-                    Ok(slot) => {
-                        pending.claim = Some(BackfillClaim {
-                            ticket,
-                            expires: self.deadline(),
-                            origin: Arc::downgrade(&action.origin),
-                            slot,
-                        });
-                        return Ok(InputPoll::Demand(InputDemand {
-                            tree,
-                            blob: flight.blob,
-                        }));
-                    }
-                    Err(error) if error.is::<NativeServiceBusy>() => {}
-                    Err(error) => return Err(error),
-                }
+                pending.claim = Some(BackfillClaim {
+                    ticket,
+                    expires: self.deadline(),
+                    origin: Arc::downgrade(&action.origin),
+                });
+                return Ok(InputPoll::Demand(InputDemand {
+                    tree,
+                    blob: flight.blob,
+                }));
             }
             drop(pending);
         }
@@ -2485,14 +2471,14 @@ impl NativeSessions {
                         .is_some_and(|claim| claim.ticket == ticket && claim.live(Instant::now())),
                 "input upload not claimed"
             );
-            let claim = pending
-                .claim
-                .take()
-                .context("input upload claim disappeared")?;
+            // Admission begins when a body is actually about to be received.
+            // A busy receiver leaves the claim intact for a retry.
+            let slot = self.upload_slot(UploadSource::Direct)?;
+            pending.claim = None;
             pending.uploading = true;
             let upload = BackfillUpload {
                 flight: Arc::clone(flight),
-                _slot: claim.slot,
+                _slot: Some(slot),
             };
             drop(pending);
             drop(state);

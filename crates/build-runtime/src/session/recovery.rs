@@ -265,32 +265,36 @@ impl NativeSessions {
         .await??;
         let mut acquired = Vec::with_capacity(missing.len());
         for blob in missing {
-            let _slot = loop {
-                check()?;
-                let mut notified = std::pin::pin!(self.peer_wake.notified());
-                notified.as_mut().enable();
-                match self.upload_slot(UploadSource::Peer) {
-                    Ok(slot) => break slot,
-                    Err(error) if error.is::<NativeServiceBusy>() => {
-                        tokio::time::timeout_at(deadline.into(), notified)
-                            .await
-                            .context("native result recovery deadline exceeded")?;
-                    }
-                    Err(error) => return Err(error),
-                }
-            };
-            acquired.push(self.acquire_peer_blob(blob, deadline, &fetch).await?);
+            acquired.push(self.acquire_peer_blob(blob, deadline, true, &fetch).await?);
         }
         check()?;
         Ok((reserved, acquired))
     }
 
-    // Caller owns a bounded upload slot before entering the shared tree
-    // flight, so an active producer never waits on slots held by followers.
+    async fn await_peer_upload_slot(&self, deadline: Instant) -> Result<super::UploadSlot> {
+        loop {
+            ensure!(Instant::now() < deadline, "native peer acquisition deadline exceeded");
+            let mut notified = std::pin::pin!(self.peer_wake.notified());
+            notified.as_mut().enable();
+            match self.upload_slot(UploadSource::Peer) {
+                Ok(slot) => return Ok(slot),
+                Err(error) if error.is::<NativeServiceBusy>() => {
+                    tokio::time::timeout_at(deadline.into(), notified)
+                        .await
+                        .context("native peer acquisition deadline exceeded")?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    // Only the producer of missing content needs a transfer slot. Cached
+    // content and followers of an existing acquisition consume none.
     pub(super) async fn acquire_peer_blob<Fut>(
         &self,
         blob: BlobRef,
         deadline: Instant,
+        wait_for_slot: bool,
         fetch: &(impl Fn(BlobRef, NativeStore, Instant) -> Fut + Sync),
     ) -> Result<Arc<TreeLease>>
     where
@@ -309,7 +313,16 @@ impl NativeSessions {
                     let reservation =
                         tokio::task::spawn_blocking(move || owned.reserve_tree_upload(&manifest))
                             .await??;
-                    let staged = if reservation.missing().is_empty() {
+                    let slot = if reservation.missing().is_empty() {
+                        None
+                    } else if wait_for_slot {
+                        Some(self.await_peer_upload_slot(deadline).await?)
+                    } else {
+                        // This speculative peer lookup must not monopolize
+                        // the demand while the originating client could send it.
+                        Some(self.upload_slot(UploadSource::Peer)?)
+                    };
+                    let staged = if slot.is_none() {
                         Vec::new()
                     } else {
                         let staged = fetch(blob, store.clone(), deadline)

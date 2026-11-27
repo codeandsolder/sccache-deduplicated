@@ -303,20 +303,15 @@ struct AdmissionPools {
 impl AdmissionPools {
     fn new(bulk: usize) -> Self {
         Self {
-            control: Arc::new(Semaphore::new(Self::control_capacity(bulk))),
+            control: Arc::new(Semaphore::new(bulk)),
             metadata: Arc::new(Semaphore::new(bulk)),
             dispatch: Arc::new(Semaphore::new(bulk)),
             bulk: Arc::new(Semaphore::new(bulk)),
         }
     }
 
-    fn control_capacity(bulk: usize) -> usize {
-        (bulk / 8).clamp(2, 8)
-    }
-
     fn total_capacity(bulk: usize) -> usize {
-        bulk.saturating_mul(3)
-            .saturating_add(Self::control_capacity(bulk))
+        bulk.saturating_mul(4)
     }
 
     fn acquire(&self, class: AdmissionClass) -> Option<Arc<OwnedSemaphorePermit>> {
@@ -1033,7 +1028,7 @@ mod streaming_tests {
             (AdmissionClass::Bulk, 4),
             (AdmissionClass::Dispatch, 4),
             (AdmissionClass::Metadata, 4),
-            (AdmissionClass::Control, 2),
+            (AdmissionClass::Control, 4),
         ] {
             let permits = (0..count)
                 .map(|_| pools.acquire(class).context("reserved lane permit"))

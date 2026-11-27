@@ -155,7 +155,6 @@ struct Shared {
     queue: Arc<ExecutionQueue>,
     reservations: Mutex<HashMap<JobId, Reservation>>,
     capacity: usize,
-    io_width: usize,
 }
 
 impl Shared {
@@ -288,7 +287,6 @@ impl Shared {
                 &assignment.spec,
                 &self.queue,
                 WorkerPreparation {
-                    estimated_result_bytes: assignment.spec.estimated_result_bytes,
                     cancelled: Arc::clone(&job.cancelled),
                     on_tree: &mut on_tree,
                     on_authorized: || async {
@@ -434,13 +432,16 @@ pub struct NativeDispatcher {
     staging: Option<tokio::sync::mpsc::Sender<Staging>>,
     staging_task: Option<tokio::task::JoinHandle<()>>,
     publication_task: Option<tokio::task::JoinHandle<()>>,
+    maintenance_task: Option<tokio::task::JoinHandle<()>>,
     threads: Vec<JoinHandle<()>>,
 }
 
 impl NativeDispatcher {
     pub(super) fn new(worker: NativeWorker, queue: Arc<ExecutionQueue>) -> Result<Self> {
         let width = queue.width().get();
-        let io_width = worker.transfer_parallelism().min(width);
+        // All admitted jobs may advance through async stages independently.
+        // Their actual transfers, decoding, storage and compiler operations
+        // have separate resource admission. A parked job owns no stage slot.
         // The reservation bound includes assigned, staging, ready, running,
         // publishing and unacknowledged terminal jobs. Each queue can hold
         // that entire bound, so a stage never deadlocks on downstream capacity.
@@ -457,10 +458,26 @@ impl NativeDispatcher {
             queue,
             reservations: Mutex::new(HashMap::new()),
             capacity,
-            io_width,
         });
         let (staging, staging_rx) = tokio::sync::mpsc::channel(capacity);
         let runtime = sccache::http_client::io_runtime()?;
+        let maintenance_task = shared.worker.maintains_local_store().then(|| {
+            let shared = Arc::downgrade(&shared);
+            runtime.spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let Some(shared) = shared.upgrade() else { break; };
+                    match tokio::task::spawn_blocking(move || shared.worker.maintain_local_store()).await {
+                        Ok(Ok(())) => (),
+                        Ok(Err(error)) => warn!("native worker maintenance failed: {error:#}"),
+                        Err(error) => {
+                            error!("native worker maintenance task failed: {error:#}");
+                            break;
+                        }
+                    }
+                }
+            })
+        });
         let (ready, ready_rx) = mpsc::sync_channel(capacity);
         let (publishing, publishing_rx) = tokio::sync::mpsc::channel(capacity);
         let threads = {
@@ -471,14 +488,14 @@ impl NativeDispatcher {
         };
         let publication_task = {
             let shared = Arc::clone(&shared);
-            spawn_async_pool(runtime, io_width, publishing_rx, move |task| {
+            spawn_async_pool(runtime, capacity, publishing_rx, move |task| {
                 let shared = Arc::clone(&shared);
                 async move { shared.publish(task).await }
             })
         };
         let staging_task = {
             let shared = Arc::clone(&shared);
-            spawn_async_pool(runtime, io_width, staging_rx, move |task| {
+            spawn_async_pool(runtime, capacity, staging_rx, move |task| {
                 let shared = Arc::clone(&shared);
                 let ready = ready.clone();
                 async move { shared.stage(task, &ready).await }
@@ -489,6 +506,7 @@ impl NativeDispatcher {
             staging: Some(staging),
             staging_task: Some(staging_task),
             publication_task: Some(publication_task),
+            maintenance_task,
             threads,
         })
     }
@@ -582,9 +600,9 @@ impl NativeDispatcher {
                 .unwrap_or(NativeQueueSnapshot::MAX_CAPACITY),
             compiler_active: u32::try_from(self.shared.queue.active())
                 .unwrap_or(NativeQueueSnapshot::MAX_CAPACITY),
-            staging_slots: u32::try_from(self.shared.io_width)
+            staging_slots: u32::try_from(self.shared.capacity)
                 .unwrap_or(NativeQueueSnapshot::MAX_CAPACITY),
-            publication_slots: u32::try_from(self.shared.io_width)
+            publication_slots: u32::try_from(self.shared.capacity)
                 .unwrap_or(NativeQueueSnapshot::MAX_CAPACITY),
             jobs: reservations
                 .iter()
@@ -676,6 +694,9 @@ impl Drop for NativeDispatcher {
             }
         }
         join_async_stage(self.publication_task.take());
+        if let Some(task) = self.maintenance_task.take() {
+            task.abort();
+        }
     }
 }
 

@@ -19,7 +19,7 @@ use super::{
 use crate::build_runtime::{
     ArchiveLength, BlobRef, CapturedExecution, ExecutionPhase, ExecutionPolicy, ExecutionSpec,
     NativeStore, PackageArchive, PackageImportLimits, PackagePreparation, PackageTransferCost,
-    StageBudget, TreeId, TreeLease, VerifiedPackage, execute,
+    TreeId, TreeLease, VerifiedPackage, execute,
     wire::{ActionObservation, ActionRequest, Ticket, WorkerTiming},
 };
 
@@ -547,19 +547,8 @@ impl NativeCacheClient {
                 "native executor platform mismatch"
             );
             let check = &|| lease.check();
-            let WorkerStorage {
-                output,
-                cached,
-                mut warm,
-            } = prepare_worker_storage(
-                store,
-                policy,
-                delivery.artifact_grace,
-                &request,
-                preparation.estimated_result_bytes,
-                check,
-            )
-            .await?;
+            let cached = resident_worker_inputs(store, &request).await?;
+            let mut warm = true;
             let mut inputs = Vec::new();
             let on_tree = preparation.on_tree;
             for (id, cached) in cached {
@@ -614,7 +603,7 @@ impl NativeCacheClient {
             Ok(PreparedExecution {
                 request,
                 inputs,
-                output,
+                grace: delivery.artifact_grace.cloned(),
                 warm_staging: warm.then(|| started.elapsed()),
             })
         }
@@ -678,21 +667,22 @@ impl NativeCacheClient {
             self.verify_execution(ticket, spec.clone())?;
             let mut prepared = self.prepare_execution(
                 context,
-                control.grace.map(|grace| (grace, policy.max_result_bytes)),
+                control.grace,
                 |id, check, _| fetch(id, check),
                 check,
                 &mut |_| {},
             )?;
-            let budget = prepared.take_budget();
+            let inputs = std::mem::take(&mut prepared.inputs);
             let captured = compile(
                 context,
                 control.queue,
                 control.transport,
-                &prepared.inputs,
-                budget,
+                &inputs,
+                prepared.grace.is_some(),
                 check,
                 |_| {},
             )?;
+            drop(inputs);
             crate::http_client::io_runtime()?.block_on(self.publish_execution(
                 context,
                 prepared,
@@ -711,7 +701,7 @@ impl NativeCacheClient {
     fn prepare_execution(
         &self,
         context: ExecutionContext<'_>,
-        grace: Option<(&super::ArtifactGrace, u64)>,
+        grace: Option<&super::ArtifactGrace>,
         mut fetch: impl FnMut(TreeId, &LeaseCheck<'_>, &mut dyn FnMut(&TreeLease)) -> Result<TreeLease>,
         check: &LeaseCheck<'_>,
         on_tree: &mut dyn FnMut(&TreeLease),
@@ -724,28 +714,11 @@ impl NativeCacheClient {
             store,
             policy,
         } = context;
-        if let Some((grace, _)) = grace {
-            grace.reap();
-        }
-        maintain_executor_space(store)?;
         let request = spec.action_request()?;
         ensure!(
             spec.platform == policy.platform,
             "native executor platform mismatch"
         );
-        // Reserve output headroom before staged inputs can consume it. Wait for
-        // grace capacity without occupying a compiler slot.
-        let output = if let Some((grace, predicted)) = grace {
-            let (reservation, waited) = crate::http_client::io_runtime()?
-                .block_on(grace.reserve_until(predicted, policy.timeout, check))?;
-            warm &= !waited;
-            Some(OutputReservation {
-                grace: reservation,
-                budget: Some(store.reserve_staging(policy.max_result_bytes)?),
-            })
-        } else {
-            None
-        };
         let mut inputs = Vec::new();
         for id in &request.input_trees {
             check()?;
@@ -780,7 +753,7 @@ impl NativeCacheClient {
         Ok(PreparedExecution {
             request,
             inputs,
-            output,
+            grace: grace.cloned(),
             warm_staging: warm.then(|| started.elapsed()),
         })
     }
@@ -824,7 +797,7 @@ impl NativeCacheClient {
     async fn publish_execution(
         &self,
         context: ExecutionContext<'_>,
-        mut prepared: PreparedExecution,
+        prepared: PreparedExecution,
         measured: MeasuredExecution,
         transport: Option<&PackageTransportTracker>,
         check: &LeaseCheck<'_>,
@@ -840,7 +813,9 @@ impl NativeCacheClient {
         let publication_started = Instant::now();
         prepared.request.validate_result(&manifest)?;
         let blobs = manifest.blobs()?;
-        let (captured, retained) = prepared.retain_output(context, captured, check).await?;
+        let mut captured = captured;
+        let retained = prepared.retain_output(context, &mut captured).await;
+        check()?;
         let (begin, scheduler_limit) = self.begin_result_upload(ticket, manifest.clone()).await?;
         let missing = begin.missing;
         ensure!(
@@ -910,78 +885,19 @@ impl NativeCacheClient {
     }
 }
 
-struct WorkerStorage {
-    output: Option<OutputReservation>,
-    cached: Vec<(TreeId, Option<Arc<TreeLease>>)>,
-    warm: bool,
-}
-
-/// Pin the already-resident closure in the same blocking task as output-space
-/// admission. No network operation holds the blocking pool or an index lock.
-async fn prepare_worker_storage(
+/// Pin resident trees without running synchronous store maintenance or
+/// reserving hypothetical output bytes on the input-staging path.
+async fn resident_worker_inputs(
     store: &NativeStore,
-    policy: &ExecutionPolicy,
-    grace: Option<&super::ArtifactGrace>,
     request: &ActionRequest,
-    estimated_result_bytes: Option<u64>,
-    check: &LeaseCheck<'_>,
-) -> Result<WorkerStorage> {
-    let predicted = estimated_result_bytes
-        .unwrap_or(policy.max_result_bytes)
-        .clamp(1, policy.max_result_bytes);
-    {
-        let store = store.clone();
-        let grace = grace.cloned();
-        tokio::task::spawn_blocking(move || {
-            if let Some(grace) = grace {
-                grace.reap();
-            }
-            maintain_executor_space(&store)
-        })
-        .await??;
-    }
-    let (reservation, warm) = if let Some(grace) = grace {
-        let (reservation, waited) = grace
-            .reserve_until(predicted, policy.timeout, check)
-            .await?;
-        (Some(reservation), !waited)
-    } else {
-        (None, true)
-    };
-    check()?;
+) -> Result<Vec<(TreeId, Option<Arc<TreeLease>>)>> {
     let store = store.clone();
-    let limit = policy.max_result_bytes;
     let trees = request.input_trees.clone();
     tokio::task::spawn_blocking(move || {
-        let output = reservation
-            .map(|reservation| {
-                Ok::<_, anyhow::Error>(OutputReservation {
-                    grace: reservation,
-                    budget: Some(store.reserve_staging(limit)?),
-                })
-            })
-            .transpose()?;
-        let cached = trees
-            .into_iter()
+        trees.into_iter()
             .map(|id| Ok((id, store.lookup_resident_tree(id)?)))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(WorkerStorage {
-            output,
-            cached,
-            warm,
-        })
-    })
-    .await?
-}
-
-fn maintain_executor_space(store: &NativeStore) -> Result<()> {
-    if let Some(report) = store.maintain_space()? {
-        ensure!(
-            report.minimum_satisfied,
-            "native executor store lacks allocatable space: {report:?}"
-        );
-    }
-    Ok(())
+            .collect()
+    }).await?
 }
 
 fn trace_tree_access(id: TreeId, tree: &TreeLease, hit: bool) -> Result<()> {
@@ -1007,45 +923,36 @@ struct ExecutionContext<'a> {
     policy: &'a ExecutionPolicy,
 }
 
-struct OutputReservation {
-    grace: super::grace::GraceReservation,
-    budget: Option<StageBudget>,
-}
-
 struct PreparedExecution {
     warm_staging: Option<Duration>,
     request: ActionRequest,
     inputs: Vec<Arc<TreeLease>>,
-    output: Option<OutputReservation>,
+    grace: Option<super::ArtifactGrace>,
 }
 
 impl PreparedExecution {
-    fn take_budget(&mut self) -> Option<StageBudget> {
-        self.output.as_mut().and_then(|output| output.budget.take())
-    }
-
     async fn retain_output(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
-        captured: CapturedExecution,
-        check: &LeaseCheck<'_>,
-    ) -> Result<(CapturedExecution, Option<super::grace::RetainedOutput>)> {
-        let Some(output) = self.output.take() else {
-            return Ok((captured, None));
-        };
-        ensure!(
-            output.budget.is_none(),
-            "compiler did not consume output reservation"
-        );
-        output
-            .grace
-            .retain(
+        captured: &mut CapturedExecution,
+    ) -> Option<super::grace::RetainedOutput> {
+        let grace = self.grace.as_ref()?;
+        let result = async {
+            grace.retain(
                 context.store.clone(),
                 self.request.action_fingerprint()?,
                 captured,
-                (context.policy.timeout, check),
-            )
-            .await
+            ).await
+        }.await;
+        match result {
+            Ok(retained) => retained,
+            Err(error) => {
+                // Optional local publication does not invalidate a valid build.
+                // Captured descriptors remain available for verified scheduler upload.
+                warn!("Native optional worker result retention failed: {error:#}");
+                None
+            }
+        }
     }
 }
 
@@ -1065,11 +972,13 @@ fn compile(
     queue: Option<&crate::dist::execution_queue::ExecutionQueue>,
     transport: Option<&PackageTransportTracker>,
     inputs: &[Arc<TreeLease>],
-    budget: Option<StageBudget>,
+    retain: bool,
     check: &LeaseCheck<'_>,
     on_phase: impl FnMut(ExecutionPhase),
 ) -> Result<MeasuredExecution> {
     let _permit = queue.map(|queue| queue.acquire(check)).transpose()?;
+    // Only actual captured output bytes enter managed CAS admission.
+    let budget = retain.then(|| context.store.reserve_staging(0)).transpose()?;
     let started = Instant::now();
     let captured = execute(
         context.spec,
@@ -1219,13 +1128,12 @@ impl Drop for WorkerLease {
 
 /// Cancellation and verified-tree progress for worker-side preparation.
 pub struct WorkerPreparation<'a, A> {
-    pub estimated_result_bytes: Option<u64>,
     pub cancelled: Arc<AtomicBool>,
     pub on_tree: &'a mut (dyn FnMut(&TreeLease) + Send),
     pub on_authorized: A,
 }
 
-/// A ready action owns its verified input closure and output reservation.
+/// A ready action owns its verified input closure and scheduler lease.
 pub struct PreparedWorker {
     prepared: PreparedExecution,
     spec: ExecutionSpec,
@@ -1242,7 +1150,7 @@ impl PreparedWorker {
         delivery: WorkerDelivery<'_>,
         on_phase: impl FnMut(ExecutionPhase),
     ) -> CompletedWorker {
-        let budget = self.prepared.take_budget();
+        let inputs = std::mem::take(&mut self.prepared.inputs);
         let context = ExecutionContext {
             ticket: self.lease.ticket,
             spec: &self.spec,
@@ -1253,11 +1161,13 @@ impl PreparedWorker {
             context,
             Some(delivery.execution_queue),
             Some(delivery.transport),
-            &self.prepared.inputs,
-            budget,
+            &inputs,
+            self.prepared.grace.is_some(),
             &|| self.lease.check(),
             on_phase,
         );
+        // Captured outputs own descriptors. Input pins are no longer needed.
+        drop(inputs);
         CompletedWorker {
             worker: self,
             captured,

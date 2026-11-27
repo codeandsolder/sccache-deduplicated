@@ -147,7 +147,9 @@ impl Default for PackageTransferCost {
             download_bytes_per_second: 128 * MIB,
             archive_download_bytes_per_second: 128 * MIB,
             raw_request_nanoseconds: 2_000_000,
-            raw_parallelism: 4,
+            // One worker-wide budget: enough concurrent small requests to
+            // hide network and filesystem latency even on a busy LAN.
+            raw_parallelism: 64,
             decode_tar_bytes_per_second: 512 * MIB,
             decode_gzip_bytes_per_second: 128 * MIB,
             decode_xz_bytes_per_second: 24 * MIB,
@@ -183,7 +185,7 @@ impl PackageTransferCost {
                 && self.per_entry_nanoseconds <= 1_000_000_000
                 && self.startup_nanoseconds <= 60_000_000_000
                 && self.raw_request_nanoseconds <= 60_000_000_000
-                && (1..=32).contains(&self.raw_parallelism),
+                && (1..=256).contains(&self.raw_parallelism),
             "invalid original-package transfer cost estimate"
         );
         Ok(())

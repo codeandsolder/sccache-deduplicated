@@ -1097,8 +1097,8 @@ impl NativeQueueSnapshot {
         (1..=Self::MAX_CAPACITY).contains(&self.capacity)
             && (1..=Self::MAX_CAPACITY).contains(&self.compiler_slots)
             && self.compiler_active <= self.compiler_slots
-            && (1..=self.compiler_slots).contains(&self.staging_slots)
-            && (1..=self.compiler_slots).contains(&self.publication_slots)
+            && (1..=self.capacity).contains(&self.staging_slots)
+            && (1..=self.capacity).contains(&self.publication_slots)
             && self.jobs.len() <= self.capacity as usize
             && self.jobs.values().all(|job| {
                 !job.phase.inputs_ready()
@@ -1138,8 +1138,8 @@ impl Default for NativeQueueSnapshot {
             capacity: Self::MAX_CAPACITY,
             compiler_slots: Self::MAX_CAPACITY,
             compiler_active: 0,
-            staging_slots: 4,
-            publication_slots: 4,
+            staging_slots: Self::MAX_CAPACITY,
+            publication_slots: Self::MAX_CAPACITY,
             jobs: std::collections::BTreeMap::new(),
         }
     }

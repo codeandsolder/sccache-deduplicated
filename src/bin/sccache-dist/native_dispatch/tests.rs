@@ -175,7 +175,13 @@ fn asynchronous_stage_pool_bounds_active_tasks_and_drains_on_close() -> Result<(
 fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (verification_tx, verification_rx) = mpsc::channel();
-    let (delegation_tx, delegation_rx) = mpsc::channel::<u16>();
+    let mut delegation_tx = HashMap::new();
+    let mut delegation_rx = HashMap::new();
+    for id in [JobId(1), JobId(2), JobId(3)] {
+        let (send, receive) = tokio::sync::oneshot::channel::<u16>();
+        delegation_tx.insert(id, send);
+        delegation_rx.insert(id, receive);
+    }
     let delegation_rx = Mutex::new(delegation_rx);
     // Model a scheduler which holds its admission lock until the worker
     // returns the assignment response. Verification is deliberately blocked.
@@ -244,15 +250,12 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
                         if verification_tx.send(JobId(id)).is_err() {
                             return StatusCode::BAD_REQUEST;
                         }
-                        let status = tokio::task::spawn_blocking(move || {
-                            delegation_rx
-                                .lock()
-                                .unwrap()
-                                .recv_timeout(Duration::from_secs(5))
-                                .unwrap_or(503)
-                        })
-                        .await
-                        .unwrap_or(503);
+                        let receive = delegation_rx.lock().unwrap().remove(&JobId(id));
+                        let Some(receive) = receive else {
+                            return StatusCode::CONFLICT;
+                        };
+                        let status = tokio::time::timeout(Duration::from_secs(5), receive)
+                            .await.ok().and_then(|result| result.ok()).unwrap_or(503);
                         StatusCode::from_u16(status).unwrap()
                     }
                 },
@@ -307,6 +310,12 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
         assert!(states.try_recv().is_err());
         assert_eq!(queue.active(), 0);
         dispatcher.assign(second, assignment(2)?, Arc::clone(&requester))?;
+        // Despite one compiler and a blocked first authorization, the
+        // second admitted job must be able to begin staging.
+        assert_eq!(verification_rx.recv_timeout(Duration::from_secs(5))?, second);
+        assert_eq!(dispatcher.snapshot().staging_slots, 2);
+        assert_eq!(dispatcher.snapshot().publication_slots, 2);
+        assert!(dispatcher.snapshot().valid());
         assert!(
             dispatcher
                 .assign(third, assignment(3)?, Arc::clone(&requester))
@@ -334,8 +343,8 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
         assert!(verification_rx.try_recv().is_err());
         assert!(states.try_recv().is_err());
 
-        // A cancellation of a queued job holds its reservation until its
-        // stage drains, and never performs verification or starts a compiler.
+        // A cancelled staging job keeps its reservation until the
+        // outstanding authorization drains, and never starts a compiler.
         assert_eq!(
             dispatcher.reconcile(&HashSet::from([first]), Instant::now()),
             1
@@ -349,7 +358,14 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
                 .assign(third, assignment(3)?, Arc::clone(&requester))
                 .is_err()
         );
-        delegation_tx.send(200)?;
+        delegation_tx.remove(&second).context("second authorization")?
+            .send(409).map_err(|_| anyhow::anyhow!("second authorization lost"))?;
+        assert_eq!(
+            states.recv_timeout(Duration::from_secs(5))?,
+            (second, JobState::Complete)
+        );
+        delegation_tx.remove(&first).context("first authorization")?
+            .send(200).map_err(|_| anyhow::anyhow!("first authorization lost"))?;
         assert_eq!(
             states.recv_timeout(Duration::from_secs(5))?,
             (first, JobState::Started)
@@ -357,10 +373,6 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
         assert_eq!(
             states.recv_timeout(Duration::from_secs(5))?,
             (first, JobState::Complete)
-        );
-        assert_eq!(
-            states.recv_timeout(Duration::from_secs(5))?,
-            (second, JobState::Complete)
         );
         assert!(verification_rx.try_recv().is_err());
 
@@ -395,7 +407,8 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
         assert_eq!(verification_rx.recv_timeout(Duration::from_secs(5))?, third);
         assert_eq!(dispatcher.reconcile(&HashSet::new(), cutoff), 0);
         assert!(states.try_recv().is_err());
-        delegation_tx.send(409)?;
+        delegation_tx.remove(&third).context("third authorization")?
+            .send(409).map_err(|_| anyhow::anyhow!("third authorization lost"))?;
         assert_eq!(
             states.recv_timeout(Duration::from_secs(5))?,
             (third, JobState::Complete)

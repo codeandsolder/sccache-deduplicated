@@ -1045,7 +1045,7 @@ impl NativeCacheClient {
                     }, self.timeout).await?;
                 }
                 let leases = ingress::map_bounded(
-                    chunk.iter().copied(), transport.parallelism(), |blob| {
+                    chunk.iter().copied(), std::num::NonZeroUsize::new(chunk.len()).expect("nonempty chunk"), |blob| {
                         self.fetch_input_blob(ticket, blob, plans.get(&blob.id), store, transport, check)
                     },
                 ).await?;
@@ -1101,18 +1101,21 @@ impl NativeCacheClient {
                 self.timeout,
             )
             .await?;
-            let deadline = Instant::now()
-                .checked_add(self.timeout)
-                .context("shared native input deadline overflow")?;
-            let cancelled = async {
-                loop {
-                    check()?;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            };
-            let blobs = chunk.iter().map(|blob| (blob.id, blob.size)).collect();
-            pins.extend(store.await_blobs(blobs, deadline, cancelled).await?);
         }
+        // Announce the entire closure before waiting for any individual blob.
+        // Otherwise a slow blob in the first metadata batch delays demand for
+        // every independent input in subsequent batches.
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .context("shared native input deadline overflow")?;
+        let cancelled = async {
+            loop {
+                check()?;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        let blobs = missing.iter().map(|blob| (blob.id, blob.size)).collect();
+        pins.extend(store.await_blobs(blobs, deadline, cancelled).await?);
         check()?;
         store
             .publish_tree_pinned_async(manifest, Vec::new(), pins)
