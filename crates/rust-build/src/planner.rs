@@ -1499,4 +1499,180 @@ mod tests {
         }
         Ok(())
     }
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires an existing managed sccache daemon and client"]
+    fn managed_planner_execution() -> Result<()> {
+        use sccache_build::BuildPlan;
+        use std::{
+            os::unix::ffi::OsStrExt,
+            process::{Command, Stdio},
+        };
+
+        fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+            fs::create_dir_all(destination)?;
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                let dest = destination.join(entry.file_name());
+                if entry.file_type()?.is_dir() {
+                    copy_tree(&entry.path(), &dest)?;
+                } else {
+                    fs::copy(entry.path(), dest)?;
+                }
+            }
+            Ok(())
+        }
+
+        fn command_for(spec: &PlanCommand, managed: Option<&Path>) -> Command {
+            let executable = BuildPlan::path(&spec.executable);
+            let mut command = Command::new(managed.unwrap_or(executable));
+            if managed.is_some() {
+                command.arg(executable);
+            }
+            if !spec.inherit_environment {
+                command.env_clear();
+            }
+            for change in &spec.environment {
+                let name = OsStr::from_bytes(&change.name);
+                if let Some(value) = &change.value {
+                    command.env(name, OsStr::from_bytes(value));
+                } else {
+                    command.env_remove(name);
+                }
+            }
+            command.current_dir(BuildPlan::path(&spec.cwd));
+            command.args(spec.arguments.iter().map(|arg| OsStr::from_bytes(arg)));
+            command
+        }
+
+        let original = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/native-plan")
+            .canonicalize()?;
+        let temp = tempfile::tempdir()?;
+        let fixture = temp.path().join("workspace");
+        copy_tree(&original, &fixture)?;
+        let workspace = Workspace::discover(&fixture.join("Cargo.toml"))?;
+        let toolchain = Toolchain::discover(&fixture, None, None, None, false, false)?;
+        let settings = Settings::load(&fixture, None)?;
+        let managed = which::which("sccache")?;
+        let mut sources = Sources::new(
+            &workspace,
+            Lockfile::load(&fixture.join("Cargo.lock"))?,
+            None,
+            temp.path().join("sources"),
+        );
+        let graph = Graph::resolve(
+            &mut sources,
+            ResolveOptions {
+                selected: workspace.defaults.clone(),
+                features: BTreeSet::new(),
+                default_features: true,
+                all_features: false,
+                dev_dependencies: true,
+                host: toolchain.host.clone(),
+                target: toolchain.target.clone(),
+            },
+        )?;
+        let final_root = temp.path().join("target");
+        let run = |mode: Mode, iteration: usize| -> Result<()> {
+            let options = PlanOptions {
+                mode,
+                no_doc: true,
+                test_targets: if mode == Mode::Test {
+                    vec!["executable".into()]
+                } else {
+                    vec![]
+                },
+                ..PlanOptions::default()
+            };
+            let planner = Planner::new(
+                &graph,
+                &workspace,
+                &settings,
+                &toolchain,
+                &options,
+                temp.path().join(format!("intermediate-{iteration}")),
+                final_root.clone(),
+            )?;
+            let mut ready = planner.graph()?;
+            while let Some(index) = ready.take_ready() {
+                let node = planner.prepare(index)?;
+                node.validate_action(&node.action)?;
+                for directory in &node.directories {
+                    fs::create_dir_all(BuildPlan::path(directory))?;
+                }
+                match &node.action {
+                    PlanAction::Noop => {}
+                    PlanAction::Compile { command } => {
+                        let output = command_for(command, Some(&managed)).output()?;
+                        ensure!(
+                            output.status.success(),
+                            "{}: {}\n{}",
+                            node.label,
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    PlanAction::Process {
+                        command,
+                        stdout,
+                        stderr,
+                        ..
+                    } => {
+                        let mut process = command_for(command, None);
+                        if let Some(path) = stdout {
+                            process.stdout(Stdio::from(fs::File::create(BuildPlan::path(path))?));
+                        }
+                        if let Some(path) = stderr {
+                            process.stderr(Stdio::from(fs::File::create(BuildPlan::path(path))?));
+                        }
+                        let output = process.output()?;
+                        ensure!(
+                            output.status.success(),
+                            "{}: {}\n{}",
+                            node.label,
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    PlanAction::Publish {
+                        source,
+                        destination,
+                    } => {
+                        fs::copy(BuildPlan::path(source), BuildPlan::path(destination))?;
+                    }
+                }
+                for output in &node.required_outputs {
+                    ensure!(
+                        BuildPlan::path(output).exists(),
+                        "missing required output: {:?}",
+                        output
+                    );
+                }
+                planner.complete(index)?;
+                ready.complete(index)?;
+            }
+            ensure!(ready.is_complete(), "unfinished action graph");
+            Ok(())
+        };
+        run(Mode::Build, 0)?;
+        let binary = final_root.join("native-plan-fixture");
+        let output = Command::new(&binary).output()?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"native-plan-ok\n");
+        run(Mode::Check, 1)?;
+        run(Mode::Test, 2)?;
+        let main = fixture.join("src/main.rs");
+        let modified = fs::metadata(&main)?.modified()?;
+        let previous = fs::read_to_string(&main)?;
+        let changed = previous.replace("native-plan-ok", "native-plan-OK");
+        assert_eq!(changed.len(), previous.len());
+        fs::write(&main, changed)?;
+        fs::File::open(&main)?.set_times(fs::FileTimes::new().set_modified(modified))?;
+        run(Mode::Build, 3)?;
+        let output = Command::new(binary).output()?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"native-plan-OK\n");
+        Ok(())
+    }
 }
