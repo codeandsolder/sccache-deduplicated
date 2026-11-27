@@ -293,13 +293,12 @@ impl Publication {
             .checked_add(timeout)
             .context("grace publication deadline overflow")?;
         let mut changed = self.pool.changed.subscribe();
-        let mut pending = (contents, lease);
+        let mut pending = Some((contents, lease));
         loop {
             check()?;
-            match self.try_commit(pending)? {
+            match self.try_commit(&mut pending)? {
                 PublicationAttempt::Committed(expires) => return Ok((expires, self.waiting)),
-                PublicationAttempt::Wait { result, expires } => {
-                    pending = result;
+                PublicationAttempt::Wait(expires) => {
                     wait_for_change(
                         &mut changed,
                         deadline,
@@ -315,11 +314,14 @@ impl Publication {
 
     fn try_commit(
         &mut self,
-        (contents, lease): (Contents, ResultLease),
+        pending: &mut Option<(Contents, ResultLease)>,
     ) -> Result<PublicationAttempt> {
         let outcome = self.pool.with_reaped(|state| -> Result<_> {
+            let (contents, _) = pending
+                .as_ref()
+                .context("missing pending grace publication")?;
             let mut additional = 0_u64;
-            for (&id, &size) in &contents {
+            for (&id, &size) in contents {
                 if let Some(&(previous, count)) = state.refs.get(&id) {
                     ensure!(
                         previous == size && count < usize::MAX,
@@ -337,6 +339,9 @@ impl Publication {
                 let expires = Instant::now()
                     .checked_add(self.pool.duration)
                     .context("grace deadline overflow")?;
+                let (contents, lease) = pending
+                    .take()
+                    .context("missing pending grace publication")?;
                 for (&id, &size) in &contents {
                     state.refs.entry(id).or_insert((size, 0)).1 += 1;
                 }
@@ -352,10 +357,7 @@ impl Publication {
                     state.waiting_publishers += 1;
                     self.waiting = true;
                 }
-                Ok(PublicationAttempt::Wait {
-                    result: (contents, lease),
-                    expires: state.next_expiry(),
-                })
+                Ok(PublicationAttempt::Wait(state.next_expiry()))
             }
         })?;
         // A newly retained result can reduce another publisher's unique
@@ -369,10 +371,7 @@ impl Publication {
 
 enum PublicationAttempt {
     Committed(Instant),
-    Wait {
-        result: (Contents, ResultLease),
-        expires: Option<Instant>,
-    },
+    Wait(Option<Instant>),
 }
 
 impl Drop for Publication {
