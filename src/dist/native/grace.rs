@@ -10,7 +10,6 @@ use anyhow::{Context, Result, ensure};
 
 use crate::build_runtime::{
     ActionFingerprint, ActionMode, CapturedExecution, ContentId, NativeStore, ResultLease,
-    StageBudget,
 };
 
 type Contents = BTreeMap<ContentId, u64>;
@@ -128,7 +127,6 @@ impl GraceReservation {
     pub(super) async fn retain(
         self,
         store: NativeStore,
-        mut budget: StageBudget,
         fingerprint: ActionFingerprint,
         captured: CapturedExecution,
         wait: (Duration, &super::LeaseCheck<'_>),
@@ -141,20 +139,17 @@ impl GraceReservation {
         }
         let publication = self.promote();
         let staging_store = store.clone();
-        let (captured, manifest, staged, existing, warm) = tokio::task::spawn_blocking(move || {
+        let (mut captured, manifest, existing, warm) = tokio::task::spawn_blocking(move || {
             let manifest = captured
                 .successful_result()
                 .context("failed execution cannot be retained")?
                 .clone();
             let existing = staging_store.reserve_upload(&manifest)?;
             let warm = existing.missing().is_empty();
-            let mut staged = Vec::new();
-            for &blob in existing.missing() {
-                staged.push(budget.stage_expected(blob, captured.open_blob(blob.id)?)?);
-            }
-            Ok::<_, anyhow::Error>((captured, manifest, staged, existing, warm))
+            Ok::<_, anyhow::Error>((captured, manifest, existing, warm))
         })
         .await??;
+        let staged = captured.seal_staged(existing.missing()).await?;
         let lease = store
             .publish_pinned_async(fingerprint, manifest, staged, ActionMode::Refresh, existing)
             .await?;

@@ -488,7 +488,7 @@ mod linux {
     ) -> Result<()> {
         let before = arc()?;
         let started = Instant::now();
-        let execution = execute(spec, store, policy, || Ok(()))?;
+        let execution = execute(spec, store, policy, None, || Ok(()))?;
         let elapsed = started.elapsed();
         if !execution.status().success() {
             let mut diagnostic = String::new();
