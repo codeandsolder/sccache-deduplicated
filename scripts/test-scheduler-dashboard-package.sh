@@ -40,6 +40,14 @@ reject "$binary" verify-dashboard --assets "$root/stale"
 reject scripts/package-scheduler-dashboard.sh "$binary" "$root/stale" "$root/mixed.tar.gz"
 test ! -e "$root/mixed.tar.gz"
 
+# A valid current WASM with old stamped JavaScript is also rejected even
+# after checksums are recalculated.
+cp -a "$assets" "$root/mixed"
+printf '\n/* old generation */\n' >> "$root/mixed/sccache-dashboard.js"
+(cd "$root/mixed" && find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$root/mixed.sha256sums")
+mv "$root/mixed.sha256sums" "$root/mixed/SHA256SUMS"
+reject "$binary" verify-dashboard --assets "$root/mixed"
+
 # Even a mutually matching pair from another source revision is rejected.
 mkdir "$root/source"
 git archive HEAD -- Cargo.toml Cargo.lock rust-toolchain.toml src crates scripts/build-scheduler-dashboard.sh scripts/publish-dashboard-assets.sh contrib/codeandsolder/release-protocol.env | tar -xf - -C "$root/source"

@@ -38,6 +38,13 @@ trap 'rm -rf "$stage"; rm -f "$stage.sha256sums"' EXIT
 for asset in sccache-dashboard.js sccache-dashboard_bg.wasm sccache-dashboard.css; do
     test -s "$stage/$asset"
 done
+# Stamp every generated script/stylesheet with the identity extracted from
+# the actual optimized WASM. A recomputed manifest cannot hide a mixed package.
+generation="$(rg --text --only-matching --no-filename 'sccache-dashboard-generation-v1:[0-9a-f]{64}' "$stage/sccache-dashboard_bg.wasm" | LC_ALL=C sort -u)"
+[[ "$generation" =~ ^sccache-dashboard-generation-v1:[0-9a-f]{64}$ ]]
+while IFS= read -r -d '' asset; do
+    printf '\n/* %s */\n' "$generation" >> "$asset"
+done < <(find "$stage" -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.css' \) -print0)
 # Hash every generated file before publishing; the scheduler verifies the
 # full manifest and the fingerprint embedded in the WASM itself.
 (cd "$stage" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$stage.sha256sums")

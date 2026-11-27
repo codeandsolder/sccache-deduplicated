@@ -138,6 +138,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ripgrep
           rustup target add --toolchain "${{ steps.protocol.outputs.rust_toolchain }}" wasm32-unknown-unknown
           release_cargo=(env -u RUSTC -u RUSTDOC cargo +${{ steps.protocol.outputs.rust_toolchain }})
           target_dir="$("${release_cargo[@]}" metadata --locked --no-deps --format-version 1 | jq -r .target_directory)"

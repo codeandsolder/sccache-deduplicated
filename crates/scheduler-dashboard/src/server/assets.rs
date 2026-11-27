@@ -109,6 +109,18 @@ impl Assets {
                 "missing dashboard asset: {name}"
             );
         }
+        let marker = format!("\n/* {expected} */\n");
+        for (name, bytes) in &verified {
+            if matches!(
+                Path::new(name).extension().and_then(|ext| ext.to_str()),
+                Some("js" | "mjs" | "css")
+            ) {
+                ensure!(
+                    bytes.ends_with(marker.as_bytes()),
+                    "dashboard asset generation mismatch: {name}"
+                );
+            }
+        }
         let wasm = &verified[WASM];
         ensure!(
             wasm.starts_with(b"\0asm\x01\0\0\0")
@@ -140,10 +152,12 @@ mod tests {
     use super::*;
     fn fixture(directory: &Path, marker: &str) -> Result<()> {
         let wasm = [b"\0asm\x01\0\0\0".as_slice(), marker.as_bytes()].concat();
+        let js = format!("js\n/* {marker} */\n");
+        let css = format!("css\n/* {marker} */\n");
         for (name, bytes) in [
-            (REQUIRED[0], b"js".as_slice()),
+            (REQUIRED[0], js.as_bytes()),
             (WASM, wasm.as_slice()),
-            (REQUIRED[2], b"css".as_slice()),
+            (REQUIRED[2], css.as_bytes()),
         ] {
             fs::write(directory.join(name), bytes)?;
         }
@@ -173,7 +187,17 @@ mod tests {
         let assets = Assets::load(directory.path())?;
         fs::write(directory.path().join(REQUIRED[0]), b"corrupt")?;
         assert!(Assets::load(directory.path()).is_err());
-        assert_eq!(assets.0[REQUIRED[0]], Bytes::from_static(b"js"));
+        assert_eq!(
+            assets.0[REQUIRED[0]],
+            Bytes::from(format!("js\n/* {} */\n", crate::GENERATION))
+        );
+        fixture(directory.path(), crate::GENERATION)?;
+        fs::write(
+            directory.path().join(REQUIRED[0]),
+            b"js\n/* old generation */\n",
+        )?;
+        manifest(directory.path())?;
+        assert!(Assets::load(directory.path()).is_err());
         fixture(directory.path(), crate::GENERATION)?;
         fs::write(directory.path().join("unlisted.js"), b"extra")?;
         assert!(Assets::load(directory.path()).is_err());
