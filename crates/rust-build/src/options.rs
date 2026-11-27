@@ -29,6 +29,7 @@ pub struct PlanOptions {
     pub bench: Vec<String>,
     pub benches: bool,
     pub no_run: bool,
+    pub coverage: Option<crate::impact::CoverageMode>,
     pub doc: bool,
     pub no_doc: bool,
     pub no_deps: bool,

@@ -153,6 +153,7 @@ impl RustBuildArgs {
             bench: self.bench.clone(),
             benches: self.benches,
             no_run: self.no_run,
+            coverage: None,
             doc: self.doc,
             no_doc: self.no_doc,
             no_deps: self.no_deps,

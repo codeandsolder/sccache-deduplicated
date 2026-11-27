@@ -163,6 +163,7 @@ pub struct Planner<'a> {
     binaries: Vec<BTreeMap<String, (usize, PathBuf)>>,
     binary_publications: Vec<Vec<usize>>,
     file_names: BTreeMap<(bool, bool, Vec<String>), Vec<String>>,
+    coverage_sources: Option<crate::impact::sources::CoverageSources>,
 }
 
 fn bytes(value: &OsStr) -> Vec<u8> {
@@ -220,6 +221,12 @@ impl<'a> Planner<'a> {
         intermediate: PathBuf,
         final_root: PathBuf,
     ) -> Result<Self> {
+        let coverage_sources = options
+            .coverage
+            .map(|_| {
+                crate::impact::sources::CoverageSources::new(graph, workspace, intermediate.clone())
+            })
+            .transpose()?;
         let mut planner = Self {
             graph,
             workspace,
@@ -237,6 +244,7 @@ impl<'a> Planner<'a> {
             binaries: vec![BTreeMap::new(); graph.units.len()],
             binary_publications: vec![Vec::new(); graph.units.len()],
             file_names: BTreeMap::new(),
+            coverage_sources,
         };
         planner.allocate()?;
         planner.dependencies()?;
@@ -307,6 +315,7 @@ impl<'a> Planner<'a> {
             format!("{:?}", self.graph.units[unit].domain),
             test,
             metadata,
+            self.options.coverage,
             &profile.options,
             if host {
                 &self.toolchain.host.triple
@@ -1100,11 +1109,25 @@ impl<'a> Planner<'a> {
             args.extend(["-C".into(), arg]);
         }
         self.dependency_arguments(unit, target, host, script, test, &mut args, &mut env)?;
-        args.extend(self.settings.rustflags(
-            platform,
-            host,
-            self.toolchain.explicit_target.is_some(),
-        )?);
+        let flags =
+            self.settings
+                .rustflags(platform, host, self.toolchain.explicit_target.is_some())?;
+        if let Some(mode) = self.options.coverage
+            && !script
+            && (!host || test)
+            && !metadata
+        {
+            let sources = self
+                .coverage_sources
+                .as_ref()
+                .context("missing coverage source map")?;
+            let mapping = sources.flags(self.graph.units[unit].package, &flags)?;
+            args.extend(flags);
+            args.extend(mode.flags().iter().map(OsString::from));
+            args.extend(mapping);
+        } else {
+            args.extend(flags);
+        }
         args.extend(manifest.lint_arguments.iter().map(OsString::from));
         if self.options.mode == Mode::Clippy && self.graph.units[unit].root && !script {
             args.extend(self.options.trailing.iter().cloned());

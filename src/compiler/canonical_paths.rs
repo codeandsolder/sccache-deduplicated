@@ -399,10 +399,26 @@ impl CanonicalRustPaths {
     }
 
     pub(crate) fn to_canonical(&self, path: &Path) -> PathBuf {
-        self.roots
-            .iter()
-            .find_map(|root| root.to_canonical(path))
-            .unwrap_or_else(|| path.to_owned())
+        // A package can live inside the leased target filesystem. Match the
+        // most specific root, just like PathTransformer and argument
+        // normalization, rather than silently mapping that source to /target.
+        let mut best = None;
+        for root in &self.roots {
+            for alias in &root.aliases {
+                if let Ok(suffix) = path.strip_prefix(alias) {
+                    let depth = alias.components().count();
+                    if best.as_ref().is_none_or(|(old, _)| depth > *old) {
+                        let mapped = if suffix.as_os_str().is_empty() {
+                            root.canonical.clone()
+                        } else {
+                            root.canonical.join(suffix)
+                        };
+                        best = Some((depth, mapped));
+                    }
+                }
+            }
+        }
+        best.map_or_else(|| path.to_owned(), |(_, mapped)| mapped)
     }
 
     #[cfg(test)]
