@@ -292,7 +292,8 @@ impl Fleet {
             PLATFORM,
             transfer,
         );
-        worker_config.traces = trace_endpoint.map(|endpoint| trace_config(endpoint, "worker"));
+        worker_config.traces =
+            trace_endpoint.map(|endpoint| trace_config(root, endpoint, "worker"));
         let (local_worker, standalone_worker) = if colocated {
             let native = worker_config
                 .native_worker
@@ -308,7 +309,7 @@ impl Fleet {
             root,
             "scheduler",
             &scheduler::Config {
-                traces: trace_endpoint.map(|endpoint| trace_config(endpoint, "scheduler")),
+                traces: trace_endpoint.map(|endpoint| trace_config(root, endpoint, "scheduler")),
                 cluster_directory,
                 local_worker,
                 public_addr: scheduler_address,
@@ -2142,10 +2143,16 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
 
 /// A test-owned in-process service, not a separately launched managed
 /// sccache daemon. It listens exclusively on a temporary Unix socket.
-fn trace_config(endpoint: &str, instance: &str) -> sccache::latency_trace::TraceConfig {
+fn trace_config(
+    root: &Path,
+    endpoint: &str,
+    instance: &str,
+) -> sccache::latency_trace::TraceConfig {
     sccache::latency_trace::TraceConfig {
         endpoint: endpoint.into(),
         instance: instance.into(),
+        spool_directory: root.join(format!("trace-spool-{instance}")),
+        max_spool_bytes: 8 * 1024 * 1024,
     }
 }
 
@@ -2410,7 +2417,7 @@ fn request_traces_follow_real_worker_and_cache_hit() -> Result<()> {
         root,
         &fleet,
         None,
-        Some(trace_config(&collector.endpoint, "client")),
+        Some(trace_config(root, &collector.endpoint, "client")),
     )?;
     fs::write(root.join("probe.c"), "int trace_probe(void) { return 42; }")?;
     for _ in 0..2 {

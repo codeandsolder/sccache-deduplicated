@@ -16,6 +16,9 @@ worker TOML configuration files, substituting the actual host identity:
 [traces]
 endpoint = "http://100.73.74.69:10428/insert/opentelemetry/v1/traces"
 instance = "cachyasus"
+# Unique private directory for this daemon (not its CAS).
+spool_directory = "/var/lib/sccache/trace-spool/client"
+max_spool_bytes = 134217728 # 128 MiB
 ```
 
 A worker colocated with the scheduler shares its exporter. Use the same
@@ -29,9 +32,29 @@ traces_url = "http://127.0.0.1:10428"
 
 Other dashboard settings remain as before. No additional HTTP collector is
 required. The endpoint accepts OTLP protobuf, not arbitrary request logs.
-The exporter batches in a bounded nonblocking queue. During backend
-unavailability trace data can be dropped, with explicit warning counts; builds
-do not wait for export. Compiler arguments, environments and working directories
+The compiler path submits to a bounded, nonblocking memory queue (256
+submissions, 16 MiB estimated allocation budget). A dedicated writer batches
+for up to 100 ms and persists checksummed, immutable OTLP records with
+atomic publication and fsync. A separate transport thread retries unavailable
+or ambiguous delivery with exponential backoff from 250 ms to 30 s. A record
+is removed only after successful delivery or explicit permanent rejection.
+The spool has one owner and retains the original FIFO across restart. Up to
+4096 records and the configured byte budget are retained; when full, new
+submissions are dropped with warning counts rather than evicting accepted
+records. A reduced budget prevents new writes until existing records drain.
+There is no synchronous compiler-path disk or network I/O; abrupt process
+termination can still lose the not-yet-persisted memory queue. Graceful client
+shutdown waits up to five seconds for disk persistence, not remote delivery.
+
+Set a distinct absolute private (0700) spool directory for each standalone
+daemon, writable by its service account, outside cache eviction. A colocated
+worker uses the scheduler's spool. On Unix both file and directory are synced;
+filesystem policy must honor fsync for power-loss durability. Windows flushes
+the record file before publication. No separate cache or additional collector
+is used. Transport retries preserve exact protobuf bytes, including trace/span
+IDs and the originating build revision. OTLP is at-least-once, so the dashboard
+deduplicates before sorting, limits and phase aggregates. Permanent rejection
+and partial acceptance are reported without retransmitting accepted spans. Compiler arguments, environments and working directories
 are not exported. Compiler/output labels and action IDs are exported; restrict
 the receiver and dashboard to the trusted fleet.
 
@@ -50,7 +73,13 @@ The timeline aligns spans by wall-clock start times and uses monotonic duration
 measurements within each host. Cross-host clock disagreement can make spans
 appear outside the root; the UI flags that instead of changing measurements.
 Overlapping spans are not additive. The fleet table reports p50/p95/p99 and
-cumulative elapsed time by phase, service, host and version. Live native client requests and distributed jobs come from the scheduler, not
+cumulative elapsed time by phase, service, host and exact source revision.
+The binary embeds the full Git SHA at build time (including commit-expanded
+Git archives); dirty compilation inputs carry a `-dirty-<SHA256>` fingerprint, archives with
+no provenance report `unknown`. Both binary `--version` and OTLP
+`service.version` identify the executing build, independently of deployment
+metadata. `sccache.package_version` retains the package version.
+Publishers verify the embedded revision against the release SHA. Live native client requests and distributed jobs come from the scheduler, not
 VictoriaTraces ingestion. Active clients send a compact snapshot every two
 seconds through the existing authenticated native service. Snapshots expire
 after ten seconds and empty reports clear prior observations. The reporter

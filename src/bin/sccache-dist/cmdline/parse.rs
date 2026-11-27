@@ -179,6 +179,7 @@ fn identity_commands(
 ) -> ClapCommand {
     command
         .version(env!("CARGO_PKG_VERSION"))
+        .long_version(sccache::BUILD_VERSION)
         .subcommand_required(true)
         .subcommand(
             ClapCommand::new("cluster-init")

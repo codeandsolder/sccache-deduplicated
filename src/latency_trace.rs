@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub struct TraceConfig {
     pub endpoint: String,
     pub instance: String,
+    pub spool_directory: std::path::PathBuf,
+    pub max_spool_bytes: u64,
 }
 
 pub use crate::build_runtime::wire::TraceContext;
@@ -151,6 +153,12 @@ pub fn enabled() -> bool {
     }
 }
 
+/// Persist queued traces before a graceful client daemon shutdown.
+pub fn flush() {
+    #[cfg(feature = "http-client")]
+    export::flush();
+}
+
 pub fn submit(spans: Vec<LatencySpan>) {
     #[cfg(feature = "http-client")]
     export::submit(spans);
@@ -165,6 +173,8 @@ pub(crate) fn instance() -> Option<&'static str> {
 
 #[cfg(feature = "http-client")]
 mod export;
+#[cfg(feature = "http-client")]
+mod spool;
 
 /// Records successive worker phases, including queue and publication waits.
 /// The owned guard crosses queue handoffs; no thread-local scope is required.

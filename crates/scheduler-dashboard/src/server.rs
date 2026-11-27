@@ -137,6 +137,7 @@ pub(super) fn now() -> u64 {
         .as_secs()
 }
 
+#[derive(Clone, Copy)]
 pub struct TelemetrySources<'a> {
     pub metrics_url: Option<&'a str>,
     pub metrics_ingress_host: Option<&'a str>,

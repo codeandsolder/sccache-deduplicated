@@ -119,6 +119,9 @@ zlib-rs-fast = { package = "zlib-rs", version = "=0.6.8", optional = true, defau
 socket2 = { version = "0.6", optional = true }
 syslog = { version = "7", optional = true }
 
+[build-dependencies]
+sha2 = "0.11"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["test-util"] }

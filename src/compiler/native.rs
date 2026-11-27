@@ -1186,6 +1186,7 @@ mod tests {
             &leases,
             None,
             || Ok(()),
+            |_| {},
         )?;
         if !result.status().success() {
             let mut stderr = Vec::new();

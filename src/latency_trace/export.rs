@@ -1,7 +1,10 @@
 //! Use the official OTLP protobuf types with the existing HTTP stack, rather
 //! than pulling in a second HTTP/TLS client for telemetry.
 
-use super::{LatencySpan, TraceConfig};
+use super::{
+    LatencySpan, TraceConfig,
+    spool::{MAX_BODY, Spool},
+};
 use anyhow::{Result, ensure};
 use opentelemetry_proto::tonic::{
     collector::trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse},
@@ -13,22 +16,42 @@ use prost::Message as _;
 use std::{
     collections::BTreeMap,
     sync::{
-        OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
 const QUEUE: usize = 256;
 const BATCH_REQUESTS: usize = 32;
 const MAX_BATCH_SPANS: usize = 8192;
+const MEMORY_BUDGET: usize = 16 * 1024 * 1024;
+const MAX_BATCH_MEMORY: usize = MAX_BODY / 2;
+const RETRY_MAX: Duration = Duration::from_secs(30);
 static EXPORT: OnceLock<Exporter> = OnceLock::new();
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 struct Exporter {
     config: TraceConfig,
-    sender: mpsc::Sender<Vec<LatencySpan>>,
+    sender: mpsc::Sender<Message>,
+    budget: Arc<Semaphore>,
+}
+
+struct Submission {
+    spans: Vec<LatencySpan>,
+    bytes: usize,
+    _permit: OwnedSemaphorePermit,
+}
+
+enum Message {
+    Spans(Submission),
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+struct Delivery {
+    spool: Mutex<Spool>,
+    ready: Notify,
 }
 
 pub(super) fn configure(config: &TraceConfig) -> Result<()> {
@@ -54,19 +77,39 @@ pub(super) fn configure(config: &TraceConfig) -> Result<()> {
             && !config.instance.chars().any(char::is_control),
         "invalid trace instance"
     );
+    let delivery = Arc::new(Delivery {
+        spool: Mutex::new(Spool::open(
+            &config.spool_directory,
+            config.max_spool_bytes,
+        )?),
+        ready: Notify::new(),
+    });
+    let client = wreq::Client::builder()
+        .no_proxy()
+        .redirect(wreq::redirect::Policy::none())
+        .build()?;
     let (sender, receiver) = mpsc::channel(QUEUE);
     let config = config.clone();
     let instance = config.instance.clone();
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let writer_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    let delivery_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let writer = Arc::clone(&delivery);
+    std::thread::Builder::new()
+        .name("sccache-trace-spool".into())
+        .spawn(move || writer_runtime.block_on(write_spool(receiver, &writer, &instance)))?;
     std::thread::Builder::new()
         .name("sccache-otlp".into())
-        .spawn(move || {
-            runtime.block_on(run(receiver, endpoint, instance));
-        })?;
+        .spawn(move || delivery_runtime.block_on(deliver(&delivery, &client, &endpoint)))?;
     EXPORT
-        .set(Exporter { config, sender })
+        .set(Exporter {
+            config,
+            sender,
+            budget: Arc::new(Semaphore::new(MEMORY_BUDGET)),
+        })
         .map_err(|_| anyhow::anyhow!("trace exporter initialized concurrently"))?;
     Ok(())
 }
@@ -80,11 +123,84 @@ pub(super) fn enabled() -> bool {
     EXPORT.get().is_some()
 }
 
+fn submission_size(spans: &[LatencySpan], capacity: usize) -> usize {
+    spans.iter().fold(
+        capacity.saturating_mul(size_of::<LatencySpan>()),
+        |bytes, span| {
+            let attributes = span.attributes.iter().fold(
+                span.attributes
+                    .capacity()
+                    .saturating_mul(size_of::<(&str, String)>()),
+                |bytes, (_, value)| bytes.saturating_add(value.capacity()),
+            );
+            bytes.saturating_add(attributes).saturating_add(
+                span.links
+                    .capacity()
+                    .saturating_mul(size_of::<super::TraceContext>()),
+            )
+        },
+    )
+}
+
 pub(super) fn submit(spans: Vec<LatencySpan>) {
     if let Some(export) = EXPORT.get() {
+        if spans.is_empty() {
+            return;
+        }
         let count = u64::try_from(spans.len()).unwrap_or(u64::MAX);
-        if export.sender.try_send(spans).is_err() {
-            DROPPED.fetch_add(count, Ordering::Relaxed);
+        let bytes = submission_size(&spans, spans.capacity());
+        let permit = u32::try_from(bytes)
+            .ok()
+            .filter(|_| bytes <= MAX_BATCH_MEMORY)
+            .and_then(|bytes| {
+                Arc::clone(&export.budget)
+                    .try_acquire_many_owned(bytes)
+                    .ok()
+            });
+        if let Some(permit) = permit
+            && export
+                .sender
+                .try_send(Message::Spans(Submission {
+                    spans,
+                    bytes,
+                    _permit: permit,
+                }))
+                .is_ok()
+        {
+            return;
+        }
+        DROPPED.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+/// A shutdown barrier waits for disk publication, not remote availability.
+pub(super) fn flush() {
+    if let Some(export) = EXPORT.get() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut message = Message::Flush(sender);
+        loop {
+            match export.sender.try_send(message) {
+                Ok(()) => {
+                    if receiver
+                        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                        .is_err()
+                    {
+                        log::warn!("trace spool shutdown flush timed out");
+                    }
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Full(pending))
+                    if std::time::Instant::now() < deadline =>
+                {
+                    message = pending;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => {
+                    log::warn!("trace spool shutdown flush unavailable");
+                    break;
+                }
+            }
         }
     }
 }
@@ -145,7 +261,8 @@ fn request(spans: Vec<LatencySpan>, instance: &str) -> ExportTraceServiceRequest
                     attributes: vec![
                         attribute("service.name", service.into()),
                         attribute("host.name", instance.into()),
-                        attribute("service.version", crate::VERSION.into()),
+                        attribute("service.version", crate::BUILD_REVISION.into()),
+                        attribute("sccache.package_version", crate::VERSION.into()),
                     ],
                     ..Default::default()
                 }),
@@ -163,65 +280,201 @@ fn request(spans: Vec<LatencySpan>, instance: &str) -> ExportTraceServiceRequest
     }
 }
 
-async fn send(client: &wreq::Client, endpoint: &url::Url, body: Vec<u8>) -> Result<()> {
-    let response = client
+enum SendResult {
+    Delivered,
+    Retry(anyhow::Error),
+    Rejected {
+        rejected: Option<u64>,
+        error: anyhow::Error,
+    },
+}
+
+async fn send(client: &wreq::Client, endpoint: &url::Url, body: Vec<u8>) -> SendResult {
+    let response = match client
         .post(endpoint.as_str())
         .header("Content-Type", "application/x-protobuf")
         .timeout(Duration::from_secs(5))
         .body(body)
         .send()
-        .await?
-        .error_for_status()?;
-    // OTLP success may carry a partial rejection. Do not report it as success.
-    let bytes = crate::http_client::read_bounded_bytes_async(response, 65536).await?;
-    let reply = ExportTraceServiceResponse::decode(bytes.as_slice())?;
-    if let Some(partial) = reply.partial_success {
-        ensure!(
-            partial.rejected_spans == 0,
-            "OTLP backend rejected {} spans",
-            partial.rejected_spans
-        );
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return SendResult::Retry(error.into()),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let error = anyhow::anyhow!("OTLP HTTP status {status}");
+        // Malformed payloads cannot improve on retry. Auth/configuration
+        // failures are retained to permit recovery after operator repair.
+        return if matches!(status.as_u16(), 400 | 413 | 415 | 422) {
+            SendResult::Rejected {
+                rejected: None,
+                error,
+            }
+        } else {
+            SendResult::Retry(error)
+        };
     }
-    Ok(())
+    let bytes = match crate::http_client::read_bounded_bytes_async(response, 65_536).await {
+        Ok(bytes) => bytes,
+        Err(error) => return SendResult::Retry(error),
+    };
+    let reply = match ExportTraceServiceResponse::decode(bytes.as_slice()) {
+        Ok(reply) => reply,
+        Err(error) => return SendResult::Retry(error.into()),
+    };
+    if let Some(partial) = reply.partial_success
+        && partial.rejected_spans != 0
+    {
+        // Retrying partial success cannot recover the rejected subset alone.
+        let Ok(rejected) = u64::try_from(partial.rejected_spans) else {
+            return SendResult::Retry(anyhow::anyhow!("invalid OTLP partial rejection count"));
+        };
+        return SendResult::Rejected {
+            rejected: Some(rejected),
+            error: anyhow::anyhow!("OTLP partial success"),
+        };
+    }
+    SendResult::Delivered
 }
 
-async fn run(mut receiver: mpsc::Receiver<Vec<LatencySpan>>, endpoint: url::Url, instance: String) {
-    let client = match wreq::Client::builder()
-        .no_proxy()
-        .redirect(wreq::redirect::Policy::none())
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            log::error!("trace HTTP client unavailable: {error}");
-            return;
+fn report_drops() {
+    let dropped = DROPPED.swap(0, Ordering::Relaxed);
+    if dropped != 0 {
+        log::warn!("OTLP spans dropped before durable delivery: {dropped}");
+    }
+}
+
+fn persist(delivery: &Delivery, instance: &str, submissions: Vec<Submission>) {
+    let count = submissions
+        .iter()
+        .map(|batch| u64::try_from(batch.spans.len()).unwrap_or(u64::MAX))
+        .sum::<u64>();
+    let spans = submissions
+        .into_iter()
+        .flat_map(|batch| batch.spans)
+        .collect();
+    let body = request(spans, instance).encode_to_vec();
+    let result = delivery
+        .spool
+        .lock()
+        .map_err(|_| anyhow::anyhow!("trace spool lock poisoned"))
+        .and_then(|mut spool| spool.push(count, &body));
+    match result {
+        Ok(true) => {}
+        Ok(false) => {
+            DROPPED.fetch_add(count, Ordering::Relaxed);
         }
-    };
-    while let Some(mut spans) = receiver.recv().await {
+        Err(error) => {
+            DROPPED.fetch_add(count, Ordering::Relaxed);
+            log::warn!("trace spool publication failed: {error:#}");
+        }
+    }
+    // A rename may have succeeded before a directory-sync failure.
+    delivery.ready.notify_one();
+    report_drops();
+}
+
+async fn write_spool(mut receiver: mpsc::Receiver<Message>, delivery: &Delivery, instance: &str) {
+    let mut pending = None;
+    loop {
+        let message = match pending.take() {
+            Some(message) => message,
+            None => match receiver.recv().await {
+                Some(message) => message,
+                None => return,
+            },
+        };
+        let first = match message {
+            Message::Flush(sender) => {
+                let _ = sender.send(());
+                continue;
+            }
+            Message::Spans(first) => first,
+        };
+        let mut bytes = first.bytes;
+        let mut count = first.spans.len();
+        let mut submissions = vec![first];
         let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
         for _ in 1..BATCH_REQUESTS {
-            if spans.len() >= MAX_BATCH_SPANS {
-                break;
-            }
             match tokio::time::timeout_at(deadline, receiver.recv()).await {
-                Ok(Some(mut next)) => spans.append(&mut next),
+                Ok(Some(Message::Spans(next)))
+                    if bytes.saturating_add(next.bytes) <= MAX_BATCH_MEMORY
+                        && count.saturating_add(next.spans.len()) <= MAX_BATCH_SPANS =>
+                {
+                    bytes += next.bytes;
+                    count += next.spans.len();
+                    submissions.push(next);
+                }
+                Ok(Some(message)) => {
+                    pending = Some(message);
+                    break;
+                }
                 _ => break,
             }
         }
-        let count = u64::try_from(spans.len()).unwrap_or(u64::MAX);
-        let body = request(spans, &instance).encode_to_vec();
-        // An ambiguous transport error is not retried: OTLP has no exactly-once
-        // guarantee and duplicates would distort latency aggregation.
-        if let Err(error) = send(&client, &endpoint, body).await {
-            DROPPED.fetch_add(count, Ordering::Relaxed);
-            log::warn!("OTLP trace batch lost: {error:#}");
+        persist(delivery, instance, submissions);
+    }
+}
+
+async fn deliver(delivery: &Delivery, client: &wreq::Client, endpoint: &url::Url) {
+    let mut delay = Duration::from_millis(250);
+    loop {
+        let record = delivery
+            .spool
+            .lock()
+            .map_err(|_| anyhow::anyhow!("trace spool lock poisoned"))
+            .and_then(|mut spool| spool.front());
+        let record = match record {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                tokio::select! {
+                    () = delivery.ready.notified() => {}
+                    () = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
+                report_drops();
+                continue;
+            }
+            Err(error) => {
+                log::warn!("trace spool read failed: {error:#}");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(RETRY_MAX);
+                continue;
+            }
+        };
+        match send(client, endpoint, record.body).await {
+            SendResult::Retry(error) => {
+                log::warn!("trace batch retained for retry: {error:#}");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(RETRY_MAX);
+                continue;
+            }
+            SendResult::Rejected { rejected, error } => {
+                log::warn!(
+                    "OTLP permanently rejected {} of {} spans: {error:#}",
+                    rejected.unwrap_or(record.count),
+                    record.count
+                );
+            }
+            SendResult::Delivered => {}
         }
-        let dropped = DROPPED.swap(0, Ordering::Relaxed);
-        if dropped != 0 {
-            log::warn!("OTLP spans dropped: {dropped}");
+        let ack = delivery
+            .spool
+            .lock()
+            .map_err(|_| anyhow::anyhow!("trace spool lock poisoned"))
+            .and_then(|mut spool| spool.ack(record.sequence));
+        if let Err(error) = ack {
+            log::warn!("trace spool acknowledgement failed: {error:#}");
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(RETRY_MAX);
+        } else {
+            delay = Duration::from_millis(250);
         }
     }
 }
+
+#[cfg(all(test, feature = "dist-server"))]
+mod delivery_tests;
 
 #[cfg(test)]
 mod tests {

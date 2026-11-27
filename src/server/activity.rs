@@ -259,7 +259,7 @@ impl TraceHistory {
             && self
                 .intervals
                 .iter()
-                .all(|interval| interval.start <= interval.end && self.elapsed >= interval.end)
+                .all(|interval| (interval.start..=self.elapsed).contains(&interval.end))
     }
 
     fn append_spans(

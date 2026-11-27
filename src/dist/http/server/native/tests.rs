@@ -1120,7 +1120,7 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
         ))?;
         assert_eq!(execution_queue.active(), 1);
         drop(busy);
-        let completed = prepared.execute(&worker_store, &policy, delivery, || {
+        let completed = prepared.execute(&worker_store, &policy, delivery, |_| {
             assert_eq!(execution_queue.active(), 1)
         });
         assert_eq!(execution_queue.active(), 0);

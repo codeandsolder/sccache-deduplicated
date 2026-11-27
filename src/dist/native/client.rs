@@ -218,7 +218,7 @@ impl Drop for Pin<'_> {
 /// lease, or returned compiler failure diagnostics without a cache entry.
 pub(super) enum Outcome<'a> {
     Ready {
-        delivery: Delivery<'a>,
+        delivery: Box<Delivery<'a>>,
         source: NativeBuildSource,
         manifest: ResultManifest,
     },
@@ -503,7 +503,7 @@ impl NativeCacheClient {
                         delivery: None,
                     };
                     return Ok(Outcome::Ready {
-                        delivery: Delivery::Scheduler(pin, None),
+                        delivery: Box::new(Delivery::Scheduler(pin, None)),
                         source: NativeBuildSource::Hit,
                         manifest,
                     });
@@ -668,7 +668,7 @@ impl NativeCacheClient {
                     max_result_bytes: policy.max_result_bytes,
                 };
                 return Ok(Outcome::Ready {
-                    delivery: Delivery::Scheduler(pin, Some(Box::new(publication))),
+                    delivery: Box::new(Delivery::Scheduler(pin, Some(Box::new(publication)))),
                     source,
                     manifest,
                 });
@@ -705,7 +705,7 @@ impl NativeCacheClient {
         // terminal response was lost, expired, or the worker restarted.
         match (self.status(pin.ticket), error) {
             (Ok(NativeStatus::Ready(manifest)), _) => Ok(Outcome::Ready {
-                delivery: Delivery::Scheduler(pin, None),
+                delivery: Box::new(Delivery::Scheduler(pin, None)),
                 source,
                 manifest,
             }),
@@ -825,7 +825,7 @@ impl NativeCacheClient {
             Ok(Outcome::Ready {
                 manifest: manifest.clone(),
                 source,
-                delivery: Delivery::Local(Box::new(captured), pin),
+                delivery: Box::new(Delivery::Local(Box::new(captured), pin)),
             })
         } else {
             Ok(Outcome::Failed {

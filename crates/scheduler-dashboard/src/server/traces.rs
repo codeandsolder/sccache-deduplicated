@@ -13,6 +13,11 @@ use crate::traces::{
 const LIMIT: usize = 100;
 const SPAN_LIMIT: usize = 4096;
 const MAX_RESPONSE: usize = 8 * 1024 * 1024;
+// Retry delivery preserves all of these fields byte-for-byte. Deduplicate
+// before limits, sorting or aggregates so transport retries cannot bias p99.
+const ROOT_FIELDS: &str = r#"trace_id,span_id,duration,start_time_unix_nano,"resource_attr:host.name","resource_attr:service.version","span_attr:sccache.compiler","span_attr:sccache.output","span_attr:sccache.outcome","span_attr:sccache.worker","span_attr:sccache.action_key""#;
+const SPAN_FIELDS: &str = r#"span_id,parent_span_id,name,start_time_unix_nano,duration,status_code,"resource_attr:service.name","resource_attr:host.name","resource_attr:service.version","span_attr:sccache.producer_trace_id""#;
+const AGGREGATE_FIELDS: &str = r#"trace_id,span_id,name,duration,"resource_attr:service.name","resource_attr:host.name","resource_attr:service.version""#;
 
 #[derive(Clone)]
 pub struct TraceService(Option<Arc<Source>>);
@@ -58,7 +63,7 @@ impl TraceService {
     pub(crate) async fn detail(&self, id: String) -> Result<TraceDetail> {
         ensure!(valid_id(&id, 32), "invalid trace ID");
         let query = format!(
-            "_time:7d trace_id:={quoted} | sort by (start_time_unix_nano) | limit {limit} | fields span_id,parent_span_id,name,start_time_unix_nano,duration,status_code,\"resource_attr:service.name\",\"resource_attr:host.name\",\"span_attr:sccache.producer_trace_id\"",
+            "_time:7d trace_id:={quoted} | uniq by ({SPAN_FIELDS}) | sort by (start_time_unix_nano) | limit {limit}",
             quoted = serde_json::to_string(&id)?,
             limit = SPAN_LIMIT + 1
         );
@@ -155,12 +160,12 @@ fn search_queries(search: &TraceSearch) -> Result<(String, String)> {
     };
     write!(
         query,
-        " | sort by ({order}) | limit {LIMIT} | fields trace_id,duration,start_time_unix_nano,\"resource_attr:host.name\",\"span_attr:sccache.compiler\",\"span_attr:sccache.output\",\"span_attr:sccache.outcome\",\"span_attr:sccache.worker\",\"span_attr:sccache.action_key\""
+        " | uniq by ({ROOT_FIELDS}) | sort by ({order}) | limit {LIMIT}"
     )?;
     // Aggregates are explicitly fleet-wide, not a sum of the selected roots'
     // children. Nested and concurrent spans are not additive.
     let aggregate = format!(
-        "_time:{range} \"resource_attr:service.name\":in(sccache-client,sccache-scheduler,sccache-worker) | stats by (name,\"resource_attr:service.name\",\"resource_attr:host.name\",\"resource_attr:service.version\") count() as count, quantile(0.5,duration) as p50, quantile(0.95,duration) as p95, quantile(0.99,duration) as p99, sum(duration) as total | sort by (total desc) | limit 200"
+        "_time:{range} \"resource_attr:service.name\":in(sccache-client,sccache-scheduler,sccache-worker) | uniq by ({AGGREGATE_FIELDS}) | stats by (name,\"resource_attr:service.name\",\"resource_attr:host.name\",\"resource_attr:service.version\") count() as count, quantile(0.5,duration) as p50, quantile(0.95,duration) as p95, quantile(0.99,duration) as p99, sum(duration) as total | sort by (total desc) | limit 200"
     );
     Ok((query, aggregate))
 }
@@ -191,6 +196,7 @@ fn summary(mut row: Row) -> Result<TraceSummary> {
         start_ns: integer(&mut row, "start_time_unix_nano")?,
         duration_ns: integer(&mut row, "duration")?,
         host: take(&mut row, "resource_attr:host.name"),
+        revision: take(&mut row, "resource_attr:service.version"),
         compiler: take(&mut row, "span_attr:sccache.compiler"),
         output: take(&mut row, "span_attr:sccache.output"),
         outcome: take(&mut row, "span_attr:sccache.outcome"),
@@ -213,6 +219,7 @@ fn span(mut row: Row) -> Result<TraceSpan> {
         name: take(&mut row, "name"),
         service: take(&mut row, "resource_attr:service.name"),
         host: take(&mut row, "resource_attr:host.name"),
+        revision: take(&mut row, "resource_attr:service.version"),
         start_ns: integer(&mut row, "start_time_unix_nano")?,
         duration_ns: integer(&mut row, "duration")?,
         error: take(&mut row, "status_code") == "2",
@@ -246,7 +253,9 @@ mod tests {
         };
         let (query, aggregate) = search_queries(&search)?;
         assert!(query.contains(r#""span_attr:sccache.output":="a\" | limit 100000""#));
-        assert!(query.contains(" | limit 100 | fields "));
+        assert!(query.contains(" | uniq by (trace_id,span_id,"));
+        assert!(query.ends_with(" | limit 100"));
+        assert!(aggregate.contains(" | uniq by (trace_id,span_id,"));
         assert!(aggregate.contains("quantile(0.99,duration)"));
         search.lookback_secs = 1;
         assert!(search_queries(&search).is_err());

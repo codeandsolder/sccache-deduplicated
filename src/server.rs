@@ -787,7 +787,9 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     addr: bound_addr.to_string(),
                 },
             )?;
-            run(future::pending())?;
+            let result = run(future::pending());
+            crate::latency_trace::flush();
+            result?;
             Ok(())
         }
         Err(error) => {

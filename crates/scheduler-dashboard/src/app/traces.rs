@@ -23,6 +23,18 @@ fn ms(ns: u64) -> String {
     format!("{}.{:03} ms", ns / 1_000_000, ns % 1_000_000 / 1_000)
 }
 
+fn revision_label(revision: &str) -> String {
+    if revision.len() >= 40
+        && revision
+            .get(..40)
+            .is_some_and(|sha| sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        format!("{}{}", &revision[..12], &revision[40..])
+    } else {
+        revision.to_owned()
+    }
+}
+
 fn span_row(
     span: TraceSpan,
     start: u64,
@@ -43,11 +55,12 @@ fn span_row(
         }
     };
     let title = format!(
-        "{} · {} · {} · offset {}",
+        "{} · {} · {} · offset {} · revision {}",
         span.host,
         span.name,
         ms(span.duration_ns),
-        ms(offset)
+        ms(offset),
+        span.revision
     );
     view! {
         <tr>
@@ -223,18 +236,18 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
                     Err(error) => view!{<p class=styles::warning>{error.to_string()}</p>}.into_any(),
                     Ok(data) => view!{
                         <p class=styles::muted>"At most 100 completed requests. New spans may take a few seconds to appear."</p>
-                        <table><thead><tr><th>"Host"</th><th>"Compiler"</th><th>"Output"</th><th>"Outcome"</th><th>"Elapsed"</th><th>"Worker"</th><th>"Trace"</th></tr></thead>
+                        <table><thead><tr><th>"Host"</th><th>"Revision"</th><th>"Compiler"</th><th>"Output"</th><th>"Outcome"</th><th>"Elapsed"</th><th>"Worker"</th><th>"Trace"</th></tr></thead>
                             <tbody>{data.traces.into_iter().map(|row| {
                                 let id=row.id.clone();
-                                view!{<tr><td>{row.host}</td><td>{row.compiler}</td><td>{row.output}</td><td>{row.outcome}</td><td>{ms(row.duration_ns)}</td><td>{row.worker}</td>
+                                view!{<tr><td>{row.host}</td><td title=row.revision.clone()>{revision_label(&row.revision)}</td><td>{row.compiler}</td><td>{row.output}</td><td>{row.outcome}</td><td>{ms(row.duration_ns)}</td><td>{row.worker}</td>
                                     <td><button on:click=move |_| {lookup.set(id.clone()); selected.set(id.clone());}>"Inspect"</button></td></tr>}
                             }).collect_view()}</tbody>
                         </table>
                         <h3>"Fleet-wide phase latency"</h3>
                         <p class=styles::muted>"Grouped by phase, service, host and version over the selected range. Other filters apply only to the request list."</p>
-                        <table><thead><tr><th>"Service"</th><th>"Host"</th><th>"Version"</th><th>"Phase"</th><th>"Count"</th><th>"p50 ms"</th><th>"p95 ms"</th><th>"p99 ms"</th><th>"Total s"</th></tr></thead>
+                        <table><thead><tr><th>"Service"</th><th>"Host"</th><th>"Revision"</th><th>"Phase"</th><th>"Count"</th><th>"p50 ms"</th><th>"p95 ms"</th><th>"p99 ms"</th><th>"Total s"</th></tr></thead>
                             <tbody>{data.phases.into_iter().map(|row| view!{
-                                <tr><td>{row.service}</td><td>{row.host}</td><td>{row.version}</td><td>{row.phase}</td><td>{row.count}</td>
+                                <tr><td>{row.service}</td><td>{row.host}</td><td title=row.version.clone()>{revision_label(&row.version)}</td><td>{row.phase}</td><td>{row.count}</td>
                                 <td>{format!("{:.3}",row.p50_ns/1e6)}</td><td>{format!("{:.3}",row.p95_ns/1e6)}</td><td>{format!("{:.3}",row.p99_ns/1e6)}</td><td>{format!("{:.3}",row.total_ns/1e9)}</td></tr>
                             }).collect_view()}</tbody>
                         </table>
