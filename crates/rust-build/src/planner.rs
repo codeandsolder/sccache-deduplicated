@@ -1535,6 +1535,14 @@ impl<'a> Planner<'a> {
         })
     }
 
+    pub fn is_test_execution(&self, index: usize) -> bool {
+        self.options.mode == Mode::Test
+            && matches!(
+                self.nodes[index].action,
+                Action::Run { .. } | Action::Rustdoc { test: true, .. }
+            )
+    }
+
     pub fn coverage_sources(&self) -> Option<&crate::impact::sources::CoverageSources> {
         self.coverage_sources.as_ref()
     }

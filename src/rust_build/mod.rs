@@ -1,6 +1,7 @@
 //! The native Rust build frontend is linked into sccache itself. It resolves
 //! the workspace, holds one artifact lease and submits actual rustc requests.
 //! No external Cargo process, Cargo job queue or Cargo fingerprint database.
+mod coverage;
 mod metadata;
 
 use crate::{build_plan, commands::CompileSession, config::Config};
@@ -95,6 +96,17 @@ pub struct RustBuildArgs {
     benches: bool,
     #[arg(long)]
     pub no_run: bool,
+    /// Execute instrumented tests and write native coverage evidence.
+    #[arg(long, value_name = "REPORT", conflicts_with = "no_run")]
+    collect_coverage: Option<PathBuf>,
+    #[arg(long, requires = "collect_coverage")]
+    aggregate_profile: Option<PathBuf>,
+    #[arg(long, requires = "collect_coverage")]
+    continuous_coverage: bool,
+    #[arg(long, requires = "collect_coverage")]
+    llvm_tools_dir: Option<PathBuf>,
+    #[arg(long, requires = "collect_coverage")]
+    test_jobs: Option<NonZeroUsize>,
     #[arg(long)]
     target: Option<OsString>,
     #[arg(long)]
@@ -153,7 +165,13 @@ impl RustBuildArgs {
             bench: self.bench.clone(),
             benches: self.benches,
             no_run: self.no_run,
-            coverage: None,
+            coverage: self.collect_coverage.as_ref().map(|_| {
+                if self.continuous_coverage {
+                    sccache_rust_build::impact::CoverageMode::Continuous
+                } else {
+                    sccache_rust_build::impact::CoverageMode::Exit
+                }
+            }),
             doc: self.doc,
             no_doc: self.no_doc,
             no_deps: self.no_deps,
@@ -262,6 +280,16 @@ fn absolute(path: &Path, cwd: &Path) -> Result<PathBuf> {
 
 fn execute(mut args: RustBuildArgs) -> Result<i32> {
     let cwd = std::env::current_dir()?;
+    ensure!(
+        args.collect_coverage.is_none() || args.mode == Mode::Test,
+        "--collect-coverage requires test mode"
+    );
+    if let (Some(report), Some(profile)) = (&args.collect_coverage, &args.aggregate_profile) {
+        ensure!(
+            cwd.join(report) != cwd.join(profile),
+            "coverage report and aggregate profile must be different files"
+        );
+    }
     if args.frozen {
         args.locked = true;
         args.offline = true;
@@ -516,6 +544,28 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
             graph.packages.len(),
             planner.len()
         );
+        if let Some(report) = args.collect_coverage.as_deref() {
+            return coverage::execute(
+                &session,
+                content,
+                &planner,
+                &toolchain,
+                &workspace,
+                lease.root(),
+                args.max_in_flight,
+                coverage::Options {
+                    report,
+                    aggregate: args.aggregate_profile.as_deref(),
+                    mode: plan_options.coverage.context("missing coverage mode")?,
+                    tools_dir: args.llvm_tools_dir.as_deref(),
+                    jobs: args
+                        .test_jobs
+                        .unwrap_or(std::thread::available_parallelism()?),
+                    trailing: &args.trailing,
+                    verbose: args.verbose > 0,
+                },
+            );
+        }
         build_plan::dispatch(planner.graph()?, args.max_in_flight, |index| {
             let node = planner
                 .prepare(index)
