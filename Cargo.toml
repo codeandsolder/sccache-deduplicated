@@ -279,7 +279,7 @@ members = ["crates/build-runtime", "crates/cluster-identity", "crates/peer-ident
 [workspace.dependencies]
 btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a4b12ba7391e03470626504fad60d887be790cfb" }
 tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a4b12ba7391e03470626504fad60d887be790cfb" }
-wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "a8385c80ba6a5b035067d3a2e472d37df591faf0", default-features = false, features = ["tokio-rt", "native-roots", "webpki-roots", "stream", "json", "form", "query", "system-proxy", "http2"] }
+wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "16a946b3a9170d6cac4233ef3d1779d0f2fff743", default-features = false, features = ["tokio-rt", "native-roots", "webpki-roots", "stream", "json", "form", "query", "system-proxy", "http2"] }
 
 [[bench]]
 harness = false

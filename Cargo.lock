@@ -2594,7 +2594,7 @@ dependencies = [
  "flate2",
  "tokio",
  "tracing",
- "wreq",
+ "wreq 0.16.1 (git+https://github.com/codeandsolder/wreq-exp.git?rev=a8385c80ba6a5b035067d3a2e472d37df591faf0)",
 ]
 
 [[package]]
@@ -4251,7 +4251,7 @@ dependencies = [
  "walkdir",
  "which",
  "windows-sys 0.61.2",
- "wreq",
+ "wreq 0.16.1 (git+https://github.com/codeandsolder/wreq-exp.git?rev=16a946b3a9170d6cac4233ef3d1779d0f2fff743)",
  "zip",
  "zlib-rs",
  "zstd",
@@ -4306,7 +4306,7 @@ dependencies = [
  "tokio-btls",
  "tower",
  "url",
- "wreq",
+ "wreq 0.16.1 (git+https://github.com/codeandsolder/wreq-exp.git?rev=16a946b3a9170d6cac4233ef3d1779d0f2fff743)",
 ]
 
 [[package]]
@@ -4334,7 +4334,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "web-sys",
- "wreq",
+ "wreq 0.16.1 (git+https://github.com/codeandsolder/wreq-exp.git?rev=16a946b3a9170d6cac4233ef3d1779d0f2fff743)",
 ]
 
 [[package]]
@@ -6031,7 +6031,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "wreq"
 version = "0.16.1"
-source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=a8385c80ba6a5b035067d3a2e472d37df591faf0#a8385c80ba6a5b035067d3a2e472d37df591faf0"
+source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=16a946b3a9170d6cac4233ef3d1779d0f2fff743#16a946b3a9170d6cac4233ef3d1779d0f2fff743"
 dependencies = [
  "base64 0.23.1",
  "btls",
@@ -6059,6 +6059,37 @@ dependencies = [
  "tokio",
  "tokio-btls",
  "tokio-util",
+ "tower",
+ "url",
+ "webpki-root-certs",
+ "windows-registry",
+]
+
+[[package]]
+name = "wreq"
+version = "0.16.1"
+source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=a8385c80ba6a5b035067d3a2e472d37df591faf0#a8385c80ba6a5b035067d3a2e472d37df591faf0"
+dependencies = [
+ "base64 0.23.1",
+ "btls",
+ "btls-sys",
+ "bytes",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httparse",
+ "ipnet",
+ "libc",
+ "lru",
+ "netty",
+ "percent-encoding",
+ "pin-project-lite",
+ "rustls-native-certs",
+ "socket2",
+ "system-configuration",
+ "tokio",
+ "tokio-btls",
  "tower",
  "url",
  "webpki-root-certs",
