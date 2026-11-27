@@ -347,7 +347,7 @@ pub fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
         for &job_id in details.jobs_assigned.keys() {
             snapshot
                 .jobs
-                .push(project_job(job_id, details, &worker, jobs.get(job_id)));
+                .push(project_job(job_id, details, &worker, jobs.get(&job_id)));
         }
         snapshot.workers.push(worker);
     }
