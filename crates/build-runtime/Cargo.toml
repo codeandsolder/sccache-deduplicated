@@ -34,6 +34,7 @@ rustix = { version = "1", features = ["fs", "time", "process", "event"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.19", default-features = false, optional = true }
 libc = { version = "0.2", optional = true }
+linux-raw-sys = { version = "0.12", optional = true, features = ["general"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time"] }
@@ -42,8 +43,8 @@ tempfile = "3"
 [features]
 default = ["store"]
 async-io = ["store", "dep:compio-buf", "dep:compio-driver", "dep:compio-runtime"]
-mapping = ["dep:tempfile", "dep:log"]
-store = ["mapping", "dep:tokio", "dep:rand", "dep:redb", "dep:flate2", "dep:lzma-rust2", "dep:sha2", "dep:tar", "dep:zstd", "dep:fuser", "dep:libc"]
+mapping = ["dep:tempfile", "dep:log", "dep:libc", "dep:linux-raw-sys"]
+store = ["mapping", "dep:tokio", "dep:rand", "dep:redb", "dep:flate2", "dep:lzma-rust2", "dep:sha2", "dep:tar", "dep:zstd", "dep:fuser"]
 
 [lints]
 workspace = true

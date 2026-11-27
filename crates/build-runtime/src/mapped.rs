@@ -15,6 +15,7 @@ use rustix::fs::{CWD, FileType, Mode, OFlags, Stat, fstat, openat};
 use crate::source::{metadata, unchanged};
 
 mod digest_cache;
+mod immutable_mount;
 mod installation;
 use crate::{
     BlobRef, ContentId, TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTimestamp,

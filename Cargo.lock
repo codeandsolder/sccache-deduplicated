@@ -4297,6 +4297,7 @@ dependencies = [
  "flate2",
  "fuser",
  "libc",
+ "linux-raw-sys",
  "log",
  "lzma-rust2",
  "rand 0.10.4",

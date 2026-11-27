@@ -64,6 +64,25 @@ pub(super) fn verity_identity(file: &File) -> Option<VerityIdentity> {
     })
 }
 
+/// All identities are process-local memo keys, never result fingerprints.
+/// A ZFS snapshot inode is immutable for the lifetime of its unique mount ID.
+/// A live dataset, even mounted read-only via a bind, does not qualify.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum ImmutableIdentity {
+    Verity(VerityIdentity),
+    Snapshot { mount: u64, inode: u64 },
+}
+
+fn immutable_identity(file: &File, version: &Stat) -> Option<ImmutableIdentity> {
+    if let Some(identity) = verity_identity(file) {
+        return Some(ImmutableIdentity::Verity(identity));
+    }
+    super::immutable_mount::zfs_snapshot_mount(file).map(|mount| ImmutableIdentity::Snapshot {
+        mount,
+        inode: version.st_ino as u64,
+    })
+}
+
 type Slot = Arc<Mutex<Option<BlobRef>>>;
 /// Optional private executor memo. The file has already been opened with the
 /// caller's credentials; the provider must not reopen it by pathname.
@@ -71,11 +90,12 @@ pub type DescriptorDigestProvider = Arc<dyn Fn(&File) -> Result<BlobRef> + Send 
 
 #[derive(Default)]
 struct Entries {
-    by_content: HashMap<VerityIdentity, Slot>,
-    order: VecDeque<VerityIdentity>,
+    by_content: HashMap<ImmutableIdentity, Slot>,
+    order: VecDeque<ImmutableIdentity>,
 }
 
-/// Memoize a BLAKE3 mapping only for kernel-verified immutable contents.
+/// Memoize a BLAKE3 mapping only for kernel-verified immutable contents
+/// (fs-verity or a descriptor belonging to a genuine ZFS snapshot).
 /// Mutable files are hashed on every discovery, irrespective of inode or age.
 pub struct SourceDigestCache {
     capacity: NonZeroUsize,
@@ -150,7 +170,7 @@ impl SourceDigestCache {
         self.digest(&path, &file, &version)
     }
 
-    fn slot(&self, identity: VerityIdentity) -> Result<Slot> {
+    fn slot(&self, identity: ImmutableIdentity) -> Result<Slot> {
         let mut entries = self
             .entries
             .lock()
@@ -178,7 +198,7 @@ impl SourceDigestCache {
             self.catalog_bytes.fetch_add(blob.size, Ordering::Relaxed);
             return Ok(blob);
         }
-        let Some(identity) = verity_identity(file) else {
+        let Some(identity) = immutable_identity(file, version) else {
             return hash_open_source(file, version);
         };
         let slot = self.slot(identity)?;
@@ -225,7 +245,7 @@ fn regular_version(file: &File) -> Result<Stat> {
     Ok(version)
 }
 
-type DescriptorKey = (ContentId, VerityIdentity);
+type DescriptorKey = (ContentId, ImmutableIdentity);
 
 #[derive(Default)]
 struct DescriptorEntries {
@@ -265,7 +285,7 @@ impl DescriptorMemo {
         file: &File,
     ) -> Result<(DescriptorProbe, Option<BlobRef>)> {
         let version = regular_version(file)?;
-        let key = verity_identity(file).map(|identity| (scope, identity));
+        let key = immutable_identity(file, &version).map(|identity| (scope, identity));
         let value = if let Some(key) = &key {
             self.entries
                 .lock()
@@ -294,7 +314,7 @@ impl DescriptorMemo {
             return Ok(());
         };
         anyhow::ensure!(
-            verity_identity(file) == Some(key.1),
+            immutable_identity(file, &probe.version) == Some(key.1),
             "verified descriptor identity changed"
         );
         let mut entries = self
