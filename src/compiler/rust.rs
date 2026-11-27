@@ -877,6 +877,20 @@ fn rust_cargo_env_for_hash(
     hashed
 }
 
+#[cfg(feature = "dist-client")]
+fn native_driver_bookkeeping(name: &str) -> bool {
+    name.starts_with("SCCACHE_")
+        || matches!(
+            name,
+            "RUSTC_WRAPPER"
+                | "RUSTC_WORKSPACE_WRAPPER"
+                | "RUSTC_ICE"
+                | "CARGO_MAKEFLAGS"
+                | "MAKEFLAGS"
+                | "MFLAGS"
+        )
+}
+
 fn is_clippy_driver(executable: &Path) -> bool {
     executable
         .file_stem()
@@ -1507,6 +1521,11 @@ where
     #[cfg(feature = "dist-client")]
     fn get_toolchain_packager(&self) -> Box<dyn pkg::ToolchainPackager> {
         Box::new(RustToolchainPackager {
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            runtime: None,
             sysroot: self.sysroot.clone(),
             canonical: false,
             host: None,
@@ -3803,7 +3822,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             }
 
             let mut changed_out_dir: Option<PathBuf> = None;
-            let env_vars = if let Some(canonical) = canonical_paths {
+            let mut env_vars = if let Some(canonical) = canonical_paths {
                 dist::osstring_tuples_to_strings(
                     &canonical.env_to_canonical_preserving(env_vars, env_dep_names),
                 )?
@@ -3850,6 +3869,17 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                 }
                 env_vars
             };
+
+            // The native executor invokes the compiler directly, not Cargo
+            // or another sccache wrapper. Its jobserver, transport and crash
+            // report destinations are not compiler inputs. Preserve explicit
+            // source observations, and remove the bookkeeping from the actual
+            // execution environment, including exact proc-macro actions.
+            if transport == CompileTransport::Native {
+                env_vars.retain(|(name, _)| {
+                    env_dep_names.contains(OsStr::new(name)) || !native_driver_bookkeeping(name)
+                });
+            }
 
             if canonical_paths.is_none()
                 && let Some(out_dir) = changed_out_dir
@@ -3988,6 +4018,16 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         }
         trace!("Dist inputs: inputs={inputs:?} crate_link_paths={crate_link_paths:?}");
 
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let runtime =
+            (!env_dep_names.contains(OsStr::new("LD_LIBRARY_PATH"))).then(|| RustRuntimeSearch {
+                executable: executable.clone(),
+                cwd: cwd.clone(),
+                environment: env_vars.clone(),
+            });
         let inputs_packager = Box::new(RustInputsPackager {
             env_vars,
             input_dirs,
@@ -4000,6 +4040,11 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         let canonical = canonical_paths.is_some();
         let target = compilation_target(&arguments, &host);
         let toolchain_packager = Box::new(RustToolchainPackager {
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            runtime,
             sysroot,
             canonical,
             host: Some(host),
@@ -4692,6 +4737,9 @@ fn canonical_native_generated_inputs_have_stable_metadata_across_leases() -> Res
         Ok(prepared)
     };
     let first = capture("first-lease", 200, false)?;
+    let changed_source_time = UNIX_EPOCH + Duration::from_secs(456);
+    fs::File::open(&source_file)?
+        .set_times(std::fs::FileTimes::new().set_modified(changed_source_time))?;
     let second = capture("second-lease", 300, true)?;
     assert_eq!(first.id(), second.id());
     let generated_path = TreePath::new(b"intermediate/libdep-123.rmeta".to_vec())?;
@@ -4706,9 +4754,10 @@ fn canonical_native_generated_inputs_have_stable_metadata_across_leases() -> Res
     assert_eq!(actual.mtime(), metadata.modified.seconds);
     assert_eq!(actual.mode() & 0o777, 0o640);
     assert_eq!(
-        fs::metadata(view.root().join("build/main.rs"))?.modified()?,
-        source_time
+        fs::metadata(view.root().join("build/main.rs"))?.mtime(),
+        metadata.modified.seconds
     );
+    assert_eq!(fs::metadata(&source_file)?.modified()?, changed_source_time);
     Ok(())
 }
 
@@ -4767,19 +4816,11 @@ impl pkg::InputsPackager for RustInputsPackager {
     // representation of rlibs merely to reduce a per-job archive.
     #[cfg(target_os = "linux")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        // A canonical Cargo output root is a generated-input namespace. Its
-        // physical mtime describes delivery/freshness, not the sandbox input.
-        // Normalize the actual remote inode timestamp, not just the key;
-        // preserve all source-file timestamps and exact permission bits.
-        let generated_roots = self
-            .path_transformer
-            .path_mappings()
-            .filter(|(_, logical)| matches!(logical.as_str(), "/intermediate" | "/target"))
-            .map(|(_, logical)| PathBuf::from(logical))
-            .collect::<std::collections::BTreeSet<_>>();
-        (*self).discover()?.into_native_mapping(|logical| {
-            generated_roots.iter().any(|root| logical.starts_with(root))
-        })
+        // Native builds expose a deterministic input filesystem. Checkout
+        // and delivery times are not inputs, including for executable proc
+        // macros. Normalize the actual sandbox inode timestamps (not merely
+        // their fingerprint), preserving file contents and permission bits.
+        (*self).discover()?.into_native_mapping(|_| true)
     }
 }
 
@@ -4841,12 +4882,73 @@ fn rlib_metadata_archive(file: &mut fs::File) -> Result<Option<Vec<u8>>> {
 
 #[cfg(feature = "dist-client")]
 struct RustToolchainPackager {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    runtime: Option<RustRuntimeSearch>,
     sysroot: PathBuf,
     dlltool_files: Vec<PathBuf>,
     canonical: bool,
     // Compiler-wide callers have no target; preserve full-package semantics.
     host: Option<String>,
     target: Option<String>,
+}
+
+#[cfg(all(
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+struct RustRuntimeSearch {
+    executable: PathBuf,
+    cwd: PathBuf,
+    environment: Vec<(OsString, OsString)>,
+}
+
+#[cfg(all(
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl RustRuntimeSearch {
+    fn prepare(
+        self,
+        builder: &mut pkg::ToolchainPackageBuilder,
+        sysroot: &Path,
+        canonical: bool,
+    ) -> Result<()> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let rustc = sysroot.join(BINS_DIR).join("rustc");
+        let libraries = super::c_toolchain::prepare_loader_search(
+            builder,
+            &[rustc, self.executable],
+            &self.environment,
+            &self.cwd,
+        )?;
+        let libraries = libraries
+            .map(|paths| -> Result<_> {
+                let root = sysroot.canonicalize()?;
+                let paths = std::env::split_paths(OsStr::from_bytes(&paths))
+                    .map(|path| {
+                        let resolved = self.cwd.join(path).canonicalize()?;
+                        Ok(if canonical {
+                            resolved.strip_prefix(&root).map_or_else(
+                                |_| resolved.clone(),
+                                |relative| Path::new("/rust").join(relative),
+                            )
+                        } else {
+                            resolved
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(std::env::join_paths(paths)?.into_vec())
+            })
+            .transpose()?;
+        builder.set_native_search(None, libraries);
+        Ok(())
+    }
 }
 
 // Rustup's installation transaction ledger records all installed components.
@@ -4982,6 +5084,11 @@ fn test_dist_toolchain_archive_contains_only_required_installed_targets() -> Res
     let archive_path = temp.path().join("toolchain.tar.gz");
     let writer = fs::File::create(&archive_path)?;
     let packager = RustToolchainPackager {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        runtime: None,
         sysroot,
         canonical: true,
         host: Some(host.to_owned()),
@@ -5026,6 +5133,7 @@ impl pkg::DiscoverToolchain for RustToolchainPackager {
             self.sysroot.display()
         );
         let Self {
+            runtime,
             sysroot,
             canonical,
             host,
@@ -5045,7 +5153,13 @@ impl pkg::DiscoverToolchain for RustToolchainPackager {
 
         let bins_path = sysroot.join(BINS_DIR);
         let sysroot_executable = bins_path.join("rustc").with_extension(EXE_EXTENSION);
-        package_builder.add_executable_and_deps(sysroot_executable)?;
+        if scope == pkg::ToolchainScope::RustCompiler
+            && let Some(runtime) = runtime
+        {
+            runtime.prepare(&mut package_builder, &sysroot, canonical)?;
+        } else {
+            package_builder.add_executable_and_deps(sysroot_executable)?;
+        }
 
         package_builder.add_dir_contents(&bins_path)?;
         if BINS_DIR != LIBS_DIR {
@@ -5124,6 +5238,11 @@ fn test_native_rust_toolchain_ignores_only_installation_ledger() -> Result<()> {
     }
     let tree = |scope| -> Result<_> {
         Ok(Box::new(RustToolchainPackager {
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            runtime: None,
             sysroot: sysroot.to_owned(),
             canonical: true,
             host: Some(host.into()),
@@ -7812,6 +7931,34 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 }),
                 Some("/clippy-config")
             );
+
+            #[cfg(target_os = "linux")]
+            {
+                let mut native = compilation.clone();
+                native.env_vars.extend([
+                    ("RUSTC_WRAPPER".into(), "/outer/sccache".into()),
+                    ("RUSTC_WORKSPACE_WRAPPER".into(), "/outer/clippy".into()),
+                    ("RUSTC_ICE".into(), "/outer/crashes".into()),
+                    ("SCCACHE_LOG".into(), "debug".into()),
+                ]);
+                native.env_dep_names.insert("RUSTC_ICE".into());
+                let mut transformer = dist::PathTransformer::new();
+                let (_, remote, _) =
+                    <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
+                        &native, &mut transformer, CompileTransport::Native,
+                    )?;
+                let remote = remote.context("native Clippy command missing")?;
+                assert!(!remote.env_vars.iter().any(|(name, _)| matches!(
+                    name.as_str(),
+                    "RUSTC_WRAPPER" | "RUSTC_WORKSPACE_WRAPPER" | "SCCACHE_LOG"
+                )));
+                assert!(
+                    remote
+                        .env_vars
+                        .iter()
+                        .any(|(name, value)| { name == "RUSTC_ICE" && value == "/outer/crashes" })
+                );
+            }
 
             // Physical Unix archives reconstruct the input path relative to
             // the original cwd, so the observed relative value is unchanged.

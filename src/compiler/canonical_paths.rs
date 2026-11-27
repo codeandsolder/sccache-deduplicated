@@ -486,8 +486,9 @@ impl CanonicalRustPaths {
         let mut canonical: Vec<_> = env
             .iter()
             .filter(|(k, _)| {
-                k != "SCCACHE_EXPERIMENTAL_CANONICAL_RUST"
-                    && !k.to_string_lossy().starts_with("SCCACHE_CANONICAL_")
+                preserve.contains(k)
+                    || (k != "SCCACHE_EXPERIMENTAL_CANONICAL_RUST"
+                        && !k.to_string_lossy().starts_with("SCCACHE_CANONICAL_"))
             })
             .map(|(k, v)| {
                 let value = if preserve.contains(k) {

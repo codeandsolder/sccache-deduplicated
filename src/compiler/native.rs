@@ -620,17 +620,22 @@ fn prepare_toolchain(
     let before = digests.catalog_hits();
     let start = Instant::now();
     let package = packager.native_mapping(scope)?;
-    if scope == pkg::ToolchainScope::PreprocessedC {
-        let search = package
-            .search
-            .context("C toolchain did not establish its execution environment")?;
-        command.environment.insert(b"PATH".to_vec(), search.path);
+    ensure!(
+        scope != pkg::ToolchainScope::PreprocessedC || package.search.is_some(),
+        "C toolchain did not establish its execution environment"
+    );
+    if let Some(search) = package.search {
+        if let Some(path) = search.path {
+            command.environment.insert(b"PATH".to_vec(), path);
+        }
         command.environment.remove(b"LD_LIBRARY_PATH".as_slice());
         if let Some(libraries) = search.libraries {
             command
                 .environment
                 .insert(b"LD_LIBRARY_PATH".to_vec(), libraries);
         }
+    }
+    if scope == pkg::ToolchainScope::PreprocessedC {
         // The native worker receives fully preprocessed input. Include
         // search already ran locally; these variables are not runtime inputs.
         for name in [

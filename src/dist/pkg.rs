@@ -58,7 +58,7 @@ pub struct NativeToolchain {
 
 #[cfg(target_os = "linux")]
 pub struct NativeSearchEnvironment {
-    pub path: Vec<u8>,
+    pub path: Option<Vec<u8>>,
     pub libraries: Option<Vec<u8>>,
 }
 
@@ -322,11 +322,8 @@ mod toolchain_imp {
             Ok(())
         }
 
-        pub fn set_native_search(&mut self, libraries: Option<Vec<u8>>) {
-            self.native_search = Some(super::NativeSearchEnvironment {
-                path: b"/__sccache/toolchain/bin".to_vec(),
-                libraries,
-            });
+        pub fn set_native_search(&mut self, path: Option<Vec<u8>>, libraries: Option<Vec<u8>>) {
+            self.native_search = Some(super::NativeSearchEnvironment { path, libraries });
         }
 
         pub const fn take_native_search(&mut self) -> Option<super::NativeSearchEnvironment> {

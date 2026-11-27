@@ -241,13 +241,12 @@ fn search_contract(
     Ok((Some(path), selected))
 }
 
-pub(super) fn prepare_search(
+pub(super) fn prepare_loader_search(
     builder: &mut ToolchainPackageBuilder,
     executables: &[PathBuf],
-    helpers: &[(OsString, PathBuf)],
     environment: &[(OsString, OsString)],
     cwd: &Path,
-) -> Result<()> {
+) -> Result<Option<Vec<u8>>> {
     ensure!(
         !environment.iter().any(|(name, value)| {
             matches!(name.to_str(), Some("LD_PRELOAD" | "LD_AUDIT")) && !value.is_empty()
@@ -277,11 +276,22 @@ pub(super) fn prepare_search(
         let libraries = closure.into_values().collect::<Vec<_>>();
         builder.add_resolved_executable(&probe.executable, &libraries)?;
     }
+    Ok(libraries)
+}
+
+pub(super) fn prepare_search(
+    builder: &mut ToolchainPackageBuilder,
+    executables: &[PathBuf],
+    helpers: &[(OsString, PathBuf)],
+    environment: &[(OsString, OsString)],
+    cwd: &Path,
+) -> Result<()> {
+    let libraries = prepare_loader_search(builder, executables, environment, cwd)?;
     for (name, path) in helpers {
         builder.add_native_helper(name, path)?;
         builder.add_native_helper(path.file_name().context("helper has no basename")?, path)?;
     }
-    builder.set_native_search(libraries);
+    builder.set_native_search(Some(b"/__sccache/toolchain/bin".to_vec()), libraries);
     Ok(())
 }
 
