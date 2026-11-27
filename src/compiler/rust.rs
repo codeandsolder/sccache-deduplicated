@@ -347,7 +347,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"12";
+const CACHE_VERSION: &[u8] = b"13";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -435,7 +435,7 @@ where
     let mut f = fs::File::open(file.as_ref())?;
     let mut deps = String::new();
     f.read_to_string(&mut deps)?;
-    Ok((parse_dep_info(&deps, cwd), parse_env_dep_info(&deps), deps))
+    Ok((parse_dep_info(&deps, cwd)?, parse_env_dep_info(&deps), deps))
 }
 
 /// Return make-style prerequisite spellings from rustc dep-info.
@@ -510,20 +510,19 @@ fn decode_make_prerequisite(spelling: &str) -> String {
     path
 }
 
-fn parse_dep_info<T>(dep_info: &str, cwd: T) -> Vec<PathBuf>
+fn parse_dep_info<T>(dep_info: &str, cwd: T) -> Result<Vec<PathBuf>>
 where
     T: AsRef<Path>,
 {
     let cwd = cwd.as_ref();
-    let Ok(deps) = dep_info_prerequisites(dep_info) else {
-        return vec![];
-    };
+    let deps = dep_info_prerequisites(dep_info)?;
+    ensure!(!deps.is_empty(), "rustc dep-info has no input files");
     let mut deps = deps
         .into_iter()
         .map(|s| cwd.join(decode_make_prerequisite(&s)))
         .collect::<Vec<_>>();
     deps.sort();
-    deps
+    Ok(deps)
 }
 
 fn parse_env_dep_info(dep_info: &str) -> Vec<(OsString, OsString)> {
@@ -1104,13 +1103,13 @@ fn compilation_target(arguments: &[Argument<ArgData>], host: &str) -> String {
 // where they appear. The weak map persists across sccache upgrades, so the
 // package format must participate in the weak key independently of compile
 // cache versioning.
-const RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA: &[u8] = b"rust-dist-toolchain-package-v3";
+const RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA: &[u8] = b"rust-dist-toolchain-package-v4";
 
 fn dist_toolchain_weak_key_with_schema(
     compiler_shlibs_digests: &[String],
     package_schema: &[u8],
     target: &str,
-    target_std_manifest_digest: Option<&str>,
+    target_runtime_digest: Option<&str>,
     noncanonical_sysroot: Option<&Path>,
 ) -> String {
     // Clippy policy, manifest inputs, proc macros and --emit affect the
@@ -1126,12 +1125,12 @@ fn dist_toolchain_weak_key_with_schema(
         weak.delimiter(sysroot.as_os_str().as_encoded_bytes());
     }
     weak.delimiter(target.as_bytes());
-    match target_std_manifest_digest {
+    match target_runtime_digest {
         Some(digest) => {
-            weak.delimiter(b"target-std-present");
+            weak.delimiter(b"target-runtime-present");
             weak.delimiter(digest.as_bytes());
         }
-        None => weak.delimiter(b"target-std-missing"),
+        None => weak.delimiter(b"target-runtime-missing"),
     }
     weak.finish()
 }
@@ -1139,14 +1138,14 @@ fn dist_toolchain_weak_key_with_schema(
 fn dist_toolchain_weak_key(
     compiler_shlibs_digests: &[String],
     target: &str,
-    target_std_manifest_digest: Option<&str>,
+    target_runtime_digest: Option<&str>,
     noncanonical_sysroot: Option<&Path>,
 ) -> String {
     dist_toolchain_weak_key_with_schema(
         compiler_shlibs_digests,
         RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA,
         target,
-        target_std_manifest_digest,
+        target_runtime_digest,
         noncanonical_sysroot,
     )
 }
@@ -3252,26 +3251,33 @@ where
         if canonical_paths.is_some() {
             m.update(b"canonical-rust-layout-v2");
         }
-        // Dist toolchain archives recursively contain the Rust sysroot, including
-        // installed cross-target standard libraries. Key the weak toolchain cache
-        // by both the effective target and rustup's target-std manifest so a
-        // host-only archive cannot be reused for a later cross-target compile,
-        // and installing a previously-missing target invalidates a failed/stale
-        // archive without perturbing the normal compilation cache key.
-        let target_std_manifest = self
-            .sysroot
-            .join(LIBS_DIR)
-            .join("rustlib")
-            .join(format!("manifest-rust-std-{target}"));
-        let target_std_manifest_digest = if target_std_manifest.is_file() {
-            Some(Digest::file(target_std_manifest, pool).await?)
-        } else {
-            None
-        };
+        // A rustup manifest is not proof of the contents of an installation.
+        // Fingerprint the actual runtime files, including the host and target
+        // libraries, linker helpers and unrecognized rustlib extensions.
+        let runtime_root = self.sysroot.join(LIBS_DIR).join("rustlib");
+        let runtime_host = self.host.clone();
+        let runtime_target = target.clone();
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        let digest_cache = native.as_ref().map(|client| client.toolchain_digests());
+        let target_runtime_digest = pool
+            .spawn_blocking(move || {
+                rust_runtime_identity(&runtime_root, &runtime_host, &runtime_target, |path| {
+                    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                    if let Some(cache) = &digest_cache {
+                        return Ok(crate::util::hex(&cache.file_digest(path)?.id.0));
+                    }
+                    Digest::reader_sync(fs::File::open(path)?)
+                })
+            })
+            .await??;
+        if let Some(digest) = &target_runtime_digest {
+            m.delimiter(b"rust-runtime-content-v1");
+            m.delimiter(digest.as_bytes());
+        }
         let weak_toolchain_key = dist_toolchain_weak_key(
             &self.compiler_shlibs_digests,
             &target,
-            target_std_manifest_digest.as_deref(),
+            target_runtime_digest.as_deref(),
             canonical_paths.is_none().then_some(self.sysroot.as_path()),
         );
         // The same selected auxiliary closure participates in both result
@@ -4913,7 +4919,6 @@ struct RustToolchainPackager {
 
 // Keep the runtime and unknown rustlib extensions. Only remove directories
 // explicitly identified as standard libraries for other installed targets.
-#[cfg(all(feature = "dist-client", target_os = "linux"))]
 fn rustlib_entries_for_target(rustlib: &Path, host: &str, target: &str) -> Result<Vec<PathBuf>> {
     let mut selected = Vec::new();
     for entry in fs::read_dir(rustlib)? {
@@ -4941,6 +4946,95 @@ fn rustlib_entries_for_target(rustlib: &Path, host: &str, target: &str) -> Resul
     }
     selected.sort();
     Ok(selected)
+}
+
+/// The same target selection policy used by the package builder. Hash the
+/// names, modes, link spellings and actual bytes, not rustup's installation
+/// manifest or mutable file metadata. An unknown target requires the complete
+/// runtime tree, just as it does for packaging.
+fn rust_runtime_identity(
+    rustlib: &Path,
+    host: &str,
+    target: &str,
+    mut hash_file: impl FnMut(&Path) -> Result<String>,
+) -> Result<Option<String>> {
+    if !rustlib.try_exists()? {
+        return Ok(None);
+    }
+    let roots = if target != "custom-target"
+        && rustlib.join(host).is_dir()
+        && rustlib.join(target).is_dir()
+    {
+        rustlib_entries_for_target(rustlib, host, target)?
+    } else {
+        vec![rustlib.to_owned()]
+    };
+    let mut digest = Digest::new();
+    digest.delimiter(b"rust-runtime-tree-v1");
+    for root in roots {
+        for entry in WalkDir::new(root).follow_links(true).sort_by_file_name() {
+            let entry = entry?;
+            let path = entry.path();
+            digest.delimiter(path.strip_prefix(rustlib)?.as_os_str().as_encoded_bytes());
+            if fs::symlink_metadata(path)?.file_type().is_symlink() {
+                digest.delimiter(b"link");
+                digest.delimiter(fs::read_link(path)?.as_os_str().as_encoded_bytes());
+            } else {
+                digest.delimiter(b"direct");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                digest.delimiter(&entry.metadata()?.permissions().mode().to_le_bytes());
+            }
+            if entry.file_type().is_file() {
+                digest.delimiter(b"file");
+                digest.delimiter(hash_file(path)?.as_bytes());
+            } else if entry.file_type().is_dir() {
+                digest.delimiter(b"directory");
+            } else {
+                bail!("unsupported rust runtime entry: {}", path.display());
+            }
+        }
+    }
+    Ok(Some(digest.finish()))
+}
+
+#[cfg(test)]
+#[test]
+fn rust_runtime_identity_tracks_actual_standard_library_bytes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let host = "x86_64-unknown-linux-gnu";
+    let target = "wasm32-wasip2";
+    let unused = "aarch64-unknown-linux-gnu";
+    for triple in [host, target, unused] {
+        fs::create_dir_all(dir.path().join(triple).join("lib"))?;
+        fs::write(
+            dir.path().join(triple).join("lib/libcore.rlib"),
+            b"same-size-a",
+        )?;
+        fs::write(
+            dir.path().join(format!("manifest-rust-std-{triple}")),
+            b"unchanged manifest",
+        )?;
+    }
+    let identity = || {
+        rust_runtime_identity(dir.path(), host, target, |path| {
+            Digest::reader_sync(fs::File::open(path)?)
+        })
+    };
+    let old = identity()?;
+    fs::write(
+        dir.path().join(unused).join("lib/libcore.rlib"),
+        b"same-size-b",
+    )?;
+    assert_eq!(old, identity()?);
+    let changed = dir.path().join(target).join("lib/libcore.rlib");
+    let modified = fs::metadata(&changed)?.modified()?;
+    fs::write(&changed, b"same-size-b")?;
+    fs::File::open(&changed)?.set_modified(modified)?;
+    assert_ne!(old, identity()?);
+    Ok(())
 }
 
 #[cfg(all(test, feature = "dist-client", target_os = "linux"))]
@@ -6400,6 +6494,9 @@ LLVM version: 15.0.2
 
     #[test]
     fn test_parse_dep_info() {
+        assert!(parse_dep_info("", "").is_err());
+        assert!(parse_dep_info("garbage", "").is_err());
+        assert!(parse_dep_info("out: ", "").is_err());
         let deps = "foo: baz.rs abc.rs bar.rs
 
 baz.rs:
@@ -6410,7 +6507,7 @@ bar.rs:
 ";
         assert_eq!(
             pathvec!["abc.rs", "bar.rs", "baz.rs"],
-            parse_dep_info(deps, "")
+            parse_dep_info(deps, "").unwrap()
         );
     }
 
@@ -6432,7 +6529,7 @@ bar.rs:
         let deps = "src/lib.rs:\nsrc/a\\ b.rs:\n\n# env-dep:FOO=bar\n";
         assert_eq!(
             pathvec!["src/a b.rs", "src/lib.rs"],
-            parse_dep_info(deps, "")
+            parse_dep_info(deps, "").unwrap()
         );
     }
 
@@ -6489,7 +6586,10 @@ baz.rs:
 
 abc def.rs:
 ";
-        assert_eq!(pathvec!["abc def.rs", "baz.rs"], parse_dep_info(deps, ""));
+        assert_eq!(
+            pathvec!["abc def.rs", "baz.rs"],
+            parse_dep_info(deps, "").unwrap()
+        );
     }
 
     #[cfg(not(windows))]
@@ -6505,12 +6605,12 @@ bar.rs:
 ";
         assert_eq!(
             pathvec!["foo/abc.rs", "foo/bar.rs", "foo/baz.rs"],
-            parse_dep_info(deps, "foo/")
+            parse_dep_info(deps, "foo/").unwrap()
         );
 
         assert_eq!(
             pathvec!["/foo/bar/abc.rs", "/foo/bar/bar.rs", "/foo/bar/baz.rs"],
-            parse_dep_info(deps, "/foo/bar/")
+            parse_dep_info(deps, "/foo/bar/").unwrap()
         );
     }
 
@@ -6527,7 +6627,7 @@ bar.rs:
 ";
         assert_eq!(
             pathvec!["/foo/abc.rs", "/foo/bar.rs", "/foo/baz.rs"],
-            parse_dep_info(deps, "/bar/")
+            parse_dep_info(deps, "/bar/").unwrap()
         );
     }
 
@@ -6544,7 +6644,7 @@ bar.rs:
 ";
         assert_eq!(
             pathvec!["foo/abc.rs", "foo/bar.rs", "foo/baz.rs"],
-            parse_dep_info(deps, "foo/")
+            parse_dep_info(deps, "foo/").unwrap()
         );
 
         assert_eq!(
@@ -6553,7 +6653,7 @@ bar.rs:
                 "c:/foo/bar/bar.rs",
                 "c:/foo/bar/baz.rs"
             ],
-            parse_dep_info(deps, "c:/foo/bar/")
+            parse_dep_info(deps, "c:/foo/bar/").unwrap()
         );
     }
 
@@ -6568,7 +6668,7 @@ c:/foo/bar.rs:
 ";
         assert_eq!(
             pathvec!["c:/foo/abc.rs", "c:/foo/bar.rs", "c:/foo/baz.rs"],
-            parse_dep_info(deps, "c:/bar/")
+            parse_dep_info(deps, "c:/bar/").unwrap()
         );
     }
 
