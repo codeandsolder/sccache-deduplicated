@@ -437,6 +437,10 @@ jobs:
           [[ "$btls" == *"github.com/codeandsolder/btls-fast"* && "$btls" != *$'\n'* ]]
           wreq="$(printf '%s\n' "$packages" | awk '$1 == "wreq" { sub(/ \(\*\)$/, ""); print }' | sort -u)"
           [[ "$wreq" == *"github.com/codeandsolder/wreq-exp"* && "$wreq" != *$'\n'* ]]
+          # Check optional providers too, not only the active release graph.
+          env -u RUSTC -u RUSTDOC cargo +${{ steps.compiler.outputs.channel }} metadata --locked \
+            --all-features --filter-platform x86_64-unknown-linux-gnu --format-version 1 \
+            | jq -e -f contrib/codeandsolder/verify-native-dependency-identities.jq
           features="$(env -u RUSTC -u RUSTDOC cargo +${{ steps.compiler.outputs.channel }} tree --locked --target x86_64-unknown-linux-gnu \
             --no-default-features --features s3,gha,dist-client,dist-server,direct-metrics,scheduler-dashboard \
             --edges features -i btls-sys)"
