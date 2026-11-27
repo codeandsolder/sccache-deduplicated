@@ -236,7 +236,7 @@ impl MappedTree {
 
     /// Capture a trusted installed toolchain using a process-local digest
     /// memo. Fresh discovery still determines the entire tree topology.
-    /// Only a matching regular-file stat version permits digest reuse.
+    /// Only a matching kernel-verified immutable content identity permits digest reuse.
     /// # Errors
     /// Returns an error for invalid topology, changed or unreadable sources.
     pub fn prepare_with_cache(self, cache: &SourceDigestCache) -> Result<PreparedTree> {
@@ -403,11 +403,22 @@ fn open_source(path: &Path) -> Result<(File, Stat)> {
 }
 
 fn hash_open_source(file: &File, stat: &Stat) -> Result<BlobRef> {
+    use std::os::unix::fs::FileExt as _;
     let size = u64::try_from(stat.st_size)?;
-    let mut reader = file.take(size.checked_add(1).context("mapped file length overflow")?);
+    let mut buffer = vec![0_u8; 128 * 1024];
+    let mut offset = 0_u64;
     let mut hash = blake3::Hasher::new();
-    hash.update_reader(&mut reader)?;
-    ensure!(reader.limit() == 1, "file size changed during capture");
+    while offset < size {
+        let count = usize::try_from((size - offset).min(buffer.len() as u64))?;
+        let read = file.read_at(&mut buffer[..count], offset)?;
+        ensure!(read != 0, "file truncated during capture");
+        hash.update(&buffer[..read]);
+        offset += read as u64;
+    }
+    ensure!(
+        file.read_at(&mut buffer[..1], size)? == 0,
+        "file extended during capture"
+    );
     unchanged(stat, &fstat(file)?)?;
     Ok(BlobRef {
         id: ContentId(*hash.finalize().as_bytes()),

@@ -1493,9 +1493,7 @@ impl Rust {
                 None
             }
         };
-        let digests =
-            futures::future::try_join_all(libs.iter().map(|path| Digest::file(path, &pool)))
-                .await?;
+        let digests = discovery.hash_toolchain_files(&libs, &pool).await?;
         Ok(Self {
             executable,
             host,
@@ -1574,14 +1572,13 @@ where
 
     fn validate_discovery<'a>(
         &'a self,
+        discovery: &'a CompilerDiscovery,
         pool: &'a tokio::runtime::Handle,
     ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
         Box::pin(async move {
             let files =
                 rust_discovery_files(&self.sysroot, &self.executable, self.dist_archive.clone())?;
-            let digests =
-                futures::future::try_join_all(files.iter().map(|path| Digest::file(path, pool)))
-                    .await?;
+            let digests = discovery.hash_toolchain_files(&files, pool).await?;
             Ok(digests == self.compiler_shlibs_digests)
         })
     }

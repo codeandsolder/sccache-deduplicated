@@ -1,4 +1,4 @@
-//! Metadata-only, cross-executor digest memo. All bytes are read in the
+//! Content-authenticated, cross-executor digest memo. All bytes are read in the
 //! credential-isolated executor. The root supervisor inspects only duplicated
 //! open file descriptors, never a requester-supplied pathname.
 use super::{frame, peer, read_sync_frame};
@@ -165,7 +165,7 @@ pub(super) fn provider(stream: UnixStream) -> DescriptorDigestProvider {
             Ok(Err(error)) => return Err(anyhow::Error::msg(error)),
             Err(error) => {
                 // The bytes were independently verified locally. Losing the
-                // metadata-only memo cannot change their action identity.
+                // immutable-content memo cannot change their action identity.
                 warn!("shared toolchain memo publication unavailable: {error:#}");
                 *guard = None;
             }

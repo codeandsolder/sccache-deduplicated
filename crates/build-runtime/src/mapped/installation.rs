@@ -1,7 +1,7 @@
 //! Verified installation metadata for short-lived compiler clients.
 //!
 //! A catalog is local trusted metadata, not an action-key input. Every reused
-//! digest is bound to a regular file version checked in the caller namespace.
+//! digest is bound to a kernel-verified immutable content identity.
 //! The normal discovery path still defines the actual recipe and its topology.
 
 use std::{
@@ -16,33 +16,28 @@ use anyhow::{Context, Result, ensure};
 use rustix::fs::{Stat, fstat};
 use serde::{Deserialize, Serialize};
 
-use super::{hash_open_source, open_source};
+use super::{
+    digest_cache::{VerityIdentity, verity_identity},
+    hash_open_source, open_source,
+};
 use crate::{
     BlobRef, InstallationManifest,
     installation::{read_document, write_document},
-    source::{FileVersion, version_is_mature},
 };
 
-const CATALOG_MAGIC: &[u8] = b"sccache-installation-catalog-v2\0";
+const CATALOG_MAGIC: &[u8] = b"sccache-installation-catalog-v3\0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct AttestedFile {
-    version: FileVersion,
+    identity: Option<VerityIdentity>,
     blob: BlobRef,
 }
 
-impl AttestedFile {
-    pub(super) fn lookup(self, stat: &Stat) -> Option<BlobRef> {
-        (self.version == FileVersion::from(stat)).then_some(self.blob)
-    }
-}
-
-/// Host- and boot-specific verified package digests. The catalog must be
+/// Content-verified package digests. The catalog must be
 /// produced and stored by the trusted installation owner, not supplied by
 /// unrelated cache clients.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InstallationCatalog {
-    boot: Vec<u8>,
     packages: BTreeSet<[u8; 32]>,
     files: BTreeMap<Vec<u8>, AttestedFile>,
 }
@@ -59,15 +54,6 @@ pub struct InstallationReport {
     pub differing_files: u64,
 }
 
-fn boot_id() -> Result<Vec<u8>> {
-    let boot = fs::read("/proc/sys/kernel/random/boot_id")?;
-    ensure!(
-        boot.len() == 37 && boot.ends_with(b"\n"),
-        "invalid Linux boot identity"
-    );
-    Ok(boot)
-}
-
 impl InstallationCatalog {
     /// Verify original package file digests against one installed sysroot.
     /// Missing or modified files remain ordinary discovered inputs.
@@ -81,7 +67,6 @@ impl InstallationCatalog {
         let root = root.canonicalize()?;
         ensure!(root.is_dir(), "installation root is not a directory");
         let mut catalog = Self {
-            boot: boot_id()?,
             packages: BTreeSet::new(),
             files: BTreeMap::new(),
         };
@@ -134,18 +119,15 @@ impl InstallationCatalog {
                 report.differing_files += 1;
                 continue;
             }
-            // Attest the verified bytes, but never publish a metadata-only
-            // fast path for a file whose original digest was acquired within
-            // a timestamp tick that may still conceal same-size rewrites.
-            if version_is_mature(&stat) {
-                let record = AttestedFile {
-                    version: FileVersion::from(&stat),
-                    blob,
-                };
-                let path = resolved.into_os_string().into_vec();
-                if let Some(previous) = catalog.files.insert(path, record) {
-                    ensure!(previous == record, "installation changed while verifying");
-                }
+            // The catalog records the expected content of all verified files.
+            // Only fs-verity identities permit subsequent reuse without reads.
+            let record = AttestedFile {
+                identity: verity_identity(&file),
+                blob,
+            };
+            let path = resolved.into_os_string().into_vec();
+            if let Some(previous) = catalog.files.insert(path, record) {
+                ensure!(previous == record, "installation changed while verifying");
             }
             report.verified_files += 1;
             report.verified_bytes += blob.size;
@@ -163,10 +145,6 @@ impl InstallationCatalog {
 
     pub(super) fn load(path: &Path) -> Result<BTreeMap<PathBuf, AttestedFile>> {
         let catalog: Self = read_document(File::open(path)?, CATALOG_MAGIC)?;
-        ensure!(
-            catalog.boot == boot_id()?,
-            "installation catalog belongs to another kernel boot"
-        );
         let mut files = BTreeMap::new();
         for (path, record) in catalog.files {
             let path = PathBuf::from(std::ffi::OsString::from_vec(path));
@@ -183,11 +161,21 @@ pub(super) fn lookup(
     file: &File,
     version: &Stat,
 ) -> Result<Option<BlobRef>> {
-    let Some(blob) = attested.get(path).and_then(|record| record.lookup(version)) else {
+    let Some(record) = attested.get(path) else {
         return Ok(None);
     };
+    let Some(identity) = verity_identity(file) else {
+        return Ok(None);
+    };
+    if record.identity != Some(identity) {
+        return Ok(None);
+    }
     crate::source::unchanged(version, &fstat(file)?)?;
-    Ok(Some(blob))
+    ensure!(
+        record.blob.size == u64::try_from(version.st_size)?,
+        "verified catalog length mismatch"
+    );
+    Ok(Some(record.blob))
 }
 
 #[cfg(all(test, feature = "store"))]

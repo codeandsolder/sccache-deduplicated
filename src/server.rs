@@ -1801,6 +1801,7 @@ where
         env: &[(OsString, OsString)],
         resolved: (PathBuf, String, Option<(PathBuf, String)>),
         proxy_digest: String,
+        discovery: crate::compiler::CompilerDiscovery,
     ) -> Result<Box<dyn Compiler<C>>> {
         let (resolved_compiler_path, digest, dist_info) = resolved;
         let info = get_compiler_info::<C>(
@@ -1810,13 +1811,7 @@ where
             args,
             env,
             &self.rt,
-            crate::compiler::CompilerDiscovery {
-                dist_archive: dist_info.clone().map(|(archive, _)| archive),
-                #[cfg(all(feature = "dist-client", target_os = "linux"))]
-                native_digests: self
-                    .native_compiler()
-                    .map(|client| client.toolchain_digests()),
-            },
+            discovery,
         )
         .await;
 
@@ -1916,6 +1911,13 @@ where
             None
         };
 
+        let discovery = crate::compiler::CompilerDiscovery {
+            dist_archive: dist_info.as_ref().map(|(archive, _)| archive.clone()),
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            native_digests: self
+                .native_compiler()
+                .map(|client| client.toolchain_digests()),
+        };
         let cached = match self.compilers.read().await.get(&resolved_compiler_path) {
             Some(Some(entry)) if entry.digest == digest && entry.dist_info == dist_info => {
                 Some(entry.compiler.box_clone())
@@ -1923,7 +1925,7 @@ where
             _ => None,
         };
         if let Some(compiler) = cached
-            && compiler.validate_discovery(&self.rt).await?
+            && compiler.validate_discovery(&discovery, &self.rt).await?
         {
             trace!("compiler_info cache hit");
             return Ok(compiler);
@@ -1937,6 +1939,7 @@ where
             env,
             (resolved_compiler_path, digest, dist_info),
             proxy_digest,
+            discovery,
         )
         .await
     }

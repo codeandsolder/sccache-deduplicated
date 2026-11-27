@@ -544,6 +544,7 @@ where
     /// Verify the content identity of compiler-specific supporting files.
     fn validate_discovery<'a>(
         &'a self,
+        _discovery: &'a CompilerDiscovery,
         _pool: &'a tokio::runtime::Handle,
     ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
         Box::pin(async { Ok(true) })

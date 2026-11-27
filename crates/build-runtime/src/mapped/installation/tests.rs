@@ -3,10 +3,9 @@ use crate::{
     ContentId, MappedMetadata, MappedTree, SourceDigestCache, TreeEntry, TreeId, TreeManifest,
     TreeMetadata, TreePath, TreeTimestamp,
 };
-use std::io::{Seek, SeekFrom};
 
 #[test]
-fn verified_installation_reuses_digest_without_reading_and_rejects_mutation() -> Result<()> {
+fn mutable_installation_is_reverified_and_rejects_mutation() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path().join("install");
     fs::create_dir(&root)?;
@@ -55,8 +54,7 @@ fn verified_installation_reuses_digest_without_reading_and_rejects_mutation() ->
     let (fresh_catalog, fresh_report) =
         InstallationCatalog::attest(&root, std::slice::from_ref(&decoded), None)?;
     assert_eq!(fresh_report.verified_files, 1);
-    assert!(fresh_catalog.files.is_empty());
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(fresh_catalog.files.len(), 1);
     let (catalog, report) =
         InstallationCatalog::attest(&root, std::slice::from_ref(&decoded), None)?;
     assert_eq!(report.verified_files, 1);
@@ -68,8 +66,8 @@ fn verified_installation_reuses_digest_without_reading_and_rejects_mutation() ->
     let (_, warm) =
         InstallationCatalog::attest(&root, std::slice::from_ref(&decoded), Some(&catalog_path))?;
     assert_eq!(warm.verified_files, 1);
-    assert_eq!(warm.reused_files, 1);
-    assert_eq!(warm.reused_bytes, 8);
+    assert_eq!(warm.reused_files, 0);
+    assert_eq!(warm.reused_bytes, 0);
     let mut cache = SourceDigestCache::default();
     cache.load_catalog(&catalog_path)?;
     let capture = |cache: Option<&SourceDigestCache>| -> Result<TreeId> {
@@ -87,24 +85,14 @@ fn verified_installation_reuses_digest_without_reading_and_rejects_mutation() ->
     };
     let original = capture(None)?;
     assert_eq!(capture(Some(&cache))?, original);
-    assert_eq!(cache.catalog_hits(), (1, 8));
-    let (mut file, stat) = open_source(&tool)?;
+    assert_eq!(cache.catalog_hits(), (0, 0));
+    let (file, stat) = open_source(&tool)?;
     assert_eq!(cache.digest(&tool, &file, &stat)?, blob);
-    assert_eq!(file.stream_position()?, 0);
-    file.seek(SeekFrom::Start(0))?;
     fs::write(&tool, b"changed!")?;
     assert_ne!(capture(Some(&cache))?, original);
     let (_, changed) = InstallationCatalog::attest(&root, &[decoded], Some(&catalog_path))?;
     assert_eq!(changed.reused_files, 0);
     assert_eq!(changed.differing_files, 2);
-    assert_eq!(cache.catalog_hits(), (2, 16));
-    let mut stale = catalog;
-    stale.boot = b"other boot".to_vec();
-    stale.write(File::create(&catalog_path)?)?;
-    assert!(
-        SourceDigestCache::default()
-            .load_catalog(&catalog_path)
-            .is_err()
-    );
+    assert_eq!(cache.catalog_hits(), (0, 0));
     Ok(())
 }

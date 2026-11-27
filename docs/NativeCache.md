@@ -848,8 +848,8 @@ file's version agree; stale records are rehashed. The catalog and recipe
 are each written atomically. These files can be retained across compiler
 processes, but the recipe does not pin the scheduler's contents indefinitely.
 The normal compiler still discovers and hashes the actual local input
-closure, including custom and modified tools; the catalog avoids repeated
-reads, and package content eliminates duplicate uploads.
+closure, including custom and modified tools; immutable fs-verity identities
+permit repeated reads to be avoided, and package content eliminates duplicate uploads.
 
 The draft native package index and portable installation manifest have
 changed format to store the verified archive length separately from the
@@ -883,23 +883,15 @@ Configure the local client (or the direct-mode daemon) with the catalog:
 native_installation_catalogs = ["/path/to/installation.catalog"]
 ```
 
-The namespace executor reads its own catalog, not a daemon-side substitute.
-The shared supervisor additionally retains a bounded metadata-only digest memo
-across credential-isolated executors. The key is the authenticated UID, GID,
-supplementary groups and mount/root identity plus the actual opened file's
-mature version. The root daemon inspects descriptor metadata without reading
-file content or opening a caller path. A miss is hashed under the caller's
-credentials; publication revalidates the descriptor and version. A conflicting
-digest disables reuse for that version. Public clients cannot use this private
-memo channel.
-Only files whose bytes verified against the expected BLAKE3 digest and whose
-current stat version matches the attestation reuse that digest. The catalog
-is scoped to the current Linux boot; reattest after reboot or installation
-changes. Missing, stale, changed and uncovered files use ordinary content
-hashing. Treat the catalog as trusted local installation metadata and store
-it with the same ownership and write controls as the installation. The
-command publishes it atomically. The compiler still discovers exact
-libraries, executable paths, symlinks, target files and host dependencies.
+The namespace executor reads its own catalog. A catalog or shared descriptor
+memo can avoid hashing file bytes only when the kernel verifies an immutable
+fs-verity content identity on a supported native filesystem. Other files,
+including ZFS and FUSE files, are always hashed from their contents. The
+private supervisor memo is scoped to authenticated credentials and filesystem
+view; no modification time, ctime, inode or age is a freshness criterion.
+Catalog records contain the verified BLAKE3 digest and optional fs-verity
+identity; version 3 replaces earlier metadata-based catalogs. Reattest older
+catalogs before use. The compiler still discovers the complete input closure.
 No action identity or sandbox tree identity changes solely because a catalog
 is present. Preseeding the scheduler with original package bytes lets the
 same content-addressed tree negotiation avoid uploads of already-known

@@ -19,26 +19,64 @@ use super::{
     hash_open_source,
     installation::{self, AttestedFile},
 };
-use crate::{
-    BlobRef, ContentId,
-    source::{FileVersion, same_version, unchanged, version_is_mature},
-};
+use crate::{BlobRef, ContentId, source::unchanged};
 
-type Slot = Arc<Mutex<Option<(Stat, BlobRef)>>>;
+// A kernel-verified Merkle-tree digest authenticates immutable contents.
+// Only use native filesystems that implement fs-verity, not arbitrary FUSE
+// implementations which can answer ioctl requests themselves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
+pub(super) struct VerityIdentity {
+    algorithm: u16,
+    digest: [u8; 32],
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn verity_identity(file: &File) -> Option<VerityIdentity> {
+    let fs = rustix::fs::fstatfs(file).ok()?;
+    // ext4, f2fs and btrfs. All other filesystems use actual byte hashing.
+    if !matches!(fs.f_type as u64, 0xef53 | 0xf2f5_2010 | 0x9123_683e) {
+        return None;
+    }
+    #[repr(C)]
+    struct Digest {
+        algorithm: u16,
+        size: u16,
+        bytes: [u8; 64],
+    }
+    const MEASURE: rustix::ioctl::Opcode = rustix::ioctl::opcode::read_write::<u32>(b'f', 134);
+    let mut digest = Digest {
+        algorithm: 0,
+        size: 64,
+        bytes: [0; 64],
+    };
+    // SAFETY: FS_IOC_MEASURE_VERITY reads the 4-byte header, then writes
+    // at most the supplied 64 bytes. The ABI uses a flexible array after
+    // two u16 fields. The file is an open regular-file descriptor.
+    unsafe { rustix::ioctl::ioctl(file, rustix::ioctl::Updater::<MEASURE, _>::new(&mut digest)) }
+        .ok()?;
+    let identity = match (digest.algorithm, digest.size) {
+        (1, 32) | (2, 64) => ContentId::of(&digest.bytes[..usize::from(digest.size)]),
+        _ => return None,
+    };
+    Some(VerityIdentity {
+        algorithm: digest.algorithm,
+        digest: identity.0,
+    })
+}
+
+type Slot = Arc<Mutex<Option<BlobRef>>>;
 /// Optional private executor memo. The file has already been opened with the
 /// caller's credentials; the provider must not reopen it by pathname.
 pub type DescriptorDigestProvider = Arc<dyn Fn(&File) -> Result<BlobRef> + Send + Sync>;
 
 #[derive(Default)]
 struct Entries {
-    by_path: HashMap<PathBuf, Slot>,
-    order: VecDeque<PathBuf>,
+    by_content: HashMap<VerityIdentity, Slot>,
+    order: VecDeque<VerityIdentity>,
 }
 
-/// Cache file digests, not bytes, for quiescent, trusted installed tools.
-///
-/// Metadata reuse assumes a filesystem that reports changes to ctime/inode
-/// identity reliably. Do not use this for mutable build-source files.
+/// Memoize a BLAKE3 mapping only for kernel-verified immutable contents.
+/// Mutable files are hashed on every discovery, irrespective of inode or age.
 pub struct SourceDigestCache {
     capacity: NonZeroUsize,
     entries: Mutex<Entries>,
@@ -61,7 +99,7 @@ impl SourceDigestCache {
         }
     }
 
-    /// Install a trusted private descriptor memo for mature toolchain files.
+    /// Install a trusted private descriptor memo for immutable toolchain files.
     #[must_use = "the returned cache owns the descriptor provider"]
     pub fn with_descriptor_provider(mut self, provider: Option<DescriptorDigestProvider>) -> Self {
         self.descriptor_provider = provider;
@@ -70,7 +108,7 @@ impl SourceDigestCache {
 
     /// Load trusted local installation metadata before sharing the memo.
     /// # Errors
-    /// Returns an error for stale boot identity, conflicting records or I/O failure.
+    /// Returns an error for conflicting records or I/O failure.
     pub fn load_catalog(&mut self, path: &Path) -> Result<()> {
         let incoming = installation::InstallationCatalog::load(path)?;
         for (path, record) in &incoming {
@@ -112,24 +150,24 @@ impl SourceDigestCache {
         self.digest(&path, &file, &version)
     }
 
-    fn slot(&self, path: &Path) -> Result<Slot> {
+    fn slot(&self, identity: VerityIdentity) -> Result<Slot> {
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| anyhow::anyhow!("source digest index poisoned"))?;
-        if let Some(slot) = entries.by_path.get(path) {
+        if let Some(slot) = entries.by_content.get(&identity) {
             return Ok(Arc::clone(slot));
         }
-        if entries.by_path.len() >= self.capacity.get() {
+        if entries.by_content.len() >= self.capacity.get() {
             let oldest = entries
                 .order
                 .pop_front()
                 .context("source digest index out of sync")?;
-            entries.by_path.remove(&oldest);
+            entries.by_content.remove(&oldest);
         }
         let slot = Arc::new(Mutex::new(None));
-        entries.order.push_back(path.to_owned());
-        entries.by_path.insert(path.to_owned(), Arc::clone(&slot));
+        entries.order.push_back(identity);
+        entries.by_content.insert(identity, Arc::clone(&slot));
         drop(entries);
         Ok(slot)
     }
@@ -140,24 +178,17 @@ impl SourceDigestCache {
             self.catalog_bytes.fetch_add(blob.size, Ordering::Relaxed);
             return Ok(blob);
         }
-        let slot = self.slot(path)?;
-        // The path-wide lock coalesces simultaneous preparations without
-        // serializing hashing of unrelated files.
+        let Some(identity) = verity_identity(file) else {
+            return hash_open_source(file, version);
+        };
+        let slot = self.slot(identity)?;
         let mut cached = slot
             .lock()
             .map_err(|_| anyhow::anyhow!("source digest slot poisoned"))?;
-        unchanged(version, &fstat(file)?)?;
-        // A same-size rewrite can preserve both timestamps within one coarse
-        // filesystem tick. A digest first measured during that tick is never
-        // safe to reuse, even after it becomes old.
-        let mature = version_is_mature(version);
-        if mature
-            && let Some((old_version, blob)) = cached.as_ref()
-            && same_version(old_version, version)
-        {
-            return Ok(*blob);
+        if let Some(blob) = *cached {
+            return Ok(blob);
         }
-        let blob = match self.descriptor_provider.as_ref().filter(|_| mature) {
+        let blob = match &self.descriptor_provider {
             Some(provider) => provider(file)?,
             None => hash_open_source(file, version)?,
         };
@@ -166,8 +197,7 @@ impl SourceDigestCache {
             blob.size == u64::try_from(version.st_size)?,
             "descriptor digest size mismatch"
         );
-        *cached = mature.then_some((*version, blob));
-        drop(cached);
+        *cached = Some(blob);
         Ok(blob)
     }
 }
@@ -195,7 +225,7 @@ fn regular_version(file: &File) -> Result<Stat> {
     Ok(version)
 }
 
-type DescriptorKey = (ContentId, FileVersion);
+type DescriptorKey = (ContentId, VerityIdentity);
 
 #[derive(Default)]
 struct DescriptorEntries {
@@ -213,9 +243,8 @@ pub struct DescriptorMemo {
 }
 
 pub struct DescriptorProbe {
-    key: DescriptorKey,
+    key: Option<DescriptorKey>,
     version: Stat,
-    mature: bool,
 }
 
 impl DescriptorMemo {
@@ -227,7 +256,7 @@ impl DescriptorMemo {
         }
     }
 
-    /// Inspect an actual open descriptor and look up its mature version.
+    /// Inspect an actual open descriptor and look up its verified content identity.
     /// # Errors
     /// Returns an error for invalid descriptors or a poisoned memo.
     pub fn probe(
@@ -236,27 +265,19 @@ impl DescriptorMemo {
         file: &File,
     ) -> Result<(DescriptorProbe, Option<BlobRef>)> {
         let version = regular_version(file)?;
-        let mature = version_is_mature(&version);
-        let key = (scope, FileVersion::from(&version));
-        let value = if mature {
+        let key = verity_identity(file).map(|identity| (scope, identity));
+        let value = if let Some(key) = &key {
             self.entries
                 .lock()
                 .map_err(|_| anyhow::anyhow!("descriptor memo poisoned"))?
                 .values
-                .get(&key)
+                .get(key)
                 .copied()
                 .flatten()
         } else {
             None
         };
-        Ok((
-            DescriptorProbe {
-                key,
-                version,
-                mature,
-            },
-            value,
-        ))
+        Ok((DescriptorProbe { key, version }, value))
     }
 
     /// Publish a digest computed by the private executor under its own
@@ -269,14 +290,18 @@ impl DescriptorMemo {
             blob.size == u64::try_from(probe.version.st_size)?,
             "descriptor digest size mismatch"
         );
-        if !probe.mature {
+        let Some(key) = probe.key else {
             return Ok(());
-        }
+        };
+        anyhow::ensure!(
+            verity_identity(file) == Some(key.1),
+            "verified descriptor identity changed"
+        );
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| anyhow::anyhow!("descriptor memo poisoned"))?;
-        if let Some(previous) = entries.values.get_mut(&probe.key) {
+        if let Some(previous) = entries.values.get_mut(&key) {
             if *previous != Some(blob) {
                 *previous = None;
                 anyhow::bail!("conflicting digest for unchanged descriptor");
@@ -290,8 +315,8 @@ impl DescriptorMemo {
                 .context("descriptor memo index out of sync")?;
             entries.values.remove(&oldest);
         }
-        entries.values.insert(probe.key, Some(blob));
-        entries.order.push_back(probe.key);
+        entries.values.insert(key, Some(blob));
+        entries.order.push_back(key);
         drop(entries);
         Ok(())
     }
@@ -307,90 +332,50 @@ impl Default for DescriptorMemo {
 mod tests {
     use super::*;
     use crate::mapped::open_source;
-    use std::{
-        fs,
-        io::{Seek, SeekFrom},
-    };
+    use std::{fs, time::SystemTime};
 
     #[test]
-    fn shared_descriptor_memo_checks_scope_version_and_capacity() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("tool");
-        let other = dir.path().join("other");
-        fs::write(&path, b"version1")?;
-        fs::write(&other, b"version2")?;
-        let memo = DescriptorMemo::new(NonZeroUsize::MIN);
-        let scope = ContentId::of(b"uid and namespace A");
-        let unrelated = ContentId::of(b"uid and namespace B");
-        let (fresh, _) = open_source(&path)?;
-        let (probe, hit) = memo.probe(scope, &fresh)?;
-        assert!(hit.is_none());
-        memo.remember(&probe, &fresh, hash_descriptor(&fresh)?)?;
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        let (file, _) = open_source(&path)?;
-        let (probe, hit) = memo.probe(scope, &file)?;
-        assert!(hit.is_none(), "fresh versions never seed later hits");
-        let expected = hash_descriptor(&file)?;
-        memo.remember(&probe, &file, expected)?;
-        let (second, _) = open_source(&path)?;
-        assert_eq!(memo.probe(scope, &second)?.1, Some(expected));
-        assert!(memo.probe(unrelated, &second)?.1.is_none());
-        let (other, _) = open_source(&other)?;
-        let (probe, hit) = memo.probe(scope, &other)?;
-        assert!(hit.is_none());
-        memo.remember(&probe, &other, hash_descriptor(&other)?)?;
-        assert!(memo.probe(scope, &second)?.1.is_none());
-        let (probe, _) = memo.probe(scope, &second)?;
-        fs::write(&path, b"modified")?;
-        assert!(memo.remember(&probe, &second, expected).is_err());
-        assert!(memo.probe(scope, &second)?.1.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn reuse_does_not_read_and_versions_invalidate_memo() -> Result<()> {
+    fn mutable_file_same_size_and_mtime_is_never_reused() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("tool");
         fs::write(&path, b"version1")?;
-        // Exercise the stable fast path after the filesystem timestamp tick,
-        // then exercise immediate same-size mutations below.
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        let old = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_modified(old)?;
         let cache = SourceDigestCache::new(NonZeroUsize::MIN);
-        let (mut file, version) = open_source(&path)?;
-        let initial = cache.digest(&path, &file, &version)?;
-        assert_eq!(initial.id, ContentId::of(b"version1"));
-        file.seek(SeekFrom::Start(0))?;
-        assert_eq!(cache.digest(&path, &file, &version)?, initial);
+        let (file, version) = open_source(&path)?;
         assert_eq!(
-            file.stream_position()?,
-            0,
-            "warm digest must not read source"
+            cache.digest(&path, &file, &version)?.id,
+            ContentId::of(b"version1")
         );
-        let replacement = temp.path().join("replacement");
-        fs::write(&replacement, b"version2")?;
-        fs::rename(&replacement, &path)?;
+        let memo = DescriptorMemo::default();
+        let scope = ContentId::of(b"scope");
+        let (probe, hit) = memo.probe(scope, &file)?;
+        assert!(hit.is_none());
+        let (file, _) = open_source(&path)?;
+        memo.remember(&probe, &file, hash_descriptor(&file)?)?;
+        assert!(memo.probe(scope, &file)?.1.is_none());
+        fs::write(&path, b"version2")?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_modified(old)?;
         let (file, version) = open_source(&path)?;
         assert_eq!(
             cache.digest(&path, &file, &version)?.id,
             ContentId::of(b"version2")
         );
-        fs::write(&path, b"version3")?;
-        let (file, version) = open_source(&path)?;
-        assert_eq!(
-            cache.digest(&path, &file, &version)?.id,
-            ContentId::of(b"version3")
+        assert!(memo.probe(scope, &file)?.1.is_none());
+        assert!(
+            cache
+                .entries
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned memo"))?
+                .by_content
+                .is_empty()
         );
-        let other = temp.path().join("other");
-        fs::write(&other, b"other")?;
-        let (file, version) = open_source(&other)?;
-        cache.digest(&other, &file, &version)?;
-        let entries = cache
-            .entries
-            .lock()
-            .map_err(|_| anyhow::anyhow!("poisoned memo"))?;
-        assert_eq!(entries.by_path.len(), 1);
-        assert!(!entries.by_path.contains_key(&path));
-        drop(entries);
         Ok(())
     }
 }

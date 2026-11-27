@@ -739,9 +739,6 @@ fn rustup_sync_acquires_once_and_reuses_portable_recipe_and_catalog() -> Result<
             },
         )]),
     )?;
-    // Installed files must be older than the source digest race window before
-    // metadata-only attestation can safely remember them.
-    std::thread::sleep(Duration::from_secs(3));
     let config = provisioning_config(root, &fleet)?;
     let catalog = root.join("installation.catalog");
     let recipe = root.join("installation.recipe");
@@ -787,7 +784,7 @@ fn rustup_sync_acquires_once_and_reuses_portable_recipe_and_catalog() -> Result<
     let warm = json_output(sync_rustup_command(&sysroot, &config, &catalog, &recipe).output()?)?;
     assert_eq!(warm["packages"]["downloaded_archive_bytes"], 0);
     assert_eq!(warm["packages"]["reused_packages"], 2);
-    assert_eq!(warm["attestation"]["reused_files"], 2);
+    assert_eq!(warm["attestation"]["reused_files"], 0);
     assert_eq!(upstream.count(), 2);
     let (scheduler, worker) = fleet.finish()?;
     assert_eq!(scheduler.blobs, 9);
@@ -808,7 +805,7 @@ fn rustup_sync_acquires_once_and_reuses_portable_recipe_and_catalog() -> Result<
             .arg(&catalog)
             .output()?,
     )?;
-    assert_eq!(report["reused_files"], 1);
+    assert_eq!(report["reused_files"], 0);
     assert_eq!(report["differing_files"], 1);
     Ok(())
 }
@@ -2705,8 +2702,8 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         "catalog-backed namespace compilation failed: {log}"
     );
     assert!(
-        log.contains("verified installation memo: 1 files"),
-        "catalog not used: {log}"
+        log.contains("verified installation memo: 0 files"),
+        "mutable catalog entry unexpectedly reused: {log}"
     );
     assert_eq!(
         fs::read(private.join("build/libprobe.rlib"))?,
