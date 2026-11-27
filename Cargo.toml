@@ -83,6 +83,7 @@ semver = "1.0"
 sccache-peer-identity = { path = "crates/peer-identity" }
 sccache-cluster-identity = { path = "crates/cluster-identity", optional = true }
 sccache-build = { path = "crates/build-runtime", default-features = false }
+sccache-rust-build = { path = "crates/rust-build" }
 sccache-dashboard = { path = "crates/scheduler-dashboard", optional = true, features = ["ssr"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11.19"
@@ -274,7 +275,7 @@ dist-tests = ["dist-client", "dist-server"]
 
 [workspace]
 exclude = ["tests/test-crate"]
-members = ["crates/build-runtime", "crates/cluster-identity", "crates/peer-identity", "crates/scheduler-dashboard", "tests/integration/randomize_readdir"]
+members = ["crates/rust-build", "crates/build-runtime", "crates/cluster-identity", "crates/peer-identity", "crates/scheduler-dashboard", "tests/integration/randomize_readdir"]
 
 [workspace.dependencies]
 btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a4b12ba7391e03470626504fad60d887be790cfb" }

@@ -1,0 +1,506 @@
+use anyhow::{Context, Result, bail, ensure};
+use semver::Version;
+use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::{self, Seek, SeekFrom},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
+
+use crate::{Dependency, Manifest, Workspace};
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LockedPackage {
+    pub name: String,
+    pub version: Version,
+    pub source: Option<String>,
+    pub checksum: Option<String>,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct Lockfile {
+    pub version: Option<u32>,
+    #[serde(default, rename = "package")]
+    pub packages: Vec<LockedPackage>,
+}
+
+impl Lockfile {
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let lock: Self = toml::from_str(&fs::read_to_string(path)?)?;
+        ensure!(
+            matches!(lock.version, Some(3 | 4)),
+            "unsupported lockfile version {:?}",
+            lock.version
+        );
+        Ok(lock)
+    }
+
+    fn parent(&self, manifest: &Manifest, source: Option<&str>) -> Result<Option<&LockedPackage>> {
+        let mut matches = self.packages.iter().filter(|p| {
+            p.name == manifest.package.name
+                && p.version == manifest.package.version
+                && p.source.as_deref() == source
+        });
+        let result = matches.next();
+        ensure!(
+            matches.next().is_none(),
+            "ambiguous lock identity for {}",
+            manifest.package.name
+        );
+        Ok(result)
+    }
+}
+
+pub struct Sources<'a> {
+    pub workspace: &'a Workspace,
+    pub lock: Lockfile,
+    pub import_root: Option<PathBuf>,
+    pub scratch: PathBuf,
+    /// Stream a verified registry archive to the provided staging file.
+    pub download: Option<&'a dyn Fn(&str, &mut fs::File) -> Result<()>>,
+    materialized: BTreeMap<String, PathBuf>,
+}
+
+fn identity(package: &LockedPackage) -> String {
+    format!(
+        "{} {} {}",
+        package.name,
+        package.version,
+        package.source.as_deref().unwrap_or("path")
+    )
+}
+
+fn locked_edge(edge: &str, package: &LockedPackage) -> bool {
+    let mut fields = edge.splitn(3, ' ');
+    if fields.next() != Some(package.name.as_str()) {
+        return false;
+    }
+    if let Some(version) = fields.next() {
+        if version != package.version.to_string() {
+            return false;
+        }
+    }
+    if let Some(source) = fields.next() {
+        return source.strip_prefix('(').and_then(|s| s.strip_suffix(')'))
+            == package.source.as_deref();
+    }
+    true
+}
+
+impl<'a> Sources<'a> {
+    pub fn new(
+        workspace: &'a Workspace,
+        lock: Lockfile,
+        import_root: Option<PathBuf>,
+        scratch: PathBuf,
+    ) -> Self {
+        Self {
+            workspace,
+            lock,
+            import_root,
+            scratch,
+            download: None,
+            materialized: BTreeMap::new(),
+        }
+    }
+
+    /// The lockfile provides the selected exact versions, including duplicate
+    /// semver-compatible versions. Never substitute a newer cached package.
+    pub fn dependency(
+        &mut self,
+        parent: &Manifest,
+        parent_source: Option<&str>,
+        dep: &Dependency,
+    ) -> Result<(Manifest, Option<String>)> {
+        if let Some(path) = &dep.path {
+            let root = path
+                .canonicalize()
+                .with_context(|| format!("resolve path dependency {}", dep.alias))?;
+            let workspace = if root.starts_with(&self.workspace.root) {
+                Some(self.workspace)
+            } else {
+                None
+            };
+            let manifest = if workspace.is_some() {
+                Manifest::load(&root, workspace)?
+            } else {
+                load_discovered(&root)?
+            };
+            validate_dependency(&manifest, dep)?;
+            if !self.lock.packages.is_empty() {
+                let locked = self
+                    .lock
+                    .parent(parent, parent_source)?
+                    .context("parent is absent from lockfile")?;
+                let child = self
+                    .lock
+                    .parent(&manifest, parent_source)?
+                    .or(self.lock.parent(&manifest, None)?)
+                    .context("path dependency absent from lockfile")?;
+                ensure!(
+                    locked
+                        .dependencies
+                        .iter()
+                        .any(|edge| locked_edge(edge, child)),
+                    "path edge {} is absent from lockfile",
+                    dep.alias
+                );
+            }
+            return Ok((manifest, parent_source.map(str::to_owned)));
+        }
+        let parent_lock = self.lock.parent(parent, parent_source)?.with_context(|| {
+            format!(
+                "{} requires a lockfile for external dependency {}",
+                parent.package.name, dep.alias
+            )
+        })?;
+        let candidates: Vec<_> = self
+            .lock
+            .packages
+            .iter()
+            .filter(|p| {
+                p.name == dep.name
+                    && dep.requirement.matches(&p.version)
+                    && parent_lock
+                        .dependencies
+                        .iter()
+                        .any(|edge| locked_edge(edge, p))
+                    && dep.git.as_ref().is_none_or(|git| {
+                        p.source.as_ref().is_some_and(|s| {
+                            s.strip_prefix("git+")
+                                .is_some_and(|s| s.split(['?', '#']).next() == Some(git))
+                        })
+                    })
+            })
+            .cloned()
+            .collect();
+        ensure!(
+            candidates.len() == 1,
+            "lockfile edge {} -> {} has {} candidates",
+            parent.package.name,
+            dep.alias,
+            candidates.len()
+        );
+        let locked = &candidates[0];
+        let root = match locked.source.as_deref() {
+            Some(source) if source.starts_with("registry+") || source.starts_with("sparse+") => {
+                self.registry(locked)?
+            }
+            Some(source) if source.starts_with("git+") => self.git(locked)?,
+            None => self.patched_path(locked)?,
+            Some(source) => bail!("unsupported locked source {source}"),
+        };
+        let manifest = if root.starts_with(&self.workspace.root) {
+            Manifest::load(&root, Some(self.workspace))?
+        } else {
+            load_discovered(&root)?
+        };
+        validate_dependency(&manifest, dep)?;
+        ensure!(
+            manifest.package.version == locked.version,
+            "locked package version mismatch"
+        );
+        Ok((manifest, locked.source.clone()))
+    }
+
+    fn patched_path(&self, package: &LockedPackage) -> Result<PathBuf> {
+        let mut candidates = BTreeSet::new();
+        if let Some(patches) = self
+            .workspace
+            .document
+            .get("patch")
+            .and_then(toml::Value::as_table)
+        {
+            for table in patches.values().filter_map(toml::Value::as_table) {
+                for (alias, spec) in table {
+                    if let Some(spec) = spec.as_table() {
+                        if spec
+                            .get("package")
+                            .and_then(toml::Value::as_str)
+                            .unwrap_or(alias)
+                            == package.name
+                            && let Some(path) = spec.get("path").and_then(toml::Value::as_str)
+                        {
+                            candidates.insert(self.workspace.root.join(path).canonicalize()?);
+                        }
+                    }
+                }
+            }
+        }
+        candidates.extend(self.workspace.members.iter().cloned());
+        let mut found = Vec::new();
+        for path in candidates {
+            let manifest = Manifest::load(&path, Some(self.workspace))?;
+            if manifest.package.name == package.name && manifest.package.version == package.version
+            {
+                found.push(path);
+            }
+        }
+        ensure!(
+            found.len() == 1,
+            "cannot uniquely locate path patch {}",
+            identity(package)
+        );
+        Ok(found.remove(0))
+    }
+
+    fn registry(&mut self, package: &LockedPackage) -> Result<PathBuf> {
+        let key = identity(package);
+        if let Some(root) = self.materialized.get(&key) {
+            return Ok(root.clone());
+        }
+        let source = package
+            .source
+            .as_deref()
+            .context("missing registry source")?;
+        let checksum = package
+            .checksum
+            .as_ref()
+            .context("registry lock has no checksum")?;
+        let name = &package.name;
+        ensure!(
+            name.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "invalid registry package name"
+        );
+        let stem = format!("{}-{}", name, package.version);
+        let filename = format!("{stem}.crate");
+        let root = self
+            .scratch
+            .join("registry")
+            .join(blake3::hash(key.as_bytes()).to_hex().as_str());
+        fs::create_dir_all(&root)?;
+        let mut archive = None;
+        if let Some(import) = &self.import_root {
+            let cache = import.join("registry/cache");
+            if cache.is_dir() {
+                for entry in fs::read_dir(cache)? {
+                    let path = entry?.path().join(&filename);
+                    if path.is_file() {
+                        let mut file = fs::File::open(path)?;
+                        if verify(&mut file, checksum)? {
+                            archive = Some(file);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if archive.is_none() {
+            let download = self
+                .download
+                .context("locked crate archive not available offline")?;
+            ensure!(
+                matches!(
+                    source,
+                    "registry+https://github.com/rust-lang/crates.io-index"
+                        | "sparse+https://index.crates.io/"
+                ),
+                "download configuration missing for {source}"
+            );
+            let path = root.join("download.crate");
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            download(
+                &format!("https://static.crates.io/crates/{name}/{filename}"),
+                &mut file,
+            )?;
+            ensure!(
+                verify(&mut file, checksum)?,
+                "download checksum mismatch for {stem}"
+            );
+            archive = Some(file);
+            // The open descriptor keeps the bytes alive until extraction ends.
+            fs::remove_file(path)?;
+        }
+        let file = archive.context("missing registry archive")?;
+        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+        tar.set_preserve_mtime(false);
+        for entry in tar.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.into_owned();
+            ensure!(
+                path.starts_with(&stem),
+                "archive entry outside package root"
+            );
+            ensure!(
+                entry.header().entry_type().is_file() || entry.header().entry_type().is_dir(),
+                "unsupported registry archive entry"
+            );
+            ensure!(entry.unpack_in(&root)?, "invalid registry archive path");
+        }
+        let root = root.join(stem);
+        self.materialized.insert(key, root.clone());
+        Ok(root)
+    }
+
+    fn git(&mut self, package: &LockedPackage) -> Result<PathBuf> {
+        let key = identity(package);
+        if let Some(root) = self.materialized.get(&key) {
+            return Ok(root.clone());
+        }
+        let source = package.source.as_deref().context("missing git source")?;
+        let (url, commit) = source
+            .strip_prefix("git+")
+            .context("not a git source")?
+            .rsplit_once('#')
+            .context("git lock lacks commit")?;
+        ensure!(
+            commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid git commit"
+        );
+        let url = url.split('?').next().context("missing git URL")?;
+        let root = self
+            .scratch
+            .join("git")
+            .join(blake3::hash(source.as_bytes()).to_hex().as_str());
+        if !root.exists() {
+            fs::create_dir_all(&root)?;
+            let mut repository = None;
+            if let Some(import) = &self.import_root {
+                let db = import.join("git/db");
+                if db.is_dir() {
+                    for entry in fs::read_dir(db)? {
+                        let path = entry?.path();
+                        if Command::new("git")
+                            .arg("--git-dir")
+                            .arg(&path)
+                            .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status()?
+                            .success()
+                        {
+                            repository = Some(path);
+                            break;
+                        }
+                    }
+                }
+            }
+            if repository.is_none() {
+                ensure!(
+                    self.download.is_some(),
+                    "locked git commit is not available offline"
+                );
+                let repo = self
+                    .scratch
+                    .join("git-objects")
+                    .join(blake3::hash(source.as_bytes()).to_hex().as_str());
+                fs::create_dir_all(&repo)?;
+                ensure!(
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(&repo)
+                        .args(["init", "--bare", "--quiet"])
+                        .status()?
+                        .success(),
+                    "git init failed"
+                );
+                ensure!(
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(&repo)
+                        .args(["fetch", "--no-tags", "--depth=1", "--", url, commit])
+                        .status()?
+                        .success(),
+                    "git fetch failed"
+                );
+                repository = Some(repo);
+            }
+            let repo = repository.context("missing git object database")?;
+            let listing = Command::new("git")
+                .arg("--git-dir")
+                .arg(&repo)
+                .args(["ls-tree", "-r", commit])
+                .output()?;
+            ensure!(listing.status.success(), "git tree inspection failed");
+            ensure!(
+                !listing
+                    .stdout
+                    .split(|b| *b == b'\n')
+                    .any(|line| line.starts_with(b"160000 ")),
+                "git submodule checkout requires explicit source resolution"
+            );
+            let mut child = Command::new("git")
+                .arg("--git-dir")
+                .arg(repo)
+                .args(["archive", "--format=tar", commit])
+                .stdout(Stdio::piped())
+                .spawn()?;
+            let mut tar = tar::Archive::new(child.stdout.take().context("git archive stdout")?);
+            tar.set_preserve_mtime(false);
+            let result = tar.unpack(&root);
+            drop(tar);
+            let status = child.wait()?;
+            result?;
+            ensure!(status.success(), "git archive failed");
+        }
+        fn find(
+            root: &Path,
+            name: &str,
+            version: &Version,
+            found: &mut Vec<PathBuf>,
+        ) -> Result<()> {
+            if root.join("Cargo.toml").is_file() {
+                if let Ok(manifest) = load_discovered(root) {
+                    if manifest.package.name == name && &manifest.package.version == version {
+                        found.push(root.to_path_buf());
+                    }
+                }
+            }
+            for entry in fs::read_dir(root)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir()
+                    && !entry.file_name().to_string_lossy().starts_with('.')
+                {
+                    find(&entry.path(), name, version, found)?;
+                }
+            }
+            Ok(())
+        }
+        let mut found = Vec::new();
+        find(&root, &package.name, &package.version, &mut found)?;
+        ensure!(
+            found.len() == 1,
+            "cannot locate unique locked git package {key}"
+        );
+        let result = found.remove(0);
+        self.materialized.insert(key, result.clone());
+        Ok(result)
+    }
+}
+
+fn load_discovered(root: &Path) -> Result<Manifest> {
+    let workspace = Workspace::discover(&root.join("Cargo.toml"))?;
+    workspace.package(root)
+}
+
+fn validate_dependency(manifest: &Manifest, dep: &Dependency) -> Result<()> {
+    ensure!(
+        manifest.package.name == dep.name && dep.requirement.matches(&manifest.package.version),
+        "dependency {} resolved to wrong package {} {}",
+        dep.alias,
+        manifest.package.name,
+        manifest.package.version
+    );
+    Ok(())
+}
+
+fn verify(file: &mut fs::File, checksum: &str) -> Result<bool> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut sha = Sha256::new();
+    io::copy(file, &mut sha)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(format!("{:x}", sha.finalize()) == checksum)
+}
