@@ -149,7 +149,7 @@ impl NativeWorker {
         let blobs = self.store.reserve_blobs(&assignment.input_blobs)?;
         let mut trees = Vec::new();
         for tree in assignment.spec.action_request()?.input_trees {
-            if let Some(pin) = self.store.lookup_tree(tree)? {
+            if let Some(pin) = self.store.lookup_resident_tree(tree)? {
                 trees.push(pin);
             }
         }

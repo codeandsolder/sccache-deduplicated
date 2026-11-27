@@ -28,7 +28,7 @@ mod linux {
     use sccache_build::{
         BuildPath, CommandSpec, ContentId, ExecutionPolicy, ExecutionRoot, ExecutionSpec,
         NativeStore, OutputSpec, TreeEntry, TreeManifest, TreeMetadata, TreePath, TreeRecipe,
-        TreeTimestamp, execute,
+        TreeTimestamp, acquire_execution_inputs, execute,
     };
 
     const HEADER_COUNT: usize = 384;
@@ -488,8 +488,18 @@ mod linux {
     ) -> Result<()> {
         let before = arc()?;
         let started = Instant::now();
-        let execution = execute(spec, store, policy, None, || Ok(()))?;
+        let inputs = acquire_execution_inputs(spec, store)?;
+        let admission = started.elapsed();
+        let execution = execute(spec, store, policy, &inputs, None, || Ok(()))?;
         let elapsed = started.elapsed();
+        let timing = execution.timings();
+        println!(
+            "PHASE backend={backend} iteration={index} admission_us={} preparation_us={} process_us={} capture_us={}",
+            admission.as_micros(),
+            timing.preparation.as_micros(),
+            timing.process.as_micros(),
+            timing.capture.as_micros()
+        );
         if !execution.status().success() {
             let mut diagnostic = String::new();
             if let Some(stderr) = execution.diagnostics().1 {

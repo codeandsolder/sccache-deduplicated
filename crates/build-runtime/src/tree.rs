@@ -127,7 +127,13 @@ impl TreeManifest {
     /// Returns an error for invalid paths, missing parents, unsupported
     /// permissions, invalid hardlinks or inconsistent content lengths.
     pub fn validate(&self) -> Result<()> {
+        self.validate_and_blobs()?;
+        Ok(())
+    }
+
+    fn validate_and_blobs(&self) -> Result<BTreeMap<ContentId, u64>> {
         self.root.validate()?;
+        let mut blobs = BTreeMap::new();
         for (path, entry) in &self.entries {
             path.validate()?;
             if let Some(parent) = path.parent() {
@@ -137,8 +143,12 @@ impl TreeManifest {
                 );
             }
             match entry {
-                TreeEntry::Directory(metadata) | TreeEntry::File { metadata, .. } => {
+                TreeEntry::Directory(metadata) => metadata.validate()?,
+                TreeEntry::File { blob, metadata } => {
                     metadata.validate()?;
+                    if let Some(previous) = blobs.insert(blob.id, blob.size) {
+                        ensure!(previous == blob.size, "inconsistent tree content length");
+                    }
                 }
                 TreeEntry::Symlink { target, modified } => {
                     ensure!(
@@ -156,8 +166,7 @@ impl TreeManifest {
                 }
             }
         }
-        self.blobs()?;
-        Ok(())
+        Ok(blobs)
     }
 
     /// Derive a stable identity for a valid normalized tree.
@@ -165,8 +174,12 @@ impl TreeManifest {
     /// # Errors
     /// Returns an error for an invalid tree or serialization failure.
     pub fn id(&self) -> Result<TreeId> {
-        self.validate()?;
-        Ok(TreeId(typed_digest(b"sccache-tree-v1\0", self)?))
+        Ok(self.identity_and_blobs()?.0)
+    }
+
+    pub(crate) fn identity_and_blobs(&self) -> Result<(TreeId, BTreeMap<ContentId, u64>)> {
+        let blobs = self.validate_and_blobs()?;
+        Ok((TreeId(typed_digest(b"sccache-tree-v1\0", self)?), blobs))
     }
 
     /// Unique file contents required by this tree.

@@ -11,9 +11,6 @@ use std::{
     time::Instant,
 };
 
-#[cfg(target_os = "linux")]
-use std::collections::VecDeque;
-
 use anyhow::{Context, Result, anyhow, ensure};
 use bincode::Options;
 use redb::{
@@ -1071,115 +1068,18 @@ impl<R: Read> Read for ReservingReader<'_, R> {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod resident;
+
 /// Single-owner, durable action index and content-addressed file storage.
-///
 /// Blocking storage operations belong on an I/O executor rather than the
-/// scheduler's asynchronous control loop. Provision the directory on a
-/// dedicated compressed filesystem/dataset; this type does not create pools,
-/// change filesystem properties or start other cache services.
-#[cfg(target_os = "linux")]
-const MAX_CACHED_TREE_MOUNTS: usize = 16;
-
-/// A bounded set of persistent immutable views, independent of each action's
-/// private writable scratch. Reusing a view preserves kernel page-cache pages.
-#[cfg(target_os = "linux")]
-#[derive(Default)]
-struct MountCache {
-    entries: BTreeMap<crate::TreeId, Arc<trees::ReadOnlyView>>,
-    order: VecDeque<crate::TreeId>,
-}
-
-#[cfg(target_os = "linux")]
-impl MountCache {
-    fn mount(
-        &mut self,
-        lease: trees::TreeLease,
-        persistent: &Path,
-        scratch: &Path,
-        native_zfs: bool,
-        protected: &[PathBuf],
-    ) -> Result<trees::MountedTree> {
-        let key = lease.id();
-        if let Some(view) = self.entries.get(&key) {
-            let mounted = trees::MountedTree::from_view(Arc::clone(view), scratch)?;
-            self.order.retain(|other| other != &key);
-            self.order.push_back(key);
-            return Ok(mounted);
-        }
-        // A new action identity need not imply a new physical view. Reuse
-        // unchanged directories, symlinks and hardlink groups from a cached
-        // root; only differing regular files are cloned/decoded into private
-        // files and read-only bound into the sandbox. Never reuse changed
-        // files beneath writable or already-mounted paths.
-        let best = self
-            .entries
-            .iter()
-            .filter_map(|(&id, view)| {
-                let plan = trees::plan_overlays(view.manifest(), lease.manifest(), protected)?;
-                // Only reuse when the changed subtree is a minority of the
-                // target: avoid spawning extra bind mounts for nearly
-                // complete replacements.
-                (plan.materialized_entries < lease.manifest().entries.len().div_ceil(2))
-                    .then_some((id, plan))
-            })
-            .min_by_key(|(id, plan)| (plan.materialized_entries, *id));
-        if let Some((base_id, plan)) = best {
-            let view = Arc::clone(&self.entries[&base_id]);
-            let mut mounted = trees::MountedTree::from_view(view, scratch)?;
-            let overlay = lease.materialize_overlays(&plan, scratch)?;
-            let stats = overlay.stats;
-            mounted.attach_overlays(overlay);
-            log::debug!(
-                "native CAS reused immutable tree {base_id:?} with {} changed files, {} changed subtrees, {} block clones, {} copied bytes",
-                plan.files.len(),
-                plan.directories.len(),
-                stats.cloned_files,
-                stats.copied_bytes,
-            );
-            self.order.retain(|other| other != &base_id);
-            self.order.push_back(base_id);
-            return Ok(mounted);
-        }
-        let view = Arc::new(if native_zfs {
-            trees::ReadOnlyView::materialize_zfs(lease, persistent)?
-        } else {
-            trees::ReadOnlyView::mount_fuse(lease, persistent)?
-        });
-        let mounted = trees::MountedTree::from_view(Arc::clone(&view), scratch)?;
-        self.entries.insert(key, view);
-        self.order.push_back(key);
-        while self.entries.len() > MAX_CACHED_TREE_MOUNTS {
-            if let Some(least_recent) = self.order.pop_front() {
-                self.entries.remove(&least_recent);
-            }
-        }
-        Ok(mounted)
-    }
-
-    /// Drop inactive cached views before evicting durable CAS content.
-    /// A view held by an executing build retains its lease and is not evicted.
-    fn drop_idle(&mut self, only: Option<crate::TreeId>) {
-        let unused: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|(id, view)| {
-                only.is_none_or(|target| **id == target) && Arc::strong_count(view) == 1
-            })
-            .map(|(&id, _)| id)
-            .collect();
-        for key in &unused {
-            self.entries.remove(key);
-        }
-        self.order.retain(|key| !unused.contains(key));
-    }
-}
-
+/// scheduler's asynchronous control loop.
 #[derive(Clone)]
 pub struct NativeStore {
     inner: Arc<Inner>,
     physical_encoding: BlobEncoding,
     #[cfg(target_os = "linux")]
-    mounts: Arc<Mutex<MountCache>>,
+    resident: Arc<resident::ResidentRuntime>,
 }
 
 impl NativeStore {
@@ -1195,33 +1095,63 @@ impl NativeStore {
         self.inner.space_policy
     }
 
+    /// Reuse a verified, pinned input lease across worker admission and
+    /// execution. A cold identity is verified by the ordinary store lookup.
+    /// No idle lease is owned by this memo; resident immutable views and
+    /// active jobs provide its lifetime.
+    /// # Errors
+    /// Returns an error for invalid content or failed store access.
+    #[cfg(target_os = "linux")]
+    pub fn lookup_resident_tree(&self, id: crate::TreeId) -> Result<Option<Arc<trees::TreeLease>>> {
+        self.resident.lookup_tree(self, id)
+    }
+
+    /// Register a newly acquired indexed input with the worker's resident
+    /// runtime, sharing an existing verified lease if another job owns one.
+    /// # Errors
+    /// Returns an error for an unrelated store or non-indexed lease.
+    #[cfg(target_os = "linux")]
+    pub fn remember_resident_tree(
+        &self,
+        lease: Arc<trees::TreeLease>,
+    ) -> Result<Arc<trees::TreeLease>> {
+        self.resident.remember_tree(self, lease)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn resident_recipe(
+        &self,
+        root: &crate::ExecutionRoot,
+        inputs: &BTreeMap<crate::TreeId, Arc<trees::TreeLease>>,
+    ) -> Result<Arc<trees::TreeLease>> {
+        self.resident.recipe(self, root, inputs)
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn mount_tree_protected(
         &self,
-        lease: trees::TreeLease,
+        lease: impl Into<Arc<trees::TreeLease>>,
         parent: &Path,
         protected: &[PathBuf],
     ) -> Result<trees::MountedTree> {
+        let lease = lease.into();
+        ensure!(
+            lease.belongs_to(self),
+            "native mount lease belongs to another store"
+        );
         let native_zfs = self.can_clone_into(parent)?;
-        self.mounts
-            .lock()
-            .map_err(|_| anyhow!("native CAS mount cache lock poisoned"))?
-            .mount(
-                lease,
-                &self.inner.root.join("mounts"),
-                parent,
-                native_zfs,
-                protected,
-            )
+        self.resident.mount(
+            lease,
+            &self.inner.root.join("mounts"),
+            parent,
+            native_zfs,
+            protected,
+        )
     }
 
     #[cfg(target_os = "linux")]
     fn drop_idle_views(&self, only: Option<crate::TreeId>) -> Result<()> {
-        self.mounts
-            .lock()
-            .map_err(|_| anyhow!("native CAS mount cache lock poisoned"))?
-            .drop_idle(only);
-        Ok(())
+        self.resident.drop_idle(only)
     }
 
     /// Open or initialize an exclusive store and recover unreferenced files.
@@ -1332,7 +1262,7 @@ impl NativeStore {
             inner,
             physical_encoding,
             #[cfg(target_os = "linux")]
-            mounts: Arc::new(Mutex::new(MountCache::default())),
+            resident: Arc::new(resident::ResidentRuntime::default()),
         })
     }
 

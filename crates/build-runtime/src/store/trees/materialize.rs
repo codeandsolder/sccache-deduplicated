@@ -5,6 +5,7 @@ use std::{
     io,
     os::unix::{ffi::OsStrExt, fs::symlink},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -20,14 +21,14 @@ use crate::{
 /// Private file bindings for changed entries of a composed tree.
 /// The target lease pins its blobs; the cached base holds the unchanged files.
 pub struct OverlayFiles {
-    lease: TreeLease,
+    lease: Arc<TreeLease>,
     directory: TempDir,
     pub(super) replacements: BTreeMap<TreePath, PathBuf>,
     pub(crate) stats: MaterializationStats,
 }
 
 impl OverlayFiles {
-    pub(super) const fn manifest(&self) -> &crate::TreeManifest {
+    pub(super) fn manifest(&self) -> &crate::TreeManifest {
         self.lease.manifest()
     }
 }
@@ -49,7 +50,7 @@ impl TreeLease {
     /// Materialize only planned private file and complete directory overlays
     /// from the target lease, preserving original mode, mtime and hardlinks.
     pub(crate) fn materialize_overlays(
-        self,
+        self: Arc<Self>,
         plan: &OverlayPlan,
         parent: &Path,
     ) -> Result<OverlayFiles> {
@@ -248,7 +249,11 @@ mod cleanup_tests {
             directories: vec![TreePath::new(b"src/work".to_vec())?],
             materialized_entries: 4,
         };
-        assert!(lease.materialize_overlays(&plan, &scratch).is_err());
+        assert!(
+            Arc::new(lease)
+                .materialize_overlays(&plan, &scratch)
+                .is_err()
+        );
         assert_eq!(fs::read_dir(&scratch)?.count(), 0);
         Ok(())
     }

@@ -564,8 +564,9 @@ impl NativeCacheClient {
             let on_tree = preparation.on_tree;
             for (id, cached) in cached {
                 check()?;
+                let already_resident = cached.is_some();
                 let (tree, hit) = if let Some(tree) = cached {
-                    (Arc::new(tree), true)
+                    (tree, true)
                 } else if delivery.artifact_grace.is_none() {
                     warm = false;
                     // Shared-store acquisition depends on the scheduler's own
@@ -593,6 +594,16 @@ impl NativeCacheClient {
                     }))
                     .await?
                 };
+                // Cold acquisition may race assignment/admission on another
+                // job. Join the same verified resident lease without blocking
+                // the async transport executor on a cold per-tree lookup.
+                let tree = if already_resident {
+                    tree
+                } else {
+                    let store = store.clone();
+                    tokio::task::spawn_blocking(move || store.remember_resident_tree(tree))
+                        .await??
+                };
                 trace_tree_access(id, &tree, hit)?;
                 on_tree(&tree);
                 inputs.push(tree);
@@ -602,7 +613,7 @@ impl NativeCacheClient {
                 .await?;
             Ok(PreparedExecution {
                 request,
-                _inputs: inputs,
+                inputs,
                 output,
                 warm_staging: warm.then(|| started.elapsed()),
             })
@@ -672,11 +683,13 @@ impl NativeCacheClient {
                 check,
                 &mut |_| {},
             )?;
+            let budget = prepared.take_budget();
             let captured = compile(
                 context,
                 control.queue,
                 control.transport,
-                prepared.take_budget(),
+                &prepared.inputs,
+                budget,
                 check,
                 || {},
             )?;
@@ -736,11 +749,12 @@ impl NativeCacheClient {
         let mut inputs = Vec::new();
         for id in &request.input_trees {
             check()?;
-            let (tree, hit) = if let Some(tree) = store.lookup_tree(*id)? {
-                (Arc::new(tree), true)
+            let (tree, hit) = if let Some(tree) = store.lookup_resident_tree(*id)? {
+                (tree, true)
             } else {
                 warm = false;
-                store.acquire_tree(*id, check, || fetch(*id, check, on_tree))?
+                let (tree, hit) = store.acquire_tree(*id, check, || fetch(*id, check, on_tree))?;
+                (store.remember_resident_tree(tree)?, hit)
             };
             trace_tree_access(*id, &tree, hit)?;
             on_tree(&tree);
@@ -765,7 +779,7 @@ impl NativeCacheClient {
         }
         Ok(PreparedExecution {
             request,
-            _inputs: inputs,
+            inputs,
             output,
             warm_staging: warm.then(|| started.elapsed()),
         })
@@ -898,7 +912,7 @@ impl NativeCacheClient {
 
 struct WorkerStorage {
     output: Option<OutputReservation>,
-    cached: Vec<(TreeId, Option<TreeLease>)>,
+    cached: Vec<(TreeId, Option<Arc<TreeLease>>)>,
     warm: bool,
 }
 
@@ -949,7 +963,7 @@ async fn prepare_worker_storage(
             .transpose()?;
         let cached = trees
             .into_iter()
-            .map(|id| Ok((id, store.lookup_tree(id)?)))
+            .map(|id| Ok((id, store.lookup_resident_tree(id)?)))
             .collect::<Result<Vec<_>>>()?;
         Ok(WorkerStorage {
             output,
@@ -1001,7 +1015,7 @@ struct OutputReservation {
 struct PreparedExecution {
     warm_staging: Option<Duration>,
     request: ActionRequest,
-    _inputs: Vec<Arc<TreeLease>>,
+    inputs: Vec<Arc<TreeLease>>,
     output: Option<OutputReservation>,
 }
 
@@ -1050,6 +1064,7 @@ fn compile(
     context: ExecutionContext<'_>,
     queue: Option<&crate::dist::execution_queue::ExecutionQueue>,
     transport: Option<&PackageTransportTracker>,
+    inputs: &[Arc<TreeLease>],
     budget: Option<StageBudget>,
     check: &LeaseCheck<'_>,
     on_start: impl FnOnce(),
@@ -1057,7 +1072,14 @@ fn compile(
     let _permit = queue.map(|queue| queue.acquire(check)).transpose()?;
     on_start();
     let started = Instant::now();
-    let captured = execute(context.spec, context.store, context.policy, budget, check)?;
+    let captured = execute(
+        context.spec,
+        context.store,
+        context.policy,
+        inputs,
+        budget,
+        check,
+    )?;
     let duration = started.elapsed();
     if captured.successful_result().is_some()
         && let Some(transport) = transport
@@ -1231,6 +1253,7 @@ impl PreparedWorker {
             context,
             Some(delivery.execution_queue),
             Some(delivery.transport),
+            &self.prepared.inputs,
             budget,
             &|| self.lease.check(),
             on_start,

@@ -477,22 +477,41 @@ impl NativeStore {
                 let lease = self
                     .lookup_tree(layer.tree)?
                     .context("recipe package missing")?;
-                entry.insert(lease);
+                entry.insert(Arc::new(lease));
             }
+        }
+        self.compose_leased_recipe(recipe, &leases)
+    }
+
+    pub(super) fn compose_leased_recipe(
+        &self,
+        recipe: &TreeRecipe,
+        inputs: &BTreeMap<TreeId, Arc<TreeLease>>,
+    ) -> Result<TreeLease> {
+        let mut leases = BTreeMap::new();
+        for layer in &recipe.layers {
+            let lease = inputs.get(&layer.tree).context("recipe package missing")?;
+            ensure!(
+                lease.id() == layer.tree && lease.belongs_to(self),
+                "recipe input lease belongs to another tree or store"
+            );
+            leases
+                .entry(layer.tree)
+                .or_insert_with(|| Arc::clone(lease));
         }
         let packages = leases
             .iter()
             .map(|(&id, lease)| (id, lease.manifest()))
             .collect();
-        let manifest = recipe.compose(&packages)?;
-        let id = manifest.id()?;
-        let blobs = manifest.blobs()?;
+        let manifest = recipe.compose_verified(&packages)?;
+        let (id, blobs) = manifest.identity_and_blobs()?;
         Ok(TreeLease {
             inner: Arc::clone(&self.inner),
             id,
             manifest,
             blobs,
-            pins: leases.into_values().flat_map(|lease| lease.pins).collect(),
+            _pins: Vec::new(),
+            _constituents: leases.into_values().collect(),
         })
     }
 
@@ -527,10 +546,11 @@ impl NativeStore {
             id,
             manifest,
             blobs,
-            pins: vec![TreePin {
+            _pins: vec![TreePin {
                 inner: Arc::clone(&self.inner),
                 id,
             }],
+            _constituents: Vec::new(),
         })
     }
 
@@ -569,8 +589,8 @@ impl NativeStore {
             id,
         };
         let manifest: TreeManifest = encoding().deserialize(record.value())?;
-        ensure!(manifest.id()? == id, "invalid indexed tree");
-        let blobs = manifest.blobs()?;
+        let (actual, blobs) = manifest.identity_and_blobs()?;
+        ensure!(actual == id, "invalid indexed tree");
         if !self.blobs_present(&blobs)? {
             return Ok(None);
         }
@@ -580,7 +600,8 @@ impl NativeStore {
             id,
             manifest,
             blobs,
-            pins: vec![pin],
+            _pins: vec![pin],
+            _constituents: Vec::new(),
         }))
     }
 
@@ -651,10 +672,26 @@ pub struct TreeLease {
     id: TreeId,
     manifest: TreeManifest,
     blobs: BTreeMap<ContentId, u64>,
-    pins: Vec<TreePin>,
+    _pins: Vec<TreePin>,
+    _constituents: Vec<Arc<Self>>,
 }
 
 impl TreeLease {
+    pub(crate) fn belongs_to(&self, store: &NativeStore) -> bool {
+        Arc::ptr_eq(&self.inner, &store.inner)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn is_indexed(&self) -> bool {
+        self._pins.iter().any(|pin| pin.id == self.id)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn holds_tree(&self, id: TreeId) -> bool {
+        self._pins.iter().any(|pin| pin.id == id)
+            || self._constituents.iter().any(|lease| lease.holds_tree(id))
+    }
+
     #[must_use = "the identifier names the leased tree"]
     pub const fn id(&self) -> TreeId {
         self.id
@@ -734,7 +771,7 @@ pub use mount::ReadOnlyView;
 #[cfg(target_os = "linux")]
 mod overlay;
 #[cfg(target_os = "linux")]
-pub(super) use overlay::plan_overlays;
+pub(super) use overlay::{OverlayPlan, plan_overlays};
 #[cfg(target_os = "linux")]
 mod materialize;
 #[cfg(test)]

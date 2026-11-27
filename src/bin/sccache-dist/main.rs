@@ -2412,7 +2412,7 @@ struct LocalAssignment {
 
 #[cfg(target_os = "linux")]
 struct NativeInputPins {
-    _trees: Vec<sccache::build_runtime::TreeLease>,
+    _trees: Vec<Arc<sccache::build_runtime::TreeLease>>,
     blobs: sccache::build_runtime::UploadReservation,
 }
 
