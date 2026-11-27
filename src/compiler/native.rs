@@ -186,7 +186,7 @@ impl NativeCompilerClient {
         files: &[PathBuf],
         pool: &tokio::runtime::Handle,
     ) -> Result<Vec<String>> {
-        let jobs = files.iter().map(|path| async {
+        let jobs = files.iter().map(|path| async move {
             if path.is_dir() {
                 return crate::util::Digest::file(path, pool).await;
             }

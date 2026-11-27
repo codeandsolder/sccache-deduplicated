@@ -4,12 +4,7 @@ use anyhow::{Result, ensure};
 use sccache_rust_build::Workspace;
 use sccache_rust_build::settings;
 use serde_json::Value;
-use std::{
-    collections::BTreeSet,
-    io,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{collections::BTreeSet, io, path::PathBuf, process::Command};
 
 pub(super) fn write(value: &Value) -> Result<i32> {
     serde_json::to_writer(io::stdout().lock(), value)?;
