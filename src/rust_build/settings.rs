@@ -31,7 +31,7 @@ fn output(command: &mut Command) -> Result<String> {
     Ok(String::from_utf8(result.stdout)?.trim_end().to_owned())
 }
 
-fn tool(
+pub(super) fn tool(
     name: &str,
     explicit: Option<&Path>,
     toolchain: Option<&str>,
@@ -239,12 +239,31 @@ impl Settings {
         Ok(result)
     }
 
+    pub fn target_dir(&self) -> Option<&Path> {
+        self.environment
+            .get(OsStr::new("CARGO_TARGET_DIR"))
+            .map(Path::new)
+            .or_else(|| {
+                self.document
+                    .get("build")
+                    .and_then(Value::as_table)
+                    .and_then(|v| v.get("target-dir"))
+                    .and_then(Value::as_str)
+                    .map(Path::new)
+            })
+    }
+
     pub fn target(&self) -> Option<&str> {
-        self.document
-            .get("build")
-            .and_then(Value::as_table)
-            .and_then(|v| v.get("target"))
-            .and_then(Value::as_str)
+        self.environment
+            .get(OsStr::new("CARGO_BUILD_TARGET"))
+            .and_then(|v| v.to_str())
+            .or_else(|| {
+                self.document
+                    .get("build")
+                    .and_then(Value::as_table)
+                    .and_then(|v| v.get("target"))
+                    .and_then(Value::as_str)
+            })
     }
 
     pub fn rustflags(

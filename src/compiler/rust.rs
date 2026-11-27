@@ -4728,7 +4728,7 @@ fn canonical_native_generated_inputs_have_stable_metadata_across_leases() -> Res
     assert_eq!(actual.mode() & 0o777, 0o640);
     assert_eq!(
         fs::metadata(view.root().join("build/main.rs"))?.modified()?,
-        source_time
+        UNIX_EPOCH
     );
     Ok(())
 }

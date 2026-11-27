@@ -1,6 +1,7 @@
 //! The native Rust build frontend is linked into sccache itself. It resolves
 //! the workspace, holds one artifact lease and submits actual rustc requests.
 //! No external Cargo process, Cargo job queue or Cargo fingerprint database.
+mod metadata;
 mod planner;
 mod settings;
 
@@ -27,6 +28,12 @@ pub enum Mode {
     Test,
     Clippy,
     Run,
+    Doc,
+    Metadata,
+    GenerateLockfile,
+    Update,
+    Fmt,
+    Clean,
 }
 
 #[derive(Debug, Parser)]
@@ -41,8 +48,20 @@ pub struct RustBuildArgs {
     toolchain: Option<String>,
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
     verbose: u8,
-    #[arg(long, default_value = "Cargo.toml")]
-    manifest_path: PathBuf,
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
+    #[arg(long)]
+    no_deps: bool,
+    #[arg(long, default_value = "1")]
+    format_version: u32,
+    #[arg(long)]
+    frozen: bool,
+    #[arg(long)]
+    exclude: Vec<String>,
+    #[arg(long)]
+    doc: bool,
+    #[arg(long)]
+    no_doc: bool,
     #[arg(short = 'p', long = "package")]
     packages: Vec<String>,
     #[arg(long)]
@@ -131,6 +150,12 @@ impl RustBuildArgs {
         if self.mode == Mode::Run {
             return target.kind == TargetKind::Binary;
         }
+        if self.mode == Mode::Doc {
+            return target.doc;
+        }
+        if self.mode == Mode::Test && self.doc {
+            return target.kind == TargetKind::Library && target.doctest;
+        }
         if self.all_targets {
             return target.kind != TargetKind::BuildScript;
         }
@@ -201,6 +226,17 @@ impl RustBuildArgs {
             );
             selected.extend(found);
         }
+        for name in &self.exclude {
+            ensure!(self.workspace, "--exclude requires --workspace");
+            let mut found = false;
+            for member in &workspace.members {
+                if workspace.package(member)?.package.name == *name {
+                    selected.remove(member);
+                    found = true;
+                }
+            }
+            ensure!(found, "unknown excluded package {name:?}");
+        }
         Ok(selected.into_iter().collect())
     }
 }
@@ -230,15 +266,62 @@ fn absolute(path: &Path, cwd: &Path) -> Result<PathBuf> {
     Ok(path.canonicalize()?)
 }
 
-fn execute(args: RustBuildArgs) -> Result<i32> {
+fn execute(mut args: RustBuildArgs) -> Result<i32> {
     let cwd = std::env::current_dir()?;
-    let workspace = Workspace::discover(&args.manifest_path)?;
+    if args.frozen {
+        args.locked = true;
+        args.offline = true;
+    }
+    let manifest = args.manifest_path.clone().map_or_else(
+        || {
+            cwd.ancestors()
+                .map(|directory| directory.join("Cargo.toml"))
+                .find(|path| path.is_file())
+                .context("no Rust manifest found")
+        },
+        Ok,
+    )?;
+    let workspace = Workspace::discover(&manifest)?;
     let import = args
         .import_root
         .clone()
         .or_else(|| std::env::var_os("CARGO_HOME").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".cargo")));
     let settings = Settings::load(&cwd, import.as_deref())?;
+    let selected = args.selected(&workspace)?;
+    let default_target = workspace.root.join("target");
+    let target_root = args
+        .target_dir
+        .as_deref()
+        .or_else(|| settings.target_dir())
+        .unwrap_or(&default_target);
+    if args.mode == Mode::Metadata {
+        return metadata::workspace(&workspace, target_root, &cwd, &args);
+    }
+    if args.mode == Mode::Clean {
+        let path = if target_root.is_absolute() {
+            target_root.to_path_buf()
+        } else {
+            cwd.join(target_root)
+        };
+        if path.exists() {
+            ensure!(
+                path.canonicalize()? != workspace.root,
+                "refusing to clean the workspace root"
+            );
+            ensure!(
+                path.join("CACHEDIR.TAG").is_file(),
+                "not a marked build output directory"
+            );
+            let directory = fs::File::open(&path)?;
+            directory.lock()?;
+            fs::remove_dir_all(&path)?;
+        }
+        return Ok(0);
+    }
+    if args.mode == Mode::Fmt {
+        return metadata::format_sources(&workspace, &selected, &args);
+    }
     let target = args
         .target
         .as_deref()
@@ -249,15 +332,34 @@ fn execute(args: RustBuildArgs) -> Result<i32> {
         args.toolchain.as_deref(),
         target,
         args.mode == Mode::Clippy,
-        false,
+        args.mode == Mode::Doc || (args.mode == Mode::Test && !args.no_run && !args.no_doc),
     )?;
-    let selected = args.selected(&workspace)?;
-    let target_root = absolute(
-        args.target_dir
-            .as_deref()
-            .unwrap_or(&workspace.root.join("target")),
-        &cwd,
-    )?;
+    if matches!(args.mode, Mode::GenerateLockfile | Mode::Update) {
+        ensure!(
+            !args.locked,
+            "lockfile generation requires permission to change the lock"
+        );
+        let scratch = tempfile::Builder::new()
+            .prefix("native-resolution-")
+            .tempdir()?;
+        let lock = if args.mode == Mode::Update {
+            Lockfile::default()
+        } else {
+            Lockfile::load(&workspace.root.join("Cargo.lock"))?
+        };
+        let mut sources = Sources::new(&workspace, lock, import, scratch.path().to_path_buf());
+        if !args.offline {
+            sources.download = Some(&download);
+        }
+        let lock = sources.resolve_lock(&toolchain.version)?;
+        lock.write(&workspace.root.join("Cargo.lock"))?;
+        return Ok(0);
+    }
+    let target_root = absolute(target_root, &cwd)?;
+    // Serialize publishers sharing the same final output namespace. Other
+    // workspaces and target directories can still run concurrently.
+    let target_lock = fs::File::open(&target_root)?;
+    target_lock.lock()?;
     let marker = target_root.join("CACHEDIR.TAG");
     if !marker.exists() {
         fs::write(
@@ -357,7 +459,20 @@ pub(crate) fn run_if_requested() -> Option<Result<i32>> {
     let mut args: Vec<_> = std::env::args_os().collect();
     let explicit = args.get(1)?.to_str()?.strip_prefix('+').map(str::to_owned);
     let mode = args.get(if explicit.is_some() { 2 } else { 1 })?.to_str()?;
-    if !matches!(mode, "build" | "check" | "test" | "clippy" | "run") {
+    if !matches!(
+        mode,
+        "build"
+            | "check"
+            | "test"
+            | "clippy"
+            | "run"
+            | "doc"
+            | "metadata"
+            | "generate-lockfile"
+            | "update"
+            | "fmt"
+            | "clean"
+    ) {
         return None;
     }
     if let Some(toolchain) = explicit {
