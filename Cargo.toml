@@ -111,7 +111,7 @@ walkdir = "2"
 which = { version = "8", default-features = false, features = ["real-sys"] }
 zip = { version = "9", default-features = false }
 zstd = "0.14"
-zlib-rs-fast = { package = "zlib-rs", version = "=0.6.8", optional = true, default-features = false, features = ["std"] }
+zlib-rs-fast = { package = "zlib-rs", version = "=0.6.9", optional = true, default-features = false, features = ["std"] }
 
 # dist-server only
 socket2 = { version = "0.6", optional = true }
