@@ -21,6 +21,7 @@ pub struct Dependency {
     pub requirement: VersionReq,
     pub path: Option<PathBuf>,
     pub git: Option<String>,
+    pub git_reference: Option<(String, String)>,
     pub registry: Option<String>,
     pub optional: bool,
     pub default_features: bool,
@@ -317,12 +318,24 @@ fn dependency(
         "artifact dependency {alias} requires explicit target planning"
     );
     let name = text(&spec, "package")?.unwrap_or(alias).to_owned();
+    let mut git_reference = None;
+    for key in ["rev", "tag", "branch"] {
+        if let Some(value) = text(&spec, key)? {
+            ensure!(
+                git_reference.is_none(),
+                "multiple git references on {alias}"
+            );
+            ensure!(spec.contains_key("git"), "{key} requires a git source");
+            git_reference = Some((key.to_owned(), value.to_owned()));
+        }
+    }
     Ok(Dependency {
         alias: alias.to_owned(),
         name,
         requirement: VersionReq::parse(text(&spec, "version")?.unwrap_or("*"))?,
         path: text(&spec, "path")?.map(|p| base.join(p)),
         git: text(&spec, "git")?.map(str::to_owned),
+        git_reference,
         registry: text(&spec, "registry")?.map(str::to_owned),
         optional: boolean(&spec, "optional", false)?,
         default_features: boolean(&spec, "default-features", true)?,

@@ -88,6 +88,7 @@ impl IndexRecord {
                     requirement: d.req,
                     path: None,
                     git: None,
+                    git_reference: None,
                     registry: d.registry,
                     optional: d.optional,
                     default_features: d.default_features,
@@ -305,17 +306,19 @@ impl State {
 }
 
 struct Search<'a, 'b> {
-    sources: &'a Sources<'b>,
+    sources: &'a mut Sources<'b>,
     cutoff: DateTime<Utc>,
     rustc: Version,
     registry: BTreeMap<String, Vec<Arc<Candidate>>>,
-    paths: BTreeMap<PathBuf, Arc<Candidate>>,
+    paths: BTreeMap<(PathBuf, Option<String>), Arc<Candidate>>,
+    git: BTreeMap<(String, Option<(String, String)>, String), Vec<Arc<Candidate>>>,
 }
 
 impl Search<'_, '_> {
-    fn path(&mut self, root: &Path) -> Result<Arc<Candidate>> {
+    fn path(&mut self, root: &Path, source: Option<String>) -> Result<Arc<Candidate>> {
         let root = root.canonicalize()?;
-        if let Some(candidate) = self.paths.get(&root) {
+        let key = (root.clone(), source.clone());
+        if let Some(candidate) = self.paths.get(&key) {
             return Ok(Arc::clone(candidate));
         }
         let manifest = if root.starts_with(&self.sources.workspace.root) {
@@ -326,12 +329,12 @@ impl Search<'_, '_> {
         let lock = LockedPackage {
             name: manifest.package.name.clone(),
             version: manifest.package.version.clone(),
-            source: None,
+            source,
             checksum: None,
             dependencies: Vec::new(),
         };
         let candidate = Arc::new(Candidate { manifest, lock });
-        self.paths.insert(root, Arc::clone(&candidate));
+        self.paths.insert(key, Arc::clone(&candidate));
         Ok(candidate)
     }
 
@@ -407,6 +410,42 @@ impl Search<'_, '_> {
         Ok(result)
     }
 
+    fn git_candidates(&mut self, dep: &Dependency) -> Result<Vec<Arc<Candidate>>> {
+        let url = dep.git.as_ref().context("missing Git URL")?;
+        let key = (url.clone(), dep.git_reference.clone(), dep.name.clone());
+        if let Some(candidates) = self.git.get(&key) {
+            return Ok(candidates
+                .iter()
+                .filter(|c| dep.requirement.matches(&c.lock.version))
+                .cloned()
+                .collect());
+        }
+        let source = self.sources.git_source(dep)?;
+        let manifests = self.sources.git_manifests(&source, &dep.name)?;
+        let candidates = manifests
+            .into_iter()
+            .map(|manifest| {
+                Arc::new(Candidate {
+                    lock: LockedPackage {
+                        name: manifest.package.name.clone(),
+                        version: manifest.package.version.clone(),
+                        source: Some(source.clone()),
+                        checksum: None,
+                        dependencies: Vec::new(),
+                    },
+                    manifest,
+                })
+            })
+            .collect::<Vec<_>>();
+        let matching = candidates
+            .iter()
+            .filter(|c| dep.requirement.matches(&c.lock.version))
+            .cloned()
+            .collect();
+        self.git.insert(key, candidates);
+        Ok(matching)
+    }
+
     fn candidates(&mut self, state: &State, need: &Need) -> Result<Vec<Arc<Candidate>>> {
         let parent = &state.chosen[&need.parent];
         let dep = &parent.candidate.manifest.dependencies[need.index];
@@ -414,15 +453,21 @@ impl Search<'_, '_> {
             return Ok(vec![Arc::clone(&state.chosen[id].candidate)]);
         }
         if let Some(path) = &dep.path {
-            let candidate = self.path(path)?;
+            let candidate = self.path(
+                path,
+                parent
+                    .candidate
+                    .lock
+                    .source
+                    .clone()
+                    .filter(|s| s.starts_with("git+")),
+            )?;
             validate_dependency(&candidate.manifest, dep)?;
             return Ok(vec![candidate]);
         }
-        ensure!(
-            dep.git.is_none(),
-            "unlocked git dependencies require an exact source lock: {}",
-            dep.alias
-        );
+        if dep.git.is_some() {
+            return self.git_candidates(dep);
+        }
         ensure!(
             dep.registry.as_deref().is_none_or(|v| matches!(
                 v,
@@ -440,8 +485,9 @@ impl Search<'_, '_> {
             .and_then(toml::Value::as_table)
             .and_then(|t| t.get("crates-io"))
             .and_then(toml::Value::as_table)
+            .cloned()
         {
-            for (name, patch) in patches {
+            for (name, patch) in &patches {
                 let Some(spec) = patch.as_table() else {
                     continue;
                 };
@@ -453,13 +499,24 @@ impl Search<'_, '_> {
                 {
                     continue;
                 }
-                let path = spec
-                    .get("path")
-                    .and_then(toml::Value::as_str)
-                    .context("unlocked non-path patch requires exact source lock")?;
-                let candidate = self.path(&self.sources.workspace.root.join(path))?;
-                candidates.retain(|other| other.lock.version != candidate.lock.version);
-                candidates.push(candidate);
+                let patches = if let Some(path) = spec.get("path").and_then(toml::Value::as_str) {
+                    vec![self.path(&self.sources.workspace.root.join(path), None)?]
+                } else if let Some(url) = spec.get("git").and_then(toml::Value::as_str) {
+                    let mut patched = dep.clone();
+                    patched.git = Some(url.to_owned());
+                    patched.git_reference = ["rev", "tag", "branch"].into_iter().find_map(|key| {
+                        spec.get(key)
+                            .and_then(toml::Value::as_str)
+                            .map(|value| (key.to_owned(), value.to_owned()))
+                    });
+                    self.git_candidates(&patched)?
+                } else {
+                    bail!("unsupported patch for {}", dep.name);
+                };
+                for candidate in patches {
+                    candidates.retain(|other| other.lock.version != candidate.lock.version);
+                    candidates.push(candidate);
+                }
             }
         }
         candidates.retain(|c| dep.requirement.matches(&c.lock.version));
@@ -484,8 +541,8 @@ impl Search<'_, '_> {
 
     fn solve(&mut self) -> Result<Lockfile> {
         let mut state = State::default();
-        for member in &self.sources.workspace.members {
-            let candidate = self.path(member)?;
+        for member in &self.sources.workspace.members.clone() {
+            let candidate = self.path(member, None)?;
             let mut requested = BTreeSet::new();
             all_features(&candidate.manifest, &mut requested);
             state.activate(candidate, requested, true)?;
@@ -537,7 +594,7 @@ impl Search<'_, '_> {
 }
 
 impl Sources<'_> {
-    pub fn resolve_lock(&self, rustc: &str) -> Result<Lockfile> {
+    pub fn resolve_lock(&mut self, rustc: &str) -> Result<Lockfile> {
         let version = rustc
             .lines()
             .find_map(|line| line.strip_prefix("release: "))
@@ -552,6 +609,7 @@ impl Sources<'_> {
             rustc: version,
             registry: BTreeMap::new(),
             paths: BTreeMap::new(),
+            git: BTreeMap::new(),
         }
         .solve()
     }
@@ -631,7 +689,7 @@ mod tests {
         let workspace = Workspace::discover(&root.join("Cargo.toml"))?;
         let scratch = temp.path().join("scratch");
         fs::create_dir_all(&scratch)?;
-        let sources = Sources::new(&workspace, Lockfile::default(), Some(import), scratch);
+        let mut sources = Sources::new(&workspace, Lockfile::default(), Some(import), scratch);
         let lock = sources.resolve_lock("release: 1.100.0-nightly")?;
         assert_eq!(lock.packages.len(), 3);
         assert!(
@@ -676,7 +734,7 @@ mod tests {
         let workspace = Workspace::discover(&root.join("Cargo.toml"))?;
         let scratch = temp.path().join("scratch");
         fs::create_dir_all(&scratch)?;
-        let sources = Sources::new(&workspace, Lockfile::default(), Some(import), scratch);
+        let mut sources = Sources::new(&workspace, Lockfile::default(), Some(import), scratch);
         let lock = sources.resolve_lock("release: 1.100.0-nightly")?;
         assert_eq!(
             lock.packages

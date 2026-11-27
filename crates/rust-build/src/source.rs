@@ -192,11 +192,10 @@ impl<'a> Sources<'a> {
                         .dependencies
                         .iter()
                         .any(|edge| locked_edge(edge, p))
-                    && dep.git.as_ref().is_none_or(|git| {
-                        p.source.as_ref().is_some_and(|s| {
-                            s.strip_prefix("git+")
-                                .is_some_and(|s| s.split(['?', '#']).next() == Some(git))
-                        })
+                    && dep.git.as_ref().is_none_or(|_| {
+                        p.source
+                            .as_deref()
+                            .is_some_and(|source| matches_git_source(dep, source))
                     })
             })
             .cloned()
@@ -368,6 +367,125 @@ impl<'a> Sources<'a> {
             return Ok(root.clone());
         }
         let source = package.source.as_deref().context("missing git source")?;
+        let mut found = self
+            .git_manifests(source, &package.name)?
+            .into_iter()
+            .filter(|manifest| manifest.package.version == package.version)
+            .collect::<Vec<_>>();
+        ensure!(
+            found.len() == 1,
+            "cannot locate unique locked git package {key}"
+        );
+        let result = found.remove(0).root;
+        self.materialized.insert(key, result.clone());
+        Ok(result)
+    }
+
+    pub(crate) fn git_source(&self, dep: &Dependency) -> Result<String> {
+        let prefix = git_source_prefix(dep)?;
+        let mut pinned = self
+            .lock
+            .packages
+            .iter()
+            .filter_map(|p| p.source.as_deref())
+            .filter(|source| {
+                source
+                    .split_once('#')
+                    .is_some_and(|(source, _)| source == prefix)
+            })
+            .collect::<BTreeSet<_>>();
+        if pinned.len() == 1 {
+            return Ok(pinned.pop_first().context("missing git pin")?.to_owned());
+        }
+        ensure!(
+            pinned.is_empty(),
+            "ambiguous existing Git source pins for {}",
+            dep.alias
+        );
+        let url = dep.git.as_deref().context("missing Git URL")?;
+        let reference = match dep
+            .git_reference
+            .as_ref()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+        {
+            Some(("rev", value))
+                if value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
+                return Ok(format!("{prefix}#{value}"));
+            }
+            Some(("branch", value)) => format!("refs/heads/{value}"),
+            Some(("tag", value)) => format!("refs/tags/{value}"),
+            Some(("rev", value)) => value.to_owned(),
+            None => "HEAD".to_owned(),
+            Some((key, _)) => bail!("invalid Git reference type {key}"),
+        };
+        // First resolve a reference in the imported object's repository.
+        if self.download.is_none() {
+            let import = self
+                .import_root
+                .as_ref()
+                .context("offline Git reference needs an object cache")?;
+            let mut commits = BTreeSet::new();
+            for entry in fs::read_dir(import.join("git/db"))? {
+                let root = entry?.path();
+                let origin = Command::new("git")
+                    .arg("--git-dir")
+                    .arg(&root)
+                    .args(["config", "--get", "remote.origin.url"])
+                    .output()?;
+                if !origin.status.success() || String::from_utf8_lossy(&origin.stdout).trim() != url
+                {
+                    continue;
+                }
+                let output = Command::new("git")
+                    .arg("--git-dir")
+                    .arg(&root)
+                    .args(["rev-parse", "--verify", &format!("{reference}^{{commit}}")])
+                    .output()?;
+                if output.status.success() {
+                    commits.insert(String::from_utf8(output.stdout)?.trim().to_owned());
+                }
+            }
+            ensure!(
+                commits.len() == 1,
+                "cannot uniquely resolve offline Git reference {reference}"
+            );
+            return Ok(format!(
+                "{prefix}#{}",
+                commits.pop_first().context("missing commit")?
+            ));
+        }
+        let output = Command::new("git")
+            .args([
+                "ls-remote",
+                "--",
+                url,
+                &reference,
+                &format!("{reference}^{{}}"),
+            ])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "cannot resolve Git reference {}",
+            dep.alias
+        );
+        let output = String::from_utf8(output.stdout)?;
+        let mut candidates = output
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(_, name)| !name.ends_with("^{}"));
+        let (commit, _) = candidates
+            .first()
+            .context("Git reference did not resolve")?;
+        ensure!(
+            commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid Git commit"
+        );
+        Ok(format!("{prefix}#{commit}"))
+    }
+
+    fn git_checkout(&self, source: &str) -> Result<PathBuf> {
         let (url, commit) = source
             .strip_prefix("git+")
             .context("not a git source")?
@@ -382,7 +500,10 @@ impl<'a> Sources<'a> {
             .scratch
             .join("git")
             .join(blake3::hash(source.as_bytes()).to_hex().as_str());
-        if !root.exists() {
+        if !root.join(".git/sccache-source-ready").is_file() {
+            if root.exists() {
+                fs::remove_dir_all(&root)?;
+            }
             fs::create_dir_all(&root)?;
             let mut repository = None;
             if let Some(import) = &self.import_root {
@@ -518,40 +639,55 @@ impl<'a> Sources<'a> {
                     "cannot acquire pinned git submodules"
                 );
             }
+            fs::write(root.join(".git/sccache-source-ready"), commit)?;
         }
-        fn find(
-            root: &Path,
-            name: &str,
-            version: &Version,
-            found: &mut Vec<PathBuf>,
-        ) -> Result<()> {
-            if root.join("Cargo.toml").is_file() {
-                if let Ok(manifest) = load_discovered(root) {
-                    if manifest.package.name == name && &manifest.package.version == version {
-                        found.push(root.to_path_buf());
-                    }
-                }
+        Ok(root)
+    }
+
+    pub(crate) fn git_manifests(&self, source: &str, name: &str) -> Result<Vec<Manifest>> {
+        let root = self.git_checkout(source)?;
+        fn find(root: &Path, name: &str, found: &mut Vec<Manifest>) -> Result<()> {
+            if root.join("Cargo.toml").is_file()
+                && let Ok(manifest) = load_discovered(root)
+                && manifest.package.name == name
+            {
+                found.push(manifest);
             }
             for entry in fs::read_dir(root)? {
                 let entry = entry?;
                 if entry.file_type()?.is_dir()
                     && !entry.file_name().to_string_lossy().starts_with('.')
                 {
-                    find(&entry.path(), name, version, found)?;
+                    find(&entry.path(), name, found)?;
                 }
             }
             Ok(())
         }
         let mut found = Vec::new();
-        find(&root, &package.name, &package.version, &mut found)?;
-        ensure!(
-            found.len() == 1,
-            "cannot locate unique locked git package {key}"
-        );
-        let result = found.remove(0);
-        self.materialized.insert(key, result.clone());
-        Ok(result)
+        find(&root, name, &mut found)?;
+        Ok(found)
     }
+}
+
+fn git_source_prefix(dep: &Dependency) -> Result<String> {
+    let url = dep.git.as_deref().context("missing git source")?;
+    let mut source = format!("git+{url}");
+    if let Some((key, value)) = &dep.git_reference {
+        ensure!(!value.contains(['#', '&', '?']), "ambiguous git reference");
+        source.push('?');
+        source.push_str(key);
+        source.push('=');
+        source.push_str(value);
+    }
+    Ok(source)
+}
+
+fn matches_git_source(dep: &Dependency, source: &str) -> bool {
+    git_source_prefix(dep).is_ok_and(|prefix| {
+        source
+            .split_once('#')
+            .is_some_and(|(source, _)| source == prefix)
+    })
 }
 
 pub(crate) fn load_discovered(root: &Path) -> Result<Manifest> {
