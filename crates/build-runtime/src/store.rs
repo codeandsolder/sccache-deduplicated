@@ -1208,6 +1208,7 @@ impl NativeStore {
         history::initialize(&write)?;
         write.open_table(RESULTS)?;
         write.open_table(TREES)?;
+        impact::initialize(&write)?;
         write.open_table(PACKAGES)?;
         write.open_multimap_table(TREE_PACKAGES)?;
         write.open_multimap_table(BLOB_PACKAGES)?;
@@ -2423,6 +2424,8 @@ pub use packages::{
     VerifiedPackage, decode_package_process,
 };
 pub use packages::{PackageImport, PackagePreparation};
+mod impact;
+pub use impact::ImpactUpdate;
 mod trees;
 #[cfg(target_os = "linux")]
 pub use trees::MountedTree;

@@ -656,6 +656,7 @@ impl NativeStore {
                 .checked_add(Self::detach_blobs(&write, &id.0, contents)?)
                 .context("tree eviction size overflow")?
         };
+        super::impact::remove_tree(&write, id)?;
         write.open_table(USAGE)?.remove(&Root::Tree(id).key())?;
         write.commit()?;
         claim.committed = true;
