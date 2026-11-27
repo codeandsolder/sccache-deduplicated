@@ -281,7 +281,14 @@ buffered and checkpointed at most once per minute during maintenance,
 plus on orderly shutdown, without write I/O on cache hits. Staged files
 hold admission reservations through publication; their releases are applied
 atomically without taking the admission lock, preventing lock-order cycles
-with concurrent eviction and index publication.
+with concurrent eviction and index publication. Result and tree negotiation
+reserves the complete missing content closure before receiving any blobs;
+individual transfers share that charge even when a stream must be retried.
+A temporarily occupied budget returns retryable HTTP 503 rather than a
+terminal publication error. Impossible single reservations are rejected
+without eviction. Admission reclaims only enough room for the incoming
+content, while maintenance may use the low watermark when no reservations
+are outstanding. Compiler input leases are released before output publication.
 
 Under cache pressure, eviction ranks roots by the expected reuse cost per
 byte that deleting them could actually reclaim. It follows the transactional

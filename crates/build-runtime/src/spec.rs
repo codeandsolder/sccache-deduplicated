@@ -7,8 +7,8 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionFingerprint, ContentId, OutputKind, TreeId, TreeManifest, TreePath, TreeRecipe,
-    identity::typed_digest, wire::ActionRequest,
+    ActionFingerprint, ContentId, OutputKind, TreeEntry, TreeId, TreeManifest, TreePath,
+    TreeRecipe, identity::typed_digest, wire::ActionRequest,
 };
 
 /// Exact canonical absolute POSIX path, including non-UTF-8 names.
@@ -62,6 +62,17 @@ pub struct CommandSpec {
 }
 
 impl CommandSpec {
+    /// Remove absolute PATH and loader search entries proven unreachable in
+    /// the immutable execution filesystem. Use only after local compiler
+    /// dependency discovery, and not for opaque compiler extensions.
+    pub fn normalize_search_environment(
+        &mut self,
+        trees: &[&TreeManifest],
+        outputs: &BTreeMap<String, OutputSpec>,
+    ) {
+        normalize_search_environment(self, trees, outputs);
+    }
+
     /// Validate all command bytes, even after wire deserialization.
     ///
     /// # Errors
@@ -113,6 +124,116 @@ impl CommandSpec {
             );
         }
         Ok(components)
+    }
+}
+
+fn path_within(path: &[u8], parent: &[u8]) -> bool {
+    parent == b"/"
+        || path == parent
+        || path
+            .strip_prefix(parent)
+            .is_some_and(|suffix| suffix.starts_with(b"/"))
+}
+
+/// A static absolute search directory absent from the declared execution
+/// filesystem cannot supply a compiler helper or shared library. Preserve
+/// relative paths, dynamic loader tokens, symlink traversal and mutable
+/// directories; their runtime contents cannot be inferred from this test.
+fn unavailable_search_directory(
+    directory: &[u8],
+    trees: &[&TreeManifest],
+    outputs: &BTreeMap<String, OutputSpec>,
+) -> bool {
+    let Some(relative) = directory.strip_prefix(b"/") else {
+        return false;
+    };
+    if relative.is_empty()
+        || relative.contains(&b'$')
+        || relative
+            .split(|&byte| byte == b'/')
+            .any(|part| part.is_empty() || part == b"." || part == b"..")
+    {
+        return false;
+    }
+    if [b"/proc".as_slice(), b"/dev", b"/tmp"]
+        .iter()
+        .any(|root| path_within(directory, root))
+    {
+        return false;
+    }
+    if outputs.values().any(|output| {
+        let output = output.path.as_bytes();
+        let end = output.iter().rposition(|&b| b == b'/').unwrap_or(0);
+        let parent = &output[..end.max(1)];
+        path_within(directory, parent) || path_within(parent, directory)
+    }) {
+        return false;
+    }
+    // A symlink in any prefix might resolve into another layer. Retain the
+    // original entry rather than incorrectly declaring the directory absent.
+    for end in relative
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &byte)| (byte == b'/').then_some(index))
+        .chain(std::iter::once(relative.len()))
+    {
+        let prefix = &relative[..end];
+        for tree in trees {
+            if matches!(tree.entries.get(prefix), Some(TreeEntry::Symlink { .. })) {
+                return false;
+            }
+        }
+    }
+    trees
+        .iter()
+        .all(|tree| !tree.entries.contains_key(relative))
+}
+
+/// Canonicalize the actual sandbox environment, not merely its fingerprint.
+/// Local preprocessing and helper discovery have already run with the
+/// caller's original environment. Only static paths that do not exist in
+/// the verified execution closure are removed.
+fn normalize_search_environment(
+    command: &mut CommandSpec,
+    trees: &[&TreeManifest],
+    outputs: &BTreeMap<String, OutputSpec>,
+) {
+    for name in [b"PATH".as_slice(), b"LD_LIBRARY_PATH"] {
+        let Some(value) = command.environment.get_mut(name) else {
+            continue;
+        };
+        let loader_path = name == b"LD_LIBRARY_PATH";
+        // Some loaders also accept semicolons, others do not. Keep those
+        // lists intact rather than changing the runtime's path syntax.
+        if loader_path && value.contains(&b';') {
+            continue;
+        }
+        let entries = value.split(|&byte| byte == b':');
+        let mut normalized = Vec::new();
+        let mut first = true;
+        for entry in entries {
+            if unavailable_search_directory(entry, trees, outputs) {
+                continue;
+            }
+            if !first {
+                normalized.push(b':');
+            }
+            first = false;
+            normalized.extend_from_slice(entry);
+        }
+        if first {
+            if loader_path {
+                // All entries were unreachable. Unset the variable rather
+                // than introduce an empty component that could search cwd.
+                command.environment.remove(name);
+            } else {
+                // An absent PATH would enable execvp's default search.
+                // Keep an explicitly non-searchable path instead.
+                *value = b"/dev/null".to_vec();
+            }
+        } else {
+            *value = normalized;
+        }
     }
 }
 
@@ -337,6 +458,90 @@ impl ExecutionSpec {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn c_search_environment_ignores_only_unavailable_absolute_directories() -> Result<()> {
+        use crate::{TreeEntry, TreeMetadata, TreeTimestamp};
+        let metadata = TreeMetadata {
+            mode: 0o755,
+            modified: TreeTimestamp {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+        };
+        let tree = TreeManifest {
+            root: metadata,
+            entries: BTreeMap::from([
+                (
+                    TreePath::new(b"usr".to_vec())?,
+                    TreeEntry::Directory(metadata),
+                ),
+                (
+                    TreePath::new(b"usr/bin".to_vec())?,
+                    TreeEntry::Directory(metadata),
+                ),
+                (
+                    TreePath::new(b"bin".to_vec())?,
+                    TreeEntry::Symlink {
+                        target: b"usr/bin".to_vec(),
+                        modified: metadata.modified,
+                    },
+                ),
+            ]),
+        };
+        tree.validate()?;
+        let outputs = BTreeMap::from([(
+            "obj".into(),
+            OutputSpec {
+                path: BuildPath::new(b"/build/output/object.o".to_vec())?,
+                required: true,
+                kind: OutputKind::File,
+            },
+        )]);
+        let make_command = |path: &[u8], loader: &[u8]| -> Result<CommandSpec> {
+            Ok(CommandSpec {
+                umask: 0o22,
+                executable: BuildPath::new(b"/usr/bin/gcc".to_vec())?,
+                arguments: vec![],
+                cwd: BuildPath::new(b"/build".to_vec())?,
+                environment: BTreeMap::from([
+                    (b"PATH".to_vec(), path.to_vec()),
+                    (b"LD_LIBRARY_PATH".to_vec(), loader.to_vec()),
+                ]),
+            })
+        };
+        let mut first = make_command(
+            b"/usr/bin:/bin:/tmp/tools:relative::/build/output",
+            b"/missing/one",
+        )?;
+        let mut second = make_command(
+            b"/missing/a:/usr/bin:/bin:/tmp/tools:relative::/build/output:/missing/b",
+            b"/missing/two",
+        )?;
+        normalize_search_environment(&mut first, &[&tree], &outputs);
+        normalize_search_environment(&mut second, &[&tree], &outputs);
+        assert_eq!(first, second);
+        assert_eq!(
+            first.environment[b"PATH".as_slice()],
+            b"/usr/bin:/bin:/tmp/tools:relative::/build/output"
+        );
+        assert!(
+            !first
+                .environment
+                .contains_key(b"LD_LIBRARY_PATH".as_slice())
+        );
+        let mut dynamic = make_command(b"/missing", b"$ORIGIN/lib:/missing:/usr/bin")?;
+        normalize_search_environment(&mut dynamic, &[&tree], &outputs);
+        assert_eq!(dynamic.environment[b"PATH".as_slice()], b"/dev/null");
+        assert_eq!(
+            dynamic.environment[b"LD_LIBRARY_PATH".as_slice()],
+            b"$ORIGIN/lib:/usr/bin"
+        );
+        let mut different = make_command(b"/bin:/usr/bin", b"/usr/bin")?;
+        normalize_search_environment(&mut different, &[&tree], &outputs);
+        assert_ne!(first.input_components()?, different.input_components()?);
+        Ok(())
+    }
+
     use super::*;
     use crate::{TreeMetadata, TreeTimestamp};
     use anyhow::Context;

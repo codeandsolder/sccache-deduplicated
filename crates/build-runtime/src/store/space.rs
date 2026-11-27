@@ -119,6 +119,19 @@ pub struct SpaceStatus {
 }
 
 impl NativeStore {
+    pub(crate) fn check_transfer_capacity(&self, bytes: u64) -> Result<()> {
+        if let Some(policy) = self.inner.space_policy {
+            ensure!(
+                bytes <= policy.max_resident_bytes,
+                StageSpaceTooLarge {
+                    requested: bytes,
+                    limit: policy.max_resident_bytes,
+                }
+            );
+        }
+        Ok(())
+    }
+
     /// Open a store with a managed resident budget and filesystem admission.
     ///
     /// # Errors
@@ -314,7 +327,11 @@ impl NativeStore {
                 self.eviction_candidates(policy.max_evictions_per_pass, free < minimum)?;
             (free, resident) = observe()?;
             for candidate in candidates {
-                let (free_limit, resident_limit) = if evicted_roots == 0 {
+                // A request needs only enough room for its actual bytes. Do
+                // not evict the entire hysteresis band for each admission.
+                // Maintenance may reclaim to the low watermark when no
+                // in-flight reservations are inflating the resident count.
+                let (free_limit, resident_limit) = if evicted_roots == 0 || need != 0 {
                     (minimum, policy.max_resident_bytes)
                 } else {
                     (target, policy.target_resident_bytes)
@@ -592,11 +609,40 @@ pub struct StageBudget {
 }
 
 #[derive(Debug)]
-struct StageSpaceExhausted;
+pub struct StageSpaceExhausted {
+    requested: u64,
+    reserved: u64,
+    resident: u64,
+    available: u64,
+    limit: u64,
+    evicted: usize,
+}
+
+#[derive(Debug)]
+pub struct StageSpaceTooLarge {
+    requested: u64,
+    limit: u64,
+}
+
+impl std::fmt::Display for StageSpaceTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "native staging request {} exceeds resident budget {}",
+            self.requested, self.limit
+        )
+    }
+}
+
+impl std::error::Error for StageSpaceTooLarge {}
 
 impl std::fmt::Display for StageSpaceExhausted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("native store has insufficient allocatable space or resident budget after bounded reclamation")
+        write!(
+            f,
+            "native CAS pressure: requested={}, reserved={}, projected_resident={}, available={}, resident_limit={}, evicted_roots={}",
+            self.requested, self.reserved, self.resident, self.available, self.limit, self.evicted
+        )
     }
 }
 
@@ -670,7 +716,9 @@ impl StageBudget {
         use std::os::unix::fs::PermissionsExt as _;
         match self.grow_to(size) {
             Ok(()) => (),
-            Err(error) if error.is::<StageSpaceExhausted>() => return Ok(None),
+            Err(error) if error.is::<StageSpaceExhausted>() || error.is::<StageSpaceTooLarge>() => {
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         }
         let budget = self.split(size)?;
@@ -713,6 +761,13 @@ impl StageBudget {
             self.reserved = self.reserved.max(size);
             return Ok(());
         };
+        ensure!(
+            size <= policy.max_resident_bytes,
+            StageSpaceTooLarge {
+                requested: size,
+                limit: policy.max_resident_bytes,
+            }
+        );
         if self.reserved >= size {
             return Ok(());
         }
@@ -728,20 +783,43 @@ impl StageBudget {
             .reserved
             .checked_add(extra)
             .context("native stage reservation overflow")?;
+        let current_resident = self.store.resident_bytes()?;
+        // Evicting resident blobs cannot help if the reservations alone
+        // exceed the budget. In particular, do not empty a hot cache while
+        // competing publications only need to finish and release headroom.
+        ensure!(
+            need <= policy.max_resident_bytes,
+            StageSpaceExhausted {
+                requested: extra,
+                reserved: state.reserved,
+                resident: current_resident.saturating_add(need),
+                available: self.store.available_bytes()?,
+                limit: policy.max_resident_bytes,
+                evicted: 0,
+            }
+        );
         let minimum = policy
             .min_available_bytes
             .checked_add(need)
             .context("native minimum space overflow")?;
-        let resident = self
-            .store
-            .resident_bytes()?
+        let resident = current_resident
             .checked_add(need)
             .context("native resident reservation overflow")?;
         if self.store.available_bytes()? < minimum || resident > policy.max_resident_bytes {
             let report = self.store.reclaim(policy, state.reserved, extra, || {
                 self.store.available_bytes()
             })?;
-            ensure!(report.minimum_satisfied, StageSpaceExhausted);
+            ensure!(
+                report.minimum_satisfied,
+                StageSpaceExhausted {
+                    requested: extra,
+                    reserved: state.reserved,
+                    resident: report.resident_bytes,
+                    available: report.available_bytes,
+                    limit: policy.max_resident_bytes,
+                    evicted: report.evicted_roots,
+                }
+            );
         }
         state.reserved = need;
         self.reserved = size;
@@ -756,10 +834,7 @@ impl StageBudget {
             "native staging content exceeds its reservation"
         );
         if self.store.inner.space_policy.is_none() {
-            return Ok(StagingReservation {
-                inner: Arc::clone(&self.store.inner),
-                reserved: 0,
-            });
+            return Ok(StagingReservation::new(&self.store.inner, 0));
         }
         if actual_bytes < self.reserved {
             let surplus = self.reserved - actual_bytes;
@@ -770,19 +845,32 @@ impl StageBudget {
             self.reserved = actual_bytes;
         }
         let reserved = std::mem::take(&mut self.reserved);
-        Ok(StagingReservation {
-            inner: Arc::clone(&self.store.inner),
-            reserved,
-        })
+        Ok(StagingReservation::new(&self.store.inner, reserved))
     }
 }
 
-pub(super) struct StagingReservation {
+#[derive(Clone)]
+pub(crate) struct StagingReservation {
+    _charge: Arc<StagingCharge>,
+}
+
+impl StagingReservation {
+    fn new(inner: &Arc<Inner>, reserved: u64) -> Self {
+        Self {
+            _charge: Arc::new(StagingCharge {
+                inner: Arc::clone(inner),
+                reserved,
+            }),
+        }
+    }
+}
+
+struct StagingCharge {
     inner: Arc<Inner>,
     reserved: u64,
 }
 
-impl Drop for StagingReservation {
+impl Drop for StagingCharge {
     fn drop(&mut self) {
         if self.reserved > 0 {
             self.inner

@@ -512,9 +512,9 @@ impl NativeCacheClient {
         })?
     }
 
-    // Retrying is deliberately limited to package resolution: a busy reply
-    // does not mutate anything, and even a repeated acquisition is idempotent.
-    fn package_control<T: Serialize + Sync, R: DeserializeOwned>(
+    // A busy reply does not mutate admission; retry only explicitly rejected
+    // package or transfer negotiations, never an uncertain completion.
+    fn admission_control<T: Serialize + Sync, R: DeserializeOwned>(
         &self,
         operation: &str,
         value: &T,
@@ -525,17 +525,14 @@ impl NativeCacheClient {
             let remaining = self
                 .timeout
                 .checked_sub(start.elapsed())
-                .context("package provisioning deadline expired")?;
+                .context("native admission deadline expired")?;
             let response = self.send_replayable(operation, data.clone(), remaining)?;
             if response.status() != http::StatusCode::SERVICE_UNAVAILABLE {
                 return decode_response(response.error_for_status()?, self.metadata_limit);
             }
             drop(response);
             let delay = Duration::from_millis(250);
-            ensure!(
-                remaining > delay,
-                "native package provisioning busy until deadline"
-            );
+            ensure!(remaining > delay, "native admission busy until deadline");
             std::thread::sleep(delay);
         }
     }
@@ -550,7 +547,7 @@ impl NativeCacheClient {
     ) -> Result<PackageAcquisition<InstallationManifest>> {
         locator.validate()?;
         let result: PackageAcquisition<InstallationManifest> =
-            self.package_control("rust_package_acquire", locator)?;
+            self.admission_control("rust_package_acquire", locator)?;
         validate_installation_manifest(locator.identity, &result.package)?;
         ensure!(
             locator
@@ -570,7 +567,7 @@ impl NativeCacheClient {
     ) -> Result<PackageAcquisition<PackageReceipt>> {
         locator.validate()?;
         let result: PackageAcquisition<PackageReceipt> =
-            self.package_control("package_acquire", locator)?;
+            self.admission_control("package_acquire", locator)?;
         ensure!(
             result.package.source.identity == locator.identity
                 && locator
@@ -590,7 +587,7 @@ impl NativeCacheClient {
         identity: PackageIdentity,
     ) -> Result<Option<InstallationManifest>> {
         let manifest: Option<InstallationManifest> =
-            self.package_control("rust_package_lookup", &identity)?;
+            self.admission_control("rust_package_lookup", &identity)?;
         if let Some(manifest) = &manifest {
             validate_installation_manifest(identity, manifest)?;
         }
@@ -601,7 +598,8 @@ impl NativeCacheClient {
     /// # Errors
     /// Returns an error for invalid provenance or transport failure.
     pub fn lookup_package(&self, identity: PackageIdentity) -> Result<Option<PackageReceipt>> {
-        let receipt: Option<PackageReceipt> = self.package_control("package_lookup", &identity)?;
+        let receipt: Option<PackageReceipt> =
+            self.admission_control("package_lookup", &identity)?;
         if let Some(receipt) = receipt {
             ensure!(
                 receipt.source.identity == identity,
@@ -878,7 +876,7 @@ impl NativeCacheClient {
     /// # Errors
     /// Returns an error for a rejected tree or transfer failure.
     pub fn offer_tree(&self, manifest: &TreeManifest) -> Result<TreeOffer> {
-        self.control("tree_offer", manifest)
+        self.admission_control("tree_offer", manifest)
     }
 
     /// Publish the offered tree, retaining the ticket's delivery pin.
@@ -1242,7 +1240,7 @@ impl NativeCacheClient {
     /// # Errors
     /// Returns an error if the output contract or session is invalid.
     pub fn begin(&self, ticket: Ticket, manifest: ResultManifest) -> Result<BeginResult> {
-        self.control("begin", &ManifestRequest { ticket, manifest })
+        self.admission_control("begin", &ManifestRequest { ticket, manifest })
     }
 
     /// Compress a new blob once and upload the encoded representation.

@@ -645,7 +645,7 @@ impl CompilerPlan {
             destinations.insert(output.name, output.destination);
         }
         let (inputs, toolchain) = packagers;
-        let command = CommandSpec {
+        let mut command = CommandSpec {
             umask: command
                 .umask
                 .context("native execution requires a known process umask")?,
@@ -692,6 +692,15 @@ impl CompilerPlan {
         let layout = layout.into_native_mapping(|_| false)?.prepare()?;
         let directories = pkg::native_directory_metadata()?;
         let inputs = vec![toolchain, inputs, layout];
+        if result_policy == ResultIdentityPolicy::PreprocessedC
+            && !opaque_compiler_extension(&command, inputs[1].manifest())
+        {
+            let manifests = inputs
+                .iter()
+                .map(PreparedTree::manifest)
+                .collect::<Vec<_>>();
+            command.normalize_search_environment(&manifests, &paths);
+        }
         let recipe = TreeRecipe::union(directories, inputs.iter().map(PreparedTree::id));
         let root = ExecutionRoot::resolve(
             recipe,

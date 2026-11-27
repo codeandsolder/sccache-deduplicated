@@ -273,7 +273,7 @@ pub struct PhysicalStager {
     path: TempPath,
     written: u64,
     synced: bool,
-    budget: StageBudget,
+    reservation: space::StagingReservation,
     ingest: Option<blob_codec::BlobIngest>,
     encoded: Vec<u8>,
     expected: BlobRef,
@@ -477,7 +477,7 @@ impl PhysicalStager {
             reference: self.expected,
             encoding: self.store.physical_encoding,
             owner: Arc::clone(&self.store.inner),
-            _reservation: self.budget.finish(self.expected.size)?,
+            _reservation: self.reservation,
         })
     }
 }
@@ -1458,8 +1458,20 @@ impl NativeStore {
         expected: BlobRef,
         encoding: BlobEncoding,
     ) -> Result<PhysicalStager> {
-        let mut budget = space::StageBudget::new(self);
-        budget.grow_to(expected.size)?;
+        let reservation = self.reserve_transfer(expected.size)?;
+        self.prepare_physical_reserved(expected, encoding, reservation)
+    }
+
+    pub(crate) fn reserve_transfer(&self, bytes: u64) -> Result<space::StagingReservation> {
+        self.reserve_staging(bytes)?.finish(bytes)
+    }
+
+    pub(crate) fn prepare_physical_reserved(
+        &self,
+        expected: BlobRef,
+        encoding: BlobEncoding,
+        reservation: space::StagingReservation,
+    ) -> Result<PhysicalStager> {
         let (file, path) = NamedTempFile::new_in(self.inner.root.join("staging"))?.into_parts();
         let mut written = 0;
         let ingest = blob_codec::BlobIngest::new(
@@ -1477,7 +1489,7 @@ impl NativeStore {
             path,
             written,
             synced: false,
-            budget,
+            reservation,
             ingest: Some(ingest),
             encoded: Vec::new(),
             expected,
@@ -2436,7 +2448,11 @@ impl<L> Seek for LeasedReader<'_, L> {
 mod history;
 mod space;
 use crate::SpacePolicy;
-pub use space::{CacheAnalyticsSampler, SpaceReport, SpaceStatus, StageBudget};
+pub(crate) use space::StagingReservation;
+pub use space::{
+    CacheAnalyticsSampler, SpaceReport, SpaceStatus, StageBudget, StageSpaceExhausted,
+    StageSpaceTooLarge,
+};
 mod audit;
 pub use audit::{ComponentAudit, NativeIndexAudit, SchemaInventory};
 mod packages;

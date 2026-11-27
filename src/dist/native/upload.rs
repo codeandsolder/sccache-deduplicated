@@ -138,10 +138,10 @@ pub(super) fn send(
 /// completion. Immutable file uploads can replay their exact bytes in this
 /// case. Do not retry connection loss or a failed integrity check here.
 #[cfg(target_os = "linux")]
-pub(super) async fn retry_busy<F, Fut>(timeout: std::time::Duration, mut attempt: F) -> Result<()>
+pub(super) async fn retry_busy<T, F, Fut>(timeout: std::time::Duration, mut attempt: F) -> Result<T>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: std::future::Future<Output = Result<T>>,
 {
     let mut delay = std::time::Duration::from_millis(25);
     tokio::time::timeout(timeout, async {
@@ -160,7 +160,7 @@ where
         }
     })
     .await
-    .context("native output upload admission deadline exceeded")?
+    .context("native transfer admission deadline exceeded")?
 }
 
 /// Demand-driven immutable file upload. There is no synchronous producer,

@@ -797,7 +797,7 @@ impl NativeCacheClient {
     async fn publish_execution(
         &self,
         context: ExecutionContext<'_>,
-        prepared: PreparedExecution,
+        mut prepared: PreparedExecution,
         measured: MeasuredExecution,
         transport: Option<&PackageTransportTracker>,
         check: &LeaseCheck<'_>,
@@ -811,12 +811,20 @@ impl NativeCacheClient {
             return Ok(captured);
         };
         let publication_started = Instant::now();
+        // Compilation has finished. Publication needs the result descriptors,
+        // not leases over the compiler's input closure. This matters when
+        // the worker and scheduler share the same resident CAS.
+        prepared.inputs.clear();
         prepared.request.validate_result(&manifest)?;
         let blobs = manifest.blobs()?;
         let mut captured = captured;
         let retained = prepared.retain_output(context, &mut captured).await;
         check()?;
-        let (begin, scheduler_limit) = self.begin_result_upload(ticket, manifest.clone()).await?;
+        let (begin, scheduler_limit) = super::upload::retry_busy(self.timeout, || async {
+            check()?;
+            self.begin_result_upload(ticket, manifest.clone()).await
+        })
+        .await?;
         let missing = begin.missing;
         ensure!(
             missing

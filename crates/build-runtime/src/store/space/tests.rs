@@ -932,3 +932,38 @@ fn observation_does_not_reclaim_or_wait_for_admission() -> Result<()> {
     assert_eq!(store.stats()?, before);
     Ok(())
 }
+
+#[test]
+fn admission_reclaims_only_the_required_headroom() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    for name in ["aaa", "bbb", "ccc"] {
+        publish(&store, name)?;
+    }
+    let mut limit = policy();
+    limit.max_resident_bytes = 9;
+    limit.target_resident_bytes = 3;
+    let report = store.reclaim(limit, 0, 1, || Ok(100_000))?;
+    assert!(report.minimum_satisfied);
+    assert_eq!(report.evicted_roots, 1);
+    assert_eq!(store.stats()?.actions, 2);
+    Ok(())
+}
+
+#[test]
+fn reservations_that_cannot_fit_do_not_evict_resident_content() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut limit = policy();
+    limit.max_resident_bytes = 20;
+    limit.target_resident_bytes = 10;
+    let store = NativeStore::open_managed(dir.path(), limit)?;
+    let hot = publish(&store, "hot")?;
+    let _reservation = store.reserve_staging(16)?;
+    let refused = store.reserve_staging(5);
+    assert!(matches!(refused, Err(error) if error.is::<StageSpaceExhausted>()));
+    assert!(store.lookup(hot)?.is_some());
+    let refused = store.reserve_staging(21);
+    assert!(matches!(refused, Err(error) if error.is::<StageSpaceTooLarge>()));
+    assert!(store.lookup(hot)?.is_some());
+    Ok(())
+}
