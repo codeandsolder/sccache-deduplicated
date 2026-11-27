@@ -339,47 +339,64 @@ fn benchmark_cas_metadata_contention() -> Result<()> {
         .publish(&fingerprint, &result, Vec::new(), crate::ActionMode::Reuse)?
         .action;
     let blobs = tree.blobs()?;
-    for width in [1, 8] {
-        let barrier = Barrier::new(width);
-        let elapsed = std::thread::scope(|scope| -> Result<_> {
-            let jobs = (0..width)
-                .map(|_| {
-                    scope.spawn(|| -> Result<_> {
-                        barrier.wait();
-                        let start = Instant::now();
-                        for _ in 0..16 {
-                            let tree = store.lookup_tree(id)?.context("benchmark tree missing")?;
-                            let result =
-                                store.lookup(action)?.context("benchmark result missing")?;
-                            let reserved = store.reserve_blobs(&blobs)?;
-                            anyhow::ensure!(
-                                reserved.missing().is_empty(),
-                                "benchmark input missing"
-                            );
-                            std::hint::black_box((&tree, &result, &reserved));
-                        }
-                        Ok(start.elapsed())
+    for (label, retained) in [("CAS_METADATA", false), ("CAS_RETAINED_RESULT", true)] {
+        let anchor = if retained {
+            Some(store.lookup(action)?.context("retained result missing")?)
+        } else {
+            None
+        };
+        for width in [1, 8] {
+            let barrier = Barrier::new(width);
+            let elapsed = std::thread::scope(|scope| -> Result<_> {
+                let jobs = (0..width)
+                    .map(|_| {
+                        scope.spawn(|| -> Result<_> {
+                            barrier.wait();
+                            let start = Instant::now();
+                            for _ in 0..16 {
+                                if retained {
+                                    std::hint::black_box(
+                                        store
+                                            .lookup(action)?
+                                            .context("benchmark result missing")?,
+                                    );
+                                    continue;
+                                }
+                                let tree =
+                                    store.lookup_tree(id)?.context("benchmark tree missing")?;
+                                let result =
+                                    store.lookup(action)?.context("benchmark result missing")?;
+                                let reserved = store.reserve_blobs(&blobs)?;
+                                anyhow::ensure!(
+                                    reserved.missing().is_empty(),
+                                    "benchmark input missing"
+                                );
+                                std::hint::black_box((&tree, &result, &reserved));
+                            }
+                            Ok(start.elapsed())
+                        })
                     })
-                })
-                .collect::<Vec<_>>();
-            jobs.into_iter()
-                .map(|job| {
-                    job.join()
-                        .map_err(|_| anyhow::anyhow!("benchmark worker panicked"))?
-                })
-                .collect::<Result<Vec<_>>>()
-        })?;
-        let maximum = elapsed.iter().max().context("missing benchmark sample")?;
-        println!(
-            "CAS_METADATA threads={width} iterations=16 files=1024 wall_ms={:.3} mean_ms={:.3}",
-            maximum.as_secs_f64() * 1000.0,
-            elapsed
-                .iter()
-                .map(std::time::Duration::as_secs_f64)
-                .sum::<f64>()
-                * 1000.0
-                / f64::from(u32::try_from(width)?)
-        );
+                    .collect::<Vec<_>>();
+                jobs.into_iter()
+                    .map(|job| {
+                        job.join()
+                            .map_err(|_| anyhow::anyhow!("benchmark worker panicked"))?
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            let maximum = elapsed.iter().max().context("missing benchmark sample")?;
+            println!(
+                "{label} threads={width} iterations=16 files=1024 wall_ms={:.3} mean_ms={:.3}",
+                maximum.as_secs_f64() * 1000.0,
+                elapsed
+                    .iter()
+                    .map(std::time::Duration::as_secs_f64)
+                    .sum::<f64>()
+                    * 1000.0
+                    / f64::from(u32::try_from(width)?)
+            );
+        }
+        std::hint::black_box(&anchor);
     }
     Ok(())
 }

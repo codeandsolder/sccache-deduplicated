@@ -386,6 +386,9 @@ impl NativeStore {
             return Ok(None);
         }
         let id = record.tree;
+        if pins.evicting == Some(super::space::Root::Tree(id)) {
+            return Ok(None);
+        }
         Ok(Some((
             record,
             self.lookup_tree_in(id, &read, pins)?

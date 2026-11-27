@@ -1,6 +1,6 @@
 //! Prepare and attach result roots independently of the durable transaction
 //! boundary, so synchronous and queued publications share conflict semantics.
-use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap};
 
 use anyhow::{Context, Result, ensure};
 use bincode::Options;
@@ -8,8 +8,8 @@ use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 use super::{
     ACTIONS, ActionRecord, Attachment, BLOB_LAYOUTS, BLOBS, BlobIndex, NativeStore,
-    PENDING_DELETIONS, Publication, Published, RESULT_ACTIONS, RESULTS, ResultLease, StagedBlob,
-    encoding, history, space::Root,
+    PENDING_DELETIONS, Publication, Published, RESULT_ACTIONS, RESULTS, ResultLease,
+    ResultSnapshot, StagedBlob, encoding, history, space::Root,
 };
 use crate::{
     ActionFingerprint, ActionKey, ActionMode, BlobRef, ContentId, ResultId, ResultManifest,
@@ -224,15 +224,16 @@ impl<'a> PreparedResult<'a> {
     }
 
     pub(super) fn lease(self, store: &NativeStore) -> Result<ResultLease> {
-        let mut pins = store.inner.lock_pins()?;
-        pins.pin_result(self.action, &self.blobs)?;
-        pins.touch(Root::Action(self.action));
-        drop(pins);
-        Ok(ResultLease {
-            inner: Arc::clone(&store.inner),
-            action: self.action,
+        let mut prepared = Some(ResultSnapshot {
             manifest: self.manifest.into_owned(),
             blobs: self.blobs,
-        })
+        });
+        let mut pins = store.inner.lock_pins()?;
+        let lease = pins
+            .pin_result(&store.inner, self.action, self.result, &mut prepared)?
+            .context("missing prepared result snapshot")?;
+        pins.touch(Root::Action(self.action));
+        drop(pins);
+        Ok(lease)
     }
 }

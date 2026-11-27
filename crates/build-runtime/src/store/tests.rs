@@ -994,6 +994,167 @@ fn opening_a_nonempty_unowned_directory_is_rejected() -> Result<()> {
 }
 
 #[test]
+fn garbage_candidates_are_rechecked_after_resurrection_and_new_reservations() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let stage = store.stage(&b"pending content"[..])?;
+    let blob = stage.reference();
+    let fingerprint = action("gc");
+    let manifest = result(blob);
+    let key = store
+        .publish(&fingerprint, &manifest, vec![stage], ActionMode::Reuse)?
+        .action;
+    assert!(matches!(store.evict(key)?, Eviction::Removed { .. }));
+    let selection = store.select_garbage(8)?;
+    assert_eq!(selection, vec![blob.id]);
+    let reservation = store.reserve_blobs(&BTreeMap::from([(blob.id, blob.size)]))?;
+    assert!(reservation.missing().is_empty());
+    assert_eq!(store.collect_selected_garbage(selection.clone())?.blobs, 0);
+    // A fully pinned pending queue can be inspected without mutation exclusion.
+    let mutation = store.inner.lock_mutations()?;
+    let collected = thread::scope(|scope| -> Result<_> {
+        let (send, receive) = std::sync::mpsc::channel();
+        let store = &store;
+        let worker = scope.spawn(move || send.send(store.collect_garbage(8)));
+        let observed = receive.recv_timeout(std::time::Duration::from_secs(2));
+        drop(mutation);
+        worker.join().map_err(|_| anyhow!("GC reader panicked"))??;
+        observed?
+    })?;
+    assert_eq!(collected.blobs, 0);
+    store.publish(&fingerprint, &manifest, Vec::new(), ActionMode::Reuse)?;
+    drop(reservation);
+    assert_eq!(store.collect_selected_garbage(selection)?.blobs, 0);
+    assert!(store.lookup(key)?.is_some());
+    assert!(matches!(store.evict(key)?, Eviction::Removed { .. }));
+    assert_eq!(store.collect_garbage(8)?.blobs, 1);
+    Ok(())
+}
+
+#[test]
+fn root_eviction_claim_excludes_only_its_target_and_releases_on_abort() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let stage = store.stage(&b"evicted content"[..])?;
+    let blob = stage.reference();
+    let target = store
+        .publish(
+            &action("target"),
+            &result(blob),
+            vec![stage],
+            ActionMode::Reuse,
+        )?
+        .action;
+    let unrelated = store
+        .publish(
+            &action("other"),
+            &result(blob),
+            Vec::new(),
+            ActionMode::Reuse,
+        )?
+        .action;
+    let claim = store
+        .inner
+        .claim_eviction(space::Root::Action(target))?
+        .context("missing eviction claim")?;
+    let (other, reserved) = thread::scope(|scope| -> Result<_> {
+        let (send, receive) = std::sync::mpsc::channel();
+        let store = &store;
+        let worker = scope.spawn(move || {
+            send.send((|| -> Result<_> {
+                ensure!(
+                    store.lookup(target)?.is_none(),
+                    "evicting action still admits readers"
+                );
+                let other = store
+                    .lookup(unrelated)?
+                    .context("unrelated result missing")?;
+                let reservation = store.reserve_blobs(&BTreeMap::from([(blob.id, blob.size)]))?;
+                Ok((other, reservation))
+            })())
+            .map_err(|_| anyhow!("eviction reader receiver disconnected"))
+        });
+        let observed = receive.recv_timeout(std::time::Duration::from_secs(2));
+        drop(claim);
+        worker
+            .join()
+            .map_err(|_| anyhow!("eviction reader panicked"))??;
+        observed?
+    })?;
+    assert!(reserved.missing().is_empty());
+    assert!(store.lookup(target)?.is_some());
+    assert_eq!(store.evict(unrelated)?, Eviction::Pinned);
+    assert!(matches!(store.evict(target)?, Eviction::Removed { .. }));
+    drop(other);
+    assert!(matches!(store.evict(unrelated)?, Eviction::Removed { .. }));
+    assert_eq!(store.collect_garbage(8)?.blobs, 0);
+    drop(reserved);
+    assert_eq!(store.collect_garbage(8)?.blobs, 1);
+    Ok(())
+}
+
+#[test]
+fn stale_action_snapshot_cannot_pin_content_retired_by_refresh_or_eviction() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let old = store.stage(&b"old"[..])?;
+    let manifest = result(old.reference());
+    let fingerprint = action("refresh");
+    let key = store
+        .publish(&fingerprint, &manifest, vec![old], ActionMode::Reuse)?
+        .action;
+    let encoded = {
+        let read = store.inner.db.begin_read()?;
+        let actions = read.open_table(ACTIONS)?;
+        let record = actions.get(&key.0)?.context("missing action")?;
+        record.value().to_vec()
+    };
+    let replacement = store.stage(&b"replacement"[..])?;
+    let updated = result(replacement.reference());
+    store.publish(
+        &fingerprint,
+        &updated,
+        vec![replacement],
+        ActionMode::Refresh,
+    )?;
+    assert_eq!(store.collect_garbage(8)?.blobs, 1);
+    assert!(matches!(
+        store.pin_current_result(
+            key,
+            &encoded,
+            manifest.id()?,
+            &mut Some(ResultSnapshot {
+                manifest: manifest.clone(),
+                blobs: manifest.blobs()?
+            })
+        )?,
+        ResultPin::Changed
+    ));
+    assert_eq!(
+        store
+            .lookup(key)?
+            .context("missing refreshed result")?
+            .manifest(),
+        &updated
+    );
+    assert!(matches!(store.evict(key)?, Eviction::Removed { .. }));
+    assert!(matches!(
+        store.pin_current_result(
+            key,
+            &encoded,
+            manifest.id()?,
+            &mut Some(ResultSnapshot {
+                manifest: manifest.clone(),
+                blobs: manifest.blobs()?
+            })
+        )?,
+        ResultPin::Missing
+    ));
+    assert_eq!(store.collect_garbage(8)?.blobs, 1);
+    Ok(())
+}
+
+#[test]
 fn lookups_do_not_wait_on_publication_lock() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = NativeStore::open(dir.path())?;
@@ -1157,6 +1318,10 @@ fn refresh_retains_shared_aliases_and_old_result_leases() -> Result<()> {
     let a = store.publish(&action("a"), &first, vec![old], ActionMode::Reuse)?;
     let b = store.publish(&action("b"), &first, vec![], ActionMode::Reuse)?;
     let reader = store.lookup(a.action)?.context("old result missing")?;
+    let alias = store.lookup(b.action)?.context("alias missing")?;
+    assert!(Arc::ptr_eq(&reader.content, &alias.content));
+    assert_eq!(store.inner.lock_pins()?.blobs.get(&old_blob.id), Some(&1));
+    drop(alias);
     let new = store.stage(&b"second"[..])?;
     let second = result(new.reference());
     let refreshed = store.publish(&action("a"), &second, vec![new], ActionMode::Refresh)?;
@@ -1178,6 +1343,7 @@ fn refresh_retains_shared_aliases_and_old_result_leases() -> Result<()> {
     reader.open_blob(old_blob.id)?.read_to_end(&mut bytes)?;
     assert_eq!(bytes, b"first");
     drop(reader);
+    assert!(!store.inner.lock_pins()?.results.contains_key(&a.result));
     assert_eq!(store.collect_garbage(8)?.blobs, 1);
     assert_eq!(
         store
@@ -1186,6 +1352,104 @@ fn refresh_retains_shared_aliases_and_old_result_leases() -> Result<()> {
             .manifest(),
         &second
     );
+    Ok(())
+}
+
+#[test]
+fn shared_result_snapshot_still_detects_missing_physical_content() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let staged = store.stage(&b"content"[..])?;
+    let blob = staged.reference();
+    let manifest = result(blob);
+    let fingerprint = action("repair");
+    let lease = store.publish_pinned(
+        &fingerprint,
+        &manifest,
+        vec![staged],
+        crate::ActionMode::Reuse,
+    )?;
+    let key = fingerprint.key()?;
+    fs::remove_file(store.inner.blob_path(blob.id))?;
+    assert!(store.lookup(key)?.is_none());
+    let repaired = store.stage(&b"content"[..])?;
+    let replacement = store.publish_pinned(
+        &fingerprint,
+        &manifest,
+        vec![repaired],
+        crate::ActionMode::Reuse,
+    )?;
+    assert!(Arc::ptr_eq(&lease.content, &replacement.content));
+    let reader = store.lookup(key)?.context("repaired result missing")?;
+    let mut bytes = Vec::new();
+    reader.open_blob(blob.id)?.read_to_end(&mut bytes)?;
+    assert_eq!(bytes, b"content");
+    assert_eq!(store.inner.lock_pins()?.blobs.get(&blob.id), Some(&1));
+    Ok(())
+}
+
+#[test]
+fn last_result_snapshot_drop_cannot_remove_replacement_pin() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let staged = store.stage(&b"content"[..])?;
+    let blob = staged.reference();
+    let manifest = result(blob);
+    let published = store.publish(
+        &action("race"),
+        &manifest,
+        vec![staged],
+        crate::ActionMode::Reuse,
+    )?;
+    let lease = store.lookup(published.action)?.context("missing result")?;
+    let old = Arc::clone(&lease.content);
+    drop(lease);
+    let mut prepared = Some(ResultSnapshot {
+        blobs: manifest.blobs()?,
+        manifest,
+    });
+    let mut pins = store.inner.lock_pins()?;
+    let weak = pins
+        .results
+        .get(&published.result)
+        .context("missing weak pin")?
+        .clone();
+    let replacement = thread::scope(|scope| {
+        let worker = scope.spawn(move || drop(old));
+        let started = Instant::now();
+        while weak.strong_count() != 0 && started.elapsed() < std::time::Duration::from_secs(2) {
+            thread::yield_now();
+        }
+        let acquired = if weak.strong_count() == 0 {
+            pins.pin_result(
+                &store.inner,
+                published.action,
+                published.result,
+                &mut prepared,
+            )
+        } else {
+            Err(anyhow::anyhow!("old content destructor did not start"))
+        };
+        drop(pins);
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("drop worker panicked"))?;
+        acquired
+    })?
+    .context("replacement pin missing")?;
+    {
+        let pins = store.inner.lock_pins()?;
+        assert_eq!(pins.blobs.get(&blob.id), Some(&1));
+        assert!(
+            pins.results
+                .get(&published.result)
+                .is_some_and(|weak| std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&replacement.content)))
+        );
+    }
+    drop(replacement);
+    let pins = store.inner.lock_pins()?;
+    assert!(!pins.results.contains_key(&published.result));
+    assert!(!pins.blobs.contains_key(&blob.id));
     Ok(())
 }
 
