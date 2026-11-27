@@ -76,7 +76,7 @@ mod store;
 pub use coordinator::{Admission, BuildCoordinator, CompilePermit};
 #[cfg(all(unix, feature = "store"))]
 pub use store::{
-    CacheAnalyticsSampler, CacheStats, ComponentAudit, Eviction, GarbageCollected, ImpactUpdate,
+    CacheAnalyticsSampler, CacheStats, ComponentAudit, Eviction, GarbageCollected,
     NativeIndexAudit, NativeStore, PackageArchiveLease, PackageDecoder, PackageImport,
     PackageImportLimits, PackagePolicy, PackagePreparation, PackageSlot, PhysicalStager, Published,
     ResultLease, SchemaInventory, SpaceReport, SpaceStatus, StageBudget, StagedBlob, TreeLease,

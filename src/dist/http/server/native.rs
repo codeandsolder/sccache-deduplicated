@@ -40,9 +40,10 @@ use crate::{
     config::scheduler::NativeCacheConfig,
     dist::native::{
         BlobSourceRequest, CloseRequest, CommitRequest, DownloadRequest, ExecutionRequest,
-        InputPrefetchRequest, ManifestRequest, OpenTreeRequest, PackageAcquisition, PackageLocator,
-        PackagePlanRequest, PackageTreeRequest, RetainRequest, RetainedDownloadRequest,
-        ScheduleRequest, StatusRequest, codec,
+        ImpactLookupRequest, ImpactPublishRequest, InputPrefetchRequest, ManifestRequest,
+        OpenTreeRequest, PackageAcquisition, PackageLocator, PackagePlanRequest,
+        PackageTreeRequest, RetainRequest, RetainedDownloadRequest, ScheduleRequest, StatusRequest,
+        codec,
         ingress::{receive_blob, receive_package, stage_blob},
     },
 };
@@ -544,6 +545,8 @@ fn native_admission_class((_, operation): &(String, String)) -> AdmissionClass {
         | "input_prefetch"
         | "retain_open"
         | "retain_add"
+        | "impact_lookup"
+        | "impact_publish"
         | "blob_sources"
         | "retain_sources"
         | "tree_offer"
@@ -1196,6 +1199,25 @@ fn dispatch(
             } = metadata(request, limit)?;
             sessions.retain_result(group, action, result, request.id())?;
             encode(&(), limit)
+        }
+        "impact_lookup" if publisher == Publisher::Client => {
+            let ImpactLookupRequest { group, scope } = metadata(request, limit)?;
+            encode(
+                &sessions.retain_impact_head(group, request.id(), scope)?,
+                limit,
+            )
+        }
+        "impact_publish" if publisher == Publisher::Client => {
+            let ImpactPublishRequest {
+                group,
+                scope,
+                expected,
+                upload,
+            } = metadata(request, limit)?;
+            encode(
+                &sessions.publish_impact_head(group, request.id(), scope, expected, upload)?,
+                limit,
+            )
         }
         "retain_renew" if publisher == Publisher::Client => {
             sessions.renew_retention(metadata(request, limit)?, request.id())?;

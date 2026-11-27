@@ -55,6 +55,19 @@ pub(super) struct PackageTreeRequest {
 }
 
 #[derive(Serialize, Deserialize)]
+pub(super) struct ImpactLookupRequest {
+    pub group: Ticket,
+    pub scope: ContentId,
+}
+#[derive(Serialize, Deserialize)]
+pub(super) struct ImpactPublishRequest {
+    pub group: Ticket,
+    pub scope: ContentId,
+    pub expected: Option<TreeId>,
+    pub upload: Ticket,
+}
+
+#[derive(Serialize, Deserialize)]
 pub(super) struct ExecutionRequest {
     pub ticket: Ticket,
     pub spec: ExecutionSpec,
@@ -645,6 +658,42 @@ impl NativeCacheClient {
             );
         }
         Ok(result)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "dist-client"))]
+    pub(crate) fn retain_impact_head(
+        &self,
+        group: Ticket,
+        scope: ContentId,
+    ) -> Result<Option<crate::build_runtime::wire::ImpactHead>> {
+        self.control("impact_lookup", &ImpactLookupRequest { group, scope })
+    }
+
+    #[cfg(all(target_os = "linux", feature = "dist-client"))]
+    pub(crate) fn publish_impact_head(
+        &self,
+        group: Ticket,
+        scope: ContentId,
+        expected: Option<TreeId>,
+        blob: BlobRef,
+        file: File,
+        interval: Duration,
+    ) -> Result<crate::build_runtime::wire::ImpactUpdate> {
+        let manifest = crate::build_runtime::NativeStore::impact_manifest(scope, blob)?;
+        let upload = self.push_tree(&manifest, |_| Ok(file.try_clone()?), interval)?;
+        let result = self.control(
+            "impact_publish",
+            &ImpactPublishRequest {
+                group,
+                scope,
+                expected,
+                upload,
+            },
+        );
+        if let Err(error) = self.close(upload) {
+            debug!("impact upload ticket close: {error:#}");
+        }
+        result
     }
 
     /// Upload the exact original archive for generic compressed transport.

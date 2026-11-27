@@ -5,7 +5,10 @@ use super::{
     NativeDownload, NativeSessions, Phase, Publisher, Ready, Result, ResultLease, Ticket, anyhow,
     bail, ensure,
 };
-use crate::{ResultId, RetainedPackage, TreeId, VerifiedPackage};
+use crate::{
+    ResultId, RetainedPackage, TreeId, TreeLease, VerifiedPackage,
+    wire::{ImpactHead, ImpactUpdate},
+};
 
 #[derive(Default)]
 pub(super) struct RetentionGroups {
@@ -24,12 +27,14 @@ struct Group {
 enum RootId {
     Result(ResultId),
     Package(TreeId),
+    Impact(TreeId),
 }
 
 #[derive(Clone)]
 enum RetainedLease {
     Result(Arc<ResultLease>),
     Package(Arc<VerifiedPackage>),
+    Impact(Arc<TreeLease>),
 }
 
 impl RetainedLease {
@@ -37,12 +42,14 @@ impl RetainedLease {
         Ok(match self {
             Self::Result(lease) => bincode::serialized_size(lease.manifest())?,
             Self::Package(package) => bincode::serialized_size(package.tree().manifest())?,
+            Self::Impact(tree) => bincode::serialized_size(tree.manifest())?,
         })
     }
 
     fn download(&self, blob: BlobRef) -> Result<NativeDownload> {
         let (file, encoding) = match self {
             Self::Result(lease) => (lease.open_file(blob.id)?, lease.physical_encoding(blob.id)?),
+            Self::Impact(tree) => (tree.open_file(blob.id)?, tree.physical_encoding(blob.id)?),
             Self::Package(package) => (
                 package.tree().open_file(blob.id)?,
                 package.tree().physical_encoding(blob.id)?,
@@ -246,6 +253,64 @@ impl NativeSessions {
         )?;
         drop(groups);
         Ok(RetainedPackage { receipt, manifest })
+    }
+
+    /// Look up an impact head and transfer the record pin to the peer's
+    /// build-scoped retention group. Existing retained-blob transport then
+    /// delivers the record with exact length and digest verification.
+    pub fn retain_impact_head(
+        &self,
+        group: Ticket,
+        owner: crate::PeerId,
+        scope: ContentId,
+    ) -> Result<Option<ImpactHead>> {
+        self.renew_retention(group, owner)?;
+        let Some((tree, blob)) = self.store().lookup_impact_head(scope)? else {
+            return Ok(None);
+        };
+        let id = tree.id();
+        let mut groups = self.retained.lock()?;
+        let group = groups
+            .get_mut(&group)
+            .context("unknown or expired native retention group")?;
+        group.touch(owner, self.deadline())?;
+        group.insert(
+            RetainedLease::Impact(Arc::new(tree)),
+            RootId::Impact(id),
+            BTreeMap::from([(blob.id, blob.size)]),
+            u64::try_from(self.limits.max_manifest_cache_bytes)?,
+        )?;
+        Ok(Some(ImpactHead { tree: id, blob }))
+    }
+
+    /// Publish only a fully uploaded, committed record tree. The upload
+    /// ticket is an existing scheduler capability, and the retention group
+    /// belongs to the authenticated caller.
+    pub fn publish_impact_head(
+        &self,
+        group: Ticket,
+        owner: crate::PeerId,
+        scope: ContentId,
+        expected: Option<TreeId>,
+        upload: Ticket,
+    ) -> Result<ImpactUpdate> {
+        self.renew_retention(group, owner)?;
+        let session = self.get(upload)?;
+        let tree = {
+            let mut state = Self::lock(&session)?;
+            self.authorize_reader(&mut state, Publisher::Client)?;
+            let Phase::Ready(Ready::Tree(delivery)) = &state.phase else {
+                bail!("impact record upload not committed");
+            };
+            let super::TreeSource::Stored(tree) = &delivery.source else {
+                bail!("impact record must be a committed upload");
+            };
+            self.store()
+                .lookup_tree(tree.id())?
+                .context("impact record lost its upload pin")?
+        };
+        self.store()
+            .compare_exchange_impact_head(scope, expected, &tree)
     }
 
     /// Renew a build-wide lease, independent of the number of retained results.

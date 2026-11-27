@@ -2,24 +2,18 @@
 //! permanent pin: ordinary cache eviction removes the corresponding index
 //! entry atomically with the tree. Clients must treat absence as a miss.
 use super::{NativeStore, TreeLease, WriteTransaction};
+use crate::wire::ImpactUpdate;
 use crate::{
     BlobRef, ContentId, TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTimestamp,
 };
 use anyhow::{Context, Result, ensure};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const HEADS: TableDefinition<'static, &[u8; 32], &[u8; 32]> =
     TableDefinition::new("impact_heads_v1");
 const REVERSE: TableDefinition<'static, &[u8; 32], &[u8; 32]> =
     TableDefinition::new("impact_head_trees_v1");
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ImpactUpdate {
-    Published(TreeId),
-    Conflict(Option<TreeId>),
-}
 
 pub(super) fn initialize(write: &WriteTransaction) -> Result<()> {
     write.open_table(HEADS)?;

@@ -317,6 +317,19 @@ pub struct TreeRead {
     pub manifest: TreeManifest,
 }
 
+/// A mutable impact head names one immutable, pinned coverage record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImpactHead {
+    pub tree: TreeId,
+    pub blob: BlobRef,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImpactUpdate {
+    Published(TreeId),
+    Conflict(Option<TreeId>),
+}
+
 /// Scheduler-issued capability to run exactly one native assignment over the
 /// worker's existing authenticated HTTPS service.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

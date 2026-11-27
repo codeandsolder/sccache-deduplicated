@@ -2425,7 +2425,6 @@ pub use packages::{
 };
 pub use packages::{PackageImport, PackagePreparation};
 mod impact;
-pub use impact::ImpactUpdate;
 mod trees;
 #[cfg(target_os = "linux")]
 pub use trees::MountedTree;
