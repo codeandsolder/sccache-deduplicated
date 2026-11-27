@@ -71,7 +71,7 @@ source staging directory. A pre-existing ecosystem source cache can be
 imported read-only; no second persistent package cache is created. Git
 sources use pinned isolated checkouts.
 
-This branch requires namespace protocol 8. The scheduler must enable
+This branch requires namespace protocol 9. The scheduler must enable
 original retention and a crates.io upstream:
 
 ```toml
@@ -105,6 +105,6 @@ It uses the already configured sccache for actual compiler requests.
 The branch is not yet a validated complete Cargo replacement. Full
 resolved metadata, alternate registries, broader workspace/platform/profile
 semantics, complete CLI compatibility, hermetic build-script result
-caching and coordinated protocol-8 integration require further work.
+caching and coordinated protocol-9 integration require further work.
 Build scripts, rustdoc and test execution are explicit local actions,
 not claimed to be independently cacheable arbitrary processes.
