@@ -28,15 +28,24 @@ test ! -e "$root/bad.tar.gz"
 # checksum manifest: an internally consistent but mismatched WASM generation.
 cp -a "$assets" "$root/stale"
 wasm="$root/stale/sccache-dashboard_bg.wasm"
-offset="$(LC_ALL=C rg --text --byte-offset --only-matching -F "$generation" "$wasm" | cut -d: -f1 | head -1)"
-test -n "$offset"
+mapfile -t offsets < <(LC_ALL=C rg --text --byte-offset --only-matching -F "$generation" "$wasm" | cut -d: -f1)
+(( ${#offsets[@]} > 0 ))
 # The first byte is always 's'; alter it without changing module structure.
-printf x | dd of="$wasm" bs=1 seek="$offset" conv=notrunc status=none
+for offset in "${offsets[@]}"; do
+    printf x | dd of="$wasm" bs=1 seek="$offset" conv=notrunc status=none
+done
 (cd "$root/stale" && find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$root/stale.sha256sums")
 mv "$root/stale.sha256sums" "$root/stale/SHA256SUMS"
 reject "$binary" verify-dashboard --assets "$root/stale"
 reject scripts/package-scheduler-dashboard.sh "$binary" "$root/stale" "$root/mixed.tar.gz"
 test ! -e "$root/mixed.tar.gz"
+
+# Even a mutually matching pair from another source revision is rejected.
+mkdir "$root/source"
+git archive HEAD -- Cargo.toml Cargo.lock rust-toolchain.toml src crates scripts/build-scheduler-dashboard.sh scripts/publish-dashboard-assets.sh contrib/codeandsolder/release-protocol.env | tar -xf - -C "$root/source"
+test "$("$binary" verify-dashboard --assets "$assets" --source "$root/source")" = "$generation"
+printf '\n/* changed source */\n' >> "$root/source/crates/scheduler-dashboard/src/styles.module.css"
+reject "$binary" verify-dashboard --assets "$assets" --source "$root/source"
 
 # Interrupted/failed preparation preserves the existing directory; a valid
 # exchange installs the entire new generation and leaves the old one staged.
