@@ -1034,6 +1034,7 @@ fn root_eviction_claim_excludes_only_its_target_and_releases_on_abort() -> Resul
                 let reservation = store.reserve_blobs(&BTreeMap::from([(blob.id, blob.size)]))?;
                 Ok((other, reservation))
             })())
+            .map_err(|_| anyhow!("eviction reader receiver disconnected"))
         });
         let observed = receive.recv_timeout(std::time::Duration::from_secs(2));
         drop(claim);
