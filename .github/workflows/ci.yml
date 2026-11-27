@@ -282,7 +282,7 @@ jobs:
     # Single current-Rust Linux lane on every PR and main push.
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@343303848026ed142e48a6a82e7a889080b99b26 # Last reusable workflow without provider-only OIDC permission
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@4c7fc62a9f9ec37aaa7c155d263cd5025e446a53 # main
     with:
       isolate-public-sccache-server: true
       # Bubblewrap 0.11+ supplies private writable overlay mounts.
@@ -313,15 +313,10 @@ jobs:
         printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'unset SCCACHE_SERVER_UDS SCCACHE_SERVER_PORT' 'exec "$@"' > "$test_runner"
         chmod +x "$test_runner"
         export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
-        cargo test --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
-        cargo test --locked --target x86_64-unknown-linux-gnu -p sccache-build -- --include-ignored --skip benchmark_native_zfs_clones_against_reuse --skip benchmark_native_zfs_clones_against_fuse_views --skip benchmark_cas_metadata_contention --skip benchmark_cas_group_commit --skip benchmark_cas_mixed_group_commit --skip benchmark_package_lookup_contention
-        cargo test --locked --target x86_64-unknown-linux-gnu -p sccache-cluster-identity
-        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --test native_dist -- --include-ignored --skip shared_daemon_credential_isolation
+        # Default integration binaries share a legacy daemon; cargo test
+        # preserves their serial_test execution semantics.
+        cargo test --locked --target x86_64-unknown-linux-gnu --test '*'
         cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --test native_dist -- --ignored --exact shared_daemon_credential_isolation
-        # The default feature set omits dist-server: explicitly run all
-        # scheduler/worker binary tests, including job resource telemetry.
-        cargo test --locked --target x86_64-unknown-linux-gnu \
-          --no-default-features --features=dist-server --bin sccache-dist
         cargo test --locked --target x86_64-unknown-linux-gnu -p sccache-dashboard --features ssr
         cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=scheduler-dashboard --bin sccache-dist scheduler_status
         cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=scheduler-dashboard --bin sccache-dist status_counts_assignment_rpc_reservations
@@ -334,9 +329,16 @@ jobs:
         env -u RUSTFLAGS scripts/build-scheduler-dashboard.sh "$target_dir/dashboard-tools/wasm-bindgen" "$target_dir/dashboard-tools/stylance"
         cargo build --locked --target x86_64-unknown-linux-gnu --no-default-features --features=scheduler-dashboard --bin sccache-dist
         scripts/test-scheduler-dashboard-browser.sh "$target_dir/x86_64-unknown-linux-gnu/debug/sccache-dist" "$target_dir/scheduler-dashboard/pkg"
-        # Reuse the already-initialized mandatory sccache for the standalone
-        # destination-profile tests. Strict compiler lints run in rust-skills2.
-        cargo test --locked --manifest-path tools/cpu-target-profile/Cargo.toml
+      test-suites: |
+        [
+          {"name":"default-unit","cargo":["--locked","--target","x86_64-unknown-linux-gnu","--lib","--bins"],"nextest":["--profile","ci-isolated"]},
+          {"name":"build-runtime","cargo":["--locked","--target","x86_64-unknown-linux-gnu","-p","sccache-build"],"nextest":["--profile","ci-isolated","--run-ignored","all","-E","not test(benchmark_native_zfs_clones_against_reuse) & not test(benchmark_native_zfs_clones_against_fuse_views) & not test(benchmark_cas_metadata_contention) & not test(benchmark_cas_group_commit) & not test(benchmark_cas_mixed_group_commit) & not test(benchmark_package_lookup_contention)"],"doctests":["--locked","--target","x86_64-unknown-linux-gnu","-p","sccache-build"]},
+          {"name":"cluster-identity","cargo":["--locked","--target","x86_64-unknown-linux-gnu","-p","sccache-cluster-identity"],"nextest":["--profile","ci-isolated"],"doctests":["--locked","-p","sccache-cluster-identity"]},
+          {"name":"scheduler-worker","cargo":["--locked","--target","x86_64-unknown-linux-gnu","--no-default-features","--features=dist-server","--bin","sccache-dist"],"nextest":["--profile","ci-isolated"]},
+          {"name":"native-http-server","continuous":true,"cargo":["--locked","--target","x86_64-unknown-linux-gnu","--no-default-features","--features=dist-client,dist-server","--lib"],"nextest":["--profile","ci-isolated","-E","test(dist::http::server::)"]},
+          {"name":"native-dist","continuous":true,"cargo":["--locked","--target","x86_64-unknown-linux-gnu","--no-default-features","--features=dist-client,dist-server","--test","native_dist"],"nextest":["--profile","ci-isolated","--run-ignored","all","-E","not test(=shared_daemon_credential_isolation)"]},
+          {"name":"cpu-target-profile","directory":"tools/cpu-target-profile","cargo":["--locked"],"doctests":["--locked"]}
+        ]
       rust-toolchain: "nightly-2026-11-23"
       rustflags: "-C target-cpu=x86-64-v2"
 
