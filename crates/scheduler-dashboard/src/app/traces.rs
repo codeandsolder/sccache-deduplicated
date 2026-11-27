@@ -272,7 +272,7 @@ fn LiveRequests(data: super::DashboardSource, navigation: TraceNavigation) -> im
                 </tr>}
             }/></tbody>
         </table>
-    }
+    }.into_any()
 }
 
 #[component]
@@ -298,7 +298,32 @@ fn LiveJobs(data: super::DashboardSource, navigation: TraceNavigation) -> impl I
                     </tr>}
                 }/></tbody>
             </table>
-    }
+    }.into_any()
+}
+
+#[component]
+fn TraceSearchControls(
+    filters: RwSignal<TraceSearch>,
+    applied: RwSignal<TraceSearch>,
+    revision: RwSignal<u64>,
+    navigation: TraceNavigation,
+) -> impl IntoView {
+    view! {
+            <div hidden=move || !matches!(navigation.view.get(), TraceView::Completed | TraceView::Phases)>
+            <div class=styles::controls>
+                <label>"Range"<select on:change=move |ev| filters.update(|f| f.lookback_secs = event_target_value(&ev).parse().unwrap_or(3600))>
+                    <option value="300">"5 minutes"</option><option value="3600" selected=true>"1 hour"</option><option value="86400">"1 day"</option><option value="604800">"7 days"</option>
+                </select></label>
+                <label>"Host"<input on:input=move |ev| filters.update(|f| f.host=event_target_value(&ev))/></label>
+                <label>"Revision (full SHA)"<input on:input=move |ev| filters.update(|f| f.revision=event_target_value(&ev))/></label>
+                <label>"Compiler"<input on:input=move |ev| filters.update(|f| f.compiler=event_target_value(&ev))/></label>
+                <label>"Output"<input on:input=move |ev| filters.update(|f| f.output=event_target_value(&ev))/></label>
+                <label>"Outcome"<input on:input=move |ev| filters.update(|f| f.outcome=event_target_value(&ev))/></label>
+                <label>"Order"<select on:change=move |ev| filters.update(|f| f.slowest=event_target_value(&ev)=="slow")><option value="slow">"Slowest"</option><option value="recent">"Recent"</option></select></label>
+                <button on:click=move |_| { applied.set(filters.get()); revision.update(|n| *n=n.wrapping_add(1)); }>"Search / refresh"</button>
+            </div>
+            </div>
+    }.into_any()
 }
 
 #[component]
@@ -336,20 +361,7 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
                         on:click=move |_| navigation.select(tab)>{tab.label()}</button>
                 }).collect_view()}
             </div>
-            <div hidden=move || !matches!(navigation.view.get(), TraceView::Completed | TraceView::Phases)>
-            <div class=styles::controls>
-                <label>"Range"<select on:change=move |ev| filters.update(|f| f.lookback_secs = event_target_value(&ev).parse().unwrap_or(3600))>
-                    <option value="300">"5 minutes"</option><option value="3600" selected=true>"1 hour"</option><option value="86400">"1 day"</option><option value="604800">"7 days"</option>
-                </select></label>
-                <label>"Host"<input on:input=move |ev| filters.update(|f| f.host=event_target_value(&ev))/></label>
-                <label>"Revision (full SHA)"<input on:input=move |ev| filters.update(|f| f.revision=event_target_value(&ev))/></label>
-                <label>"Compiler"<input on:input=move |ev| filters.update(|f| f.compiler=event_target_value(&ev))/></label>
-                <label>"Output"<input on:input=move |ev| filters.update(|f| f.output=event_target_value(&ev))/></label>
-                <label>"Outcome"<input on:input=move |ev| filters.update(|f| f.outcome=event_target_value(&ev))/></label>
-                <label>"Order"<select on:change=move |ev| filters.update(|f| f.slowest=event_target_value(&ev)=="slow")><option value="slow">"Slowest"</option><option value="recent">"Recent"</option></select></label>
-                <button on:click=move |_| { applied.set(filters.get()); revision.update(|n| *n=n.wrapping_add(1)); }>"Search / refresh"</button>
-            </div>
-            </div>
+            <TraceSearchControls filters=filters applied=applied revision=revision navigation=navigation/>
             <div class=styles::controls><label>"Trace ID"<input prop:value=move || navigation.lookup.get() on:input=move |ev| navigation.lookup.set(event_target_value(&ev))/></label>
                 <button on:click=move |_| navigation.open(navigation.lookup.get_untracked())>"Open"</button>
                 <button hidden=move || navigation.view.get() != TraceView::Detail on:click=move |_| navigation.select(navigation.previous.get_untracked())>"Back to list"</button>
@@ -361,7 +373,7 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
             <div class=styles::trace_pane id="trace-active-jobs" hidden=move || navigation.view.get() != TraceView::Jobs>
                 <LiveJobs data=data navigation=navigation/>
             </div>
-            <div id="trace-detail" class=styles::trace_pane hidden=move || navigation.view.get() != TraceView::Detail>
+            {view!{<div id="trace-detail" class=styles::trace_pane hidden=move || navigation.view.get() != TraceView::Detail>
             <Suspense fallback=|| view!{<p>"Loading timeline…"</p>}>
                 {move || detail.get().map(|result| match result {
                     Ok(Some(detail)) => view!{<Timeline detail=detail navigation=navigation/>}.into_any(),
@@ -369,7 +381,7 @@ pub(super) fn TracePanel(data: super::DashboardSource) -> impl IntoView {
                     Err(error) => view!{<p class=styles::warning>{error.to_string()}</p>}.into_any(),
                 })}
             </Suspense>
-            </div>
+            </div>}.into_any()}
             <Suspense fallback=move || view!{<p hidden=move || !matches!(navigation.view.get(), TraceView::Completed | TraceView::Phases)>"Loading traces…"</p>}>
                 {move || overview.get().map(|result| match result {
                     Err(error) => view!{<p hidden=move || !matches!(navigation.view.get(), TraceView::Completed | TraceView::Phases) class=styles::warning>{error.to_string()}</p>}.into_any(),
