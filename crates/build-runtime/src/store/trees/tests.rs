@@ -200,6 +200,105 @@ async fn benchmark_cas_group_commit() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "mixed CAS group commit benchmark"]
+async fn benchmark_cas_mixed_group_commit() -> Result<()> {
+    use crate::ActionMode;
+    use std::{sync::atomic::Ordering, time::Instant};
+    for grouped in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let store = NativeStore::open(temp.path())?;
+        let mut jobs = Vec::new();
+        for index in 0..256_u32 {
+            let bytes = index.to_le_bytes().repeat(1024);
+            let staged = store.stage(bytes.as_slice())?;
+            let fingerprint = ActionFingerprint {
+                schema: "publication-benchmark".into(),
+                components: BTreeMap::from([("source".into(), staged.reference().id)]),
+            };
+            jobs.push((index, fingerprint, staged));
+        }
+        let start = Instant::now();
+        let mut active = Vec::new();
+        for (index, fingerprint, staged) in jobs {
+            let store = store.clone();
+            let work = async move {
+                let blob = staged.reference();
+                if index % 2 == 0 {
+                    let manifest = NativeStore::blob_retention_manifest(blob)?;
+                    if grouped {
+                        drop(
+                            store
+                                .publish_tree_pinned_async(manifest, vec![staged], ())
+                                .await?,
+                        );
+                    } else {
+                        drop(store.publish_tree_pinned(&manifest, vec![staged])?);
+                    }
+                } else {
+                    let manifest = ResultManifest {
+                        outputs: BTreeMap::from([(
+                            "obj".into(),
+                            Artifact::File {
+                                blob,
+                                mode: Some(0o644),
+                            },
+                        )]),
+                        stdout: None,
+                        stderr: None,
+                    };
+                    if grouped {
+                        drop(
+                            store
+                                .publish_pinned_async(
+                                    fingerprint,
+                                    manifest,
+                                    vec![staged],
+                                    ActionMode::Reuse,
+                                    (),
+                                )
+                                .await?,
+                        );
+                    } else {
+                        drop(store.publish_pinned(
+                            &fingerprint,
+                            &manifest,
+                            vec![staged],
+                            ActionMode::Reuse,
+                        )?);
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            };
+            if grouped {
+                active.push(tokio::spawn(work));
+            } else {
+                work.await?;
+            }
+        }
+        for job in active {
+            job.await??;
+        }
+        let commits = if grouped {
+            store
+                .inner
+                .publication_queue
+                .committed_batches
+                .load(Ordering::Relaxed)
+        } else {
+            256
+        };
+        let stats = store.stats()?;
+        assert_eq!(stats.trees, 128);
+        assert_eq!(stats.actions, 128);
+        println!(
+            "CAS_MIXED_GROUP_COMMIT grouped={grouped} requests=256 commits={commits} wall_ms={:.3}",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    Ok(())
+}
+
 /// Measure warm tree/result leases and reservation admission over the same
 /// immutable closure, including contention between independent consumers.
 #[test]
