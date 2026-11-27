@@ -756,23 +756,7 @@ impl NativeCacheClient {
         let publication_started = Instant::now();
         prepared.request.validate_result(&manifest)?;
         let blobs = manifest.blobs()?;
-        let (captured, retained) = if let Some(output) = prepared.output.take() {
-            ensure!(
-                output.budget.is_none(),
-                "compiler did not consume output reservation"
-            );
-            output
-                .grace
-                .retain(
-                    store.clone(),
-                    prepared.request.action_fingerprint()?,
-                    captured,
-                    (context.policy.timeout, check),
-                )
-                .await?
-        } else {
-            (captured, None)
-        };
+        let (captured, retained) = prepared.retain_output(context, captured, check).await?;
         let begin: crate::build_runtime::wire::BeginResult = self
             .control_with_timeout_async(
                 "begin",
@@ -974,6 +958,30 @@ struct PreparedExecution {
 impl PreparedExecution {
     fn take_budget(&mut self) -> Option<StageBudget> {
         self.output.as_mut().and_then(|output| output.budget.take())
+    }
+
+    async fn retain_output(
+        &mut self,
+        context: ExecutionContext<'_>,
+        captured: CapturedExecution,
+        check: &LeaseCheck<'_>,
+    ) -> Result<(CapturedExecution, Option<super::grace::RetainedOutput>)> {
+        let Some(output) = self.output.take() else {
+            return Ok((captured, None));
+        };
+        ensure!(
+            output.budget.is_none(),
+            "compiler did not consume output reservation"
+        );
+        output
+            .grace
+            .retain(
+                context.store.clone(),
+                self.request.action_fingerprint()?,
+                captured,
+                (context.policy.timeout, check),
+            )
+            .await
     }
 }
 
