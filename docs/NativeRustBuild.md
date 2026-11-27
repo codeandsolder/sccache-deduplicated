@@ -16,6 +16,7 @@ sccache check --all-targets --locked
 sccache test --workspace --locked
 sccache clippy --all-targets --locked -- -D warnings
 sccache +nightly-2026-11-23 build --release --locked
+sccache build --toolchain-root /path/to/immutable/toolchain --locked
 sccache run --bin my-program -- arg1 arg2
 sccache doc --no-deps
 sccache generate-lockfile
@@ -61,12 +62,18 @@ Compiler cache identity uses file contents, arguments, relevant environment,
 toolchain identities and the captured input closure. Compiler discovery,
 rlib dependency discovery, C/C++ include validation and compiler-helper
 discovery must not accept mtime or ctime as freshness evidence. Immutable
-fs-verity files can reuse a verified digest; mutable files are rehashed.
+fs-verity files and genuine read-only ZFS snapshot files can reuse a verified
+digest; mutable files are rehashed. Snapshot recognition uses descriptor-based
+kernel mount metadata, including the unique mount ID and snapshot source.
+Ordinary read-only mounts and unsupported kernels do not qualify.
 Rust key schema 13 binds canonical source paths and extern aliases to their
 contents, and hashes actual installed host/target runtime files rather than
 trusting rustup installation manifests. Git checkouts use a canonical root
-covering all sibling crates. Mutable runtime trees incur repeated hashing
-until an immutable snapshot/lease mechanism can amortize it.
+covering all sibling crates. Select a pinned installation with
+`--toolchain-root` or `[build] toolchain-root` in project configuration.
+The compiler and companion tools must resolve inside that installation,
+and the compiler must report the same sysroot. Snapshot provisioning and
+retention remain the administrator's responsibility.
 
 Native compiler sandbox input timestamps are normalized. Metadata checks
 that detect a concurrent modification during capture are race guards, not
@@ -76,11 +83,15 @@ to their compiler semantics.
 
 ## Registry package delivery
 
-The daemon requests exact checksum-verified crate archive bytes from the
-existing scheduler package CAS, via the build lease. Archives are staged
-privately, verified against the lockfile and extracted within that build's
-source staging directory. A pre-existing ecosystem source cache can be
-imported read-only; no second persistent package cache is created. Git
+The scheduler verifies the archive checksum and imports the package tree
+once. The daemon pins that tree under the existing build retention group
+and sends its manifest to the frontend. The build filesystem exposes
+individual files as authenticated CAS references and retrieves bytes only
+when read. Source hashing can reuse verified content IDs; compilation
+input trees use the same content store. No original archive needs to be
+retained for this delivery mode. A pre-existing ecosystem archive cache
+can be imported read-only on an offline miss; no second persistent package
+cache is created. Git
 sources use pinned isolated checkouts. The resolved metadata command emits
 separate host and target units and stable source-relative paths for leased
 external sources; it does not pretend ephemeral checkout paths remain valid
@@ -101,14 +112,10 @@ sccache-archive-path = "crates/{crate}/{crate}-{version}.crate"
 Configure the corresponding upstream origin on the scheduler. The scheduler
 never accepts a requester-supplied arbitrary archive origin.
 
-This branch requires namespace protocol 9. The scheduler must enable
-original retention and a crates.io upstream:
+This branch requires namespace protocol 9 and the matching scheduler
+package-tree endpoint. Configure a crates.io upstream:
 
 ```toml
-[native_cache.package_import]
-retain_original = true
-# Retain the existing resource limits for this table.
-
 [native_cache.package_upstreams.crates]
 origin = "https://static.crates.io/"
 timeout_secs = 180
@@ -144,7 +151,7 @@ cargo run --offline --locked -p sccache-rust-build --example inspect -- \
 The branch is not yet a validated complete Cargo replacement. Broader
 workspace/platform/profile semantics, authenticated private registry
 integration, remaining CLI operations, hermetic build-script result caching,
-immutable toolchain snapshot amortization and coordinated protocol-9
-integration require further work.
+fleet snapshot provisioning and coordinated protocol-9 integration require
+further work.
 Build scripts, rustdoc and test execution are explicit local actions,
 not claimed to be independently cacheable arbitrary processes.

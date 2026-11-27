@@ -222,6 +222,7 @@ async fn package_response(
             routes.sessions.renew_retention(group, request.id())?;
             let sessions = Arc::clone(&routes.sessions);
             let identity = locator.identity;
+            let expected_size = locator.expected_size;
             let limits = routes.service.limits;
             let cached =
                 tokio::task::spawn_blocking(move || sessions.lookup_package(identity, limits))
@@ -240,6 +241,10 @@ async fn package_response(
                     .await?
                     .0
             };
+            ensure!(
+                expected_size.is_none_or(|size| size == package.source().size),
+                "package archive length mismatch"
+            );
             let owner = request.id();
             let sessions = Arc::clone(&routes.sessions);
             return tokio::task::spawn_blocking(move || {
