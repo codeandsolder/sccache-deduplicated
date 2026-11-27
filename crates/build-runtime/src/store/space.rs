@@ -141,10 +141,17 @@ impl NativeStore {
     }
 
     fn resident_bytes(&self) -> Result<u64> {
-        let stats = self.stats()?;
-        stats
-            .logical_bytes
-            .checked_add(stats.pending_gc_bytes)
+        let read = self.inner.db.begin_read()?;
+        let accounting = read.open_table(super::ACCOUNTING)?;
+        let live = accounting
+            .get(super::LIVE_BYTES)?
+            .context("missing live accounting")?
+            .value();
+        let pending = accounting
+            .get(super::PENDING_BYTES)?
+            .context("missing pending accounting")?
+            .value();
+        live.checked_add(pending)
             .context("native resident byte overflow")
     }
 

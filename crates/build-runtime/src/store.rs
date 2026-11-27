@@ -550,7 +550,7 @@ pub struct CacheStats {
 }
 
 /// Work completed by a bounded garbage collection pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GarbageCollected {
     pub blobs: u64,
     pub logical_bytes: u64,
@@ -2051,6 +2051,19 @@ impl NativeStore {
     /// Returns an error for database failures; per-file failures remain queued
     /// and are reported in the collection result.
     pub fn collect_garbage(&self, limit: usize) -> Result<GarbageCollected> {
+        // A read snapshot with no queued deletions needs no exclusion from
+        // concurrent publication. Later deletions belong to the next pass.
+        if limit == 0
+            || self
+                .inner
+                .db
+                .begin_read()?
+                .open_table(PENDING_DELETIONS)?
+                .len()?
+                == 0
+        {
+            return Ok(GarbageCollected::default());
+        }
         let _mutation = self.inner.lock_mutations()?;
         let pins = self.inner.lock_pins()?;
         let read = self.inner.db.begin_read()?;

@@ -104,24 +104,14 @@ impl NativeStore {
             // Candidate enumeration uses a read snapshot, not the store's
             // global mutation lock. Revalidate and pin each chosen package
             // atomically with eviction before exposing its archive.
-            let mutation = self.inner.lock_mutations()?;
-            let current = {
-                let read = self.inner.db.begin_read()?;
-                let packages = read.open_table(PACKAGES)?;
-                packages
-                    .get(&key.0)?
-                    .map(|entry| encoding().deserialize::<PackageRecord>(entry.value()))
-                    .transpose()?
-            };
-            if current.and_then(|record| record.archive()) != Some(candidate.archive) {
+            let Some((_, tree)) = self.lookup_indexed_package(key, |record| {
+                Ok(record.archive() == Some(candidate.archive))
+            })?
+            else {
                 continue;
-            }
-            let tree = self
-                .lookup_tree(candidate.archive.tree)?
-                .context("indexed package tree missing")?;
+            };
             self.inner
                 .check_blob(candidate.archive.blob.id, candidate.archive.blob.size)?;
-            drop(mutation);
             for id in candidate.covers {
                 remaining.remove(&id);
             }

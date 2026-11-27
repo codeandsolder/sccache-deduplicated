@@ -351,30 +351,44 @@ impl NativeStore {
         identity: PackageIdentity,
         policy: PackagePolicy,
     ) -> Result<Option<VerifiedPackage>> {
-        let _mutation = self.inner.lock_mutations()?;
         let key = package_key(identity, policy)?;
-        let id = {
-            let read = self.inner.db.begin_read()?;
-            let table = read.open_table(PACKAGES)?;
-            table
-                .get(&key.0)?
-                .map(|entry| encoding().deserialize::<PackageRecord>(entry.value()))
-                .transpose()?
-        };
-        let Some(record) = id else {
+        self.lookup_indexed_package(key, |record| {
+            ensure!(
+                record.source.identity == identity,
+                "inconsistent package identity"
+            );
+            Ok(true)
+        })
+        .map(|found| {
+            found.map(|(record, tree)| VerifiedPackage {
+                source: record.source,
+                tree,
+            })
+        })
+    }
+
+    fn lookup_indexed_package(
+        &self,
+        key: ContentId,
+        accept: impl FnOnce(&PackageRecord) -> Result<bool>,
+    ) -> Result<Option<(PackageRecord, TreeLease)>> {
+        // Eviction removes the package mapping and its tree under the pin
+        // mutex. Pin that same snapshot's tree before releasing the mutex;
+        // manifest decoding and physical validation need no mutation lock.
+        let pins = self.inner.lock_pins()?;
+        let read = self.inner.db.begin_read()?;
+        let table = read.open_table(PACKAGES)?;
+        let Some(record) = table.get(&key.0)? else {
             return Ok(None);
         };
-        ensure!(
-            record.source.identity == identity,
-            "inconsistent package identity"
-        );
+        let record: PackageRecord = encoding().deserialize(record.value())?;
+        if !accept(&record)? {
+            return Ok(None);
+        }
         let tree = self
-            .lookup_tree(record.tree)?
+            .lookup_tree_in(record.tree, &read, pins)?
             .context("indexed package tree missing")?;
-        Ok(Some(VerifiedPackage {
-            source: record.source,
-            tree,
-        }))
+        Ok(Some((record, tree)))
     }
 
     /// Verify the compressed package against its upstream SHA-256 and length,
