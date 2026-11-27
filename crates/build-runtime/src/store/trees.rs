@@ -591,7 +591,6 @@ impl NativeStore {
     pub fn evict_tree(&self, id: TreeId) -> Result<Eviction> {
         #[cfg(target_os = "linux")]
         self.drop_idle_views(Some(id))?;
-        let _mutation = self.inner.lock_mutations()?;
         let Some(mut claim) = self.inner.claim_eviction(Root::Tree(id))? else {
             return Ok(Eviction::Pinned);
         };

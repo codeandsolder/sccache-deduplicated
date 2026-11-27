@@ -759,6 +759,7 @@ struct EvictionClaim<'a> {
     inner: &'a Inner,
     root: space::Root,
     committed: bool,
+    _mutation: MutexGuard<'a, ()>,
 }
 
 impl Drop for EvictionClaim<'_> {
@@ -796,6 +797,7 @@ impl Inner {
     }
 
     fn claim_eviction(&self, root: space::Root) -> Result<Option<EvictionClaim<'_>>> {
+        let mutation = self.lock_mutations()?;
         let mut pins = self.lock_pins()?;
         let pinned = match root {
             space::Root::Action(action) => pins.actions.contains_key(&action),
@@ -814,6 +816,7 @@ impl Inner {
             inner: self,
             root,
             committed: false,
+            _mutation: mutation,
         }))
     }
 
@@ -1902,33 +1905,36 @@ impl NativeStore {
     /// Returns an error for corrupt metadata, missing blobs or I/O failure.
     pub fn lookup(&self, action: ActionKey) -> Result<Option<ResultLease>> {
         loop {
-            let read = self.inner.db.begin_read()?;
-            let actions = read.open_table(ACTIONS)?;
-            let Some(encoded) = actions.get(&action.0)? else {
-                return Ok(None);
+            let (manifest, blobs) = {
+                let read = self.inner.db.begin_read()?;
+                let actions = read.open_table(ACTIONS)?;
+                let Some(encoded) = actions.get(&action.0)? else {
+                    return Ok(None);
+                };
+                let record: ActionRecord = encoding().deserialize(encoded.value())?;
+                ensure!(
+                    record.fingerprint.key()? == action,
+                    "invalid indexed action fingerprint"
+                );
+                let results = read.open_table(RESULTS)?;
+                let manifest = results
+                    .get(&record.result.0)?
+                    .context("missing indexed result")?;
+                let manifest: ResultManifest = encoding().deserialize(manifest.value())?;
+                ensure!(
+                    manifest.id()? == record.result,
+                    "invalid indexed result manifest"
+                );
+                let blobs = manifest.blobs()?;
+                // Decode, hash and validate immutable metadata outside the pin
+                // mutex. A refresh may change its action mapping while we work.
+                match self.pin_current_result(action, encoded.value(), &blobs)? {
+                    ResultPin::Missing => return Ok(None),
+                    ResultPin::Changed => continue,
+                    ResultPin::Acquired => {}
+                }
+                (manifest, blobs)
             };
-            let record: ActionRecord = encoding().deserialize(encoded.value())?;
-            ensure!(
-                record.fingerprint.key()? == action,
-                "invalid indexed action fingerprint"
-            );
-            let results = read.open_table(RESULTS)?;
-            let manifest = results
-                .get(&record.result.0)?
-                .context("missing indexed result")?;
-            let manifest: ResultManifest = encoding().deserialize(manifest.value())?;
-            ensure!(
-                manifest.id()? == record.result,
-                "invalid indexed result manifest"
-            );
-            let blobs = manifest.blobs()?;
-            // Decode, hash and validate immutable metadata outside the pin
-            // mutex. A refresh may change its action mapping while we work.
-            match self.pin_current_result(action, encoded.value(), &blobs)? {
-                ResultPin::Missing => return Ok(None),
-                ResultPin::Changed => continue,
-                ResultPin::Acquired => {}
-            }
             let lease = ResultLease {
                 inner: Arc::clone(&self.inner),
                 action,
@@ -1999,7 +2005,6 @@ impl NativeStore {
     /// # Errors
     /// Returns an error for inconsistent metadata or storage failures.
     pub fn evict(&self, action: ActionKey) -> Result<Eviction> {
-        let _mutation = self.inner.lock_mutations()?;
         let Some(mut claim) = self.inner.claim_eviction(space::Root::Action(action))? else {
             return Ok(Eviction::Pinned);
         };

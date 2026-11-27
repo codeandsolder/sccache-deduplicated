@@ -994,6 +994,112 @@ fn opening_a_nonempty_unowned_directory_is_rejected() -> Result<()> {
 }
 
 #[test]
+fn root_eviction_claim_excludes_only_its_target_and_releases_on_abort() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let stage = store.stage(&b"evicted content"[..])?;
+    let blob = stage.reference();
+    let target = store
+        .publish(
+            &action("target"),
+            &result(blob),
+            vec![stage],
+            ActionMode::Reuse,
+        )?
+        .action;
+    let unrelated = store
+        .publish(
+            &action("other"),
+            &result(blob),
+            Vec::new(),
+            ActionMode::Reuse,
+        )?
+        .action;
+    let claim = store
+        .inner
+        .claim_eviction(space::Root::Action(target))?
+        .context("missing eviction claim")?;
+    let (other, reserved) = thread::scope(|scope| -> Result<_> {
+        let (send, receive) = std::sync::mpsc::channel();
+        let store = &store;
+        let worker = scope.spawn(move || {
+            send.send((|| -> Result<_> {
+                ensure!(
+                    store.lookup(target)?.is_none(),
+                    "evicting action still admits readers"
+                );
+                let other = store
+                    .lookup(unrelated)?
+                    .context("unrelated result missing")?;
+                let reservation = store.reserve_blobs(&BTreeMap::from([(blob.id, blob.size)]))?;
+                Ok((other, reservation))
+            })())
+        });
+        let observed = receive.recv_timeout(std::time::Duration::from_secs(2));
+        drop(claim);
+        worker
+            .join()
+            .map_err(|_| anyhow!("eviction reader panicked"))??;
+        observed?
+    })?;
+    assert!(reserved.missing().is_empty());
+    assert!(store.lookup(target)?.is_some());
+    assert_eq!(store.evict(unrelated)?, Eviction::Pinned);
+    assert!(matches!(store.evict(target)?, Eviction::Removed { .. }));
+    drop(other);
+    assert!(matches!(store.evict(unrelated)?, Eviction::Removed { .. }));
+    assert_eq!(store.collect_garbage(8)?.blobs, 0);
+    drop(reserved);
+    assert_eq!(store.collect_garbage(8)?.blobs, 1);
+    Ok(())
+}
+
+#[test]
+fn stale_action_snapshot_cannot_pin_content_retired_by_refresh_or_eviction() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let old = store.stage(&b"old"[..])?;
+    let manifest = result(old.reference());
+    let fingerprint = action("refresh");
+    let key = store
+        .publish(&fingerprint, &manifest, vec![old], ActionMode::Reuse)?
+        .action;
+    let encoded = {
+        let read = store.inner.db.begin_read()?;
+        let actions = read.open_table(ACTIONS)?;
+        let record = actions.get(&key.0)?.context("missing action")?;
+        record.value().to_vec()
+    };
+    let replacement = store.stage(&b"replacement"[..])?;
+    let updated = result(replacement.reference());
+    store.publish(
+        &fingerprint,
+        &updated,
+        vec![replacement],
+        ActionMode::Refresh,
+    )?;
+    assert_eq!(store.collect_garbage(8)?.blobs, 1);
+    assert!(matches!(
+        store.pin_current_result(key, &encoded, &manifest.blobs()?)?,
+        ResultPin::Changed
+    ));
+    assert_eq!(
+        store
+            .lookup(key)?
+            .context("missing refreshed result")?
+            .manifest(),
+        &updated
+    );
+    assert!(matches!(store.evict(key)?, Eviction::Removed { .. }));
+    assert!(matches!(
+        store.pin_current_result(key, &encoded, &manifest.blobs()?)?,
+        ResultPin::Missing
+    ));
+    assert_eq!(store.collect_garbage(8)?.blobs, 1);
+    Ok(())
+}
+
+#[test]
 fn lookups_do_not_wait_on_publication_lock() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = NativeStore::open(dir.path())?;
