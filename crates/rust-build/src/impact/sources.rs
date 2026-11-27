@@ -168,6 +168,23 @@ impl CoverageSources {
                     .context("local coverage source escapes Git root");
             }
         }
+        // A registry checkout inside the intermediate tree is still a
+        // registry source, not a generated local file. Choose the most
+        // specific physical source root before the broader scratch mapping.
+        if let Some(source) = self
+            .sources
+            .values()
+            .filter(|source| file.starts_with(&source.root))
+            .max_by_key(|source| source.root.components().count())
+            && (source.root.starts_with(&self.generated) || !file.starts_with(&self.generated))
+        {
+            if !source.repository {
+                return Ok(None);
+            }
+            return repo_key(git_root, file)?
+                .map(Some)
+                .context("local coverage source escapes Git root");
+        }
         if let Ok(suffix) = file
             .strip_prefix(GENERATED_PREFIX)
             .or_else(|_| file.strip_prefix(&self.generated))
@@ -180,18 +197,6 @@ impl CoverageSources {
                 "invalid generated coverage path"
             );
             return Ok(Some(format!("@generated/{suffix}")));
-        }
-        // Local fallback (no canonical sandbox) can emit physical names.
-        // Match physical package roots before generic Git-root handling.
-        for source in self.sources.values() {
-            if file.starts_with(&source.root) {
-                if !source.repository {
-                    return Ok(None);
-                }
-                return repo_key(git_root, file)?
-                    .map(Some)
-                    .context("local coverage source escapes Git root");
-            }
         }
         if file.starts_with("/rustc") || file.starts_with("/rust") {
             return Ok(None);

@@ -1140,6 +1140,17 @@ impl<'a> CompileSession<'a> {
         &self,
         command: &mut process::Command,
     ) -> Result<process::ExitStatus> {
+        self.with_local_process(command, |command| {
+            command.status().context("execute local build action")
+        })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_local_process<T>(
+        &self,
+        command: &mut process::Command,
+        execute: impl FnOnce(&mut process::Command) -> Result<T>,
+    ) -> Result<T> {
         // Only local, non-compiler actions acquire a local process slot here.
         // Compiler requests go through their normal admission/placement path.
         let _token = self.runtime.block_on(self.jobserver.acquire())?;
@@ -1148,7 +1159,7 @@ impl<'a> CompileSession<'a> {
             lease.inherit(command)?;
         }
         self.jobserver.configure(command);
-        command.status().context("execute local build action")
+        execute(command)
     }
 }
 

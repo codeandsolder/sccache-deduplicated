@@ -7,7 +7,7 @@ use crate::{
         ContentId, PlanAction, PlanNode,
         intermediate_fs::{IntermediateContent, intermediate_reference},
     },
-    commands::CompileSession,
+    commands::{CompileInvocation, CompileSession},
     dist::native::intermediate::Content,
 };
 use anyhow::{Context, Result, ensure};
@@ -35,7 +35,7 @@ use std::{
     process::{Command, ExitStatus, Stdio},
     sync::{Arc, Mutex, mpsc},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tempfile::{NamedTempFile, TempDir};
 
@@ -184,6 +184,110 @@ fn successful(output: Captured, label: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+/// LLVM continuous mode is a runtime capability, not just a filename flag.
+/// Verify a managed, instrumented executable leaves usable counters after
+/// SIGKILL before trusting this mode for a collection.
+fn verify_continuous(
+    session: &CompileSession<'_>,
+    toolchain: &Toolchain,
+    scratch: &Path,
+    tools: &LlvmTools,
+) -> Result<()> {
+    ensure!(
+        toolchain.host.triple == toolchain.target.triple,
+        "continuous coverage requires a native target"
+    );
+    let probe = tempfile::tempdir_in(scratch)?;
+    let source = probe.path().join("probe.rs");
+    let binary = probe.path().join("coverage-probe");
+    let marker = probe.path().join("ready");
+    fs::write(
+        &source,
+        r#"
+#[inline(never)]
+fn continuous_probe_hit() -> u32 { std::hint::black_box(42) }
+fn main() {
+    assert_eq!(continuous_probe_hit(), 42);
+    std::fs::write(std::env::args_os().nth(1).unwrap(), b"ready").unwrap();
+    loop { std::thread::park(); }
+}
+"#,
+    )?;
+    let mut args: Vec<OsString> = vec![
+        "--crate-name".into(),
+        "coverage_probe".into(),
+        "--crate-type=bin".into(),
+        "--edition=2024".into(),
+        "--emit=link".into(),
+    ];
+    args.extend(CoverageMode::Continuous.flags().iter().map(OsString::from));
+    args.extend([
+        source.as_os_str().to_owned(),
+        "-o".into(),
+        binary.as_os_str().to_owned(),
+    ]);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let status = session.execute(
+        CompileInvocation {
+            exe: &toolchain.rustc,
+            cmdline: args,
+            cwd: probe.path(),
+            env_vars: std::env::vars_os().collect(),
+        },
+        &mut stdout,
+        &mut stderr,
+    )?;
+    ensure!(
+        status == 0,
+        "continuous coverage probe compilation: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let mut command = Command::new(&binary);
+    command
+        .arg(&marker)
+        .env(
+            "LLVM_PROFILE_FILE",
+            probe.path().join(CoverageMode::Continuous.profile_name()),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    session.with_local_process(&mut command, |command| {
+        let mut child = command.spawn()?;
+        let ready = (|| -> Result<()> {
+            let start = Instant::now();
+            while !marker.is_file() {
+                ensure!(
+                    child.try_wait()?.is_none(),
+                    "continuous coverage probe exited prematurely"
+                );
+                ensure!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "continuous coverage probe timed out"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        })();
+        let killed = child.kill();
+        let reaped = child.wait();
+        ready?;
+        killed?;
+        reaped?;
+        Ok(())
+    })?;
+    let profile = merge_text(session, scratch, tools, &raw_profiles(probe.path())?)?;
+    let text = fs::read_to_string(profile.path())?;
+    ensure!(
+        executed_functions(&text)?
+            .iter()
+            .any(|name| name.contains("continuous_probe_hit")),
+        "LLVM continuous coverage did not preserve executed counters after process termination"
+    );
+    Ok(())
+}
+
 fn raw_profiles(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(dir)? {
@@ -255,6 +359,7 @@ struct SuiteReport {
     whole_harness: bool,
     passed: bool,
     coverage_error: Option<String>,
+    collection_failed: bool,
 }
 
 struct TestResult {
@@ -450,7 +555,13 @@ impl Collector<'_> {
         Ok(TestResult { report, profile })
     }
 
-    fn whole(&self, node: &PlanNode, unit: String, reason: String) -> Result<SuiteReport> {
+    fn whole(
+        &self,
+        node: &PlanNode,
+        unit: String,
+        mut reason: String,
+        mut collection_failed: bool,
+    ) -> Result<SuiteReport> {
         let PlanAction::Process { command, .. } = &node.action else {
             anyhow::bail!("test execution was not a process");
         };
@@ -468,10 +579,10 @@ impl Collector<'_> {
             if !raw.is_empty() {
                 match merge_text(self.session, &self.scratch, &self.tools, &raw) {
                     Ok(profile) => locked(&self.profiles)?.push(profile),
-                    Err(error) => eprintln!(
-                        "aggregate profile for {} unavailable: {error:#}",
-                        node.label
-                    ),
+                    Err(error) => {
+                        collection_failed = true;
+                        reason.push_str(&format!("; aggregate profile unavailable: {error:#}"));
+                    }
                 }
             }
         }
@@ -484,6 +595,7 @@ impl Collector<'_> {
             whole_harness: true,
             passed: output.status.success(),
             coverage_error: Some(reason),
+            collection_failed,
         })
     }
 
@@ -504,6 +616,7 @@ impl Collector<'_> {
                             node,
                             unit,
                             format!("per-test collection unavailable: {error:#}"),
+                            true,
                         )?;
                         locked(&self.suites)?.push(result);
                         return Ok(());
@@ -514,6 +627,7 @@ impl Collector<'_> {
                     node,
                     unit,
                     "harness options require whole-process execution".into(),
+                    false,
                 )?;
                 locked(&self.suites)?.push(result);
                 return Ok(());
@@ -523,6 +637,7 @@ impl Collector<'_> {
                 node,
                 node.label.clone(),
                 "custom harness or doctest: full execution".into(),
+                false,
             )?;
             locked(&self.suites)?.push(result);
             return Ok(());
@@ -580,6 +695,8 @@ impl Collector<'_> {
             ignored.len(),
             reports.iter().filter(|r| r.coverage.is_some()).count()
         );
+        let collection_failed =
+            coverage_error.is_some() || reports.iter().any(|test| test.coverage.is_none());
         locked(&self.suites)?.push(SuiteReport {
             unit: harness.plan.unit.clone(),
             label: node.label.clone(),
@@ -588,6 +705,7 @@ impl Collector<'_> {
             tests: reports,
             whole_harness: false,
             passed,
+            collection_failed,
             coverage_error,
         });
         Ok(())
@@ -605,6 +723,7 @@ struct Report<'a> {
     stable_source_snapshot: bool,
     suites: Vec<SuiteReport>,
     aggregate_published: bool,
+    aggregate_error: Option<String>,
 }
 
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -668,6 +787,9 @@ pub(crate) fn execute(
     let scratch: TempDir = tempfile::Builder::new()
         .prefix("test-coverage-")
         .tempdir_in(lease_root)?;
+    if options.mode == CoverageMode::Continuous {
+        verify_continuous(session, toolchain, scratch.path(), &tools)?;
+    }
     let empty_text = scratch.path().join("empty.proftext");
     let empty_profile = scratch.path().join("empty.profdata");
     fs::write(&empty_text, b"")?;
@@ -750,18 +872,20 @@ pub(crate) fn execute(
         .flat_map(|suite| &suite.tests)
         .filter(|test| test.coverage.is_some())
         .count();
-    let incomplete = suites
-        .iter()
-        .filter(|suite| !suite.whole_harness)
-        .any(|suite| {
-            suite.coverage_error.is_some() || suite.tests.iter().any(|test| test.coverage.is_none())
-        });
+    let incomplete = suites.iter().any(|suite| suite.collection_failed);
+    let mut aggregate_error = None;
     let aggregate_published = if passed && stable && !incomplete {
-        options
+        match options
             .aggregate
             .map(|path| publish_aggregate(&collector, path))
-            .transpose()?
-            .unwrap_or(false)
+            .transpose()
+        {
+            Ok(published) => published.unwrap_or(false),
+            Err(error) => {
+                aggregate_error = Some(format!("{error:#}"));
+                false
+            }
+        }
     } else {
         false
     };
@@ -775,6 +899,7 @@ pub(crate) fn execute(
         stable_source_snapshot: stable,
         suites,
         aggregate_published,
+        aggregate_error,
     };
     atomic_json(options.report, &report)?;
     eprintln!(

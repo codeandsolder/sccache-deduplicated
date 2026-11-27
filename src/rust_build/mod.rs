@@ -529,6 +529,12 @@ fn execute(mut args: RustBuildArgs) -> Result<i32> {
         let _target_lock = target_lock;
         args.validate_targets(&graph)?;
         let plan_options = args.plan_options()?;
+        // Never replace ordinary build products with instrumented binaries.
+        let final_root = if plan_options.coverage.is_some() {
+            lease.root().join("coverage-target")
+        } else {
+            final_root
+        };
         let planner = Planner::new(
             &graph,
             &workspace,
