@@ -14,9 +14,8 @@ permissions:
 
 jobs:
   strict-rust:
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@4d1f6661ec4de02760706d415ca37c5628cca4c4 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@aeb7d43941a8c655e53a3094bf39268a25bff742 # main
     with:
-      command: ":"
       rustflags: ""
       rust-targets: wasm32-unknown-unknown
       python-ci-paths: tools
