@@ -43,6 +43,22 @@ pub(crate) fn native_directory_metadata() -> Result<crate::build_runtime::TreeMe
 pub enum ToolchainScope {
     Default,
     RustCompiler,
+    RustOpaque,
+    PreprocessedC,
+}
+
+/// Native package and the execution search environment selected by its
+/// discovery. No caller path list is used as the compiler's runtime contract.
+#[cfg(target_os = "linux")]
+pub struct NativeToolchain {
+    pub mapping: crate::build_runtime::MappedTree,
+    pub search: Option<NativeSearchEnvironment>,
+}
+
+#[cfg(target_os = "linux")]
+pub struct NativeSearchEnvironment {
+    pub path: Option<Vec<u8>>,
+    pub libraries: Option<Vec<u8>>,
 }
 
 pub trait ToolchainPackager: Send {
@@ -51,10 +67,7 @@ pub trait ToolchainPackager: Send {
     /// # Errors
     /// Returns an error if discovery fails or this packager has no native mapping.
     #[cfg(target_os = "linux")]
-    fn native_mapping(
-        self: Box<Self>,
-        _scope: ToolchainScope,
-    ) -> Result<crate::build_runtime::MappedTree> {
+    fn native_mapping(self: Box<Self>, _scope: ToolchainScope) -> Result<NativeToolchain> {
         bail!("native mapping not supported by this toolchain packager")
     }
 }
@@ -73,11 +86,13 @@ pub(crate) trait DiscoverToolchain: Send + Sized {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 impl<T: DiscoverToolchain> ToolchainPackager for T {
-    fn native_mapping(
-        self: Box<Self>,
-        scope: ToolchainScope,
-    ) -> Result<crate::build_runtime::MappedTree> {
-        self.package_builder(scope)?.into_native_mapping()
+    fn native_mapping(self: Box<Self>, scope: ToolchainScope) -> Result<NativeToolchain> {
+        let mut builder = self.package_builder(scope)?;
+        let search = builder.take_native_search();
+        Ok(NativeToolchain {
+            mapping: builder.into_native_mapping()?,
+            search,
+        })
     }
 }
 
@@ -129,6 +144,10 @@ mod toolchain_imp {
         // `tar_safe_path`).
         symlinks: BTreeMap<PathBuf, PathBuf>,
         root_mappings: Vec<(PathBuf, PathBuf)>,
+        // Explicit canonical-root aliases are rewritten before traversing
+        // the host filesystem. They are not sandbox filesystem entries.
+        root_aliases: Vec<(PathBuf, PathBuf)>,
+        native_search: Option<super::NativeSearchEnvironment>,
     }
 
     impl ToolchainPackageBuilder {
@@ -139,12 +158,21 @@ mod toolchain_imp {
                 file_set: BTreeMap::new(),
                 symlinks: BTreeMap::new(),
                 root_mappings: Vec::new(),
+                root_aliases: Vec::new(),
+                native_search: None,
             }
         }
 
         pub fn add_root_mapping(&mut self, local_root: PathBuf, archive_root: PathBuf) {
-            let local_root = local_root.canonicalize().unwrap_or(local_root);
-            self.root_mappings.push((local_root, archive_root));
+            let real = local_root
+                .canonicalize()
+                .unwrap_or_else(|_| local_root.clone());
+            if real != local_root {
+                self.root_aliases.push((local_root, real.clone()));
+                self.root_aliases
+                    .sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+            }
+            self.root_mappings.push((real, archive_root));
             self.root_mappings
                 .sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
         }
@@ -202,6 +230,57 @@ mod toolchain_imp {
                 self.file_set.insert(tar_path, obj_path);
             }
             Ok(())
+        }
+
+        /// Record an already-resolved ELF closure without probing individual
+        /// libraries a second time (which would lose the executable RUNPATH).
+        ///
+        /// # Errors
+        /// Returns an error if an executable or selected library cannot be captured.
+        pub fn add_resolved_executable(
+            &mut self,
+            executable: &Path,
+            libraries: &[PathBuf],
+        ) -> Result<()> {
+            self.add_file(executable.to_owned())?;
+            for library in libraries {
+                self.add_file(library.clone())?;
+            }
+            Ok(())
+        }
+
+        /// Publish the exact selected helper name in a private executable
+        /// search directory. Names may be used by drivers as fallback
+        /// searches, independently of their compiled-in absolute paths.
+        ///
+        /// # Errors
+        /// Returns an error if the alias is invalid, resolution fails, or names conflict.
+        pub fn add_native_helper(
+            &mut self,
+            name: &std::ffi::OsStr,
+            executable: &Path,
+        ) -> Result<()> {
+            let alias = Path::new("/__sccache/toolchain/bin").join(name);
+            anyhow::ensure!(
+                name == alias.file_name().unwrap_or_default(),
+                "invalid native helper name"
+            );
+            let executable = executable.canonicalize()?;
+            if let Some(previous) = self.symlinks.insert(alias, executable.clone()) {
+                anyhow::ensure!(
+                    previous == executable,
+                    "conflicting selected native helpers"
+                );
+            }
+            Ok(())
+        }
+
+        pub fn set_native_search(&mut self, path: Option<Vec<u8>>, libraries: Option<Vec<u8>>) {
+            self.native_search = Some(super::NativeSearchEnvironment { path, libraries });
+        }
+
+        pub const fn take_native_search(&mut self) -> Option<super::NativeSearchEnvironment> {
+            self.native_search.take()
         }
 
         /// Add a directory entry to the package.
@@ -330,23 +409,34 @@ mod toolchain_imp {
             Ok(mapping)
         }
 
+        fn resolve_root_alias<'a>(&self, path: &'a Path) -> std::borrow::Cow<'a, Path> {
+            for (alias, real) in &self.root_aliases {
+                if let Ok(suffix) = path.strip_prefix(alias) {
+                    return std::borrow::Cow::Owned(real.join(suffix));
+                }
+            }
+            std::borrow::Cow::Borrowed(path)
+        }
+
         fn map_path(&self, path: &Path) -> PathBuf {
+            let path = self.resolve_root_alias(path);
             for (local_root, archive_root) in &self.root_mappings {
                 if let Ok(suffix) = path.strip_prefix(local_root) {
                     return archive_root.join(suffix);
                 }
             }
-            path.to_owned()
+            path.into_owned()
         }
 
         /// Simplify the path and strip the leading slash.
         ///
         /// Symlinks in the path are recorded for inclusion in the tarball.
         fn tarify_path(&mut self, path: &Path) -> Result<PathBuf> {
+            let path = self.resolve_root_alias(path);
             let simplified = SimplifyPath {
                 resolved_symlinks: Some(&mut self.symlinks),
             }
-            .simplify(path)?;
+            .simplify(&path)?;
 
             Ok(tar_safe_path(self.map_path(&simplified)))
         }
@@ -416,6 +506,31 @@ mod toolchain_imp {
             builder.tarify_path(&rustc)?,
             PathBuf::from("rust/bin/rustc")
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "native-store")]
+    #[test]
+    fn native_toolchain_mapping_ignores_declared_root_alias_topology() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("real-toolchain");
+        std::fs::create_dir_all(root.join("bin"))?;
+        std::fs::write(root.join("bin/compiler"), b"compiler")?;
+        std::os::unix::fs::symlink("compiler", root.join("bin/inner"))?;
+        let campaign = temp.path().join("campaign/rustup/toolchains");
+        std::fs::create_dir_all(&campaign)?;
+        let alias = campaign.join("nightly");
+        std::os::unix::fs::symlink(&root, &alias)?;
+        let capture = |path: &Path| -> Result<_> {
+            let mut builder = ToolchainPackageBuilder::new();
+            builder.add_root_mapping(root.clone(), "/rust".into());
+            builder.add_root_mapping(path.to_owned(), "/rust".into());
+            builder.add_file(path.join("bin/inner"))?;
+            builder.into_native_mapping()?.prepare()
+        };
+        let direct = capture(&root)?;
+        let aliased = capture(&alias)?;
+        assert_eq!(direct.manifest(), aliased.manifest());
         Ok(())
     }
 

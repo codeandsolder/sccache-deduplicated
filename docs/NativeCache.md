@@ -231,8 +231,7 @@ max_metadata_bytes = 67108864
 [native_cache.space]
 min_available_bytes = 536870912
 target_available_bytes = 2147483648
-max_resident_bytes = 274877906944
-target_resident_bytes = 257698037760
+# On a dedicated quota-controlled filesystem, omit logical resident limits.
 max_evictions_per_pass = 32
 gc_batch = 1024
 ```
@@ -275,16 +274,26 @@ gc_batch = 1024
 
 The native store uses one transactional index, lease/GC implementation, and
 usage-aware eviction policy on scheduler and worker. The
-resident budget counts uncompressed live blobs and queued garbage conservatively;
-ZFS separately compresses them and the filesystem free-space watermarks still
-apply. For actual physical cache isolation, place each store on a quota-managed
-dataset. Worker replicas are persistent and reuse the same verified blobs and
+optional logical resident watermarks count uncompressed live blobs and queued
+garbage. For a quota-managed dataset, omit both logical watermarks and use the
+filesystem free-space watermarks to drive eviction against the actual allocated
+bytes, including compression, index, temporary files and scratch on that dataset.
+Keep logical limits only for a store sharing a filesystem without a dedicated quota.
+Reservations conservatively reserve worst-case incoming bytes. Worker replicas are persistent and reuse the same verified blobs and
 package trees, fetching missing inputs only. Access frequency and recency are
 buffered and checkpointed at most once per minute during maintenance,
 plus on orderly shutdown, without write I/O on cache hits. Staged files
 hold admission reservations through publication; their releases are applied
 atomically without taking the admission lock, preventing lock-order cycles
-with concurrent eviction and index publication.
+with concurrent eviction and index publication. Result and tree negotiation
+reserves the complete missing content closure before receiving any blobs;
+individual transfers share that charge even when a stream must be retried.
+A temporarily occupied budget returns retryable HTTP 503 rather than a
+terminal publication error. Impossible single reservations are rejected
+without eviction. Admission never performs eviction or GC. Background maintenance replenishes
+headroom proactively to the retention target (4 GiB below the hard limit
+in the fleet), and observes larger rejected reservations as demand for
+additional headroom. It never holds the admission lock during reclamation. Compiler input leases are released before output publication.
 
 Under cache pressure, eviction ranks roots by the expected reuse cost per
 byte that deleting them could actually reclaim. It follows the transactional
@@ -479,6 +488,24 @@ artifacts rather than generating another, metadata-only variant of each
 rlib. The archive emitter still supports per-file trimming and streams
 ordinary files instead of collecting them into a buffer. The native
 input and toolchain trees use the same explicit directory normalization.
+
+For ordinary preprocessed C and C++ actions, the package owns its executable
+search path. The client resolves helpers using the requested driver and its
+arguments, captures the selected ELF dependency closures, and verifies a
+reconstructed library search contract without the host's loader cache.
+Changing Cargo output directories or irrelevant PATH/LD_LIBRARY_PATH entries
+does not change that contract. Actual changes in selected helpers or shared
+libraries remain inputs. Opaque compiler extensions retain exact execution
+identity; arbitrary loader injection is not automatically distributed.
+
+The dashboard's Cache hits tab includes durable counters of successful new-key
+reuse-mode publications whose artifacts match another known action, and the
+subset whose complete results (including diagnostics) match. Existing live
+manifests and retained eviction receipts are comparison data, not retroactively
+counted misses. Same-key retries, recovery, and explicit refreshes do not count.
+The comparison index follows retention and does not pin payloads. Identical
+outputs alone are evidence of redundant work, not permission to alias
+semantically different compiler requests.
 
 ## Validation
 

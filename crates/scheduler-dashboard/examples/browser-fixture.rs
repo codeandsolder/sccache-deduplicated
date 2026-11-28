@@ -264,6 +264,11 @@ fn telemetry(phase: u64) -> NativeTelemetry {
             refreshes: 1,
             ..Default::default()
         }),
+        duplicate_misses: Some(sccache_build::analytics::DuplicateMisses {
+            new_keys: 20 + phase,
+            identical_outputs: 8 + phase,
+            identical_results: 5 + phase,
+        }),
         analytics: Some(analytics()),
         cache: Some(Cache {
             actions: 17,

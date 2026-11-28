@@ -15,6 +15,12 @@
 #[macro_use]
 mod args;
 mod c;
+#[cfg(all(
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod c_toolchain;
 mod canonical_native;
 pub mod canonical_paths;
 #[macro_use]

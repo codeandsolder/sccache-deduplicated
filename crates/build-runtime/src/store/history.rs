@@ -6,7 +6,7 @@ use bincode::Options;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
-use super::{ACTIONS, ActionRecord, NativeStore, RESULTS, encoding};
+use super::{ACTIONS, ActionRecord, NativeStore, RESULTS, duplicate_results, encoding};
 use crate::{ActionKey, ResultManifest};
 
 const MANIFESTS: TableDefinition<'static, &[u8; 32], &[u8]> =
@@ -93,6 +93,7 @@ fn trim(write: &WriteTransaction, limit: u64) -> Result<()> {
             ActionKey(*key.value())
         };
         forget(write, action)?;
+        duplicate_results::forget(write, action)?;
     }
 }
 
@@ -114,7 +115,8 @@ pub(super) fn remember(
     let bytes = encoding().serialize(&Receipt { sequence, manifest })?;
     let added = charge(bytes.len())?;
     if added > limit {
-        return Ok(());
+        drop(state);
+        return duplicate_results::forget(write, action);
     }
     let old = state
         .get(BYTES)?
@@ -137,6 +139,16 @@ pub(super) fn remember(
         .insert(&action.0, bytes.as_slice())?;
     write.open_table(AGE)?.insert(sequence, &action.0)?;
     trim(write, limit)
+}
+
+pub(super) fn seed_duplicate_index(write: &WriteTransaction) -> Result<()> {
+    let receipts = write.open_table(MANIFESTS)?;
+    for item in receipts.iter()? {
+        let (key, value) = item?;
+        let receipt: Receipt = encoding().deserialize(value.value())?;
+        duplicate_results::record_existing(write, ActionKey(*key.value()), &receipt.manifest)?;
+    }
+    Ok(())
 }
 
 impl NativeStore {

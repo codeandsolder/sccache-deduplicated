@@ -50,8 +50,8 @@ fn space() -> SpacePolicy {
     SpacePolicy {
         min_available_bytes: 1024 * 1024,
         target_available_bytes: 2 * 1024 * 1024,
-        max_resident_bytes: u64::MAX,
-        target_resident_bytes: u64::MAX,
+        max_resident_bytes: Some(u64::MAX),
+        target_resident_bytes: Some(u64::MAX),
         max_evictions_per_pass: 8,
         gc_batch: 128,
     }

@@ -1565,3 +1565,115 @@ fn result_receipt_budget_evicts_oldest_metadata_only() -> Result<()> {
     assert_eq!(store.stats()?.blobs, 0);
     Ok(())
 }
+
+#[test]
+fn duplicate_misses_count_new_keys_not_replays_and_survive_eviction_and_restart() -> Result<()> {
+    use crate::analytics::DuplicateMisses;
+    let dir = tempfile::tempdir()?;
+    let manifest;
+    let a = action("a");
+    let b = action("b");
+    let c = action("c");
+    {
+        let store = NativeStore::open(dir.path())?;
+        store.enable_result_history(4096)?;
+        let blob = store.stage(&b"same output"[..])?;
+        manifest = result(blob.reference());
+        store.publish(&a, &manifest, vec![blob], ActionMode::Reuse)?;
+        store.publish(&b, &manifest, vec![], ActionMode::Reuse)?;
+        store.publish(&b, &manifest, vec![], ActionMode::Reuse)?;
+        store.publish(&action("forced"), &manifest, vec![], ActionMode::Refresh)?;
+        let diag = store.stage(&b"warning"[..])?;
+        let mut changed = manifest.clone();
+        changed.stderr = Some(diag.reference());
+        store.publish(&c, &changed, vec![diag], ActionMode::Reuse)?;
+        assert_eq!(
+            store.duplicate_misses()?,
+            DuplicateMisses {
+                new_keys: 3,
+                identical_outputs: 2,
+                identical_results: 1
+            }
+        );
+        for key in [&a, &b, &c, &action("forced")] {
+            store.evict(key.key()?)?;
+        }
+        store.collect_garbage(32)?;
+        assert_eq!(store.stats()?.blobs, 0);
+    }
+    let store = NativeStore::open(dir.path())?;
+    let blob = store.stage(&b"same output"[..])?;
+    store.publish(&a, &manifest, vec![blob], ActionMode::Reuse)?;
+    // Recovery/recompile of a known action does not count as a new-key miss.
+    assert_eq!(
+        store.duplicate_misses()?,
+        DuplicateMisses {
+            new_keys: 3,
+            identical_outputs: 2,
+            identical_results: 1
+        }
+    );
+    store.evict(a.key()?)?;
+    store.collect_garbage(32)?;
+    // Another key can still match an evicted result, even without resident bytes.
+    let blob = store.stage(&b"same output"[..])?;
+    let other = store.publish(&action("other"), &manifest, vec![blob], ActionMode::Reuse)?;
+    assert_eq!(
+        store.duplicate_misses()?,
+        DuplicateMisses {
+            new_keys: 4,
+            identical_outputs: 3,
+            identical_results: 2
+        }
+    );
+    store.evict(other.action)?;
+    store.enable_result_history(0)?;
+    store.collect_garbage(32)?;
+    let blob = store.stage(&b"same output"[..])?;
+    store.publish(
+        &action("after trim"),
+        &manifest,
+        vec![blob],
+        ActionMode::Reuse,
+    )?;
+    assert_eq!(
+        store.duplicate_misses()?,
+        DuplicateMisses {
+            new_keys: 5,
+            identical_outputs: 3,
+            identical_results: 2
+        }
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn duplicate_misses_see_concurrent_publications_in_the_same_transaction() -> Result<()> {
+    use crate::analytics::DuplicateMisses;
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let a = store.stage(&b"same output"[..])?;
+    let b = store.stage(&b"same output"[..])?;
+    let manifest = result(a.reference());
+    let (a, b) = tokio::join!(
+        store.publish_pinned_async(
+            action("one"),
+            manifest.clone(),
+            vec![a],
+            ActionMode::Reuse,
+            ()
+        ),
+        store.publish_pinned_async(action("two"), manifest, vec![b], ActionMode::Reuse, ()),
+    );
+    drop(a?);
+    drop(b?);
+    assert_eq!(
+        store.duplicate_misses()?,
+        DuplicateMisses {
+            new_keys: 2,
+            identical_outputs: 1,
+            identical_results: 1
+        }
+    );
+    Ok(())
+}

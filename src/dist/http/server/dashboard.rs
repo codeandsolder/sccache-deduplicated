@@ -41,8 +41,10 @@ fn space(status: SpaceStatus) -> CacheSpace {
         reserved: status.reserved_bytes,
         min_available: status.policy.map(|policy| policy.min_available_bytes),
         target_available: status.policy.map(|policy| policy.target_available_bytes),
-        max_resident: status.policy.map(|policy| policy.max_resident_bytes),
-        target_resident: status.policy.map(|policy| policy.target_resident_bytes),
+        max_resident: status.policy.and_then(|policy| policy.max_resident_bytes),
+        target_resident: status
+            .policy
+            .and_then(|policy| policy.target_resident_bytes),
     }
 }
 
@@ -59,6 +61,11 @@ pub(super) fn snapshot(sessions: &NativeSessions, network: &NetworkMeter) -> Nat
             errors: admissions.errors,
         }),
         live_traces: sessions.live_traces().ok(),
+        duplicate_misses: sessions
+            .store()
+            .duplicate_misses()
+            .map_err(|error| warn!("dashboard duplicate miss counter unavailable: {error:#}"))
+            .ok(),
         ..Default::default()
     };
     match sessions.store().stats() {

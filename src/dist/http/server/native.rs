@@ -1021,6 +1021,10 @@ fn native_response(operation: &str, result: Result<Response>) -> Response {
             "native input bytes rejected",
         )
             .into_response(),
+        Err(error) if error.is::<crate::build_runtime::StageSpaceExhausted>() => {
+            debug!("Native cache {operation} waiting for storage: {error:#}");
+            (StatusCode::SERVICE_UNAVAILABLE, "native cache storage busy").into_response()
+        }
         Err(error) if error.is::<NativeServiceBusy>() => {
             (StatusCode::SERVICE_UNAVAILABLE, "native service busy").into_response()
         }

@@ -90,14 +90,33 @@ impl SessionLimits {
 /// One shared verified transfer state for result and input-tree publication.
 struct Transfer {
     reservation: UploadReservation,
+    budget: crate::store::StagingReservation,
     missing: BTreeMap<ContentId, BlobRef>,
     staged: BTreeMap<ContentId, StagedBlob>,
     active: BTreeSet<ContentId>,
 }
 
 impl Transfer {
-    fn new(reservation: UploadReservation) -> Self {
-        Self {
+    fn new(
+        store: &NativeStore,
+        reservation: UploadReservation,
+        closure: &BTreeMap<ContentId, u64>,
+    ) -> Result<Self> {
+        // Admit the actual missing closure atomically, before accepting any
+        // bytes. Partial uploads must not deadlock competing publications.
+        let bytes = reservation.missing().iter().try_fold(0_u64, |sum, blob| {
+            sum.checked_add(blob.size).context("transfer size overflow")
+        })?;
+        if bytes != 0 {
+            let total = closure.values().try_fold(0_u64, |sum, &size| {
+                sum.checked_add(size)
+                    .context("transfer closure size overflow")
+            })?;
+            store.check_transfer_capacity(total)?;
+        }
+        let budget = store.reserve_transfer(bytes)?;
+        Ok(Self {
+            budget,
             missing: reservation
                 .missing()
                 .iter()
@@ -106,7 +125,7 @@ impl Transfer {
             reservation,
             staged: BTreeMap::new(),
             active: BTreeSet::new(),
-        }
+        })
     }
 
     fn missing(&self) -> Vec<BlobRef> {
@@ -1418,7 +1437,7 @@ impl NativeSessions {
             manifest.logical_bytes()? <= self.limits.max_result_bytes,
             "native result logical byte limit exceeded"
         );
-        let transfer = Transfer::new(self.store().reserve_blobs(&blobs)?);
+        let transfer = Transfer::new(self.store(), self.store().reserve_blobs(&blobs)?, &blobs)?;
         let mut state = Self::lock(&session)?;
         self.authorize(&mut state, publisher)?;
         // Another identical begin may already have won, or the ticket may
@@ -1442,14 +1461,19 @@ impl NativeSessions {
     pub fn offer_tree(&self, manifest: TreeManifest) -> Result<TreeOffer> {
         self.reap()?;
         let id = manifest.id()?;
-        self.limits.check_blobs(Kind::Tree, &manifest.blobs()?)?;
+        let blobs = manifest.blobs()?;
+        self.limits.check_blobs(Kind::Tree, &blobs)?;
         let (phase, missing) = if let Some(lease) = self.store().lookup_tree(id)? {
             (
                 Phase::Ready(Ready::Tree(Box::new(TreeDelivery::new(lease)))),
                 Vec::new(),
             )
         } else {
-            let transfer = Transfer::new(self.store().reserve_tree_upload(&manifest)?);
+            let transfer = Transfer::new(
+                self.store(),
+                self.store().reserve_tree_upload(&manifest)?,
+                &blobs,
+            )?;
             let missing = transfer.missing();
             (
                 Phase::Pending(Box::new(Pending::Tree { manifest, transfer })),
@@ -1593,7 +1617,7 @@ impl NativeSessions {
     ) -> Result<NativeUpload> {
         let slot = self.upload_slot(UploadSource::Direct)?;
         let session = self.get(ticket)?;
-        {
+        let budget = {
             let mut state = Self::lock(&session)?;
             ensure!(
                 state.kind != Kind::Action || matches!(publisher, Publisher::Worker { .. }),
@@ -1603,12 +1627,14 @@ impl NativeSessions {
             let Phase::Pending(pending) = &mut state.phase else {
                 bail!("no active native upload");
             };
-            pending
+            let transfer = pending
                 .transfer_mut()
-                .context("no negotiated native upload")?
-                .start(blob, self.limits.max_concurrent_uploads)?;
+                .context("no negotiated native upload")?;
+            transfer.start(blob, self.limits.max_concurrent_uploads)?;
+            let budget = transfer.budget.clone();
             drop(state);
-        }
+            budget
+        };
         let guard = UploadGuard {
             session,
             publisher,
@@ -1616,7 +1642,9 @@ impl NativeSessions {
             active: true,
             _slot: slot,
         };
-        let stager = self.store().prepare_physical(blob, encoding)?;
+        let stager = self
+            .store()
+            .prepare_physical_reserved(blob, encoding, budget)?;
         Ok(NativeUpload {
             stager,
             publication: UploadPublication::Direct(guard),

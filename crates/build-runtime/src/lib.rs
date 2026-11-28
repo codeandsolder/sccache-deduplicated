@@ -73,8 +73,9 @@ pub use store::{
     CacheAnalyticsSampler, CacheStats, ComponentAudit, Eviction, GarbageCollected,
     NativeIndexAudit, NativeStore, PackageArchiveLease, PackageDecoder, PackageImport,
     PackageImportLimits, PackagePolicy, PackagePreparation, PackageSlot, PhysicalStager, Published,
-    ResultLease, SchemaInventory, SpaceReport, SpaceStatus, StageBudget, StagedBlob, TreeLease,
-    UploadReservation, VerifiedPackage, decode_package_process,
+    ResultLease, SchemaInventory, SpaceReport, SpaceStatus, StageBudget, StageSpaceExhausted,
+    StageSpaceTooLarge, StagedBlob, TreeLease, UploadReservation, VerifiedPackage,
+    decode_package_process,
 };
 
 #[cfg(all(target_os = "linux", feature = "store"))]

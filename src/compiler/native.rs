@@ -368,6 +368,20 @@ impl NativeCompilerClient {
     ) -> Result<(NativeBuildResult, crate::build_runtime::ActionKey)> {
         let fingerprint = plan.spec.action_request()?.action_fingerprint()?;
         let key = fingerprint.key()?;
+        crate::server::activity::key_evidence(
+            &fingerprint.schema,
+            &blake3::Hash::from_bytes(key.0).to_hex().to_string(),
+            fingerprint
+                .components
+                .iter()
+                .map(|(name, digest)| {
+                    (
+                        name.as_str(),
+                        blake3::Hash::from_bytes(digest.0).to_hex().to_string(),
+                    )
+                })
+                .collect(),
+        );
         debug!(
             "native action {key:?}: components={:?}; input trees={:?}",
             fingerprint.components,
@@ -424,6 +438,7 @@ struct NativeOutput {
     name: String,
     source: PathBuf,
     destination: PathBuf,
+    remote: Option<BuildPath>,
     required: bool,
     kind: OutputKind,
 }
@@ -435,6 +450,7 @@ impl NativeOutput {
             name: output.key,
             source: path.clone(),
             destination: path,
+            remote: None,
             required: !output.optional,
             kind: OutputKind::File,
         }
@@ -444,6 +460,7 @@ impl NativeOutput {
             name,
             source,
             destination,
+            remote: None,
             required: true,
             kind: OutputKind::GeneratedTree,
         }
@@ -464,6 +481,9 @@ impl NativeOutput {
                 ),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error).context("inspect native output destination"),
+            }
+            if let Some(remote) = &self.remote {
+                return Ok(remote.clone());
             }
             let parent = self
                 .source
@@ -617,6 +637,83 @@ fn compiler_environment(command: &CommandSpec, policy: ResultIdentityPolicy) -> 
         }
     }
     ContentId(*digest.finalize().as_bytes())
+}
+
+fn prepare_toolchain(
+    packager: Box<dyn pkg::ToolchainPackager>,
+    digests: &SourceDigestCache,
+    policy: ResultIdentityPolicy,
+    command: &mut CommandSpec,
+    inputs: &TreeManifest,
+) -> Result<PreparedTree> {
+    let scope = match (policy, opaque_compiler_extension(command, inputs)) {
+        (ResultIdentityPolicy::Rust, false) => pkg::ToolchainScope::RustCompiler,
+        (ResultIdentityPolicy::Rust, true) => pkg::ToolchainScope::RustOpaque,
+        (ResultIdentityPolicy::PreprocessedC, false) => pkg::ToolchainScope::PreprocessedC,
+        _ => pkg::ToolchainScope::Default,
+    };
+    let before = digests.catalog_hits();
+    let start = Instant::now();
+    let package = packager.native_mapping(scope)?;
+    ensure!(
+        scope != pkg::ToolchainScope::PreprocessedC || package.search.is_some(),
+        "C toolchain did not establish its execution environment"
+    );
+    if let Some(search) = package.search {
+        if let Some(path) = search.path {
+            command.environment.insert(b"PATH".to_vec(), path);
+        }
+        command.environment.remove(b"LD_LIBRARY_PATH".as_slice());
+        if let Some(libraries) = search.libraries {
+            command
+                .environment
+                .insert(b"LD_LIBRARY_PATH".to_vec(), libraries);
+        }
+    }
+    if scope == pkg::ToolchainScope::PreprocessedC {
+        // Diagnostics are produced under one reproducible locale/terminal
+        // contract. The local preprocessor has already consumed source-level
+        // environment and include search.
+        command.environment.retain(|name, _| {
+            !name.starts_with(b"LC_")
+                && ![
+                    b"LANG".as_slice(),
+                    b"LANGUAGE",
+                    b"TZ",
+                    b"TERM",
+                    b"COLORTERM",
+                ]
+                .contains(&name.as_slice())
+        });
+        for (name, value) in [
+            (b"LANG".as_slice(), b"C".as_slice()),
+            (b"LC_ALL", b"C"),
+            (b"TZ", b"UTC"),
+        ] {
+            command.environment.insert(name.to_vec(), value.to_vec());
+        }
+        // The native worker receives fully preprocessed input. Include
+        // search already ran locally; these variables are not runtime inputs.
+        for name in [
+            b"CPATH".as_slice(),
+            b"C_INCLUDE_PATH",
+            b"CPLUS_INCLUDE_PATH",
+            b"OBJC_INCLUDE_PATH",
+        ] {
+            command.environment.remove(name);
+        }
+    }
+    let prepared = package.mapping.prepare_with_cache(digests)?;
+    let after = digests.catalog_hits();
+    debug!(
+        "native toolchain preparation took {:.3}s; verified installation memo: {} files, {} bytes (process totals: {} files, {} bytes)",
+        start.elapsed().as_secs_f64(),
+        after.0.saturating_sub(before.0),
+        after.1.saturating_sub(before.1),
+        after.0,
+        after.1
+    );
+    Ok(prepared)
 }
 
 #[derive(Clone)]
@@ -868,7 +965,7 @@ impl CompilerPlan {
             destinations.insert(output.name, output.destination);
         }
         let (inputs, toolchain) = packagers;
-        let command = CommandSpec {
+        let mut command = CommandSpec {
             umask: command
                 .umask
                 .context("native execution requires a known process umask")?,
@@ -894,27 +991,13 @@ impl CompilerPlan {
         } else {
             mapped.prepare()?
         };
-        let scope = if result_policy == ResultIdentityPolicy::Rust
-            && !opaque_compiler_extension(&command, inputs.manifest())
-        {
-            pkg::ToolchainScope::RustCompiler
-        } else {
-            pkg::ToolchainScope::Default
-        };
-        let before = toolchain_digests.catalog_hits();
-        let start = Instant::now();
-        let toolchain = toolchain
-            .native_mapping(scope)?
-            .prepare_with_cache(toolchain_digests)?;
-        let after = toolchain_digests.catalog_hits();
-        debug!(
-            "native toolchain preparation took {:.3}s; verified installation memo: {} files, {} bytes (process totals: {} files, {} bytes)",
-            start.elapsed().as_secs_f64(),
-            after.0.saturating_sub(before.0),
-            after.1.saturating_sub(before.1),
-            after.0,
-            after.1
-        );
+        let toolchain = prepare_toolchain(
+            toolchain,
+            toolchain_digests,
+            result_policy,
+            &mut command,
+            inputs.manifest(),
+        )?;
         let layout = layout.into_native_mapping(|_| false)?.prepare()?;
         let directories = pkg::native_directory_metadata()?;
         let inputs = vec![toolchain, inputs, layout];
@@ -1152,6 +1235,35 @@ fn prepare_dispatch(
         *scratch = Some(directory);
         *split = Some(link);
         outputs
+    } else if compilation.native_relocatable_output() {
+        let [output] = <[_; 1]>::try_from(expected)
+            .map_err(|_| anyhow::anyhow!("relocatable object requires exactly one output"))?;
+        ensure!(
+            output.key == "obj" && !output.optional,
+            "invalid relocatable object"
+        );
+        let mut output = NativeOutput::file(cwd, output);
+        let mut positions = remote
+            .arguments
+            .iter()
+            .enumerate()
+            .filter(|(_, argument)| *argument == "-o");
+        let (position, _) = positions
+            .next()
+            .context("missing native object destination")?;
+        ensure!(
+            positions.next().is_none(),
+            "multiple native object destinations"
+        );
+        let destination = remote
+            .arguments
+            .get_mut(position + 1)
+            .context("missing -o operand")?;
+        // The toolchain already declares /out. The actual command and
+        // output contract share this path, independent of delivery.
+        *destination = "/out/object.o".into();
+        output.remote = Some(BuildPath::new(b"/out/object.o".to_vec())?);
+        vec![output]
     } else {
         expected
             .into_iter()
@@ -1433,6 +1545,60 @@ mod tests {
         Ok(config)
     }
 
+    fn hash_test_invocation(
+        rt: &tokio::runtime::Runtime,
+        creator: &ProcessCommandCreator,
+        executable: &Path,
+        cwd: &Path,
+        args: &[OsString],
+        environment: &[(OsString, OsString)],
+        config: &Config,
+        native_identity: bool,
+    ) -> Result<super::super::HashResult<ProcessCommandCreator>> {
+        let pool = rt.handle();
+        let storage = storage_from_config(config, pool)?;
+        assert_eq!(storage.cache_type_name(), "native");
+        let (compiler, _) = rt.block_on(get_compiler_info(
+            creator.clone(),
+            executable,
+            cwd,
+            args,
+            environment,
+            pool,
+            crate::compiler::CompilerDiscovery::default(),
+        ))?;
+        let CompilerArguments::Ok(mut hasher) = compiler.parse_arguments(
+            args,
+            cwd,
+            environment,
+            super::super::CompilerCachePolicy::Native,
+        ) else {
+            anyhow::bail!("real compiler arguments are not cacheable");
+        };
+        let hashed = rt.block_on(hasher.generate_hash_key(GenerateHashKeyContext {
+            native: native_identity.then(|| {
+                Arc::new(NativeCompilerClient::new(
+                    config.dist.native.clone().unwrap(),
+                    config.dist.scheduler_url.clone(),
+                    None,
+                    config.dist.auth.clone(),
+                    Vec::new(),
+                    &[],
+                ))
+            }),
+            creator,
+            cwd: cwd.to_owned(),
+            env_vars: environment.to_vec(),
+            may_dist: true,
+            pool,
+            rewrite_includes_only: false,
+            storage,
+            cache_control: CacheControl::Default,
+        }))?;
+        assert_eq!(hashed.cache_control, CacheControl::Default);
+        Ok(hashed)
+    }
+
     fn verify_compilation(
         executable: &Path,
         args: &[&str],
@@ -1472,42 +1638,18 @@ mod tests {
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
         let environment = vec![("PATH".into(), "/usr/bin:/bin".into())];
         let rt = tokio::runtime::Runtime::new()?;
-        let pool = rt.handle();
         let config = config()?;
-
-        let storage = storage_from_config(&config, pool)?;
-        assert_eq!(storage.cache_type_name(), "native");
         let creator = ProcessCommandCreator::new(&Client::new_num(1));
-        let (compiler, _) = rt.block_on(get_compiler_info(
-            creator.clone(),
+        let hashed = hash_test_invocation(
+            &rt,
+            &creator,
             executable,
             &cwd,
             &args,
             &environment,
-            pool,
-            crate::compiler::CompilerDiscovery::default(),
-        ))?;
-        let CompilerArguments::Ok(mut hasher) = compiler.parse_arguments(
-            &args,
-            &cwd,
-            &environment,
-            super::super::CompilerCachePolicy::Native,
-        ) else {
-            anyhow::bail!("real compiler arguments are not cacheable");
-        };
-        let hashed = rt.block_on(hasher.generate_hash_key(GenerateHashKeyContext {
-            #[cfg(all(feature = "dist-client", target_os = "linux"))]
-            native: None,
-            creator: &creator,
-            cwd: cwd.clone(),
-            env_vars: environment.clone(),
-            may_dist: true,
-            pool,
-            rewrite_includes_only: false,
-            storage,
-            cache_control: CacheControl::Default,
-        }))?;
-        assert_eq!(hashed.cache_control, CacheControl::Default);
+            &config,
+            false,
+        )?;
         let compilation = hashed.compilation;
         let result_policy = compilation.native_result_policy();
         let mut transformer = dist::PathTransformer::new();
@@ -1807,6 +1949,224 @@ mod tests {
             }
         }
         assert!(!cwd.join("unexpected-archive-cache").exists());
+        Ok(())
+    }
+
+    fn cxx_cargo_plan(
+        rt: &tokio::runtime::Runtime,
+        root: &Path,
+        compiler_path: &Path,
+        digests: &SourceDigestCache,
+        alternate: bool,
+    ) -> Result<CompilerPlan> {
+        let target = root.join("target");
+        let profile = target.join("debug");
+        let out = profile.join("build/boringssl-0123456789abcdef/out");
+        let cwd = out.join("native-cxx/build");
+        for directory in [&cwd, &profile.join("deps"), &profile.join("bin")] {
+            std::fs::create_dir_all(directory)?;
+        }
+        let source = out.join("input.cc");
+        std::fs::write(
+            &source,
+            "#include <vector>\nextern \"C\" int size() { std::vector<int> a{1,2,3}; return a.size(); }\nextern \"C\" const char* file() { return __FILE__; }\n",
+        )?;
+        let environment = vec![
+            (
+                "PATH".into(),
+                format!(
+                    "{}:/usr/bin:/bin:{}",
+                    if alternate { "/bin" } else { "/usr/bin" },
+                    profile.join("bin").display()
+                )
+                .into(),
+            ),
+            (
+                "LD_LIBRARY_PATH".into(),
+                format!(
+                    "{}:{}:{}",
+                    profile.join("deps").display(),
+                    profile.display(),
+                    root.join("missing").display()
+                )
+                .into(),
+            ),
+            ("OUT_DIR".into(), out.as_os_str().into()),
+            (
+                "SCCACHE_CANONICAL_TARGET_ROOT".into(),
+                target.as_os_str().into(),
+            ),
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            ("LANG".into(), "C".into()),
+        ];
+        let args = vec![
+            "-g".into(),
+            "-O2".into(),
+            "-MMD".into(),
+            "-MF".into(),
+            cwd.join("input.d").into_os_string(),
+            "-c".into(),
+            source.into_os_string(),
+            "-o".into(),
+            cwd.join(if alternate { "renamed.o" } else { "input.o" })
+                .into_os_string(),
+        ];
+        let config = config()?;
+
+        let creator = ProcessCommandCreator::new(&Client::new_num(1));
+        let hash = hash_test_invocation(
+            rt,
+            &creator,
+            compiler_path,
+            &cwd,
+            &args,
+            &environment,
+            &config,
+            true,
+        )?;
+        let compilation = hash.compilation;
+        let policy = compilation.native_result_policy();
+        let mut transformer = dist::PathTransformer::new();
+        let (_, remote, cacheable) =
+            compilation.generate_compile_commands(&mut transformer, CompileTransport::Native)?;
+        assert_eq!(cacheable, Cacheable::Yes);
+        let mut remote = remote.context("missing real C++ native command")?;
+        let (outputs, layout, packagers) = prepare_dispatch(
+            compilation,
+            &mut remote,
+            transformer,
+            &cwd,
+            environment,
+            &mut None,
+            &mut None,
+        )?;
+        assert!(
+            remote
+                .arguments
+                .windows(2)
+                .any(|args| args == ["-o", "/out/object.o"])
+        );
+        assert_eq!(
+            outputs[0].destination,
+            cwd.join(if alternate { "renamed.o" } else { "input.o" })
+        );
+        CompilerPlan::prepare(
+            remote,
+            &cwd,
+            outputs,
+            layout,
+            packagers,
+            (ContentId::of(b"test"), policy, &hash.key),
+            (digests, None),
+        )
+    }
+
+    fn execute_cxx_cargo_plan(
+        plan: &CompilerPlan,
+        store: &NativeStore,
+        scratch: &Path,
+    ) -> Result<crate::build_runtime::ResultManifest> {
+        let leases = plan
+            .inputs
+            .iter()
+            .map(|tree| tree.import(store).map(Arc::new))
+            .collect::<Result<Vec<_>>>()?;
+        let result = execute(
+            &plan.spec,
+            store,
+            &ExecutionPolicy {
+                platform: ContentId::of(b"test"),
+                bubblewrap: "/usr/bin/bwrap".into(),
+                scratch: scratch.to_owned(),
+                timeout: Duration::from_secs(60),
+                max_result_bytes: 64 * 1024 * 1024,
+            },
+            &leases,
+            None,
+            || Ok(()),
+            |_| {},
+        )?;
+        if !result.status().success() {
+            let mut stderr = Vec::new();
+            if let Some(blob) = result.diagnostics().1 {
+                result.open_blob(blob.id)?.read_to_end(&mut stderr)?;
+            }
+            anyhow::bail!(
+                "isolated C++ compile failed: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        let manifest = result
+            .successful_result()
+            .context("missing C++ result")?
+            .clone();
+        let staged = manifest
+            .blobs()?
+            .into_iter()
+            .map(|(id, size)| {
+                store.stage_expected(
+                    crate::build_runtime::BlobRef { id, size },
+                    result.open_blob(id)?,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        store.publish(
+            &plan.spec.action_request()?.action_fingerprint()?,
+            &manifest,
+            staged,
+            ActionMode::Reuse,
+        )?;
+        Ok(manifest)
+    }
+
+    #[test]
+    #[ignore = "requires real g++ and Linux Bubblewrap"]
+    fn native_cxx_cargo_search_environment_is_independent_of_build_root() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let rt = tokio::runtime::Runtime::new()?;
+        let compiler = which::which("g++")?;
+        let digests = SourceDigestCache::default();
+        let first = cxx_cargo_plan(&rt, &temp.path().join("first"), &compiler, &digests, false)?;
+        let second = cxx_cargo_plan(&rt, &temp.path().join("second"), &compiler, &digests, true)?;
+        assert_eq!(
+            first.spec.command.environment[b"PATH".as_slice()],
+            b"/__sccache/toolchain/bin"
+        );
+        assert!(
+            !first
+                .spec
+                .command
+                .environment
+                .contains_key(b"LD_LIBRARY_PATH".as_slice())
+        );
+        assert!(
+            !second
+                .spec
+                .command
+                .environment
+                .contains_key(b"LD_LIBRARY_PATH".as_slice())
+        );
+        let fingerprint = first.spec.action_request()?.action_fingerprint()?;
+        let other = second.spec.action_request()?.action_fingerprint()?;
+        assert_eq!(
+            fingerprint,
+            other,
+            "different components: {:?}",
+            fingerprint.differing_components(&other)
+        );
+        let store = NativeStore::open(&temp.path().join("cas"))?;
+        let first_result = execute_cxx_cargo_plan(&first, &store, temp.path())?;
+        let hit = store
+            .lookup(other.key()?)?
+            .context("second root missed the first result")?;
+        assert_eq!(hit.manifest(), &first_result);
+        drop(hit);
+        let second_result = execute_cxx_cargo_plan(&second, &store, temp.path())?;
+        assert_eq!(
+            first_result, second_result,
+            "independent sandbox executions differed"
+        );
+        assert_eq!(store.duplicate_misses()?.identical_outputs, 0);
         Ok(())
     }
 

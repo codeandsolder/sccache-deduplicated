@@ -46,6 +46,7 @@ pub enum Command {
         index: std::path::PathBuf,
         schema: Option<String>,
         without: Vec<String>,
+        action_key: Option<String>,
     },
     NativeDecodePackage {
         compression: sccache::build_runtime::PackageCompression,

@@ -295,7 +295,8 @@ fn native_package_commands(command: ClapCommand) -> ClapCommand {
                 .about("Inspect a closed native index or consistent offline snapshot without changing it")
                 .arg(flag_infer_long("index").value_parser(clap::value_parser!(PathBuf)).required(true))
                 .arg(flag_infer_long("schema").requires("without"))
-                .arg(flag_infer_long("without").action(clap::ArgAction::Append).requires("schema")),
+                .arg(flag_infer_long("without").action(clap::ArgAction::Append).requires("schema"))
+                .arg(flag_infer_long("action-key").conflicts_with_all(["schema", "without"])),
         )
 }
 
@@ -737,6 +738,7 @@ fn parse_installation(name: &str, matches: &clap::ArgMatches) -> anyhow::Result<
                 .context("missing native index path")?
                 .clone(),
             schema: matches.get_one::<String>("schema").cloned(),
+            action_key: matches.get_one::<String>("action-key").cloned(),
             without: matches
                 .get_many::<String>("without")
                 .into_iter()

@@ -41,7 +41,7 @@ use crate::errors::{Context, ProcessError, Result, bail};
 use anyhow::ensure;
 
 use super::CacheControl;
-use super::canonical_native::NativeCargoPaths;
+use super::canonical_native::{NativeCargoPaths, relocatable_object};
 
 /// A generic implementation of the `Compiler` trait for C/C++ compilers.
 #[derive(Clone)]
@@ -396,6 +396,8 @@ struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
     allow_dist: bool,
     native_resolution: Option<NativeCodegenResolution>,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    relocate_native_object: bool,
     #[cfg(feature = "dist-client")]
     preprocessed_input: Vec<u8>,
     executable: PathBuf,
@@ -855,9 +857,26 @@ where
 
         // Hash the same remapped filename identity that the compiler uses for
         // debug information. Do not strip arbitrary source literals or flags.
+        let relocate_native_object = canonical_native.is_some()
+            && native_identity
+            && matches!(
+                self.compiler.kind(),
+                CCompilerKind::Gcc | CCompilerKind::Clang
+            )
+            && relocatable_object(&parsed_args);
         let key_input = if let Some(paths) = &canonical_native {
             let normalized = paths.preprocessed_key_bytes(&preprocessor_output);
-            extra_hashes.push(paths.context_digest(&self.parsed_args, &cwd, &normalized));
+            extra_hashes.push(paths.context_digest(
+                &self.parsed_args,
+                &cwd,
+                &normalized,
+                native_identity
+                    && matches!(
+                        self.compiler.kind(),
+                        CCompilerKind::Gcc | CCompilerKind::Clang
+                    )
+                    && relocatable_object(&parsed_args),
+            ));
             normalized
         } else {
             Cow::Borrowed(preprocessor_output.as_slice())
@@ -915,6 +934,8 @@ where
                 parsed_args,
                 allow_dist,
                 native_resolution,
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                relocate_native_object,
                 #[cfg(feature = "dist-client")]
                 preprocessed_input: preprocessor_output,
                 executable: self.executable.clone(),
@@ -1446,6 +1467,11 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         }
     }
 
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    fn native_relocatable_output(&self) -> bool {
+        self.relocate_native_object
+    }
+
     fn generate_compile_commands(
         &self,
         path_transformer: &mut dist::PathTransformer,
@@ -1475,6 +1501,11 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
     fn automatic_dist_toolchain_is_ready(&self) -> bool {
         use std::io::Read as _;
 
+        if self.env_vars.iter().any(|(name, value)| {
+            matches!(name.to_str(), Some("LD_PRELOAD" | "LD_AUDIT")) && !value.is_empty()
+        }) {
+            return false;
+        }
         // A script's transitive execution environment is not automatically
         // discoverable by ELF dependency analysis. A custom archive may
         // still explicitly provide the wrapper and its dependencies.
@@ -1511,11 +1542,17 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
             extra_dist_files: parsed_args.extra_dist_files,
             extra_hash_files: parsed_args.extra_hash_files,
         });
+        let driver_args = parsed_args
+            .common_args
+            .into_iter()
+            .chain(parsed_args.arch_args)
+            .collect();
         let toolchain_packager = Box::new(CToolchainPackager {
             executable,
             kind: compiler.kind(),
             cwd,
             env_vars,
+            driver_args,
         });
         Ok((inputs_packager, toolchain_packager))
     }
@@ -1583,6 +1620,7 @@ struct CToolchainPackager {
     kind: CCompilerKind,
     cwd: PathBuf,
     env_vars: Vec<(OsString, OsString)>,
+    driver_args: Vec<OsString>,
 }
 
 #[cfg(all(
@@ -1614,10 +1652,12 @@ fn real_cross_gcc_package_preserves_executable_helper_search_path() -> Result<()
         kind: CCompilerKind::Gcc,
         cwd: temp.path().to_owned(),
         env_vars: Vec::new(),
+        driver_args: Vec::new(),
     };
     let store = crate::build_runtime::NativeStore::open(&temp.path().join("store"))?;
     let tree =
         pkg::ToolchainPackager::native_mapping(Box::new(packager), pkg::ToolchainScope::Default)?
+            .mapping
             .prepare()?
             .import(&store)?;
     let view = tree.materialize(temp.path())?;
@@ -1629,81 +1669,99 @@ fn real_cross_gcc_package_preserves_executable_helper_search_path() -> Result<()
     Ok(())
 }
 
+#[cfg(all(
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl CToolchainPackager {
+    fn named_tool(
+        &self,
+        kind: &str,
+        name: &str,
+        scope: pkg::ToolchainScope,
+    ) -> Result<Option<PathBuf>> {
+        use std::os::unix::ffi::OsStringExt;
+        let output = process::Command::new(&self.executable)
+            .args(&self.driver_args)
+            .arg(format!("-print-{kind}-name={name}"))
+            .current_dir(&self.cwd)
+            .env_clear()
+            .envs(self.env_vars.iter().cloned())
+            .output()?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let mut bytes = output.stdout;
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
+        let path = PathBuf::from(OsString::from_vec(bytes));
+        if path.is_absolute() {
+            return Ok(path.is_file().then_some(path));
+        }
+        if path.components().count() > 1 {
+            let path = self.cwd.join(path);
+            return Ok(path.is_file().then_some(path));
+        }
+        if kind != "prog" {
+            return Ok(None);
+        }
+        let search = self
+            .env_vars
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "PATH")
+            .map_or_else(
+                || OsString::from("/bin:/usr/bin"),
+                |(_, value)| value.clone(),
+            );
+        let Some(path) = which::which_in(path, Some(search), &self.cwd).ok() else {
+            return Ok(None);
+        };
+        // PATH aliases are not execution inputs. Package the selected
+        // executable, rather than the spelling of the caller's search dir.
+        if scope == pkg::ToolchainScope::PreprocessedC {
+            Ok(Some(path.canonicalize()?))
+        } else {
+            Ok(Some(path))
+        }
+    }
+}
+
 #[cfg(feature = "dist-client")]
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 impl pkg::DiscoverToolchain for CToolchainPackager {
-    fn package_builder(self, _scope: pkg::ToolchainScope) -> Result<pkg::ToolchainPackageBuilder> {
-        use std::os::unix::ffi::OsStringExt;
-
+    fn package_builder(self, scope: pkg::ToolchainScope) -> Result<pkg::ToolchainPackageBuilder> {
         info!("Generating toolchain {}", self.executable.display());
         let mut package_builder = pkg::ToolchainPackageBuilder::new();
         package_builder.add_common()?;
-        package_builder.add_executable_and_deps(self.executable.clone())?;
+        let mut executables = vec![self.executable.clone()];
+        let mut helpers = Vec::new();
 
-        // Helper to use -print-file-name and -print-prog-name to look up
-        // files by path.
-        let named_file = |kind: &str, name: &str| -> Option<PathBuf> {
-            let mut output = process::Command::new(&self.executable)
-                .arg(format!("-print-{kind}-name={name}"))
-                .current_dir(&self.cwd)
-                .envs(self.env_vars.iter().cloned())
-                .output()
-                .ok()?;
-            debug!(
-                "find named {kind} {name} output:\n{}\n===\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-            if !output.status.success() {
-                debug!("exit failure");
-                return None;
-            }
-
-            // Remove the trailing newline (if present)
-            if output.stdout.last() == Some(&b'\n') {
-                output.stdout.pop();
-            }
-
-            // Create our PathBuf from the raw bytes.  Assume that relative
-            // paths can be found via PATH.
-            let path: PathBuf = OsString::from_vec(output.stdout).into();
-            if path.is_absolute() {
-                Some(path)
-            } else {
-                let paths = self
-                    .env_vars
-                    .iter()
-                    .find(|(key, _)| key.as_os_str() == OsStr::new("PATH"))
-                    .map(|(_, value)| value.clone())
-                    .or_else(|| std::env::var_os("PATH"))
-                    .unwrap_or_default();
-                which::which_in(path, Some(paths), &self.cwd).ok()
-            }
-        };
-
-        // Helper to add a named file/program by to the package.
-        // We ignore the case where the file doesn't exist, as we don't need it.
-        let add_named_prog =
-            |builder: &mut pkg::ToolchainPackageBuilder, name: &str| -> Result<()> {
-                if let Some(path) = named_file("prog", name) {
-                    builder.add_executable_and_deps(path)?;
+        let mut add_named_prog = |name: &str| -> Result<()> {
+            if let Some(path) = self.named_tool("prog", name, scope)? {
+                if scope == pkg::ToolchainScope::PreprocessedC {
+                    helpers.push((OsString::from(name), path.clone()));
                 }
-                Ok(())
-            };
+                executables.push(path);
+            }
+            Ok(())
+        };
         let add_named_file =
             |builder: &mut pkg::ToolchainPackageBuilder, name: &str| -> Result<()> {
-                if let Some(path) = named_file("file", name) {
+                if let Some(path) = self.named_tool("file", name, scope)? {
                     builder.add_file(path)?;
                 }
                 Ok(())
             };
 
         // Add basic |as| and |objcopy| programs.
-        add_named_prog(&mut package_builder, "as")?;
-        add_named_prog(&mut package_builder, "objcopy")?;
+        add_named_prog("as")?;
+        add_named_prog("objcopy")?;
 
         // Linker configuration.
         if Path::new("/etc/ld.so.conf").is_file() {
@@ -1718,7 +1776,7 @@ impl pkg::DiscoverToolchain for CToolchainPackager {
         match self.kind {
             CCompilerKind::Clang => {
                 // Clang uses internal header files, so add them.
-                if let Some(limits_h) = named_file("file", "include/limits.h") {
+                if let Some(limits_h) = self.named_tool("file", "include/limits.h", scope)? {
                     info!("limits_h = {}", limits_h.display());
                     let include_dir = limits_h
                         .parent()
@@ -1729,12 +1787,12 @@ impl pkg::DiscoverToolchain for CToolchainPackager {
 
             CCompilerKind::Gcc => {
                 // Various external programs / files which may be needed by gcc
-                add_named_prog(&mut package_builder, "ld")?;
-                add_named_prog(&mut package_builder, "collect2")?;
-                add_named_prog(&mut package_builder, "lto-wrapper")?;
-                add_named_prog(&mut package_builder, "lto1")?;
-                add_named_prog(&mut package_builder, "cc1")?;
-                add_named_prog(&mut package_builder, "cc1plus")?;
+                add_named_prog("ld")?;
+                add_named_prog("collect2")?;
+                add_named_prog("lto-wrapper")?;
+                add_named_prog("lto1")?;
+                add_named_prog("cc1")?;
+                add_named_prog("cc1plus")?;
                 add_named_file(&mut package_builder, "specs")?;
                 add_named_file(&mut package_builder, "liblto_plugin.so")?;
             }
@@ -1749,8 +1807,8 @@ impl pkg::DiscoverToolchain for CToolchainPackager {
                 add_named_file(&mut package_builder, "cpp1")?;
                 add_named_file(&mut package_builder, "cpp2")?;
                 add_named_file(&mut package_builder, "opt")?;
-                add_named_prog(&mut package_builder, "llc")?;
-                add_named_prog(&mut package_builder, "acclnk")?;
+                add_named_prog("llc")?;
+                add_named_prog("acclnk")?;
             }
 
             CCompilerKind::Diab | CCompilerKind::Msvc | CCompilerKind::TaskingVX => {
@@ -1761,6 +1819,19 @@ impl pkg::DiscoverToolchain for CToolchainPackager {
             }
         }
 
+        if scope == pkg::ToolchainScope::PreprocessedC {
+            super::c_toolchain::prepare_search(
+                &mut package_builder,
+                &executables,
+                &helpers,
+                &self.env_vars,
+                &self.cwd,
+            )?;
+        } else {
+            for executable in executables {
+                package_builder.add_executable_and_deps(executable)?;
+            }
+        }
         // Bundle into a compressed tarfile.
         Ok(package_builder)
     }
@@ -2068,14 +2139,20 @@ impl<'a> HashKeyParams<'a> {
     /// # Note
     /// If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
     pub fn compute(&self) -> String {
-        let mut m = Digest::new();
+        let mut m = Digest::audited("c-frontend");
+        m.audit_field("sccache.key.compiler");
         m.update(self.compiler_digest.as_bytes());
         // clang and clang++ have different behavior despite being byte-for-byte identical binaries, so
         // we have to incorporate that into the hash as well.
+        m.audit_field("sccache.key.driver_mode");
         m.update(&[u8::from(self.plusplus)]);
+        m.audit_field("sccache.key.schema");
         m.update(CACHE_VERSION);
+        m.audit_field("sccache.key.language");
         m.update(self.language.as_str().as_bytes());
+        m.audit_field("sccache.key.arguments");
         hash_arguments(&mut m, self.arguments, self.basedirs);
+        m.audit_field("sccache.key.auxiliary");
         hash_auxiliary_inputs(&mut m, self.extra_hashes, self.assembler_digest);
         // The compiler writes the source's file name into the object (the
         // STT_FILE symbol on ELF), and -P leaves it out of the preprocessed
@@ -2083,16 +2160,19 @@ impl<'a> HashKeyParams<'a> {
         // object naming only one of them. The directory is left out: the
         // symbol does not record it, and keeping it would cost cache hits
         // across checkouts.
+        m.audit_field("sccache.key.input_basename");
         hash_input_file_name_marker(&mut m, self.input_file_name.is_some());
         if let Some(input_file_name) = self.input_file_name {
             hash_length_prefixed(&mut m, input_file_name.as_encoded_bytes());
         }
 
+        m.audit_field("sccache.key.environment");
         hash_cached_env_vars(&mut m, self.env_vars, &CACHED_ENV_VARS);
 
         // Version only the debug-dependent keys: objects without debug data
         // retain their existing cache identity, while old unsafe debug hits
         // cannot alias the additional domain and directory payload.
+        m.audit_field("sccache.key.debug_compdir");
         if let Some(dir) = self.debug_compilation_dir {
             m.delimiter(b"c-effective-debug-compdir-v1");
             hash_length_prefixed(&mut m, dir);
@@ -2101,6 +2181,7 @@ impl<'a> HashKeyParams<'a> {
         // Strip basedirs from preprocessor output if configured
         let preprocessor_output_to_hash = strip_basedirs(self.preprocessor_output, self.basedirs);
 
+        m.audit_field("sccache.key.preprocessed");
         m.update(&preprocessor_output_to_hash);
         m.finish()
     }

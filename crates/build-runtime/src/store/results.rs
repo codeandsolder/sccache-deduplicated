@@ -9,7 +9,7 @@ use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 use super::{
     ACTIONS, ActionRecord, Attachment, BLOB_LAYOUTS, BLOBS, BlobIndex, NativeStore,
     PENDING_DELETIONS, Publication, Published, RESULT_ACTIONS, RESULTS, ResultLease,
-    ResultSnapshot, StagedBlob, encoding, history, space::Root,
+    ResultSnapshot, StagedBlob, duplicate_results, encoding, history, space::Root,
 };
 use crate::{
     ActionFingerprint, ActionKey, ActionMode, BlobRef, ContentId, ResultId, ResultManifest,
@@ -20,6 +20,7 @@ pub(super) struct PreparedResult<'a> {
     manifest: Cow<'a, ResultManifest>,
     action: ActionKey,
     result: ResultId,
+    output_identity: [u8; 32],
     blobs: BTreeMap<ContentId, u64>,
     staged: BTreeMap<ContentId, StagedBlob>,
     mode: ActionMode,
@@ -40,6 +41,7 @@ impl<'a> PreparedResult<'a> {
     ) -> Result<Self> {
         let action = fingerprint.key()?;
         let result = manifest.id()?;
+        let output_identity = duplicate_results::output_identity(&manifest)?;
         let blobs = manifest.blobs()?;
         let staged = store.prepare_staging(&blobs, staged)?;
         // Validate all staged descriptors before entering a shared transaction;
@@ -56,6 +58,7 @@ impl<'a> PreparedResult<'a> {
             manifest,
             action,
             result,
+            output_identity,
             blobs,
             staged,
             mode,
@@ -220,6 +223,14 @@ impl<'a> PreparedResult<'a> {
         drop(result_actions);
         drop(results);
         drop(actions);
+        duplicate_results::observe(
+            write,
+            self.action,
+            &self.output_identity,
+            &self.result.0,
+            self.mode == ActionMode::Reuse && plan.previous.is_none(),
+            !self.manifest.outputs.is_empty(),
+        )?;
         history::forget(write, self.action)
     }
 

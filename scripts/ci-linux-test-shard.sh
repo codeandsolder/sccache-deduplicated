@@ -14,6 +14,8 @@ case "${1:?missing Linux CI shard}" in
         cargo test --locked --target x86_64-unknown-linux-gnu --features dist-tests --test system --test sccache_cargo --test cache_hit_rate --test logging --test server --test sccache_rustc --test oauth --test rust_link_replay
         ;;
     native)
+        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --lib native_cxx_cargo_search_environment_is_independent_of_build_root -- --ignored
+        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --lib custom_shared_library_selection_survives_search_reconstruction -- --ignored
         cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --test native_dist -- --ignored --exact shared_daemon_credential_isolation
         ;;
     dashboard)

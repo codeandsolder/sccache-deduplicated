@@ -273,7 +273,7 @@ pub struct PhysicalStager {
     path: TempPath,
     written: u64,
     synced: bool,
-    budget: StageBudget,
+    reservation: space::StagingReservation,
     ingest: Option<blob_codec::BlobIngest>,
     encoded: Vec<u8>,
     expected: BlobRef,
@@ -477,7 +477,7 @@ impl PhysicalStager {
             reference: self.expected,
             encoding: self.store.physical_encoding,
             owner: Arc::clone(&self.store.inner),
-            _reservation: self.budget.finish(self.expected.size)?,
+            _reservation: self.reservation,
         })
     }
 }
@@ -666,6 +666,7 @@ struct Inner {
     publications: publications::PublicationWaits,
     space_policy: Option<SpacePolicy>,
     space: Mutex<space::SpaceState>,
+    space_maintenance: Mutex<()>,
     // Releases never acquire the space admission lock, avoiding lock-order
     // inversion with transactional publication and eviction.
     space_released: AtomicU64,
@@ -1165,6 +1166,18 @@ impl NativeStore {
         Self::open_inner(root, None)
     }
 
+    fn load_usage(db: &Database) -> Result<Pins> {
+        let mut pins = Pins::default();
+        let read = db.begin_read()?;
+        for entry in read.open_table(USAGE)?.iter()? {
+            let (key, value) = entry?;
+            let root = space::Root::from_key(*key.value())?;
+            let record: space::UsageRecord = encoding().deserialize(value.value())?;
+            pins.usage.insert(root, record);
+        }
+        Ok(pins)
+    }
+
     fn open_inner(root: &Path, space_policy: Option<SpacePolicy>) -> Result<Self> {
         fs::create_dir_all(root)?;
         let root = fs::canonicalize(root)?;
@@ -1216,6 +1229,7 @@ impl NativeStore {
         write.open_table(BLOB_LAYOUTS)?;
         write.open_multimap_table(RESULT_ACTIONS)?;
         write.open_multimap_table(BLOB_ROOTS)?;
+        duplicate_results::initialize(&write)?;
         write.open_table(PENDING_DELETIONS)?;
         {
             let mut accounting = write.open_table(ACCOUNTING)?;
@@ -1227,16 +1241,7 @@ impl NativeStore {
             }
         }
         write.commit()?;
-        let mut pins = Pins::default();
-        {
-            let read = db.begin_read()?;
-            for entry in read.open_table(USAGE)?.iter()? {
-                let (key, value) = entry?;
-                let root = space::Root::from_key(*key.value())?;
-                let record: space::UsageRecord = encoding().deserialize(value.value())?;
-                pins.usage.insert(root, record);
-            }
-        }
+        let pins = Self::load_usage(&db)?;
         let result_history_limit = history::configured_limit(&db)?;
         let physical_encoding = if is_native_zfs(&root.join("staging"))? {
             BlobEncoding::Raw
@@ -1256,6 +1261,7 @@ impl NativeStore {
             publications: publications::PublicationWaits::default(),
             space_policy,
             space: Mutex::default(),
+            space_maintenance: Mutex::default(),
             space_released: AtomicU64::new(0),
             result_history_limit: AtomicU64::new(result_history_limit),
         });
@@ -1359,9 +1365,11 @@ impl NativeStore {
                             .context("staging budget overflow")?;
                         // A small managed worker must be able to stage a
                         // small object even with a budget below one chunk.
-                        let reservation = self.inner.space_policy.map_or(reservation, |policy| {
-                            reservation.min(policy.max_resident_bytes)
-                        });
+                        let reservation = if let Some(policy) = self.inner.space_policy {
+                            reservation.min(self.staging_limit(policy)?)
+                        } else {
+                            reservation
+                        };
                         ensure!(
                             size <= reservation,
                             "native staged content exceeds resident budget"
@@ -1458,8 +1466,20 @@ impl NativeStore {
         expected: BlobRef,
         encoding: BlobEncoding,
     ) -> Result<PhysicalStager> {
-        let mut budget = space::StageBudget::new(self);
-        budget.grow_to(expected.size)?;
+        let reservation = self.reserve_transfer(expected.size)?;
+        self.prepare_physical_reserved(expected, encoding, reservation)
+    }
+
+    pub(crate) fn reserve_transfer(&self, bytes: u64) -> Result<space::StagingReservation> {
+        self.reserve_staging(bytes)?.finish(bytes)
+    }
+
+    pub(crate) fn prepare_physical_reserved(
+        &self,
+        expected: BlobRef,
+        encoding: BlobEncoding,
+        reservation: space::StagingReservation,
+    ) -> Result<PhysicalStager> {
         let (file, path) = NamedTempFile::new_in(self.inner.root.join("staging"))?.into_parts();
         let mut written = 0;
         let ingest = blob_codec::BlobIngest::new(
@@ -1477,7 +1497,7 @@ impl NativeStore {
             path,
             written,
             synced: false,
-            budget,
+            reservation,
             ingest: Some(ingest),
             encoded: Vec::new(),
             expected,
@@ -2014,6 +2034,8 @@ impl NativeStore {
                     .context("missing indexed result")?;
                 let manifest: ResultManifest = encoding().deserialize(manifest.value())?;
                 history::remember(&write, action, manifest, limit)?;
+            } else {
+                duplicate_results::forget(&write, action)?;
             }
             unreferenced_logical_bytes = Self::release_result_reference(
                 &write,
@@ -2433,10 +2455,15 @@ impl<L> Seek for LeasedReader<'_, L> {
     }
 }
 
+mod duplicate_results;
 mod history;
 mod space;
 use crate::SpacePolicy;
-pub use space::{CacheAnalyticsSampler, SpaceReport, SpaceStatus, StageBudget};
+pub use space::StagingReservation;
+pub use space::{
+    CacheAnalyticsSampler, SpaceReport, SpaceStatus, StageBudget, StageSpaceExhausted,
+    StageSpaceTooLarge,
+};
 mod audit;
 pub use audit::{ComponentAudit, NativeIndexAudit, SchemaInventory};
 mod packages;

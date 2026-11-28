@@ -10,7 +10,7 @@ use bincode::Options;
 use redb::{ReadOnlyDatabase, ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 
-use super::{ACTIONS, ActionRecord, NativeStore, encoding};
+use super::{ACTIONS, ActionRecord, NativeStore, RESULTS, encoding};
 use crate::{ActionKey, ResultId};
 
 /// Observed evidence for jointly ignoring selected named action components.
@@ -111,6 +111,35 @@ impl NativeIndexAudit {
     /// Returns an error for inconsistent metadata or I/O failure.
     pub fn inventory(&self) -> Result<BTreeMap<String, SchemaInventory>> {
         inventory(&self.db)
+    }
+
+    /// Return the verified result identity for an exact live action.
+    ///
+    /// # Errors
+    /// Returns an error for inconsistent or unreadable action metadata.
+    pub fn action_result(&self, key: ActionKey) -> Result<Option<ResultId>> {
+        let read = self.db.begin_read()?;
+        let actions = read.open_table(ACTIONS)?;
+        let Some(record) = actions.get(&key.0)? else {
+            return Ok(None);
+        };
+        let record: ActionRecord = encoding().deserialize(record.value())?;
+        ensure!(
+            record.fingerprint.key()? == key,
+            "invalid indexed action fingerprint"
+        );
+        let results = read.open_table(RESULTS)?;
+        let manifest: crate::ResultManifest = encoding().deserialize(
+            results
+                .get(&record.result.0)?
+                .context("missing indexed result")?
+                .value(),
+        )?;
+        ensure!(
+            manifest.id()? == record.result,
+            "invalid indexed result manifest"
+        );
+        Ok(Some(record.result))
     }
 
     /// Compare action outcomes after projecting out exactly these components.

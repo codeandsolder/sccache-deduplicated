@@ -50,7 +50,10 @@ async fn cancelled_async_commit_finishes_session_and_can_be_replayed() -> Result
 }
 
 fn service(dir: &std::path::Path) -> Result<NativeSessions> {
-    let store = NativeStore::open(dir)?;
+    service_with_store(NativeStore::open(dir)?)
+}
+
+fn service_with_store(store: NativeStore) -> Result<NativeSessions> {
     store.publish_tree(&empty_root(), vec![])?;
     NativeSessions::new(
         store,
@@ -248,6 +251,158 @@ fn result_upload_saturation_is_retryable_and_does_not_consume_admission() -> Res
     upload_encoded(&service, ticket, worker, stdout, b"stdout")?;
     upload_encoded(&service, ticket, worker, object, b"object")?;
     assert_eq!(service.commit(ticket, worker)?, output);
+    Ok(())
+}
+
+#[test]
+fn competing_results_reserve_complete_missing_closures_and_retry() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open_managed(
+        dir.path(),
+        crate::SpacePolicy {
+            min_available_bytes: 1,
+            target_available_bytes: 1,
+            max_resident_bytes: Some(20),
+            target_resident_bytes: Some(20),
+            max_evictions_per_pass: 8,
+            gc_batch: 8,
+        },
+    )?;
+    let service = service_with_store(store)?;
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
+    let NativeAdmission::Compile { ticket: first } =
+        service.admit(None, request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("expected first compilation")
+    };
+    let mut second_request = request()?;
+    second_request
+        .fingerprint
+        .components
+        .insert("source".into(), ContentId::of(b"other"));
+    let NativeAdmission::Compile { ticket: second } = service.admit(
+        None,
+        second_request,
+        worker,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
+    else {
+        bail!("expected second compilation")
+    };
+    let mut first_manifest = manifest(b"object");
+    let stdout = BlobRef {
+        id: ContentId::of(b"stdout"),
+        size: 6,
+    };
+    first_manifest.stdout = Some(stdout);
+    let mut second_manifest = manifest(b"second");
+    let stderr = BlobRef {
+        id: ContentId::of(b"stderr"),
+        size: 6,
+    };
+    second_manifest.stderr = Some(stderr);
+    service.begin(first, worker, first_manifest.clone())?;
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(12));
+    let refused = service.begin(second, worker, second_manifest.clone());
+    assert!(matches!(refused, Err(error) if error.is::<crate::StageSpaceExhausted>()));
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(12));
+    let object = first_manifest.outputs["obj"].test_file_blob();
+    drop(service.prepare_upload(first, worker, object, BlobEncoding::Raw)?);
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(12));
+    upload_encoded(&service, first, worker, object, b"object")?;
+    upload_encoded(&service, first, worker, stdout, b"stdout")?;
+    assert_eq!(service.commit(first, worker)?, first_manifest);
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(0));
+    service.close(first, Publisher::Client)?;
+    service.store().maintain_space()?;
+    service.begin(second, worker, second_manifest.clone())?;
+    upload_encoded(
+        &service,
+        second,
+        worker,
+        second_manifest.outputs["obj"].test_file_blob(),
+        b"second",
+    )?;
+    upload_encoded(&service, second, worker, stderr, b"stderr")?;
+    assert_eq!(service.commit(second, worker)?, second_manifest);
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(0));
+    Ok(())
+}
+
+#[test]
+fn transfer_larger_than_resident_budget_is_not_retryable() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service_with_store(NativeStore::open_managed(
+        dir.path(),
+        crate::SpacePolicy {
+            min_available_bytes: 1,
+            target_available_bytes: 1,
+            max_resident_bytes: Some(10),
+            target_resident_bytes: Some(10),
+            max_evictions_per_pass: 8,
+            gc_batch: 8,
+        },
+    )?)?;
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
+    let NativeAdmission::Compile { ticket } =
+        service.admit(None, request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("expected compilation")
+    };
+    let mut output = manifest(b"object");
+    output.stdout = Some(BlobRef {
+        id: ContentId::of(b"stdout"),
+        size: 6,
+    });
+    assert!(
+        matches!(service.begin(ticket, worker, output), Err(error) if error.is::<crate::StageSpaceTooLarge>())
+    );
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(0));
+    Ok(())
+}
+
+#[test]
+fn cancelled_transfer_retains_budget_until_active_upload_is_dropped() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service_with_store(NativeStore::open_managed(
+        dir.path(),
+        crate::SpacePolicy {
+            min_available_bytes: 1,
+            target_available_bytes: 1,
+            max_resident_bytes: Some(12),
+            target_resident_bytes: Some(12),
+            max_evictions_per_pass: 8,
+            gc_batch: 8,
+        },
+    )?)?;
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
+    let NativeAdmission::Compile { ticket } =
+        service.admit(None, request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("expected compilation")
+    };
+    let output = manifest(b"object");
+    service.begin(ticket, worker, output.clone())?;
+    let upload = service.prepare_upload(
+        ticket,
+        worker,
+        output.outputs["obj"].test_file_blob(),
+        BlobEncoding::Raw,
+    )?;
+    service.close(ticket, Publisher::Client)?;
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(6));
+    drop(upload);
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(0));
     Ok(())
 }
 
