@@ -120,7 +120,10 @@ normalized for both key and execution. The build-script output root is
 `/generated`. The dispatch validator uses the identical realized environment.
 Rustc embeds the physical working directory even without debug information;
 native commands normalize it with a default prefix map to `/sccache/cwd`.
-Only an explicit restricted remap scope retains cwd identity. Do not hash
+An explicit restricted remap scope retains physical cwd identity. With full
+remapping, retain only the realized directory when an explicit user map
+overrides the default, following rustc's reverse prefix order and explicit
+`-Zremap-cwd-prefix` precedence. Do not hash
 all Cargo environment variables. Retain the actual package identity where ordinary proc macros use it,
 compiler switches supplied through the environment, and Clippy policy and flags.
 Resolve duplicate environment assignments before discovery, hashing or execution;

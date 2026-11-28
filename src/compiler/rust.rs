@@ -317,7 +317,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"23";
+const CACHE_VERSION: &[u8] = b"24";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -1309,9 +1309,54 @@ fn native_normalizes_cwd(arguments: &[Argument<ArgData>]) -> bool {
         .unwrap_or(true)
 }
 
+const NATIVE_REMAPPED_CWD: &str = "/sccache/cwd";
+
+/// Determine the compiler's actual source-map working directory. Rustc
+/// applies prefix mappings in reverse order, with an explicit cwd-prefix
+/// option taking precedence over all ordinary mappings. Only the realized
+/// directory is observable; an unmatched physical prefix is not an input.
+fn native_cwd_identity(
+    cwd: &Path,
+    arguments: &[Argument<ArgData>],
+    canonical: Option<&CanonicalRustPaths>,
+) -> PathBuf {
+    if !native_normalizes_cwd(arguments) {
+        return cwd.to_owned();
+    }
+    let normalize = |value: &OsStr| {
+        canonical.map_or_else(|| value.to_owned(), |paths| paths.normalize_os_value(value))
+    };
+    if let Some(prefix) = arguments.iter().rev().find_map(|arg| match arg.get_data() {
+        Some(Unstable(ArgUnstable { opt, value })) if option_is(opt, "remap-cwd-prefix") => {
+            value.as_deref()
+        }
+        _ => None,
+    }) {
+        return PathBuf::from(normalize(OsStr::new(prefix)));
+    }
+    for arg in arguments.iter().rev() {
+        let Argument::WithValue("--remap-path-prefix", PassThrough(value), _) = arg else {
+            continue;
+        };
+        let value = normalize(value);
+        let Some((from, to)) = value.to_str().and_then(|value| value.rsplit_once('=')) else {
+            continue;
+        };
+        if let Ok(rest) = cwd.strip_prefix(from) {
+            return if rest.as_os_str().is_empty() {
+                PathBuf::from(to)
+            } else {
+                Path::new(to).join(rest)
+            };
+        }
+    }
+    PathBuf::from(NATIVE_REMAPPED_CWD)
+}
+
 fn native_cwd_remap(cwd: &Path) -> Argument<ArgData> {
     let mut mapping = cwd.as_os_str().to_owned();
-    mapping.push("=/sccache/cwd");
+    mapping.push("=");
+    mapping.push(NATIVE_REMAPPED_CWD);
     Argument::WithValue(
         "--remap-path-prefix",
         ArgData::PassThrough(mapping),
@@ -4514,7 +4559,13 @@ where
             .as_ref()
             .map_or_else(|| cwd.clone(), |canonical| canonical.canonical_cwd(&cwd));
         m.audit_field("sccache.key.cwd");
-        if !native_discovery || !native_normalizes_cwd(&effective_arguments) {
+        if native_discovery {
+            let effective_cwd =
+                native_cwd_identity(&hash_cwd, &effective_arguments, canonical_paths.as_ref());
+            if effective_cwd != Path::new(NATIVE_REMAPPED_CWD) {
+                effective_cwd.hash(&mut HashToDigest { digest: &mut m });
+            }
+        } else {
             hash_cwd.hash(&mut HashToDigest { digest: &mut m });
         }
         // The driver and shared-library contents already identify the
@@ -10392,6 +10443,49 @@ version='2.0.0'
         );
 
         assert_eq!(h.gcno, Some("foo-a1b6419f8321841f.gcno".into()));
+    }
+
+    #[test]
+    fn native_cwd_identity_respects_effective_remap_precedence() {
+        let parsed = parses!(
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "src/lib.rs",
+            "--emit=link",
+            "--out-dir",
+            "/out",
+            "--remap-path-prefix=/one=/custom",
+            "--remap-path-prefix=/one/sub=/override"
+        );
+        let identity = |cwd: &str| native_cwd_identity(Path::new(cwd), &parsed.arguments, None);
+        assert_eq!(identity("/two"), Path::new(NATIVE_REMAPPED_CWD));
+        assert_eq!(identity("/one"), Path::new("/custom"));
+        assert_eq!(identity("/one/sub"), Path::new("/override"));
+        assert_eq!(identity("/one/sibling"), Path::new("/custom/sibling"));
+        let mut args = parsed.arguments;
+        args.push(Argument::WithValue(
+            "-Z",
+            Unstable(ArgUnstable {
+                opt: "remap_cwd_prefix".into(),
+                value: Some("/explicit".into()),
+            }),
+            ArgDisposition::Separated,
+        ));
+        assert_eq!(
+            native_cwd_identity(Path::new("/one"), &args, None),
+            Path::new("/explicit")
+        );
+        args.push(Argument::WithValue(
+            "--remap-path-scope",
+            PassThrough("diagnostics".into()),
+            ArgDisposition::Separated,
+        ));
+        assert_eq!(
+            native_cwd_identity(Path::new("/one"), &args, None),
+            Path::new("/one")
+        );
     }
 
     #[test]
