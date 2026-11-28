@@ -30,6 +30,11 @@ use crate::{
     source::{metadata, timestamp, unchanged},
 };
 
+#[cfg(feature = "store")]
+mod filesystem;
+#[cfg(feature = "store")]
+pub use filesystem::{DiscoveredInputs, DiscoveryMount, DiscoverySession, DiscoveryTransport};
+
 /// A logical operation, not a physical origin path.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum DiscoveryQuery {
@@ -80,10 +85,60 @@ impl From<FileType> for DiscoveryKind {
     }
 }
 
+/// Origin-local inode identity. The transcript canonicalizes equivalence
+/// classes before hashing: device and inode numbers are never cache keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DiscoveryInode {
+    device: u64,
+    inode: u64,
+}
+
+impl DiscoveryInode {
+    #[cfg(feature = "store")]
+    fn replay_inode(self) -> Result<u64> {
+        ensure!(
+            self.device == 0 && self.inode != 0,
+            "noncanonical replay inode"
+        );
+        Ok(self.inode)
+    }
+
+    fn from_stat(stat: &Stat) -> Self {
+        Self {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryMetadata {
+    pub inode: DiscoveryInode,
+    pub metadata: TreeMetadata,
+    pub links: u32,
+}
+
+impl DiscoveryMetadata {
+    fn from_stat(stat: &Stat) -> Result<Self> {
+        Ok(Self {
+            inode: DiscoveryInode::from_stat(stat),
+            metadata: metadata(stat)?,
+            links: u32::try_from(stat.st_nlink)?,
+        })
+    }
+
+    fn validate(self) -> Result<()> {
+        self.metadata.validate()?;
+        ensure!(self.links > 0, "discovery inode has no links");
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveryDirent {
     pub name: Vec<u8>,
     pub kind: DiscoveryKind,
+    pub inode: DiscoveryInode,
 }
 
 /// Lookup and read results share the same normalized metadata contract as
@@ -94,23 +149,54 @@ pub enum DiscoveryReply {
     Missing,
     NotDirectory,
     IsDirectory,
-    Directory(TreeMetadata),
+    Directory(DiscoveryMetadata),
     Regular {
-        metadata: TreeMetadata,
+        metadata: DiscoveryMetadata,
         size: u64,
     },
     Symlink {
+        inode: DiscoveryInode,
+        links: u32,
         target: Vec<u8>,
         modified: TreeTimestamp,
     },
     DirectoryEntries(Vec<DiscoveryDirent>),
     File {
-        metadata: TreeMetadata,
+        metadata: DiscoveryMetadata,
         blob: BlobRef,
     },
 }
 
 impl DiscoveryReply {
+    fn normalize_inodes(
+        &mut self,
+        aliases: &mut BTreeMap<DiscoveryInode, DiscoveryInode>,
+    ) -> Result<()> {
+        let mut normalize = |inode: &mut DiscoveryInode| -> Result<()> {
+            let next = u64::try_from(aliases.len())?
+                .checked_add(1)
+                .context("discovery inode count overflow")?;
+            *inode = *aliases.entry(*inode).or_insert(DiscoveryInode {
+                device: 0,
+                inode: next,
+            });
+            Ok(())
+        };
+        match self {
+            Self::Directory(meta)
+            | Self::Regular { metadata: meta, .. }
+            | Self::File { metadata: meta, .. } => normalize(&mut meta.inode)?,
+            Self::Symlink { inode, .. } => normalize(inode)?,
+            Self::DirectoryEntries(entries) => {
+                for entry in entries {
+                    normalize(&mut entry.inode)?;
+                }
+            }
+            Self::Missing | Self::NotDirectory | Self::IsDirectory => {}
+        }
+        Ok(())
+    }
+
     fn validate(&self, query: &DiscoveryQuery) -> Result<()> {
         use DiscoveryQuery as Q;
         use DiscoveryReply as R;
@@ -118,9 +204,17 @@ impl DiscoveryReply {
             (_, R::Missing | R::NotDirectory) | (Q::ReadFile(_), R::IsDirectory) => Ok(()),
             (Q::Lookup(_), R::Directory(meta) | R::Regular { metadata: meta, .. })
             | (Q::ReadFile(_), R::File { metadata: meta, .. }) => meta.validate(),
-            (Q::Lookup(_), R::Symlink { target, modified }) => {
+            (
+                Q::Lookup(_),
+                R::Symlink {
+                    target,
+                    modified,
+                    links,
+                    ..
+                },
+            ) => {
                 ensure!(
-                    !target.is_empty() && !target.contains(&0),
+                    !target.is_empty() && !target.contains(&0) && *links > 0,
                     "invalid discovery symlink"
                 );
                 ensure!(
@@ -190,16 +284,28 @@ impl DiscoveryTranscript {
         self.0.get(query)
     }
 
+    /// Canonicalize the observed inode equivalence relation, in query/path
+    /// order, independent of host inode numbers or discovery concurrency.
+    /// The replay uses these same normalized identities.
+    /// # Errors
+    /// Returns an error for invalid observations, including deserialized data.
+    pub fn canonical(&self) -> Result<Self> {
+        let mut canonical = self.clone();
+        let mut aliases = BTreeMap::new();
+        for (query, reply) in &mut canonical.0 {
+            query.validate()?;
+            reply.validate(query)?;
+            reply.normalize_inodes(&mut aliases)?;
+        }
+        Ok(canonical)
+    }
+
     /// # Errors
     /// Returns an error for invalid observations, including deserialized data.
     pub fn fingerprint(&self) -> Result<ContentId> {
-        for (query, reply) in &self.0 {
-            query.validate()?;
-            reply.validate(query)?;
-        }
         Ok(ContentId(typed_digest(
-            b"sccache-input-discovery-v1\0",
-            &self.0,
+            b"sccache-input-discovery-v2\0",
+            &self.canonical()?.0,
         )?))
     }
 
@@ -222,7 +328,7 @@ impl DiscoveryReplay {
     /// # Errors
     /// Returns an error for a malformed transcript.
     pub fn new(transcript: DiscoveryTranscript) -> Result<Self> {
-        transcript.fingerprint()?;
+        let transcript = transcript.canonical()?;
         Ok(Self {
             transcript,
             seen: BTreeSet::new(),
@@ -239,6 +345,32 @@ impl DiscoveryReplay {
         };
         self.seen.insert(query.clone());
         Ok(reply)
+    }
+
+    #[cfg(feature = "store")]
+    fn file_query(
+        &self,
+        query: DiscoveryQuery,
+        inode: DiscoveryInode,
+        scope: &BuildPath,
+    ) -> Result<DiscoveryQuery> {
+        if self.transcript.get(&query).is_some() {
+            return Ok(query);
+        }
+        self.transcript
+            .0
+            .iter()
+            .find_map(|(candidate, reply)| {
+                if let (DiscoveryQuery::ReadFile(path), DiscoveryReply::File { metadata, .. }) =
+                    (candidate, reply)
+                    && path.within(scope.as_bytes())
+                    && metadata.inode == inode
+                {
+                    return Some(candidate.clone());
+                }
+                None
+            })
+            .context("unobserved file content during replay")
     }
 
     /// A replay with a different observation set must not be published under
@@ -386,12 +518,16 @@ impl DiscoveryOrigin {
         let kind = FileType::from_raw_mode(stat.st_mode);
         let reply = match query {
             DiscoveryQuery::Lookup(_) => match kind {
-                FileType::Directory => DiscoveryReply::Directory(metadata(&stat)?),
+                FileType::Directory => {
+                    DiscoveryReply::Directory(DiscoveryMetadata::from_stat(&stat)?)
+                }
                 FileType::RegularFile => DiscoveryReply::Regular {
-                    metadata: metadata(&stat)?,
+                    metadata: DiscoveryMetadata::from_stat(&stat)?,
                     size: u64::try_from(stat.st_size)?,
                 },
                 FileType::Symlink => DiscoveryReply::Symlink {
+                    inode: DiscoveryInode::from_stat(&stat),
+                    links: u32::try_from(stat.st_nlink)?,
                     target: readlinkat(&file, "", Vec::new())?.into_bytes(),
                     modified: timestamp(&stat)?,
                 },
@@ -414,9 +550,29 @@ impl DiscoveryOrigin {
                         entries.len() < max_dirents,
                         "discovery directory entry limit exceeded"
                     );
+                    let kind = if entry.file_type() == FileType::Unknown {
+                        FileType::from_raw_mode(
+                            rustix::fs::statat(
+                                &reader,
+                                OsStr::from_bytes(name),
+                                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                            )?
+                            .st_mode,
+                        )
+                    } else {
+                        entry.file_type()
+                    };
+                    ensure!(
+                        kind != FileType::Unknown,
+                        "unknown discovery directory entry"
+                    );
                     entries.push(DiscoveryDirent {
                         name: name.to_vec(),
-                        kind: entry.file_type().into(),
+                        kind: kind.into(),
+                        inode: DiscoveryInode {
+                            device: stat.st_dev,
+                            inode: entry.ino(),
+                        },
                     });
                 }
                 entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
@@ -440,7 +596,7 @@ impl DiscoveryOrigin {
                 unchanged(&stat, &fstat(&reader)?)?;
                 return Ok((
                     DiscoveryReply::File {
-                        metadata: metadata(&stat)?,
+                        metadata: DiscoveryMetadata::from_stat(&stat)?,
                         blob,
                     },
                     Some(reader),
@@ -522,11 +678,17 @@ impl DiscoveryOrigin {
         );
         previous.fingerprint()?;
         for (query, expected) in &previous.0 {
-            if self.query(query.clone())? != *expected {
+            let mut actual = self.query(query.clone())?;
+            let mut expected = expected.clone();
+            actual.normalize_inodes(&mut BTreeMap::new())?;
+            expected.normalize_inodes(&mut BTreeMap::new())?;
+            if actual != expected {
                 return Ok(None);
             }
         }
-        self.seal()?;
+        if self.seal()?.canonical()? != previous.canonical()? {
+            return Ok(None);
+        }
         Ok(Some(self))
     }
 
@@ -762,6 +924,41 @@ mod tests {
             origin
                 .query(DiscoveryQuery::ReadFile(path(b"/input/nested/b")?))
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inode_equivalence_not_host_inode_number_participates_in_identity() -> Result<()> {
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        let distinct = tempfile::tempdir()?;
+        for dir in [first.path(), second.path(), distinct.path()] {
+            fs::write(dir.join("a"), b"bytes")?;
+            fs::hard_link(dir.join("a"), dir.join("b"))?;
+        }
+        // Replace b with an independent inode of identical contents.
+        fs::remove_file(distinct.path().join("b"))?;
+        fs::write(distinct.path().join("b"), b"bytes")?;
+        let observe = |dir: &Path| -> Result<DiscoveryTranscript> {
+            let mut origin = DiscoveryOrigin::new(DiscoveryLimits {
+                max_queries: 8,
+                max_dirents: 8,
+                max_content_bytes: 1024,
+            })?;
+            origin.add_root(path(b"/input")?, dir)?;
+            // Directory enumeration observes inode equivalence, not file bytes
+            // or the unrelated timestamps of these independently created files.
+            origin.query(DiscoveryQuery::ReadDirectory(path(b"/input")?))?;
+            Ok(origin.seal()?.clone())
+        };
+        assert_eq!(
+            observe(first.path())?.fingerprint()?,
+            observe(second.path())?.fingerprint()?
+        );
+        assert_ne!(
+            observe(first.path())?.fingerprint()?,
+            observe(distinct.path())?.fingerprint()?
         );
         Ok(())
     }
