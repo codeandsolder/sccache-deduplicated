@@ -190,6 +190,11 @@ catalog rotation is required to re-resolve an existing set. The current
 transport streams a zstd-compressed Docker image archive, not a local
 rebuild; Docker deduplicates shared layers on disk.
 
+For initial host installation, run the reviewed `install-profile-broker`
+as root after setting the authority and restricted SSH configuration. It
+installs the broker before switching the launcher and does not restart the
+compiler daemon. Subsequent project builds require no privileged commands.
+
 For prewarming, administrators may run `sccache-runtime-profile provision`
 on the authority, never on a client. Normal Cargo invocations require no
 per-project provisioning commands.

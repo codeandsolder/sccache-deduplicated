@@ -121,7 +121,7 @@ jobs:
           contrib/codeandsolder/fleet/test-native-only-config
           contrib/codeandsolder/test-native-cache-reuse --self-test
           sudo contrib/codeandsolder/fleet/test-activate-host
-          shellcheck -x contrib/codeandsolder/runtime/{build-image,run,sccache-runtime-profile,sccache-runtime-profile-service,test-run,test-runtime,test-profile,test-profile-service}
+          shellcheck -x contrib/codeandsolder/runtime/{build-image,run,install-profile-broker,sccache-runtime-profile,sccache-runtime-profile-service,test-run,test-runtime,test-profile,test-profile-service}
           shellcheck -x scripts/ci-{prepare-linux-tests,linux-test-shard,build-dist-tests,dist-test-shard}.sh
           contrib/codeandsolder/runtime/test-run
           contrib/codeandsolder/runtime/test-profile
