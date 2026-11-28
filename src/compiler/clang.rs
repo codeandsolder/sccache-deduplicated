@@ -123,13 +123,8 @@ impl CCompilerImpl for Clang {
             env_vars,
             may_dist,
             rewrite_includes_only,
-            preprocessor_cache_mode,
         } = context;
-        let mut ignorable_whitespace_flags = if preprocessor_cache_mode {
-            vec![]
-        } else {
-            vec!["-P".to_string()]
-        };
+        let mut ignorable_whitespace_flags = vec!["-P".to_string()];
 
         // Clang 14 and later support -fminimize-whitespace, which normalizes away non-semantic whitespace which in turn increases cache hit rate.
         // '-fminimize-whitespace' invalid for input of type assembler-with-cpp

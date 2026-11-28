@@ -155,7 +155,6 @@ pub fn dist_test_sccache_client_cfg(
     system: &harness::DistSystem,
 ) -> sccache::config::FileConfig {
     let mut sccache_cfg = harness::sccache_client_cfg(tmpdir, false);
-    sccache_cfg.cache.disk.as_mut().unwrap().size = 0;
     system.configure_client(&mut sccache_cfg);
     sccache_cfg
 }

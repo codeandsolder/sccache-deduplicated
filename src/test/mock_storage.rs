@@ -12,34 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cache::{Cache, CacheWrite, Storage};
-use crate::config::PreprocessorCacheModeConfig;
+use crate::cache::Storage;
 use crate::errors::*;
 use async_trait::async_trait;
-use futures::channel::mpsc;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Mutex;
-use tokio::time::sleep;
 
 /// A mock `Storage` implementation.
 pub struct MockStorage {
-    rx: Arc<Mutex<mpsc::UnboundedReceiver<Result<Cache>>>>,
-    tx: mpsc::UnboundedSender<Result<Cache>>,
-    delay: Option<Duration>,
-    preprocessor_cache_mode: bool,
     fail_size_query: bool,
 }
 
 impl MockStorage {
     /// Create a new `MockStorage`. if `delay` is `Some`, wait for that amount of time before returning from operations.
-    pub(crate) fn new(delay: Option<Duration>, preprocessor_cache_mode: bool) -> Self {
-        let (tx, rx) = mpsc::unbounded();
+    pub(crate) fn new() -> Self {
         Self {
-            tx,
-            rx: Arc::new(Mutex::new(rx)),
-            delay,
-            preprocessor_cache_mode,
             fail_size_query: false,
         }
     }
@@ -47,32 +32,10 @@ impl MockStorage {
     pub(crate) fn fail_current_size(&mut self) {
         self.fail_size_query = true;
     }
-
-    /// Queue up `res` to be returned as the next result from `Storage::get`.
-    pub(crate) fn next_get(&self, res: Result<Cache>) {
-        let sent = self.tx.unbounded_send(res);
-        assert!(sent.is_ok(), "MockStorage receiver unexpectedly closed");
-    }
 }
 
 #[async_trait]
 impl Storage for MockStorage {
-    async fn get(&self, _key: &str) -> Result<Cache> {
-        if let Some(delay) = self.delay {
-            sleep(delay).await;
-        }
-        self.rx.lock().await.try_recv().map_err(|error| {
-            anyhow::anyhow!("MockStorage get called but no get results available: {error}")
-        })?
-    }
-    async fn put(&self, _key: &str, _entry: CacheWrite) -> Result<Duration> {
-        Ok(if let Some(delay) = self.delay {
-            sleep(delay).await;
-            delay
-        } else {
-            Duration::from_secs(0)
-        })
-    }
     fn location(&self) -> String {
         "Mock Storage".to_string()
     }
@@ -82,11 +45,5 @@ impl Storage for MockStorage {
     }
     async fn max_size(&self) -> Result<Option<u64>> {
         Ok(None)
-    }
-    fn preprocessor_cache_mode_config(&self) -> PreprocessorCacheModeConfig {
-        PreprocessorCacheModeConfig {
-            use_preprocessor_cache_mode: self.preprocessor_cache_mode,
-            ..Default::default()
-        }
     }
 }

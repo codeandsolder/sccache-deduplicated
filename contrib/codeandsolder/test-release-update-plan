@@ -50,7 +50,7 @@ cat > "$release/build.txt" <<EOF
 source_sha=$new_sha
 rust_toolchain=nightly-2026-11-20
 rustflags=-C target-cpu=x86-64-v2
-features=s3,dist-client,dist-server,direct-metrics
+features=dist-client,dist-server,direct-metrics
 dist_protocol=3
 rollout_epoch=4
 capabilities=direct-metrics

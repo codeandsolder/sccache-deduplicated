@@ -261,7 +261,6 @@ where
         profile_generate: false,
         color_mode: ColorMode::Off,
         suppress_rewrite_includes_only: false,
-        too_hard_for_preprocessor_cache_mode: None,
     })
 }
 

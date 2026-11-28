@@ -12,19 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cache::CacheMode;
-use crate::cache::disk::DiskCache;
 use crate::client::connect_to_server;
 use crate::commands::{CompileInvocation, do_compile, request_shutdown, request_stats};
-use crate::config::PreprocessorCacheModeConfig;
 use crate::jobserver::Client;
 use crate::mock_command::*;
 use crate::server::{DistClientContainer, SccacheServer, ServerMessage};
+use crate::test::mock_storage::MockStorage;
 use crate::test::utils::*;
-use fs::File;
-use fs_err as fs;
 use futures::channel::oneshot::{self, Sender};
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -36,8 +32,6 @@ use tokio::runtime::Runtime;
 struct ServerOptions {
     /// The server's idle shutdown timeout.
     idle_timeout: Option<u64>,
-    /// The maximum size of the disk cache.
-    cache_size: Option<u64>,
 }
 
 /// Run a server on a background thread, and return a tuple of useful things.
@@ -49,7 +43,7 @@ struct ServerOptions {
 ///   use for all process creation.
 /// * The `JoinHandle` for the server thread.
 fn run_server_thread<T>(
-    cache_dir: &Path,
+    _cache_dir: &Path,
     options: T,
 ) -> (
     crate::net::SocketAddr,
@@ -61,27 +55,13 @@ where
     T: Into<Option<ServerOptions>> + Send + 'static,
 {
     let options = options.into();
-    let cache_dir = cache_dir.to_path_buf();
-
-    let cache_size = options
-        .as_ref()
-        .and_then(|o| o.cache_size.as_ref())
-        .copied()
-        .unwrap_or(u64::MAX);
     // Create a server on a background thread, get some useful bits from it.
     let (tx, rx) = mpsc::channel();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let handle = thread::spawn(move || {
         let runtime = Runtime::new().unwrap();
         let dist_client = DistClientContainer::new_disabled();
-        let storage = Arc::new(DiskCache::new(
-            &cache_dir,
-            cache_size,
-            runtime.handle(),
-            PreprocessorCacheModeConfig::default(),
-            CacheMode::ReadWrite,
-            vec![],
-        ));
+        let storage = Arc::new(MockStorage::new());
 
         let client = Client::new();
         let srv = SccacheServer::new(
@@ -229,83 +209,40 @@ fn test_server_unsupported_compiler() {
 }
 
 #[test]
-fn test_server_compile() {
-    let _ = env_logger::try_init();
-    let f = TestFixture::new();
-    let gcc = f.mk_bin("gcc").unwrap();
-    let (addr, sender, server_creator, child) = run_server_thread(f.tempdir.path(), None);
-    // Connect to the server.
-    const PREPROCESSOR_STDOUT: &[u8] = b"preprocessor stdout";
-    const PREPROCESSOR_STDERR: &[u8] = b"preprocessor stderr";
-    const STDOUT: &[u8] = b"some stdout";
-    const STDERR: &[u8] = b"some stderr";
+fn test_server_rejects_compilation_without_native_scheduler() {
+    let fixture = TestFixture::new();
+    let gcc = fixture.mk_bin("gcc").unwrap();
+    let (addr, sender, server_creator, child) = run_server_thread(fixture.tempdir.path(), None);
     let conn = connect_to_server(&addr).unwrap();
-    // Write a dummy input file so the preprocessor cache mode can work
-    std::fs::write(f.tempdir.path().join("file.c"), "whatever").unwrap();
     {
-        let mut c = server_creator.lock().unwrap();
-        // The server will check the compiler. Pretend it's GCC.
-        c.next_command_spawns(Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")));
-        // The assembler version and path probes.
-        c.next_command_spawns(Ok(MockChild::new(
+        let mut creator = server_creator.lock().unwrap();
+        creator.next_command_spawns(Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")));
+        creator.next_command_spawns(Ok(MockChild::new(
             exit_status(0),
             "GNU assembler (GNU Binutils) 2.42",
             "",
         )));
-        c.next_command_spawns(Ok(MockChild::new(exit_status(0), "as", "")));
-        // Preprocessor invocation.
-        c.next_command_spawns(Ok(MockChild::new(
-            exit_status(0),
-            PREPROCESSOR_STDOUT,
-            PREPROCESSOR_STDERR,
-        )));
-        // Compiler invocation.
-        //TODO: wire up a way to get data written to stdin.
-        let obj = f.tempdir.path().join("file.o");
-        c.next_command_calls(move |_| {
-            // Pretend to compile something.
-            let mut f = File::create(&obj)?;
-            f.write_all(b"file contents")?;
-            Ok(MockChild::new(exit_status(0), STDOUT, STDERR))
-        });
+        creator.next_command_spawns(Ok(MockChild::new(exit_status(0), "as", "")));
     }
-    // Ask the server to compile something.
-    //TODO: MockCommand should validate these!
-    let exe = &gcc;
-    let cmdline = vec!["-c".into(), "file.c".into(), "-o".into(), "file.o".into()];
-    let cwd = f.tempdir.path();
-    // This creator shouldn't create any processes. It will assert if
-    // it tries to.
-    let client_creator = new_creator();
-    let mut stdout = Cursor::new(Vec::new());
-    let mut stderr = Cursor::new(Vec::new());
-    let path = Some(f.paths);
+    let args = vec!["-c".into(), "file.c".into(), "-o".into(), "file.o".into()];
     let runtime = Runtime::new().unwrap();
     let invocation = CompileInvocation {
-        exe,
-        cmdline,
-        cwd,
+        exe: &gcc,
+        cmdline: args,
+        cwd: fixture.tempdir.path(),
         env_vars: vec![],
     };
-    assert_eq!(
-        0,
-        do_compile(
-            client_creator,
-            &runtime,
-            conn,
-            invocation,
-            path,
-            &mut stdout,
-            &mut stderr
-        )
-        .unwrap()
+    let result = do_compile(
+        new_creator(),
+        &runtime,
+        conn,
+        invocation,
+        Some(fixture.paths),
+        &mut Vec::new(),
+        &mut Vec::new(),
     );
-    // Make sure we ran the mock processes.
-    assert_eq!(0, server_creator.lock().unwrap().children.len());
-    assert_eq!(STDOUT, stdout.into_inner().as_slice());
-    assert_eq!(STDERR, stderr.into_inner().as_slice());
-    // Shut down the server.
-    sender.send(ServerMessage::Shutdown).ok().unwrap();
-    // Ensure that it shuts down.
+    assert!(!matches!(result, Ok(0)));
+    assert!(!fixture.tempdir.path().join("file.o").exists());
+    sender.send(ServerMessage::Shutdown).unwrap();
     child.join().unwrap();
 }

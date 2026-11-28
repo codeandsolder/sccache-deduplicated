@@ -232,31 +232,8 @@ pub fn sccache_client_cfg(
     tmpdir: &Path,
     preprocessor_cache_mode: bool,
 ) -> sccache::config::FileConfig {
-    let cache_relpath = "client-cache";
-    fs::create_dir(tmpdir.join(cache_relpath)).unwrap();
-
-    let disk_cache = sccache::config::DiskCacheConfig {
-        dir: tmpdir.join(cache_relpath),
-        preprocessor_cache_mode: sccache::config::PreprocessorCacheModeConfig {
-            use_preprocessor_cache_mode: preprocessor_cache_mode,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let _ = (tmpdir, preprocessor_cache_mode);
     sccache::config::FileConfig {
-        cache: sccache::config::CacheConfigs {
-            azure: None,
-            disk: Some(disk_cache),
-            gcs: None,
-            gha: None,
-            memcached: None,
-            redis: None,
-            s3: None,
-            webdav: None,
-            oss: None,
-            cos: None,
-            multilevel: None,
-        },
         dist: sccache::config::DistConfig {
             cluster: None,
             auth: Default::default(), // dangerously_insecure

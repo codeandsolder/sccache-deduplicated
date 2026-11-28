@@ -27,7 +27,6 @@ use fs::File;
 use fs_err as fs;
 use predicates::prelude::*;
 use regex::Regex;
-use sccache::lru_disk_cache::CACHEDIR_TAG_FILE_NAME;
 use serial_test::serial;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -2099,79 +2098,14 @@ fn restart_local_daemon_with(dir: &Path, cfg: &sccache::config::FileConfig) {
     );
 }
 
-/// A preprocessor cache entry sccache cannot read, whether truncated or in a
-/// format it does not know, must not fail the compilation.
-#[test]
-#[serial]
-#[cfg(all(unix, not(target_os = "macos")))]
-fn test_unreadable_preprocessor_cache_entry_is_a_miss() {
-    let _ = env_logger::try_init();
-    let tempdir = tempfile::Builder::new()
-        .prefix("sccache_system_test")
-        .tempdir()
-        .unwrap();
-
-    let Some(compiler) = find_gcc_or_clang() else {
-        return;
-    };
-
-    copy_to_tempdir(&[INPUT], tempdir.path());
-    let sccache_cfg = sccache_client_cfg(tempdir.path(), true);
-    restart_local_daemon_with(tempdir.path(), &sccache_cfg);
-
-    let compile = |expected_hits: u64| {
-        zero_stats();
-        fs::remove_file(tempdir.path().join(OUTPUT)).ok();
-        sccache_command()
-            .args(compile_cmdline(
-                compiler.name,
-                &compiler.exe,
-                INPUT,
-                OUTPUT,
-                Vec::new(),
-            ))
-            .current_dir(tempdir.path())
-            .envs(compiler.env_vars.clone())
-            .assert()
-            .success();
-        get_stats(move |info| {
-            assert_eq!(expected_hits, info.stats.cache_hits.all());
-            assert_eq!(1 - expected_hits, info.stats.cache_misses.all());
-        });
-    };
-
-    compile(0);
-
-    let entries: Vec<_> =
-        walkdir::WalkDir::new(sccache_cfg.cache.disk.unwrap().dir.join("preprocessor"))
-            .into_iter()
-            .map(|entry| entry.unwrap())
-            .filter(|entry| {
-                entry.file_type().is_file() && entry.file_name() != CACHEDIR_TAG_FILE_NAME
-            })
-            .collect();
-    assert!(
-        !entries.is_empty(),
-        "no preprocessor cache entry was stored"
-    );
-    for entry in entries {
-        fs::write(entry.path(), [0xff]).unwrap();
-    }
-
-    // The object is still cached; only the preprocessor cache is unusable.
-    compile(1);
-    assert!(stop_local_daemon());
-}
-
 #[test]
 #[serial]
 fn test_stats_no_server() {
-    // Ensure there's no existing sccache server running.
     let _ = stop_local_daemon();
-    get_stats(|_| {});
+    sccache_command().arg("--show-stats").assert().failure();
     assert!(
         !stop_local_daemon(),
-        "Server shouldn't be running after --show-stats"
+        "stats must not start an unmanaged daemon"
     );
 }
 

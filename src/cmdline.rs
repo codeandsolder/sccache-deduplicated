@@ -83,7 +83,6 @@ pub enum Command {
         /// The environment variables to use for execution.
         env_vars: Vec<(OsString, OsString)>,
     },
-    DebugPreprocessorCacheEntries,
 }
 
 fn flag_long_and_short(name: &'static str, short: char) -> Arg {
@@ -97,34 +96,7 @@ fn flag_infer_long(name: &'static str) -> Arg {
 const ENABLED_FEATURES_HELP: &str = concat!(
     "Linux Cargo launcher: --cargo-final -- [Cargo arguments] (temporary intermediates)\n",
     "                      --cargo-all -- [Cargo arguments] (normal Cargo retention)\n\n",
-    "Enabled features:\n",
-    "    S3:        ",
-    cfg!(feature = "s3"),
-    "\n",
-    "    Redis:     ",
-    cfg!(feature = "redis"),
-    "\n",
-    "    Memcached: ",
-    cfg!(feature = "memcached"),
-    "\n",
-    "    GCS:       ",
-    cfg!(feature = "gcs"),
-    "\n",
-    "    GHA:       ",
-    cfg!(feature = "gha"),
-    "\n",
-    "    Azure:     ",
-    cfg!(feature = "azure"),
-    "\n",
-    "    WebDAV:    ",
-    cfg!(feature = "webdav"),
-    "\n",
-    "    OSS:       ",
-    cfg!(feature = "oss"),
-    "\n",
-    "    COS:       ",
-    cfg!(feature = "cos"),
-    "\n"
+    "Execution storage: native scheduler CAS only"
 );
 /// Get the [`clap::Command`] used for argument parsing.
 fn get_clap_command() -> clap::Command {
@@ -153,9 +125,6 @@ fn get_clap_command() -> clap::Command {
             flag_infer_long("start-server")
                 .help("start background server")
                 .action(ArgAction::SetTrue),
-            flag_infer_long("debug-preprocessor-cache")
-                .help("show all preprocessor cache entries")
-                .action(ArgAction::SetTrue),
             flag_infer_long("stop-server")
                 .help("stop background server")
                 .action(ArgAction::SetTrue),
@@ -183,7 +152,6 @@ fn get_clap_command() -> clap::Command {
                 .args([
                     "capabilities",
                     "dist-auth",
-                    "debug-preprocessor-cache",
                     "dist-status",
                     "show-stats",
                     "active-compiles",
@@ -253,8 +221,6 @@ fn command_from_matches(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Comm
         Ok(Command::ShowStats(stats_format(matches)?, true))
     } else if matches.get_flag("start-server") {
         Ok(Command::StartServer)
-    } else if matches.get_flag("debug-preprocessor-cache") {
-        Ok(Command::DebugPreprocessorCacheEntries)
     } else if matches.get_flag("stop-server") {
         Ok(Command::StopServer)
     } else if matches.get_flag("zero-stats") {

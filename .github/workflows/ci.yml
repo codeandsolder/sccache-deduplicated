@@ -64,7 +64,7 @@ jobs:
       RUSTFLAGS: ${{ startsWith(github.ref, 'refs/tags/') && '' || '-C target-cpu=x86-64-v2' }}
     strategy:
       matrix:
-        feature: [ azure, direct-metrics, gcs, gha, memcached, redis, s3, webdav, dist-server, "dist-client,s3" ]
+        feature: [ direct-metrics, dist-client, dist-server, "dist-client,dist-server" ]
     steps:
       - name: Clone repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -401,7 +401,7 @@ jobs:
         run: |
           set -euo pipefail
           env -u RUSTC -u RUSTDOC cargo +${{ steps.compiler.outputs.channel }} build --release --locked --no-default-features \
-            --features s3,gha,dist-client,dist-server,direct-metrics \
+            --features dist-client,dist-server,direct-metrics \
             --bin sccache --bin sccache-dist --message-format=json > "$RUNNER_TEMP/release-binaries.jsonl"
           mapfile -t binaries < <(jq -r 'select(.reason=="compiler-artifact" and .executable!=null and (.target.name=="sccache" or .target.name=="sccache-dist")) | .executable' "$RUNNER_TEMP/release-binaries.jsonl")
           [[ ${#binaries[@]} == 2 ]]
@@ -412,7 +412,7 @@ jobs:
         run: |
           set -euo pipefail
           packages="$(env -u RUSTC -u RUSTDOC cargo +${{ steps.compiler.outputs.channel }} tree --locked --no-default-features \
-            --features s3,gha,dist-client,dist-server,direct-metrics,scheduler-dashboard \
+            --features dist-client,dist-server,direct-metrics,scheduler-dashboard \
             --edges normal --prefix none --format '{p}')"
           # These alternate application stacks were deliberately removed.
           printf '%s\n' "$packages" | awk '
@@ -431,7 +431,7 @@ jobs:
             --all-features --filter-platform x86_64-unknown-linux-gnu --format-version 1 \
             | jq -e -f contrib/codeandsolder/verify-native-dependency-identities.jq
           features="$(env -u RUSTC -u RUSTDOC cargo +${{ steps.compiler.outputs.channel }} tree --locked --target x86_64-unknown-linux-gnu \
-            --no-default-features --features s3,gha,dist-client,dist-server,direct-metrics,scheduler-dashboard \
+            --no-default-features --features dist-client,dist-server,direct-metrics,scheduler-dashboard \
             --edges features -i btls-sys)"
           rg -q 'btls-sys feature "static-cxx-runtime"' <<<"$features"
       - name: Link and verify exact scheduler release feature profile
@@ -440,7 +440,7 @@ jobs:
         run: |
           set -euo pipefail
           env -u RUSTC -u RUSTDOC cargo +${{ steps.compiler.outputs.channel }} build --release --locked --no-default-features \
-            --features s3,gha,dist-client,dist-server,direct-metrics,scheduler-dashboard \
+            --features dist-client,dist-server,direct-metrics,scheduler-dashboard \
             --bin sccache-dist --message-format=json > "$RUNNER_TEMP/release-dashboard.jsonl"
           mapfile -t binaries < <(jq -r 'select(.reason=="compiler-artifact" and .executable!=null and .target.name=="sccache-dist") | .executable' "$RUNNER_TEMP/release-dashboard.jsonl")
           [[ ${#binaries[@]} == 1 ]]

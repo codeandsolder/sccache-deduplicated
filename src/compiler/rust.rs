@@ -6149,7 +6149,9 @@ c:/foo/bar.rs:
             "leaf.rs",
         ])?;
         let runtime = tokio::runtime::Runtime::new()?;
-        let creator = ProcessCommandCreator::new(&crate::jobserver::Client::new_num(1));
+        let creator = <ProcessCommandCreator as CommandCreatorSync>::new(
+            &crate::jobserver::Client::new_num(1),
+        );
         let env = std::env::vars_os().collect::<Vec<_>>();
         let inspect = |link: bool| -> Result<Vec<PathBuf>> {
             let direct = if link {
@@ -6289,7 +6291,7 @@ c:/foo/bar.rs:
                     may_dist: true,
                     pool: &pool,
                     rewrite_includes_only: false,
-                    storage: Arc::new(MockStorage::new(None, false)),
+                    storage: Arc::new(MockStorage::new()),
                     cache_control: CacheControl::Default,
                 })
                 .wait()?;
@@ -6378,7 +6380,7 @@ c:/foo/bar.rs:
                 may_dist: false,
                 pool: &pool,
                 rewrite_includes_only: false,
-                storage: Arc::new(MockStorage::new(None, false)),
+                storage: Arc::new(MockStorage::new()),
                 cache_control: CacheControl::Default,
             })
             .wait()
@@ -6396,9 +6398,8 @@ c:/foo/bar.rs:
         assert!(!dep_info.contains("deps.d"));
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_generate_hash_key(preprocessor_cache_mode: bool) {
+    #[test]
+    fn test_generate_hash_key() {
         use ar::{Builder, Header};
         drop(env_logger::try_init());
         let f = TestFixture::new();
@@ -6497,7 +6498,7 @@ c:/foo/bar.rs:
                 may_dist: false,
                 pool: &pool,
                 rewrite_includes_only: false,
-                storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                storage: Arc::new(MockStorage::new()),
                 cache_control: CacheControl::Default,
             })
             .wait()
@@ -6668,7 +6669,7 @@ c:/foo/bar.rs:
                     may_dist: false,
                     pool: &pool,
                     rewrite_includes_only: false,
-                    storage: Arc::new(MockStorage::new(None, false)),
+                    storage: Arc::new(MockStorage::new()),
                     cache_control: CacheControl::Default,
                 })
                 .wait()
@@ -6709,7 +6710,7 @@ c:/foo/bar.rs:
         args: &[&'static str],
         env_vars: &[(OsString, OsString)],
         pre_func: F,
-        preprocessor_cache_mode: bool,
+        _preprocessor_cache_mode: bool,
         executable: &str,
     ) -> (String, String)
     where
@@ -6763,7 +6764,7 @@ c:/foo/bar.rs:
                 may_dist: false,
                 pool: &pool,
                 rewrite_includes_only: false,
-                storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                storage: Arc::new(MockStorage::new()),
                 cache_control: CacheControl::Default,
             })
             .wait()
@@ -7262,7 +7263,7 @@ c:/foo/bar.rs:
                     may_dist,
                     pool: &pool,
                     rewrite_includes_only: false,
-                    storage: Arc::new(MockStorage::new(None, false)),
+                    storage: Arc::new(MockStorage::new()),
                     cache_control: CacheControl::Default,
                 })
                 .wait()
@@ -7570,7 +7571,7 @@ c:/foo/bar.rs:
                     may_dist: true,
                     pool: &pool,
                     rewrite_includes_only: false,
-                    storage: Arc::new(MockStorage::new(None, false)),
+                    storage: Arc::new(MockStorage::new()),
                     cache_control: CacheControl::Default,
                 })
                 .wait()
@@ -7704,7 +7705,7 @@ c:/foo/bar.rs:
                 may_dist: false,
                 pool: &pool,
                 rewrite_includes_only: false,
-                storage: Arc::new(MockStorage::new(None, false)),
+                storage: Arc::new(MockStorage::new()),
                 cache_control: CacheControl::Default,
             })
             .wait()?;
@@ -8024,9 +8025,8 @@ version='2.0.0'
         Ok(())
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_equal_hashes_externs(preprocessor_cache_mode: bool) {
+    #[test]
+    fn test_equal_hashes_externs() {
         // Put some content in the extern rlibs so we can verify that the content hashes are
         // used in the right order.
         fn mk_files(tempdir: &Path) -> Result<()> {
@@ -8055,7 +8055,7 @@ version='2.0.0'
                 ],
                 &[],
                 mk_files,
-                preprocessor_cache_mode,
+                false,
             ),
             hash_key(
                 &f,
@@ -8076,14 +8076,13 @@ version='2.0.0'
                 ],
                 &[],
                 mk_files,
-                preprocessor_cache_mode,
+                false,
             )
         );
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_equal_hashes_link_paths(preprocessor_cache_mode: bool) {
+    #[test]
+    fn test_equal_hashes_link_paths() {
         let f = TestFixture::new();
         assert_eq!(
             hash_key(
@@ -8105,7 +8104,7 @@ version='2.0.0'
                 ],
                 &[],
                 nothing,
-                preprocessor_cache_mode,
+                false,
             ),
             hash_key(
                 &f,
@@ -8126,14 +8125,13 @@ version='2.0.0'
                 ],
                 &[],
                 nothing,
-                preprocessor_cache_mode,
+                false,
             )
         );
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_equal_hashes_ignored_args(preprocessor_cache_mode: bool) {
+    #[test]
+    fn test_equal_hashes_ignored_args() {
         let f = TestFixture::new();
         assert_eq!(
             hash_key(
@@ -8157,7 +8155,7 @@ version='2.0.0'
                 ],
                 &[],
                 nothing,
-                preprocessor_cache_mode,
+                false,
             ),
             hash_key(
                 &f,
@@ -8180,14 +8178,13 @@ version='2.0.0'
                 ],
                 &[],
                 nothing,
-                preprocessor_cache_mode,
+                false,
             )
         );
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_different_hashes_check_cfg_arg(preprocessor_cache_mode: bool) {
+    #[test]
+    fn test_different_hashes_check_cfg_arg() {
         let f = TestFixture::new();
         assert_ne!(
             hash_key(
@@ -8207,7 +8204,7 @@ version='2.0.0'
                 ],
                 &[],
                 nothing,
-                preprocessor_cache_mode,
+                false,
             ),
             hash_key(
                 &f,
@@ -8228,14 +8225,13 @@ version='2.0.0'
                 ],
                 &[],
                 nothing,
-                preprocessor_cache_mode,
+                false,
             )
         );
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_equal_hashes_cfg_features(preprocessor_cache_mode: bool) {
+    #[test]
+    fn test_equal_hashes_cfg_features() {
         let f = TestFixture::new();
         assert_eq!(
             hash_key(
@@ -8257,7 +8253,7 @@ version='2.0.0'
                 ],
                 &[],
                 nothing,
-                preprocessor_cache_mode,
+                false,
             ),
             hash_key(
                 &f,
@@ -8278,7 +8274,7 @@ version='2.0.0'
                 ],
                 &[],
                 nothing,
-                preprocessor_cache_mode,
+                false,
             )
         );
     }

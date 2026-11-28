@@ -679,10 +679,6 @@ where
         _path_transformer: dist::PathTransformer,
     ) -> Result<DistPackagers>;
 
-    fn is_locally_preprocessed(&self) -> bool {
-        true
-    }
-
     /// Returns an iterator over the results of this compilation.
     ///
     /// Each item is a descriptive (and unique) name of the output paired with
@@ -2046,9 +2042,8 @@ LLVM version: 6.0",
         Ok(())
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_compiler_version_affects_hash(preprocessor_cache_mode: bool) -> Result<()> {
+    #[test]
+    fn test_compiler_version_affects_hash() -> Result<()> {
         let f = TestFixture::new();
         let clang = f.mk_bin("clang")?;
         let creator = new_creator();
@@ -2099,7 +2094,7 @@ LLVM version: 6.0",
                         may_dist: false,
                         pool,
                         rewrite_includes_only: false,
-                        storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                        storage: Arc::new(MockStorage::new()),
                         cache_control: CacheControl::Default,
                     })
                     .wait()
@@ -2110,9 +2105,8 @@ LLVM version: 6.0",
         Ok(())
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_assembler_affects_hash(preprocessor_cache_mode: bool) -> Result<()> {
+    #[test]
+    fn test_assembler_affects_hash() -> Result<()> {
         let f = TestFixture::new();
         let clang = f.mk_bin("clang")?;
         let creator = new_creator();
@@ -2166,7 +2160,7 @@ LLVM version: 6.0",
                     may_dist: false,
                     pool,
                     rewrite_includes_only: false,
-                    storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                    storage: Arc::new(MockStorage::new()),
                     cache_control: CacheControl::Default,
                 })
                 .wait()?
@@ -2205,9 +2199,8 @@ LLVM version: 6.0",
         Ok(())
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_assembler_incbin_payload_affects_hash(preprocessor_cache_mode: bool) -> Result<()> {
+    #[test]
+    fn test_assembler_incbin_payload_affects_hash() -> Result<()> {
         let f = TestFixture::new();
         let clang = f.mk_bin("clang")?;
         let creator = new_creator();
@@ -2263,7 +2256,7 @@ LLVM version: 6.0",
                     may_dist: true,
                     pool,
                     rewrite_includes_only: false,
-                    storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                    storage: Arc::new(MockStorage::new()),
                     cache_control: CacheControl::Default,
                 })
                 .wait()?
@@ -2276,16 +2269,9 @@ LLVM version: 6.0",
         Ok(())
     }
 
-    #[test_case(true, "-fPIC", "-fno-pic", false; "common args with preprocessor cache")]
-    #[test_case(false, "-fPIC", "-fno-pic", false; "common args without preprocessor cache")]
-    #[test_case(true, "-DHELLO", "-DHI", true; "preprocessor args with preprocessor cache")]
-    #[test_case(false, "-DHELLO", "-DHI", true; "preprocessor args without preprocessor cache")]
-    fn test_argument_hash_equivalence(
-        preprocessor_cache_mode: bool,
-        first: &str,
-        second: &str,
-        equivalent: bool,
-    ) -> Result<()> {
+    #[test_case("-fPIC", "-fno-pic", false; "common args")]
+    #[test_case("-DHELLO", "-DHI", true; "preprocessor args")]
+    fn test_argument_hash_equivalence(first: &str, second: &str, equivalent: bool) -> Result<()> {
         let f = TestFixture::new();
         let creator = new_creator();
         let runtime = single_threaded_runtime();
@@ -2347,7 +2333,7 @@ LLVM version: 6.0",
                         may_dist: false,
                         pool,
                         rewrite_includes_only: false,
-                        storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                        storage: Arc::new(MockStorage::new()),
                         cache_control: CacheControl::Default,
                     })
                     .wait()
@@ -2361,8 +2347,7 @@ LLVM version: 6.0",
         Ok(())
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
+    #[test]
     fn test_preprocessed_file_works_without_preprocessor_call(
         preprocessor_cache_mode: bool,
     ) -> Result<()> {
@@ -2422,7 +2407,7 @@ LLVM version: 6.0",
                         may_dist: false,
                         pool,
                         rewrite_includes_only: false,
-                        storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                        storage: Arc::new(MockStorage::new()),
                         cache_control: CacheControl::Default,
                     })
                     .wait()
@@ -2492,7 +2477,7 @@ LLVM version: 6.0",
         else {
             bail!("test compiler was not recognized");
         };
-        let storage = Arc::new(MockStorage::new(None, false));
+        let storage = Arc::new(MockStorage::new());
         let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
         // No compiler process is queued after discovery.
         let error = runtime

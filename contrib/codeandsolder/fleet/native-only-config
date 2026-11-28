@@ -20,7 +20,7 @@ case "$mode" in
     fi
     awk '
       /^[[:space:]]*\[/ { section=$0 }
-      section ~ /^[[:space:]]*\[cache\.disk\][[:space:]]*$/ { next }
+      section ~ /^[[:space:]]*\[cache([.][^]]+)?\][[:space:]]*$/ { next }
       section ~ /^[[:space:]]*\[dist\][[:space:]]*$/ &&
         /^[[:space:]]*(cache_dir|toolchain_cache_size|rewrite_includes_only|toolchains)[[:space:]]*=/ { next }
       { print }

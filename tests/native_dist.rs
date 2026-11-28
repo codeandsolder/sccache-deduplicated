@@ -2261,7 +2261,7 @@ impl LocalService {
             max_metadata_bytes: 64 * 1024 * 1024,
             max_result_bytes: 64 * 1024 * 1024,
         });
-        config.fallback_cache.dir = root.join("unexpected-archive-cache");
+
         let address = sccache::server::SocketAddr::parse_uds(
             socket
                 .to_str()

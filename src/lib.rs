@@ -43,7 +43,6 @@ pub mod dist;
 pub mod http_client;
 mod jobserver;
 pub mod latency_trace;
-pub mod lru_disk_cache;
 mod mock_command;
 mod net;
 mod protocol;

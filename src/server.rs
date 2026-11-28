@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.SCCACHE_MAX_FRAME_LENGTH
 
-use crate::cache::readonly::ReadOnlyStorage;
-use crate::cache::{CacheMode, Storage, storage_from_config};
+use crate::cache::{Storage, storage_from_config};
 use crate::compiler::{
     CacheCompileContext, CacheControl, CompileResult, Compiler, CompilerArguments,
     CompilerCachePolicy, CompilerHasher, CompilerKind, CompilerProxy, Language, get_compiler_info,
@@ -331,27 +330,8 @@ fn initialize_server_storage(
         }
     };
 
-    let cache_mode = runtime.block_on(async {
-        match raw_storage.check().await {
-            Ok(mode) => Ok(mode),
-            Err(error) => {
-                error!("storage check failed for: {error:?}");
-                notify_server_startup(
-                    notify,
-                    ServerStartup::Err {
-                        reason: error.to_string(),
-                    },
-                )?;
-                Err(error)
-            }
-        }
-    })?;
-    info!("server has setup with {cache_mode:?}");
-
-    Ok(match cache_mode {
-        CacheMode::ReadOnly => Arc::new(ReadOnlyStorage(raw_storage)),
-        CacheMode::ReadWrite => raw_storage,
-    })
+    let _ = runtime;
+    Ok(raw_storage)
 }
 
 fn bind_server(
@@ -670,7 +650,6 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             #[cfg(target_os = "linux")]
             shared,
         } = self;
-        let storage = Arc::clone(&service.storage);
         #[cfg(all(target_os = "linux", feature = "dist-client"))]
         let _live_traces = crate::latency_trace::instance()
             .zip(service.dist_client.native.as_ref())
@@ -777,17 +756,6 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         // Note that we cap the amount of time this can take, however, as we
         // don't want to wait *too* long.
         runtime.block_on(async { time::timeout(SHUTDOWN_TIMEOUT, wait).await })?;
-
-        info!(
-            "draining detached cache work for at most {} seconds",
-            SHUTDOWN_TIMEOUT.as_secs()
-        );
-        match runtime
-            .block_on(async { time::timeout(SHUTDOWN_TIMEOUT, storage.drain_background()).await })
-        {
-            Ok(()) => info!("background cache work drained"),
-            Err(_) => warn!("timed out while draining background cache work"),
-        }
 
         info!("ok, fully shutting down now");
 
@@ -985,11 +953,6 @@ where
             }
             Request::Shutdown => {
                 debug!("handle_client: shutdown");
-                // Drain detached cache work already registered while the
-                // shutdown request is being handled. The server performs a
-                // second drain after active client services finish, covering
-                // work registered by compile requests that were already in flight.
-                self.storage.drain_background().await;
                 let info = self.get_info().await?;
                 let mut tx = self.tx.clone();
                 if tx.send(ServerMessage::Shutdown).await.is_err() {
@@ -1004,9 +967,7 @@ where
                     location: self.storage.location(),
                     cache_type_name: self.storage.cache_type_name().to_owned(),
                     basedirs: self.storage.basedirs().to_vec(),
-                    preprocessor_cache_mode_config: self.storage.preprocessor_cache_mode_config(),
-                    cache_mode: self.storage.check().await.unwrap_or(CacheMode::ReadWrite),
-                    max_size: self.storage.max_size().await.unwrap_or(None),
+                    max_size: self.storage.max_size().await?,
                     namespace_protocol: crate::protocol::NAMESPACE_PROTOCOL_VERSION,
                     transfer_chunk_bytes: transfers.chunk_bytes(),
                     native: transfers.native_policy(),
@@ -1014,7 +975,7 @@ where
                 Ok(Message::WithoutBody(Response::StorageHandshake(info)))
             }
             Request::Transfer(request) => {
-                let result = transfers.handle(request, self.storage.as_ref()).await;
+                let result = transfers.handle(request).await;
                 Ok(Message::WithoutBody(Response::Transfer(
                     result.map_err(|error| format!("{error:#}")),
                 )))
@@ -1410,11 +1371,6 @@ where
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
     pub(crate) fn native_compiler(&self) -> Option<Arc<crate::compiler::NativeCompilerClient>> {
         self.dist_client.native.clone()
-    }
-
-    #[cfg(feature = "direct-metrics")]
-    pub(crate) fn metrics_storage(&self) -> Arc<dyn Storage> {
-        self.storage.clone()
     }
 
     pub(crate) async fn get_info(&self) -> Result<ServerInfo> {
@@ -2032,8 +1988,6 @@ pub struct ServerStats {
     pub dist_compiles: HashMap<String, usize>,
     /// The count of distributed execution infrastructure failures
     pub dist_errors: u64,
-    /// Multi-level cache statistics (if multi-level caching is enabled)
-    pub multi_level: Option<crate::cache::multilevel::MultiLevelStats>,
 }
 
 impl std::ops::AddAssign for ServerStats {
@@ -2067,14 +2021,6 @@ impl std::ops::AddAssign for ServerStats {
             *self.dist_compiles.entry(k).or_default() += v;
         }
         self.dist_errors += rhs.dist_errors;
-        self.multi_level = match (self.multi_level.take(), rhs.multi_level) {
-            (Some(mut a), Some(b)) => {
-                a += b;
-                Some(a)
-            }
-            (a, None) => a,
-            (None, b) => b,
-        };
     }
 }
 
@@ -2085,7 +2031,6 @@ pub struct ServerInfo {
     pub cache_location: String,
     pub cache_size: Option<u64>,
     pub max_cache_size: Option<u64>,
-    pub use_preprocessor_cache_mode: bool,
     pub version: String,
     pub basedirs: Vec<String>,
 }
@@ -2096,7 +2041,6 @@ struct ServerInfoWire {
     cache_location: String,
     cache_size: Option<u64>,
     max_cache_size: Option<u64>,
-    use_preprocessor_cache_mode: bool,
     version: String,
     basedirs: Vec<String>,
 }
@@ -2112,7 +2056,6 @@ impl<'de> Deserialize<'de> for ServerInfo {
             cache_location: wire.cache_location,
             cache_size: wire.cache_size,
             max_cache_size: wire.max_cache_size,
-            use_preprocessor_cache_mode: wire.use_preprocessor_cache_mode,
             version: wire.version,
             basedirs: wire.basedirs,
         })
@@ -2155,7 +2098,6 @@ impl Default for ServerStats {
             not_cached_crate_types: HashMap::new(),
             dist_compiles: HashMap::new(),
             dist_errors: u64::default(),
-            multi_level: None,
         }
     }
 }
@@ -2306,9 +2248,6 @@ impl ServerStats {
             self.dist_errors,
             "Failed distributed compilations",
         );
-        if let Some(multi_level) = &self.multi_level {
-            rows.extend(multi_level.format_stats());
-        }
         rows
     }
 
@@ -2466,21 +2405,12 @@ impl ServerInfo {
     /// Returns an error if the configured storage cannot report its current or
     /// maximum cache size.
     pub async fn new(stats: ServerStats, storage: Option<&dyn Storage>) -> Result<Self> {
-        let (
-            cache_location,
-            use_preprocessor_cache_mode,
-            cache_size,
-            max_cache_size,
-            basedirs,
-            multi_level,
-        ) = if let Some(storage) = storage {
+        let (cache_location, cache_size, max_cache_size, basedirs) = if let Some(storage) = storage
+        {
             let (cache_size, max_cache_size) =
                 futures::try_join!(storage.current_size(), storage.max_size())?;
             (
                 storage.location(),
-                storage
-                    .preprocessor_cache_mode_config()
-                    .use_preprocessor_cache_mode,
                 cache_size,
                 max_cache_size,
                 storage
@@ -2488,21 +2418,16 @@ impl ServerInfo {
                     .iter()
                     .map(|p| String::from_utf8_lossy(p).to_string())
                     .collect(),
-                storage.multilevel_stats(),
             )
         } else {
-            (String::new(), false, None, None, Vec::new(), None)
+            (String::new(), None, None, Vec::new())
         };
         let version = env!("CARGO_PKG_VERSION").to_string();
         Ok(Self {
-            stats: ServerStats {
-                multi_level,
-                ..stats
-            },
+            stats,
             cache_location,
             cache_size,
             max_cache_size,
-            use_preprocessor_cache_mode,
             version,
             basedirs,
         })
@@ -2512,15 +2437,6 @@ impl ServerInfo {
     pub fn print(&self, advanced: bool) {
         let (name_width, stat_width) = self.stats.print(&mut StdoutServerStatsWriter, advanced);
         println!("{:<name_width$} {}", "Cache location", self.cache_location);
-        if let Some(ref ml_stats) = self.stats.multi_level {
-            for level in &ml_stats.0 {
-                println!(
-                    "{:<name_width$} {}",
-                    format!("  {}", level.name),
-                    level.location
-                );
-            }
-        }
         println!(
             "{:<name_width$} {}",
             "Base directories",
@@ -2530,17 +2446,6 @@ impl ServerInfo {
                 self.basedirs.join(", ")
             }
         );
-        if self.cache_location.starts_with("Local disk") {
-            println!(
-                "{:<name_width$} {}",
-                "Use direct/preprocessor mode?",
-                if self.use_preprocessor_cache_mode {
-                    "yes"
-                } else {
-                    "no"
-                }
-            );
-        }
         println!("{:<name_width$} {}", "Version (client)", self.version);
         for &(name, val) in &[
             ("Cache size", &self.cache_size),
@@ -2838,7 +2743,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_compile_listing_does_not_touch_cache_storage() -> Result<()> {
-        let mut storage = crate::test::mock_storage::MockStorage::new(None, false);
+        let mut storage = crate::test::mock_storage::MockStorage::new();
         storage.fail_current_size();
         let service = SccacheService::<ProcessCommandCreator>::mock_with_storage(
             Arc::new(storage),
@@ -2891,7 +2796,7 @@ mod tests {
     fn watchdog_fixture(
         phase_timeout_secs: u64,
     ) -> (SccacheService<ProcessCommandCreator>, Compile) {
-        let storage = crate::test::mock_storage::MockStorage::new(None, false);
+        let storage = crate::test::mock_storage::MockStorage::new();
         let mut service =
             SccacheService::mock_with_storage(Arc::new(storage), tokio::runtime::Handle::current());
         service.compile_limits = CompileLimits {
@@ -3135,7 +3040,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_response_handler_closes_connection_without_waiting_for_peer() -> Result<()> {
-        let mut storage = crate::test::mock_storage::MockStorage::new(None, false);
+        let mut storage = crate::test::mock_storage::MockStorage::new();
         storage.fail_current_size();
         let service = SccacheService::<ProcessCommandCreator>::mock_with_storage(
             Arc::new(storage),

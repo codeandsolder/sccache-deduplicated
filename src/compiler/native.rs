@@ -1273,10 +1273,6 @@ pub(super) async fn compile<T: CommandCreatorSync>(
         "compiler invocation is not cacheable"
     );
     ensure!(
-        compilation.is_locally_preprocessed(),
-        "native compile input discovery is incomplete"
-    );
-    ensure!(
         compilation.automatic_dist_toolchain_is_ready(),
         "automatic distributed compiler toolchain is incomplete"
     );
@@ -1477,8 +1473,8 @@ mod tests {
         let environment = vec![("PATH".into(), "/usr/bin:/bin".into())];
         let rt = tokio::runtime::Runtime::new()?;
         let pool = rt.handle();
-        let mut config = config()?;
-        config.fallback_cache.dir = cwd.join("unexpected-archive-cache");
+        let config = config()?;
+
         let storage = storage_from_config(&config, pool)?;
         assert_eq!(storage.cache_type_name(), "native");
         let creator = ProcessCommandCreator::new(&Client::new_num(1));
@@ -1810,7 +1806,7 @@ mod tests {
                 );
             }
         }
-        assert!(!config.fallback_cache.dir.exists());
+        assert!(!cwd.join("unexpected-archive-cache").exists());
         Ok(())
     }
 

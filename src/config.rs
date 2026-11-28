@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cache::CacheMode;
 #[cfg(target_os = "windows")]
 use crate::util::normalize_win_path;
 use directories::ProjectDirs;
@@ -22,8 +21,9 @@ use fs_err as fs;
 use serde::ser::Serializer;
 use serde::{
     Deserialize, Serialize,
-    de::{self, DeserializeOwned, Deserializer},
+    de::{DeserializeOwned, Deserializer},
 };
+use std::collections::HashMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
@@ -31,124 +31,18 @@ use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::str::FromStr;
 use std::sync::Mutex;
-use std::{collections::HashMap, fmt};
 use typed_path::Utf8TypedPathBuf;
 
 use crate::errors::{Context, Result, anyhow, bail};
-
-/// Defines how the multi-level cache handles write failures.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WriteErrorPolicy {
-    /// Never fail on write errors - log warnings only (most permissive)
-    Ignore,
-    /// Fail only if L0 write fails (default - balances reliability and performance)
-    #[default]
-    L0,
-    /// Fail if any read-write level fails (most strict)
-    All,
-}
-
-impl FromStr for WriteErrorPolicy {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "ignore" => Ok(Self::Ignore),
-            "l0" => Ok(Self::L0),
-            "all" => Ok(Self::All),
-            _ => Err(anyhow!(
-                "Invalid write policy '{s}'. Valid values: ignore, l0, all"
-            )),
-        }
-    }
-}
-
-impl fmt::Display for WriteErrorPolicy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Ignore => write!(f, "ignore"),
-            Self::L0 => write!(f, "l0"),
-            Self::All => write!(f, "all"),
-        }
-    }
-}
-
-const fn default_multilevel_slow_write_concurrency() -> usize {
-    4
-}
-
-/// Configuration for multi-level cache.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MultiLevelConfig {
-    /// Ordered list of cache backends (L0, L1, L2, ...)
-    #[serde(rename = "chain")]
-    pub chain: Vec<String>,
-    /// Write failure handling policy
-    #[serde(default)]
-    pub write_error_policy: WriteErrorPolicy,
-    /// Maximum number of concurrent operations against slower cache levels.
-    #[serde(default = "default_multilevel_slow_write_concurrency")]
-    pub slow_write_concurrency: usize,
-}
 
 static CACHED_CONFIG: Mutex<Option<(PathBuf, CachedFileConfig)>> = Mutex::new(None);
 
 const ORGANIZATION: &str = "Mozilla";
 const APP_NAME: &str = "sccache";
+#[cfg(test)]
 const TEN_GIGS: u64 = 10 * 1024 * 1024 * 1024;
 
 pub const INSECURE_DIST_CLIENT_TOKEN: &str = "dangerously_insecure_client";
-
-// Unfortunately this means that nothing else can use the sccache cache dir as
-// this top level directory is used directly to store sccache cached objects...
-#[must_use = "the returned path identifies the default disk cache location"]
-pub fn default_disk_cache_dir() -> PathBuf {
-    ProjectDirs::from("", ORGANIZATION, APP_NAME).map_or_else(
-        || env::temp_dir().join(APP_NAME),
-        |dirs| dirs.cache_dir().to_owned(),
-    )
-}
-const fn default_disk_cache_size() -> u64 {
-    TEN_GIGS
-}
-struct StringOrU64Visitor;
-
-impl de::Visitor<'_> for StringOrU64Visitor {
-    type Value = u64;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a string with size suffix (like '20G') or a u64")
-    }
-
-    fn visit_str<E>(self, value: &str) -> StdResult<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        parse_size(value).ok_or_else(|| E::custom(format!("Invalid size value: {value}")))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> StdResult<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(value)
-    }
-
-    fn visit_i64<E>(self, value: i64) -> StdResult<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        u64::try_from(value).map_err(|_| E::custom("negative values not supported"))
-    }
-}
-
-fn deserialize_size_from_str<'de, D>(deserializer: D) -> StdResult<u64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserializer.deserialize_any(StringOrU64Visitor)
-}
 
 #[must_use = "check the result to distinguish a valid byte count from invalid input"]
 pub fn parse_size(val: &str) -> Option<u64> {
@@ -219,538 +113,6 @@ impl HTTPUrl {
     #[must_use = "the HTTP URL is returned without modifying the wrapper"]
     pub fn to_url(&self) -> url::Url {
         self.0.clone()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AzureCacheConfig {
-    /// Shared-key connection string. When set, the shared-key path is used.
-    /// When absent, the Microsoft Entra ID (passwordless) path is used and
-    /// `storage_account`/`endpoint` supply the blob endpoint.
-    pub connection_string: Option<String>,
-    pub container: String,
-    pub key_prefix: String,
-    /// Storage account name for the Entra ID path. The blob endpoint is
-    /// synthesized as `https://{storage_account}.blob.core.windows.net`.
-    pub storage_account: Option<String>,
-    /// Full blob endpoint override for the Entra ID path (sovereign clouds,
-    /// custom DNS). Takes precedence over `storage_account`.
-    pub endpoint: Option<String>,
-    #[serde(default)]
-    pub rw_mode: CacheModeConfig,
-}
-
-/// Configuration switches for preprocessor cache mode.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each boolean is an independently named user configuration switch and must remain directly serializable"
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(default)]
-pub struct PreprocessorCacheModeConfig {
-    /// Whether to use preprocessor cache mode entirely
-    pub use_preprocessor_cache_mode: bool,
-    /// If false (default), only compare header files by hashing their contents.
-    /// If true, will use size + ctime + mtime to check whether a file has changed.
-    /// See other flags below for more control over this behavior.
-    pub file_stat_matches: bool,
-    /// If true (default), uses the ctime (file status change on UNIX,
-    /// creation time on Windows) to check that a file has/hasn't changed.
-    /// Can be useful to disable when backdating modification times
-    /// in a controlled manner.
-    pub use_ctime_for_stat: bool,
-    /// If true, ignore `__DATE__`, `__TIME__` and `__TIMESTAMP__` being present
-    /// in the source code. Will speed up preprocessor cache mode,
-    /// but can result in false positives.
-    pub ignore_time_macros: bool,
-    /// If true, preprocessor cache mode will not cache system headers, only
-    /// add them to the hash.
-    pub skip_system_headers: bool,
-    /// If true (default), will add the current working directory in the hash to
-    /// distinguish two compilations from different directories.
-    pub hash_working_directory: bool,
-}
-
-impl Default for PreprocessorCacheModeConfig {
-    fn default() -> Self {
-        Self {
-            use_preprocessor_cache_mode: false,
-            file_stat_matches: false,
-            use_ctime_for_stat: true,
-            ignore_time_macros: false,
-            skip_system_headers: false,
-            hash_working_directory: true,
-        }
-    }
-}
-
-impl PreprocessorCacheModeConfig {
-    /// Return a default [`Self`], but with the cache active.
-    #[must_use = "the returned settings enable direct preprocessor caching"]
-    pub fn activated() -> Self {
-        Self {
-            use_preprocessor_cache_mode: true,
-            ..Default::default()
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(default)]
-pub struct DiskCacheConfig {
-    pub dir: PathBuf,
-    #[serde(deserialize_with = "deserialize_size_from_str")]
-    pub size: u64,
-    pub preprocessor_cache_mode: PreprocessorCacheModeConfig,
-    pub rw_mode: CacheModeConfig,
-}
-
-impl Default for DiskCacheConfig {
-    fn default() -> Self {
-        Self {
-            dir: default_disk_cache_dir(),
-            size: default_disk_cache_size(),
-            preprocessor_cache_mode: PreprocessorCacheModeConfig::activated(),
-            rw_mode: CacheModeConfig::ReadWrite,
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub enum CacheModeConfig {
-    #[serde(rename = "READ_ONLY")]
-    ReadOnly,
-    #[serde(rename = "READ_WRITE")]
-    #[default]
-    ReadWrite,
-}
-
-impl From<CacheModeConfig> for CacheMode {
-    fn from(value: CacheModeConfig) -> Self {
-        match value {
-            CacheModeConfig::ReadOnly => Self::ReadOnly,
-            CacheModeConfig::ReadWrite => Self::ReadWrite,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GCSCacheConfig {
-    pub bucket: String,
-    pub key_prefix: String,
-    pub cred_path: Option<String>,
-    pub service_account: Option<String>,
-    pub rw_mode: CacheModeConfig,
-    pub credential_url: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GHACacheConfig {
-    pub enabled: bool,
-    /// Version for gha cache is a namespace. By setting different versions,
-    /// we can avoid mixed caches.
-    pub version: String,
-    #[serde(default)]
-    pub rw_mode: CacheModeConfig,
-}
-
-/// Memcached's default value of expiration is 10800s (3 hours), which is too
-/// short for use case of sccache.
-///
-/// We increase the default expiration to 86400s (1 day) to balance between
-/// memory consumpation and cache hit rate.
-///
-/// Please change this value freely if we have a better choice.
-const DEFAULT_MEMCACHED_CACHE_EXPIRATION: u32 = 86400;
-
-const fn default_memcached_cache_expiration() -> u32 {
-    DEFAULT_MEMCACHED_CACHE_EXPIRATION
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct MemcachedCacheConfig {
-    #[serde(alias = "endpoint")]
-    pub url: String,
-
-    /// Username to authenticate with.
-    pub username: Option<String>,
-
-    /// Password to authenticate with.
-    pub password: Option<String>,
-
-    /// the expiration time in seconds.
-    ///
-    /// Default to 24 hours (86400)
-    /// Up to 30 days (2592000)
-    #[serde(default = "default_memcached_cache_expiration")]
-    pub expiration: u32,
-
-    #[serde(default)]
-    pub key_prefix: String,
-
-    #[serde(default)]
-    pub rw_mode: CacheModeConfig,
-}
-
-/// redis has no default TTL - all caches live forever
-///
-/// We keep the TTL as 0 here as redis does
-///
-/// Please change this value freely if we have a better choice.
-const DEFAULT_REDIS_CACHE_TTL: u64 = 0;
-pub const DEFAULT_REDIS_DB: u32 = 0;
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct RedisCacheConfig {
-    /// The single-node redis endpoint.
-    /// Mutually exclusive with `cluster_endpoints`.
-    pub endpoint: Option<String>,
-
-    /// The redis cluster endpoints.
-    /// Mutually exclusive with `endpoint`.
-    pub cluster_endpoints: Option<String>,
-
-    /// Username to authenticate with.
-    pub username: Option<String>,
-
-    /// Password to authenticate with.
-    pub password: Option<String>,
-
-    /// The redis URL.
-    /// Deprecated in favor of `endpoint`.
-    pub url: Option<String>,
-
-    /// the db number to use
-    ///
-    /// Default to 0
-    #[serde(default)]
-    pub db: u32,
-
-    /// the ttl (expiration) time in seconds.
-    ///
-    /// Default to infinity (0)
-    #[serde(default, alias = "expiration")]
-    pub ttl: u64,
-
-    #[serde(default)]
-    pub key_prefix: String,
-
-    #[serde(default)]
-    pub rw_mode: CacheModeConfig,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WebdavCacheConfig {
-    pub endpoint: String,
-    #[serde(default)]
-    pub key_prefix: String,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub token: Option<String>,
-    #[serde(default)]
-    pub rw_mode: CacheModeConfig,
-    /// Skip PROPFIND/MKCOL calls before writes, for servers (e.g. Nexus raw
-    /// repositories) that only implement GET/HEAD/PUT/DELETE.
-    #[serde(default)]
-    pub disable_create_dir: bool,
-}
-
-const fn default_s3_capacity_touch_interval_secs() -> u64 {
-    60
-}
-const fn default_s3_capacity_state_flush_interval_secs() -> u64 {
-    5
-}
-const fn default_s3_capacity_heat_half_life_secs() -> u64 {
-    6 * 60 * 60
-}
-const fn default_s3_capacity_eviction_concurrency() -> usize {
-    16
-}
-const fn default_s3_capacity_lease_ttl_secs() -> u64 {
-    10 * 60
-}
-fn default_s3_capacity_metadata_prefix() -> String {
-    ".sccache-meta/v2".to_owned()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct S3CapacityConfig {
-    pub high_watermark: u64,
-    pub low_watermark: u64,
-    #[serde(default = "default_s3_capacity_touch_interval_secs")]
-    pub touch_interval_secs: u64,
-    #[serde(default = "default_s3_capacity_state_flush_interval_secs")]
-    pub state_flush_interval_secs: u64,
-    #[serde(default = "default_s3_capacity_heat_half_life_secs")]
-    pub heat_half_life_secs: u64,
-    #[serde(default = "default_s3_capacity_eviction_concurrency")]
-    pub eviction_concurrency: usize,
-    #[serde(default = "default_s3_capacity_lease_ttl_secs")]
-    pub lease_ttl_secs: u64,
-    #[serde(default = "default_s3_capacity_metadata_prefix")]
-    pub metadata_prefix: String,
-}
-
-impl S3CapacityConfig {
-    /// Validate managed S3 capacity settings.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when watermarks, intervals, heat decay, eviction
-    /// concurrency, or lease timing would make the capacity policy invalid.
-    pub fn validate(&self) -> Result<()> {
-        if self.low_watermark >= self.high_watermark {
-            bail!("S3 managed cache low_watermark must be smaller than high_watermark");
-        }
-        if self.high_watermark == 0 {
-            bail!("S3 managed cache high_watermark must be non-zero");
-        }
-        if self.touch_interval_secs == 0 || self.state_flush_interval_secs == 0 {
-            bail!("S3 managed cache intervals must be non-zero");
-        }
-        if self.heat_half_life_secs == 0 {
-            bail!("S3 managed cache heat_half_life_secs must be non-zero");
-        }
-        if self.eviction_concurrency == 0 {
-            bail!("S3 managed cache eviction_concurrency must be non-zero");
-        }
-        if self.lease_ttl_secs < 3 {
-            bail!("S3 managed cache lease_ttl_secs must be at least 3 seconds");
-        }
-        if self.metadata_prefix.trim_matches('/').is_empty() {
-            bail!("S3 managed cache metadata_prefix must be non-empty");
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct S3CacheConfig {
-    pub bucket: String,
-    pub region: Option<String>,
-    #[serde(default)]
-    pub key_prefix: String,
-    pub no_credentials: bool,
-    pub endpoint: Option<String>,
-    pub use_ssl: Option<bool>,
-    pub server_side_encryption: Option<bool>,
-    pub server_side_encryption_aws_kms: Option<bool>,
-    pub server_side_encryption_kms_key_id: Option<String>,
-    pub enable_virtual_host_style: Option<bool>,
-    #[serde(default)]
-    pub rw_mode: CacheModeConfig,
-    #[serde(default)]
-    pub capacity: Option<S3CapacityConfig>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OSSCacheConfig {
-    pub bucket: String,
-    #[serde(default)]
-    pub key_prefix: String,
-    pub endpoint: Option<String>,
-    pub no_credentials: bool,
-    #[serde(default)]
-    pub rw_mode: CacheModeConfig,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct COSCacheConfig {
-    pub bucket: String,
-    #[serde(default)]
-    pub key_prefix: String,
-    pub endpoint: Option<String>,
-    #[serde(default)]
-    pub rw_mode: CacheModeConfig,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CacheType {
-    Azure(AzureCacheConfig),
-    Gcs(GCSCacheConfig),
-    Gha(GHACacheConfig),
-    Memcached(MemcachedCacheConfig),
-    Redis(RedisCacheConfig),
-    S3(S3CacheConfig),
-    Webdav(WebdavCacheConfig),
-    Oss(OSSCacheConfig),
-    Cos(COSCacheConfig),
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct CacheConfigs {
-    pub azure: Option<AzureCacheConfig>,
-    pub disk: Option<DiskCacheConfig>,
-    pub gcs: Option<GCSCacheConfig>,
-    pub gha: Option<GHACacheConfig>,
-    pub memcached: Option<MemcachedCacheConfig>,
-    pub redis: Option<RedisCacheConfig>,
-    pub s3: Option<S3CacheConfig>,
-    pub webdav: Option<WebdavCacheConfig>,
-    pub oss: Option<OSSCacheConfig>,
-    pub cos: Option<COSCacheConfig>,
-    /// Multi-level cache configuration
-    pub multilevel: Option<MultiLevelConfig>,
-}
-
-impl CacheConfigs {
-    /// Return cache type in an arbitrary but
-    /// consistent ordering (Phase 1 behavior - single cache)
-    fn into_fallback(self) -> (Option<CacheType>, DiskCacheConfig) {
-        let Self {
-            azure,
-            disk,
-            gcs,
-            gha,
-            memcached,
-            redis,
-            s3,
-            webdav,
-            oss,
-            cos,
-            multilevel: _,
-        } = self;
-
-        let cache_type = s3
-            .map(CacheType::S3)
-            .or_else(|| redis.map(CacheType::Redis))
-            .or_else(|| memcached.map(CacheType::Memcached))
-            .or_else(|| gcs.map(CacheType::Gcs))
-            .or_else(|| gha.map(CacheType::Gha))
-            .or_else(|| azure.map(CacheType::Azure))
-            .or_else(|| webdav.map(CacheType::Webdav))
-            .or_else(|| oss.map(CacheType::Oss))
-            .or_else(|| cos.map(CacheType::Cos));
-
-        let fallback = disk.unwrap_or_default();
-
-        (cache_type, fallback)
-    }
-
-    /// Get ordered list of cache types based on configured levels.
-    /// If levels are specified, returns them in order with validation.
-    /// If no levels specified and single remote cache, returns that single cache.
-    /// If no levels and multiple caches, returns error.
-    /// # Errors
-    ///
-    /// Returns an error if the configured chain names an unknown or unconfigured
-    /// backend, or if a legacy single-cache configuration is ambiguous.
-    pub fn get_cache_levels(self) -> Result<Vec<CacheType>> {
-        if let Some(ml_config) = &self.multilevel {
-            // Build caches in the order specified by multilevel chain
-            let mut caches = Vec::new();
-            for level_name in &ml_config.chain {
-                let level_name = level_name.trim();
-                let cache_type = match level_name {
-                    "s3" => self.s3.clone().map(CacheType::S3).ok_or_else(|| {
-                        anyhow!("S3 cache not configured but specified in levels")
-                    })?,
-                    "redis" => self.redis.clone().map(CacheType::Redis).ok_or_else(|| {
-                        anyhow!("Redis cache not configured but specified in levels")
-                    })?,
-                    "memcached" => self
-                        .memcached
-                        .clone()
-                        .map(CacheType::Memcached)
-                        .ok_or_else(|| {
-                            anyhow!("Memcached cache not configured but specified in levels")
-                        })?,
-                    "gcs" => self.gcs.clone().map(CacheType::Gcs).ok_or_else(|| {
-                        anyhow!("GCS cache not configured but specified in levels")
-                    })?,
-                    "gha" => self.gha.clone().map(CacheType::Gha).ok_or_else(|| {
-                        anyhow!("GHA cache not configured but specified in levels")
-                    })?,
-                    "azure" => self.azure.clone().map(CacheType::Azure).ok_or_else(|| {
-                        anyhow!("Azure cache not configured but specified in levels")
-                    })?,
-                    "webdav" => self.webdav.clone().map(CacheType::Webdav).ok_or_else(|| {
-                        anyhow!("Webdav cache not configured but specified in levels")
-                    })?,
-                    "oss" => self.oss.clone().map(CacheType::Oss).ok_or_else(|| {
-                        anyhow!("OSS cache not configured but specified in levels")
-                    })?,
-                    "disk" => {
-                        // Disk cache is handled separately in MultiLevelStorage::from_config
-                        // Mark it by continuing - it will be added to the storage list there
-                        continue;
-                    }
-                    _ => bail!("Unknown cache level: {level_name}"),
-                };
-                caches.push(cache_type);
-            }
-            Ok(caches)
-        } else {
-            // No levels specified - use single cache (backward compatible)
-            let (cache_type, _) = self.into_fallback();
-            Ok(cache_type.map_or_default(|ct| vec![ct]))
-        }
-    }
-
-    /// Override self with any existing fields from other
-    fn merge(&mut self, other: Self) {
-        let Self {
-            azure,
-            disk,
-            gcs,
-            gha,
-            memcached,
-            redis,
-            s3,
-            webdav,
-            oss,
-            cos,
-            multilevel,
-        } = other;
-
-        if azure.is_some() {
-            self.azure = azure;
-        }
-        if disk.is_some() {
-            self.disk = disk;
-        }
-        if gcs.is_some() {
-            self.gcs = gcs;
-        }
-        if gha.is_some() {
-            self.gha = gha;
-        }
-        if memcached.is_some() {
-            self.memcached = memcached;
-        }
-        if redis.is_some() {
-            self.redis = redis;
-        }
-        if s3.is_some() {
-            self.s3 = s3;
-        }
-        if webdav.is_some() {
-            self.webdav = webdav;
-        }
-        if oss.is_some() {
-            self.oss = oss;
-        }
-        if cos.is_some() {
-            self.cos = cos;
-        }
-
-        if multilevel.is_some() {
-            self.multilevel = multilevel;
-        }
     }
 }
 
@@ -1104,7 +466,6 @@ pub struct SharedDaemonConfig {
 #[serde(default)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
-    pub cache: CacheConfigs,
     pub dist: DistConfig,
     pub server_startup_timeout_ms: Option<u64>,
     /// Base directories to strip from paths for cache key computation.
@@ -1183,7 +544,6 @@ impl Environment {
 
 #[derive(Debug, Default)]
 pub struct EnvConfig {
-    cache: CacheConfigs,
     basedirs: Option<Vec<String>>,
     client_side_mode: Option<bool>,
 }
@@ -1196,46 +556,6 @@ fn string_from_env_var(environment: &Environment, env_var_name: &str) -> Option<
         .map(str::to_owned)
 }
 
-fn key_prefix_from_env_var(environment: &Environment, env_var_name: &str) -> String {
-    string_from_env_var(environment, env_var_name)
-        .as_ref()
-        .map(|s| s.trim_end_matches('/'))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default()
-        .to_owned()
-}
-
-fn cache_mode_from_env_var(
-    environment: &Environment,
-    env_var_name: &str,
-) -> Option<CacheModeConfig> {
-    string_from_env_var(environment, env_var_name).and_then(|value| {
-        match value.to_uppercase().as_str() {
-            "READ_ONLY" => Some(CacheModeConfig::ReadOnly),
-            "READ_WRITE" => Some(CacheModeConfig::ReadWrite),
-            _ => {
-                warn!("{env_var_name} must be 'READ_ONLY' or 'READ_WRITE'");
-                None
-            }
-        }
-    })
-}
-
-fn number_from_env_var<A: std::str::FromStr>(
-    environment: &Environment,
-    env_var_name: &str,
-) -> Option<Result<A>>
-where
-    <A as FromStr>::Err: std::fmt::Debug,
-{
-    let value = string_from_env_var(environment, env_var_name)?;
-
-    value
-        .parse::<A>()
-        .map_err(|err| anyhow!("{env_var_name} value is invalid: {err:?}"))
-        .into()
-}
-
 fn bool_from_env_var(environment: &Environment, env_var_name: &str) -> Result<Option<bool>> {
     string_from_env_var(environment, env_var_name)
         .map(|value| match value.to_lowercase().as_str() {
@@ -1246,461 +566,39 @@ fn bool_from_env_var(environment: &Environment, env_var_name: &str) -> Result<Op
         .transpose()
 }
 
-fn skip_cache_check_from_env(environment: &Environment) -> Result<bool> {
-    Ok(bool_from_env_var(environment, "SCCACHE_SKIP_CACHE_CHECK")?.unwrap_or(false))
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "environment decoding mirrors the flat documented SCCACHE variable groups; keeping mappings contiguous makes names and defaults auditable"
-)]
 fn config_from_environment(environment: &Environment) -> Result<EnvConfig> {
-    // ======= AWS =======
-    let s3 = if let Some(bucket) = string_from_env_var(environment, "SCCACHE_BUCKET") {
-        let region = string_from_env_var(environment, "SCCACHE_REGION");
-        let no_credentials =
-            bool_from_env_var(environment, "SCCACHE_S3_NO_CREDENTIALS")?.unwrap_or(false);
-        let use_ssl = bool_from_env_var(environment, "SCCACHE_S3_USE_SSL")?;
-        let server_side_encryption =
-            bool_from_env_var(environment, "SCCACHE_S3_SERVER_SIDE_ENCRYPTION")?;
-        let server_side_encryption_aws_kms =
-            bool_from_env_var(environment, "SCCACHE_S3_SERVER_SIDE_ENCRYPTION_AWS_KMS")?;
-        let server_side_encryption_kms_key_id =
-            string_from_env_var(environment, "SCCACHE_S3_SERVER_SIDE_ENCRYPTION_KMS_KEY_ID");
-        let endpoint = string_from_env_var(environment, "SCCACHE_ENDPOINT");
-        let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_S3_KEY_PREFIX");
-        let enable_virtual_host_style =
-            bool_from_env_var(environment, "SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE")?;
-        let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_S3_RW_MODE")
-            .unwrap_or(CacheModeConfig::ReadWrite);
-        let capacity = match (
-            number_from_env_var::<u64>(environment, "SCCACHE_S3_CAPACITY_HIGH_WATERMARK")
-                .transpose()?,
-            number_from_env_var::<u64>(environment, "SCCACHE_S3_CAPACITY_LOW_WATERMARK")
-                .transpose()?,
-        ) {
-            (None, None) => None,
-            (Some(high_watermark), Some(low_watermark)) => Some(S3CapacityConfig {
-                high_watermark,
-                low_watermark,
-                touch_interval_secs: number_from_env_var(
-                    environment,
-                    "SCCACHE_S3_CAPACITY_TOUCH_INTERVAL_SECS",
-                )
-                .transpose()?
-                .unwrap_or_else(default_s3_capacity_touch_interval_secs),
-                state_flush_interval_secs: number_from_env_var(
-                    environment,
-                    "SCCACHE_S3_CAPACITY_STATE_FLUSH_INTERVAL_SECS",
-                )
-                .transpose()?
-                .unwrap_or_else(default_s3_capacity_state_flush_interval_secs),
-                heat_half_life_secs: number_from_env_var(
-                    environment,
-                    "SCCACHE_S3_CAPACITY_HEAT_HALF_LIFE_SECS",
-                )
-                .transpose()?
-                .unwrap_or_else(default_s3_capacity_heat_half_life_secs),
-                eviction_concurrency: number_from_env_var(
-                    environment,
-                    "SCCACHE_S3_CAPACITY_EVICTION_CONCURRENCY",
-                )
-                .transpose()?
-                .unwrap_or_else(default_s3_capacity_eviction_concurrency),
-                lease_ttl_secs: number_from_env_var(
-                    environment,
-                    "SCCACHE_S3_CAPACITY_LEASE_TTL_SECS",
-                )
-                .transpose()?
-                .unwrap_or_else(default_s3_capacity_lease_ttl_secs),
-                metadata_prefix: string_from_env_var(
-                    environment,
-                    "SCCACHE_S3_CAPACITY_METADATA_PREFIX",
-                )
-                .unwrap_or_else(default_s3_capacity_metadata_prefix),
-            }),
-            _ => bail!(
-                "SCCACHE_S3_CAPACITY_HIGH_WATERMARK and SCCACHE_S3_CAPACITY_LOW_WATERMARK must be set together"
-            ),
-        };
-        if let Some(capacity) = &capacity {
-            capacity.validate()?;
-        }
-
-        Some(S3CacheConfig {
-            bucket,
-            region,
-            key_prefix,
-            no_credentials,
-            endpoint,
-            use_ssl,
-            server_side_encryption,
-            server_side_encryption_aws_kms,
-            server_side_encryption_kms_key_id,
-            enable_virtual_host_style,
-            rw_mode,
-            capacity,
-        })
-    } else {
-        None
-    };
-
-    if s3.as_ref().is_some_and(|s3| s3.no_credentials)
-        && (environment.var_os("AWS_ACCESS_KEY_ID").is_some()
-            || environment.var_os("AWS_SECRET_ACCESS_KEY").is_some())
-    {
-        bail!("If setting S3 credentials, SCCACHE_S3_NO_CREDENTIALS must not be set.");
-    }
-
-    // ======= redis =======
-    let redis = match (
-        string_from_env_var(environment, "SCCACHE_REDIS"),
-        string_from_env_var(environment, "SCCACHE_REDIS_ENDPOINT"),
-        string_from_env_var(environment, "SCCACHE_REDIS_CLUSTER_ENDPOINTS"),
-    ) {
-        (None, None, None) => None,
-        (url, endpoint, cluster_endpoints) => {
-            let db = number_from_env_var(environment, "SCCACHE_REDIS_DB")
-                .transpose()?
-                .unwrap_or(DEFAULT_REDIS_DB);
-
-            let username = string_from_env_var(environment, "SCCACHE_REDIS_USERNAME");
-            let password = string_from_env_var(environment, "SCCACHE_REDIS_PASSWORD");
-
-            let ttl = number_from_env_var(environment, "SCCACHE_REDIS_EXPIRATION")
-                .or_else(|| number_from_env_var(environment, "SCCACHE_REDIS_TTL"))
-                .transpose()?
-                .unwrap_or(DEFAULT_REDIS_CACHE_TTL);
-
-            let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_REDIS_KEY_PREFIX");
-
-            let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_REDIS_RW_MODE")
-                .unwrap_or(CacheModeConfig::ReadWrite);
-
-            Some(RedisCacheConfig {
-                endpoint,
-                cluster_endpoints,
-                username,
-                password,
-                url,
-                db,
-                ttl,
-                key_prefix,
-                rw_mode,
-            })
-        }
-    };
-
-    if environment.var_os("SCCACHE_REDIS_EXPIRATION").is_some()
-        && environment.var_os("SCCACHE_REDIS_TTL").is_some()
-    {
-        bail!("You mustn't set both SCCACHE_REDIS_EXPIRATION and SCCACHE_REDIS_TTL. Use only one.");
-    }
-
-    // ======= memcached =======
-    let memcached = if let Some(url) = string_from_env_var(environment, "SCCACHE_MEMCACHED")
-        .or_else(|| string_from_env_var(environment, "SCCACHE_MEMCACHED_ENDPOINT"))
-    {
-        let username = string_from_env_var(environment, "SCCACHE_MEMCACHED_USERNAME");
-        let password = string_from_env_var(environment, "SCCACHE_MEMCACHED_PASSWORD");
-
-        let expiration = number_from_env_var(environment, "SCCACHE_MEMCACHED_EXPIRATION")
-            .transpose()?
-            .unwrap_or(DEFAULT_MEMCACHED_CACHE_EXPIRATION);
-
-        let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_MEMCACHED_KEY_PREFIX");
-
-        let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_MEMCACHED_RW_MODE")
-            .unwrap_or(CacheModeConfig::ReadWrite);
-
-        Some(MemcachedCacheConfig {
-            url,
-            username,
-            password,
-            expiration,
-            key_prefix,
-            rw_mode,
-        })
-    } else {
-        None
-    };
-
-    if environment.var_os("SCCACHE_MEMCACHED").is_some()
-        && environment.var_os("SCCACHE_MEMCACHED_ENDPOINT").is_some()
-    {
-        bail!(
-            "You mustn't set both SCCACHE_MEMCACHED and SCCACHE_MEMCACHED_ENDPOINT. Please, use only SCCACHE_MEMCACHED_ENDPOINT."
-        );
-    }
-
-    // ======= GCP/GCS =======
-    if (string_from_env_var(environment, "SCCACHE_GCS_CREDENTIALS_URL").is_some()
-        || string_from_env_var(environment, "SCCACHE_GCS_OAUTH_URL").is_some()
-        || string_from_env_var(environment, "SCCACHE_GCS_KEY_PATH").is_some())
-        && string_from_env_var(environment, "SCCACHE_GCS_BUCKET").is_none()
-    {
-        bail!(
-            "If setting GCS credentials, SCCACHE_GCS_BUCKET and an auth mechanism need to be set."
-        );
-    }
-
-    let gcs = string_from_env_var(environment, "SCCACHE_GCS_BUCKET").map(|bucket| {
-        let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_GCS_KEY_PREFIX");
-
-        if string_from_env_var(environment, "SCCACHE_GCS_OAUTH_URL").is_some() {
-            eprintln!("SCCACHE_GCS_OAUTH_URL has been deprecated");
-            eprintln!("if you intend to use vm metadata for auth, please set correct service account instead");
-        }
-
-        let credential_url = string_from_env_var(environment, "SCCACHE_GCS_CREDENTIALS_URL");
-
-        let cred_path = string_from_env_var(environment, "SCCACHE_GCS_KEY_PATH");
-        let service_account = string_from_env_var(environment, "SCCACHE_GCS_SERVICE_ACCOUNT");
-
-        let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_GCS_RW_MODE").unwrap_or_else(|| {
-            warn!("No valid SCCACHE_GCS_RW_MODE value was found -- defaulting to READ_ONLY.");
-            CacheModeConfig::ReadOnly
-        });
-
-        GCSCacheConfig {
-            bucket,
-            key_prefix,
-            cred_path,
-            service_account,
-            rw_mode,
-            credential_url,
-        }
-    });
-
-    // ======= GHA =======
-    let gha_rw_mode: CacheModeConfig = cache_mode_from_env_var(environment, "SCCACHE_GHA_RW_MODE")
-        .unwrap_or(CacheModeConfig::ReadWrite);
-    let gha = if let Some(version) = string_from_env_var(environment, "SCCACHE_GHA_VERSION") {
-        // If SCCACHE_GHA_VERSION has been set, we don't need to check
-        // SCCACHE_GHA_ENABLED's value anymore.
-        Some(GHACacheConfig {
-            enabled: true,
-            version,
-            rw_mode: gha_rw_mode,
-        })
-    } else if bool_from_env_var(environment, "SCCACHE_GHA_ENABLED")?.unwrap_or(false) {
-        // If only SCCACHE_GHA_ENABLED has been set to the true value, enable with
-        // default version.
-        Some(GHACacheConfig {
-            enabled: true,
-            version: String::new(),
-            rw_mode: gha_rw_mode,
-        })
-    } else {
-        None
-    };
-
-    // ======= Azure =======
-    // Azure is enabled whenever a container is configured. Authentication is
-    // then selected by presence:
-    //   * SCCACHE_AZURE_CONNECTION_STRING                     -> shared-key (legacy) path
-    //   * SCCACHE_AZURE_STORAGE_ACCOUNT / SCCACHE_AZURE_ENDPOINT -> Entra ID (passwordless)
-    let azure = if let Some(container) =
-        string_from_env_var(environment, "SCCACHE_AZURE_BLOB_CONTAINER")
-    {
-        let connection_string = string_from_env_var(environment, "SCCACHE_AZURE_CONNECTION_STRING");
-        let storage_account = string_from_env_var(environment, "SCCACHE_AZURE_STORAGE_ACCOUNT");
-        let endpoint = string_from_env_var(environment, "SCCACHE_AZURE_ENDPOINT");
-        let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_AZURE_KEY_PREFIX");
-        let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_AZURE_RW_MODE")
-            .unwrap_or(CacheModeConfig::ReadWrite);
-
-        let has_entra_source = storage_account.is_some() || endpoint.is_some();
-        if connection_string.is_some() && has_entra_source {
-            bail!(
-                "Set either SCCACHE_AZURE_CONNECTION_STRING (shared key) or SCCACHE_AZURE_STORAGE_ACCOUNT / SCCACHE_AZURE_ENDPOINT (Entra ID), not both."
+    for name in environment.vars.keys() {
+        let retired = [
+            "SCCACHE_S3_",
+            "SCCACHE_GCS_",
+            "SCCACHE_AZURE_",
+            "SCCACHE_REDIS_",
+            "SCCACHE_MEMCACHED_",
+            "SCCACHE_GHA_",
+            "SCCACHE_WEBDAV_",
+            "SCCACHE_OSS_",
+            "SCCACHE_COS_",
+            "SCCACHE_MULTILEVEL_",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+            || matches!(
+                name.as_str(),
+                "SCCACHE_BUCKET"
+                    | "SCCACHE_REGION"
+                    | "SCCACHE_ENDPOINT"
+                    | "SCCACHE_DIR"
+                    | "SCCACHE_CACHE_SIZE"
+                    | "SCCACHE_SKIP_CACHE_CHECK"
+                    | "SCCACHE_DIRECT"
+                    | "SCCACHE_LOCAL_RW_MODE"
+                    | "SCCACHE_REDIS"
+                    | "SCCACHE_MEMCACHED"
             );
+        if retired {
+            bail!("retired cache setting {name}; use the native scheduler CAS");
         }
-        if connection_string.is_none() && !has_entra_source {
-            // Backwards compatible with the historical behavior where a
-            // container without any auth source left the Azure backend disabled
-            // (previously the destructure required both the connection string
-            // and the container). Warn rather than fail so a stray container
-            // variable cannot take down an unrelated cache backend, while still
-            // surfacing the misconfiguration. This is deliberately more lenient
-            // than a file config: an explicit `[cache.azure]` block with no auth
-            // source is a real misconfiguration and errors at operator build
-            // (AzureBlobCache::build -> resolve_blob_endpoint), because a config
-            // file — unlike an ambient env var — is an unambiguous opt-in.
-            warn!(
-                "SCCACHE_AZURE_BLOB_CONTAINER is set but no Azure auth source was provided \
-                 (SCCACHE_AZURE_CONNECTION_STRING, SCCACHE_AZURE_STORAGE_ACCOUNT or \
-                 SCCACHE_AZURE_ENDPOINT); the Azure cache backend is disabled."
-            );
-            None
-        } else {
-            Some(AzureCacheConfig {
-                connection_string,
-                container,
-                key_prefix,
-                storage_account,
-                endpoint,
-                rw_mode,
-            })
-        }
-    } else {
-        None
-    };
-
-    // ======= WebDAV =======
-    let webdav = if let Some(endpoint) = string_from_env_var(environment, "SCCACHE_WEBDAV_ENDPOINT")
-    {
-        let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_WEBDAV_KEY_PREFIX");
-        let username = string_from_env_var(environment, "SCCACHE_WEBDAV_USERNAME");
-        let password = string_from_env_var(environment, "SCCACHE_WEBDAV_PASSWORD");
-        let token = string_from_env_var(environment, "SCCACHE_WEBDAV_TOKEN");
-        let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_WEBDAV_RW_MODE")
-            .unwrap_or(CacheModeConfig::ReadWrite);
-        let disable_create_dir =
-            bool_from_env_var(environment, "SCCACHE_WEBDAV_DISABLE_CREATE_DIR")?.unwrap_or(false);
-
-        Some(WebdavCacheConfig {
-            endpoint,
-            key_prefix,
-            username,
-            password,
-            token,
-            rw_mode,
-            disable_create_dir,
-        })
-    } else {
-        None
-    };
-
-    // ======= OSS =======
-    let oss = if let Some(bucket) = string_from_env_var(environment, "SCCACHE_OSS_BUCKET") {
-        let endpoint = string_from_env_var(environment, "SCCACHE_OSS_ENDPOINT");
-        let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_OSS_KEY_PREFIX");
-
-        let no_credentials =
-            bool_from_env_var(environment, "SCCACHE_OSS_NO_CREDENTIALS")?.unwrap_or(false);
-
-        let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_OSS_RW_MODE")
-            .unwrap_or(CacheModeConfig::ReadWrite);
-
-        Some(OSSCacheConfig {
-            bucket,
-            key_prefix,
-            endpoint,
-            no_credentials,
-            rw_mode,
-        })
-    } else {
-        None
-    };
-
-    if oss.as_ref().is_some_and(|oss| oss.no_credentials)
-        && (environment.var_os("ALIBABA_CLOUD_ACCESS_KEY_ID").is_some()
-            || environment
-                .var_os("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
-                .is_some())
-    {
-        bail!("If setting OSS credentials, SCCACHE_OSS_NO_CREDENTIALS must not be set.");
     }
-
-    // ======= COS =======
-    let cos = string_from_env_var(environment, "SCCACHE_COS_BUCKET").map(|bucket| {
-        let endpoint = string_from_env_var(environment, "SCCACHE_COS_ENDPOINT");
-        let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_COS_KEY_PREFIX");
-
-        let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_COS_RW_MODE")
-            .unwrap_or(CacheModeConfig::ReadWrite);
-
-        COSCacheConfig {
-            bucket,
-            key_prefix,
-            endpoint,
-            rw_mode,
-        }
-    });
-
-    // ======= Local =======
-    let disk_dir = environment.var_os("SCCACHE_DIR").map(PathBuf::from);
-    let disk_sz = environment
-        .var_os("SCCACHE_CACHE_SIZE")
-        .map(|value| {
-            value.to_str().and_then(parse_size).ok_or_else(|| {
-                anyhow!(
-                    "SCCACHE_CACHE_SIZE value is invalid: {}",
-                    crate::util::debug_display(value)
-                )
-            })
-        })
-        .transpose()?;
-
-    let mut preprocessor_mode_config = PreprocessorCacheModeConfig::activated();
-    let preprocessor_mode_overridden = bool_from_env_var(environment, "SCCACHE_DIRECT")?
-        .is_some_and(|value| {
-            preprocessor_mode_config.use_preprocessor_cache_mode = value;
-            true
-        });
-
-    let (disk_rw_mode, disk_rw_mode_overridden) =
-        cache_mode_from_env_var(environment, "SCCACHE_LOCAL_RW_MODE")
-            .map_or((CacheModeConfig::ReadWrite, false), |mode| (mode, true));
-
-    let any_overridden = disk_dir.is_some()
-        || disk_sz.is_some()
-        || preprocessor_mode_overridden
-        || disk_rw_mode_overridden;
-    let disk = if any_overridden {
-        Some(DiskCacheConfig {
-            dir: disk_dir.unwrap_or_else(default_disk_cache_dir),
-            size: disk_sz.unwrap_or_else(default_disk_cache_size),
-            preprocessor_cache_mode: preprocessor_mode_config,
-            rw_mode: disk_rw_mode,
-        })
-    } else {
-        None
-    };
-
-    // Parse multi-level cache configuration
-    let multilevel = if let Some(chain_str) =
-        string_from_env_var(environment, "SCCACHE_MULTILEVEL_CHAIN")
-    {
-        let chain: Vec<String> = chain_str.split(',').map(|s| s.trim().to_string()).collect();
-
-        let write_error_policy =
-            string_from_env_var(environment, "SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY")
-                .and_then(|s| s.parse::<WriteErrorPolicy>().ok())
-                .unwrap_or_default();
-
-        let slow_write_concurrency =
-            number_from_env_var::<usize>(environment, "SCCACHE_MULTILEVEL_SLOW_WRITE_CONCURRENCY")
-                .transpose()?
-                .unwrap_or_else(default_multilevel_slow_write_concurrency);
-        if slow_write_concurrency == 0 {
-            bail!("SCCACHE_MULTILEVEL_SLOW_WRITE_CONCURRENCY must be at least 1");
-        }
-
-        Some(MultiLevelConfig {
-            chain,
-            write_error_policy,
-            slow_write_concurrency,
-        })
-    } else {
-        None
-    };
-
-    let cache = CacheConfigs {
-        azure,
-        disk,
-        gcs,
-        gha,
-        memcached,
-        redis,
-        s3,
-        webdav,
-        oss,
-        cos,
-        multilevel,
-    };
-
     // ======= Base directory =======
     // Support multiple paths separated by ';' on Windows and ':' on other platforms
     // to match PATH behavior.
@@ -1719,7 +617,6 @@ fn config_from_environment(environment: &Environment) -> Result<EnvConfig> {
     let client_side_mode = bool_from_env_var(environment, "SCCACHE_CLIENT_SIDE")?;
 
     Ok(EnvConfig {
-        cache,
         basedirs,
         client_side_mode,
     })
@@ -1759,12 +656,8 @@ fn config_file_with_environment(
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Config {
-    pub cache: Option<CacheType>,
-    pub cache_configs: CacheConfigs,
-    pub fallback_cache: DiskCacheConfig,
     pub dist: DistConfig,
     pub server_startup_timeout: Option<std::time::Duration>,
-    pub skip_cache_check: bool,
     /// Base directory (or directories) to strip from paths for cache key computation.
     /// Similar to ccache's `CCACHE_BASEDIR`.
     pub basedirs: Vec<Vec<u8>>,
@@ -1789,7 +682,6 @@ impl Config {
 
     fn load_from_environment(environment: &Environment) -> Result<Self> {
         let env_conf = config_from_environment(environment)?;
-        let skip_cache_check = skip_cache_check_from_env(environment)?;
 
         let file_conf_path = config_file_with_environment(environment, "SCCACHE_CONF", "config")?;
         let file_conf =
@@ -1802,16 +694,11 @@ impl Config {
                 None => FileConfig::default(),
             };
 
-        let mut config = Self::from_env_and_file_configs(env_conf, file_conf)?;
-        config.skip_cache_check = skip_cache_check;
-        Ok(config)
+        Self::from_env_and_file_configs(env_conf, file_conf)
     }
 
     fn from_env_and_file_configs(env_conf: EnvConfig, file_conf: FileConfig) -> Result<Self> {
-        let mut conf_caches: CacheConfigs = CacheConfigs::default();
-
         let FileConfig {
-            cache,
             dist,
             server_startup_timeout_ms,
             basedirs: file_basedirs,
@@ -1822,18 +709,15 @@ impl Config {
             traces,
         } = file_conf;
         compile_limits.validate()?;
-        conf_caches.merge(cache);
         compiler_aliases.validate()?;
 
         let server_startup_timeout =
             server_startup_timeout_ms.map(std::time::Duration::from_millis);
 
         let EnvConfig {
-            cache,
             basedirs: env_basedirs,
             client_side_mode: env_client_side_mode,
         } = env_conf;
-        conf_caches.merge(cache);
 
         // Environment variable takes precedence over file config if it is set
         let basedirs_raw = env_basedirs.unwrap_or(file_basedirs);
@@ -1898,14 +782,9 @@ impl Config {
             );
         }
 
-        let (caches, fallback_cache) = conf_caches.clone().into_fallback();
         Ok(Self {
-            cache: caches,
-            cache_configs: conf_caches,
-            fallback_cache,
             dist,
             server_startup_timeout,
-            skip_cache_check: false,
             basedirs,
             client_side_mode,
             shared_daemon,
@@ -2469,31 +1348,6 @@ fn test_parse_size() {
 }
 
 #[test]
-fn test_env_cache_size() -> Result<()> {
-    let mut environment = Environment::default();
-    environment.set("SCCACHE_CACHE_SIZE", "2G");
-    let config = config_from_environment(&environment)?;
-    assert_eq!(
-        config.cache.disk.map(|disk| disk.size),
-        Some(2 * 1024 * 1024 * 1024)
-    );
-    Ok(())
-}
-
-#[test]
-fn test_env_cache_size_invalid() {
-    for value in ["", "20GB", "1.5G", "10 G", "G", "16777216T"] {
-        let mut environment = Environment::default();
-        environment.set("SCCACHE_CACHE_SIZE", value);
-        let error = config_from_environment(&environment).expect_err(value);
-        assert_eq!(
-            format!("SCCACHE_CACHE_SIZE value is invalid: {value:?}"),
-            error.to_string()
-        );
-    }
-}
-
-#[test]
 fn test_string_from_env_var() {
     let mut environment = Environment::default();
     let var_name = "TEST_SCCACHE_VAR";
@@ -2518,173 +1372,6 @@ fn test_string_from_env_var() {
 
         assert_eq!(result, expected);
     }
-}
-
-#[test]
-fn test_skip_cache_check_from_env() {
-    let mut environment = Environment::default();
-    const ENV_VAR: &str = "SCCACHE_SKIP_CACHE_CHECK";
-
-    {
-        environment.remove(ENV_VAR);
-    }
-    assert!(!skip_cache_check_from_env(&environment).unwrap());
-
-    for (value, expected) in [
-        ("true", true),
-        ("on", true),
-        ("1", true),
-        ("false", false),
-        ("off", false),
-        ("0", false),
-    ] {
-        {
-            environment.set(ENV_VAR, value);
-        }
-        assert_eq!(skip_cache_check_from_env(&environment).unwrap(), expected);
-    }
-
-    {
-        environment.set(ENV_VAR, "invalid");
-    }
-    assert_eq!(
-        skip_cache_check_from_env(&environment)
-            .unwrap_err()
-            .to_string(),
-        "SCCACHE_SKIP_CACHE_CHECK must be 'true', 'on', '1', 'false', 'off' or '0'."
-    );
-
-    {
-        environment.remove(ENV_VAR);
-    }
-}
-
-#[test]
-fn config_overrides() {
-    let env_conf = EnvConfig {
-        cache: CacheConfigs {
-            azure: Some(AzureCacheConfig {
-                connection_string: None,
-                container: String::new(),
-                key_prefix: String::new(),
-                storage_account: None,
-                endpoint: None,
-                rw_mode: CacheModeConfig::ReadWrite,
-            }),
-            disk: Some(DiskCacheConfig {
-                dir: "/env-cache".into(),
-                size: 5,
-                preprocessor_cache_mode: Default::default(),
-                rw_mode: CacheModeConfig::ReadWrite,
-            }),
-            redis: Some(RedisCacheConfig {
-                endpoint: Some("myotherredisurl".to_owned()),
-                ttl: 24 * 3600,
-                key_prefix: "/redis/prefix".into(),
-                db: 10,
-                username: Some("user".to_owned()),
-                password: Some("secret".to_owned()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        basedirs: None,
-        client_side_mode: None,
-    };
-
-    let file_conf = FileConfig {
-        cache: CacheConfigs {
-            disk: Some(DiskCacheConfig {
-                dir: "/file-cache".into(),
-                size: 15,
-                preprocessor_cache_mode: Default::default(),
-                rw_mode: CacheModeConfig::ReadWrite,
-            }),
-            memcached: Some(MemcachedCacheConfig {
-                url: "memurl".to_owned(),
-                expiration: 24 * 3600,
-                key_prefix: String::new(),
-                ..Default::default()
-            }),
-            redis: Some(RedisCacheConfig {
-                url: Some("myredisurl".to_owned()),
-                ttl: 25 * 3600,
-                key_prefix: String::new(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
-        basedirs: vec![],
-        client_side_mode: false,
-        shared_daemon: None,
-        compiler_aliases: Default::default(),
-        compile_limits: Default::default(),
-        traces: None,
-    };
-
-    assert_eq!(
-        Config::from_env_and_file_configs(env_conf, file_conf).unwrap(),
-        Config {
-            cache: Some(CacheType::Redis(RedisCacheConfig {
-                endpoint: Some("myotherredisurl".to_owned()),
-                ttl: 24 * 3600,
-                key_prefix: "/redis/prefix".into(),
-                db: 10,
-                username: Some("user".to_owned()),
-                password: Some("secret".to_owned()),
-                ..Default::default()
-            })),
-            cache_configs: CacheConfigs {
-                azure: Some(AzureCacheConfig {
-                    connection_string: None,
-                    container: String::new(),
-                    key_prefix: String::new(),
-                    storage_account: None,
-                    endpoint: None,
-                    rw_mode: CacheModeConfig::ReadWrite,
-                }),
-                disk: Some(DiskCacheConfig {
-                    dir: "/env-cache".into(),
-                    size: 5,
-                    preprocessor_cache_mode: Default::default(),
-                    rw_mode: CacheModeConfig::ReadWrite,
-                }),
-                memcached: Some(MemcachedCacheConfig {
-                    url: "memurl".to_owned(),
-                    expiration: 24 * 3600,
-                    key_prefix: String::new(),
-                    ..Default::default()
-                }),
-                redis: Some(RedisCacheConfig {
-                    endpoint: Some("myotherredisurl".to_owned()),
-                    ttl: 24 * 3600,
-                    key_prefix: "/redis/prefix".into(),
-                    db: 10,
-                    username: Some("user".to_owned()),
-                    password: Some("secret".to_owned()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            fallback_cache: DiskCacheConfig {
-                dir: "/env-cache".into(),
-                size: 5,
-                preprocessor_cache_mode: Default::default(),
-                rw_mode: CacheModeConfig::ReadWrite,
-            },
-            dist: Default::default(),
-            server_startup_timeout: None,
-            skip_cache_check: false,
-            basedirs: vec![],
-            client_side_mode: false,
-            shared_daemon: None,
-            compiler_aliases: Default::default(),
-            compile_limits: Default::default(),
-            traces: None,
-        }
-    );
 }
 
 #[test]
@@ -2742,10 +1429,6 @@ fn test_deserialize_basedirs() {
     let toml = r#"
         basedirs = ["/home/user/project", "/home/user/workspace"]
 
-        [cache.disk]
-        dir = "/tmp/cache"
-        size = 1073741824
-
         [dist]
     "#;
 
@@ -2763,82 +1446,11 @@ fn test_deserialize_basedirs() {
 fn test_deserialize_basedirs_missing() {
     // Test no basedirs specified (should default to empty vec)
     let toml = r#"
-        [cache.disk]
-        dir = "/tmp/cache"
-        size = 1073741824
-
         [dist]
     "#;
 
     let config: FileConfig = toml::from_str(toml).unwrap();
     assert_eq!(config.basedirs, [] as [std::string::String; 0]);
-}
-
-#[test]
-fn test_cache_mode_from_env_var() {
-    let mut environment = Environment::default();
-    struct CacheEnvCheckInfo {
-        env_var_value: Option<String>,
-        expected_cache_mode: Option<CacheModeConfig>,
-    }
-
-    let env_check_infos = vec![
-        CacheEnvCheckInfo {
-            env_var_value: None,
-            expected_cache_mode: None,
-        },
-        CacheEnvCheckInfo {
-            env_var_value: Some(String::new()),
-            expected_cache_mode: None,
-        },
-        CacheEnvCheckInfo {
-            env_var_value: Some("read_only".to_string()),
-            expected_cache_mode: Some(CacheModeConfig::ReadOnly),
-        },
-        CacheEnvCheckInfo {
-            env_var_value: Some("read_write".to_string()),
-            expected_cache_mode: Some(CacheModeConfig::ReadWrite),
-        },
-        CacheEnvCheckInfo {
-            env_var_value: Some("ReAd_ONly".to_string()),
-            expected_cache_mode: Some(CacheModeConfig::ReadOnly),
-        },
-        CacheEnvCheckInfo {
-            env_var_value: Some("read_WRITE".to_string()),
-            expected_cache_mode: Some(CacheModeConfig::ReadWrite),
-        },
-        CacheEnvCheckInfo {
-            env_var_value: Some("read_only_typo".to_string()),
-            expected_cache_mode: None,
-        },
-        CacheEnvCheckInfo {
-            env_var_value: Some("foo".to_string()),
-            expected_cache_mode: None,
-        },
-        CacheEnvCheckInfo {
-            env_var_value: Some("any_unsupported_value".to_string()),
-            expected_cache_mode: None,
-        },
-    ];
-
-    let var_name = "SCCACHE_ANY_CACHE_MODE_ENV_VAR";
-
-    for info in env_check_infos {
-        {
-            if let Some(env_var_value) = &info.env_var_value {
-                environment.set(var_name, env_var_value);
-            } else {
-                environment.remove(var_name);
-            }
-        }
-        let cache_mode = cache_mode_from_env_var(&environment, var_name);
-
-        {
-            environment.remove(var_name);
-        }
-
-        assert_eq!(cache_mode, info.expected_cache_mode);
-    }
 }
 
 #[test]
@@ -3013,579 +1625,6 @@ fn test_env_basedirs_not_set() {
 }
 
 #[test]
-fn test_s3_capacity_file_config() {
-    let toml = r#"
-[cache.s3]
-bucket = "cache"
-no_credentials = true
-
-[cache.s3.capacity]
-high_watermark = 11811160064
-low_watermark = 9663676416
-touch_interval_secs = 30
-heat_half_life_secs = 3600
-"#;
-    let config: FileConfig = toml::from_str(toml).unwrap();
-    let capacity = config.cache.s3.unwrap().capacity.unwrap();
-    assert_eq!(capacity.high_watermark, 11 * 1024 * 1024 * 1024);
-    assert_eq!(capacity.low_watermark, 9 * 1024 * 1024 * 1024);
-    assert_eq!(capacity.touch_interval_secs, 30);
-    assert_eq!(capacity.state_flush_interval_secs, 5);
-    assert_eq!(capacity.heat_half_life_secs, 3600);
-    assert_eq!(capacity.eviction_concurrency, 16);
-    assert_eq!(capacity.lease_ttl_secs, 600);
-    assert_eq!(capacity.metadata_prefix, ".sccache-meta/v2");
-    capacity.validate().unwrap();
-}
-
-#[test]
-fn test_s3_capacity_rejects_too_short_lease() {
-    let capacity = S3CapacityConfig {
-        high_watermark: 100,
-        low_watermark: 50,
-        touch_interval_secs: 60,
-        state_flush_interval_secs: 60,
-        heat_half_life_secs: 3600,
-        eviction_concurrency: 1,
-        lease_ttl_secs: 2,
-        metadata_prefix: ".meta".to_owned(),
-    };
-    assert!(capacity.validate().is_err());
-}
-
-#[test]
-fn test_s3_capacity_rejects_inverted_watermarks() {
-    let capacity = S3CapacityConfig {
-        high_watermark: 100,
-        low_watermark: 100,
-        touch_interval_secs: 60,
-        state_flush_interval_secs: 60,
-        heat_half_life_secs: 3600,
-        eviction_concurrency: 1,
-        lease_ttl_secs: 60,
-        metadata_prefix: ".meta".to_owned(),
-    };
-    assert!(capacity.validate().is_err());
-}
-
-#[test]
-fn test_s3_capacity_from_env() {
-    let mut environment = Environment::default();
-    {
-        environment.set("SCCACHE_BUCKET", "cache");
-        environment.set("SCCACHE_S3_CAPACITY_HIGH_WATERMARK", "1000");
-        environment.set("SCCACHE_S3_CAPACITY_LOW_WATERMARK", "700");
-        environment.set("SCCACHE_S3_CAPACITY_TOUCH_INTERVAL_SECS", "5");
-    }
-    let config = config_from_environment(&environment).unwrap();
-    {
-        environment.remove("SCCACHE_BUCKET");
-        environment.remove("SCCACHE_S3_CAPACITY_HIGH_WATERMARK");
-        environment.remove("SCCACHE_S3_CAPACITY_LOW_WATERMARK");
-        environment.remove("SCCACHE_S3_CAPACITY_TOUCH_INTERVAL_SECS");
-    }
-    let capacity = config.cache.s3.unwrap().capacity.unwrap();
-    assert_eq!(capacity.high_watermark, 1000);
-    assert_eq!(capacity.low_watermark, 700);
-    assert_eq!(capacity.touch_interval_secs, 5);
-}
-
-#[test]
-fn test_s3_capacity_env_requires_both_watermarks() {
-    let mut environment = Environment::default();
-    {
-        environment.set("SCCACHE_BUCKET", "cache");
-        environment.set("SCCACHE_S3_CAPACITY_HIGH_WATERMARK", "1000");
-    }
-    let result = config_from_environment(&environment);
-    {
-        environment.remove("SCCACHE_BUCKET");
-        environment.remove("SCCACHE_S3_CAPACITY_HIGH_WATERMARK");
-    }
-    assert!(result.is_err());
-}
-
-#[test]
-#[cfg(feature = "s3")]
-fn test_s3_no_credentials_conflict() {
-    let mut environment = Environment::default();
-    {
-        environment.set("SCCACHE_S3_NO_CREDENTIALS", "true");
-        environment.set("SCCACHE_BUCKET", "my-bucket");
-        environment.set("AWS_ACCESS_KEY_ID", "aws-access-key-id");
-        environment.set("AWS_SECRET_ACCESS_KEY", "aws-secret-access-key");
-    }
-
-    let cfg = config_from_environment(&environment);
-
-    {
-        environment.remove("SCCACHE_S3_NO_CREDENTIALS");
-        environment.remove("SCCACHE_BUCKET");
-        environment.remove("AWS_ACCESS_KEY_ID");
-        environment.remove("AWS_SECRET_ACCESS_KEY");
-    }
-
-    let error = cfg.unwrap_err();
-    assert_eq!(
-        "If setting S3 credentials, SCCACHE_S3_NO_CREDENTIALS must not be set.",
-        error.to_string()
-    );
-}
-
-#[test]
-fn test_s3_no_credentials_invalid() {
-    let mut environment = Environment::default();
-    {
-        environment.set("SCCACHE_S3_NO_CREDENTIALS", "yes");
-        environment.set("SCCACHE_BUCKET", "my-bucket");
-    }
-
-    let cfg = config_from_environment(&environment);
-
-    {
-        environment.remove("SCCACHE_S3_NO_CREDENTIALS");
-        environment.remove("SCCACHE_BUCKET");
-    }
-
-    let error = cfg.unwrap_err();
-    assert_eq!(
-        "SCCACHE_S3_NO_CREDENTIALS must be 'true', 'on', '1', 'false', 'off' or '0'.",
-        error.to_string()
-    );
-}
-
-#[test]
-fn test_s3_no_credentials_valid_true() {
-    let mut environment = Environment::default();
-    {
-        environment.set("SCCACHE_S3_NO_CREDENTIALS", "true");
-        environment.set("SCCACHE_BUCKET", "my-bucket");
-    }
-
-    let cfg = config_from_environment(&environment);
-
-    {
-        environment.remove("SCCACHE_S3_NO_CREDENTIALS");
-        environment.remove("SCCACHE_BUCKET");
-    }
-
-    let env_cfg = cfg.unwrap();
-    match env_cfg.cache.s3 {
-        Some(S3CacheConfig {
-            ref bucket,
-            no_credentials,
-            ..
-        }) => {
-            assert_eq!(bucket, "my-bucket");
-            assert!(no_credentials);
-        }
-        None => unreachable!(),
-    }
-}
-
-#[test]
-fn test_s3_no_credentials_valid_false() {
-    let mut environment = Environment::default();
-    {
-        environment.set("SCCACHE_S3_NO_CREDENTIALS", "false");
-        environment.set("SCCACHE_BUCKET", "my-bucket");
-    }
-
-    let cfg = config_from_environment(&environment);
-
-    {
-        environment.remove("SCCACHE_S3_NO_CREDENTIALS");
-        environment.remove("SCCACHE_BUCKET");
-    }
-
-    let env_cfg = cfg.unwrap();
-    match env_cfg.cache.s3 {
-        Some(S3CacheConfig {
-            ref bucket,
-            no_credentials,
-            ..
-        }) => {
-            assert_eq!(bucket, "my-bucket");
-            assert!(!no_credentials);
-        }
-        None => unreachable!(),
-    }
-}
-
-#[test]
-#[cfg(feature = "s3")]
-fn test_s3_sse_kms_from_env() {
-    let mut environment = Environment::default();
-    {
-        environment.set("SCCACHE_BUCKET", "my-bucket");
-        environment.set("SCCACHE_S3_SERVER_SIDE_ENCRYPTION_AWS_KMS", "true");
-        environment.set(
-            "SCCACHE_S3_SERVER_SIDE_ENCRYPTION_KMS_KEY_ID",
-            "arn:aws:kms:us-east-1:111:key/abc",
-        );
-    }
-
-    let cfg = config_from_environment(&environment);
-
-    {
-        environment.remove("SCCACHE_BUCKET");
-        environment.remove("SCCACHE_S3_SERVER_SIDE_ENCRYPTION_AWS_KMS");
-        environment.remove("SCCACHE_S3_SERVER_SIDE_ENCRYPTION_KMS_KEY_ID");
-    }
-
-    let env_cfg = cfg.unwrap();
-    match env_cfg.cache.s3 {
-        Some(S3CacheConfig {
-            server_side_encryption_aws_kms,
-            ref server_side_encryption_kms_key_id,
-            ..
-        }) => {
-            assert_eq!(server_side_encryption_aws_kms, Some(true));
-            assert_eq!(
-                server_side_encryption_kms_key_id.as_deref(),
-                Some("arn:aws:kms:us-east-1:111:key/abc")
-            );
-        }
-        None => unreachable!(),
-    }
-}
-
-#[test]
-#[cfg(feature = "webdav")]
-fn test_webdav_disable_create_dir_from_env() {
-    let mut environment = Environment::default();
-    {
-        environment.set("SCCACHE_WEBDAV_ENDPOINT", "https://example.com/webdav");
-        environment.set("SCCACHE_WEBDAV_DISABLE_CREATE_DIR", "true");
-    }
-
-    let cfg = config_from_environment(&environment);
-
-    {
-        environment.remove("SCCACHE_WEBDAV_ENDPOINT");
-        environment.remove("SCCACHE_WEBDAV_DISABLE_CREATE_DIR");
-    }
-
-    let env_cfg = cfg.unwrap();
-    match env_cfg.cache.webdav {
-        Some(WebdavCacheConfig {
-            disable_create_dir, ..
-        }) => {
-            assert!(disable_create_dir);
-        }
-        None => unreachable!(),
-    }
-}
-
-#[test]
-#[cfg(feature = "webdav")]
-fn test_webdav_disable_create_dir_defaults_to_false() {
-    let mut environment = Environment::default();
-    {
-        environment.set("SCCACHE_WEBDAV_ENDPOINT", "https://example.com/webdav");
-        environment.remove("SCCACHE_WEBDAV_DISABLE_CREATE_DIR");
-    }
-
-    let cfg = config_from_environment(&environment);
-
-    {
-        environment.remove("SCCACHE_WEBDAV_ENDPOINT");
-    }
-
-    let env_cfg = cfg.unwrap();
-    match env_cfg.cache.webdav {
-        Some(WebdavCacheConfig {
-            disable_create_dir, ..
-        }) => {
-            assert!(!disable_create_dir);
-        }
-        None => unreachable!(),
-    }
-}
-
-#[test]
-#[cfg(feature = "azure")]
-fn test_azure_entra_storage_account_enables() {
-    let mut environment = Environment::default();
-    {
-        environment.set("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
-        environment.set("SCCACHE_AZURE_STORAGE_ACCOUNT", "mystorageacct");
-    }
-
-    let cfg = config_from_environment(&environment);
-
-    {
-        environment.remove("SCCACHE_AZURE_BLOB_CONTAINER");
-        environment.remove("SCCACHE_AZURE_STORAGE_ACCOUNT");
-    }
-
-    let env_cfg = cfg.unwrap();
-    match env_cfg.cache.azure {
-        Some(AzureCacheConfig {
-            ref connection_string,
-            ref container,
-            ref storage_account,
-            ref endpoint,
-            ..
-        }) => {
-            assert_eq!(container, "my-container");
-            assert!(connection_string.is_none());
-            assert_eq!(storage_account.as_deref(), Some("mystorageacct"));
-            assert!(endpoint.is_none());
-        }
-        None => unreachable!(),
-    }
-}
-
-#[test]
-#[cfg(feature = "azure")]
-fn test_azure_entra_endpoint_enables() {
-    let mut environment = Environment::default();
-    {
-        environment.set("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
-        environment.set(
-            "SCCACHE_AZURE_ENDPOINT",
-            "https://acct.blob.core.usgovcloudapi.net",
-        );
-    }
-
-    let cfg = config_from_environment(&environment);
-
-    {
-        environment.remove("SCCACHE_AZURE_BLOB_CONTAINER");
-        environment.remove("SCCACHE_AZURE_ENDPOINT");
-    }
-
-    let env_cfg = cfg.unwrap();
-    match env_cfg.cache.azure {
-        Some(AzureCacheConfig {
-            ref connection_string,
-            ref storage_account,
-            ref endpoint,
-            ..
-        }) => {
-            assert!(connection_string.is_none());
-            assert!(storage_account.is_none());
-            assert_eq!(
-                endpoint.as_deref(),
-                Some("https://acct.blob.core.usgovcloudapi.net")
-            );
-        }
-        None => unreachable!(),
-    }
-}
-
-#[test]
-#[cfg(feature = "azure")]
-fn test_azure_connection_string_still_works() {
-    let mut environment = Environment::default();
-    {
-        environment.set("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
-        environment.set("SCCACHE_AZURE_CONNECTION_STRING", "some-connection-string");
-    }
-
-    let cfg = config_from_environment(&environment);
-
-    {
-        environment.remove("SCCACHE_AZURE_BLOB_CONTAINER");
-        environment.remove("SCCACHE_AZURE_CONNECTION_STRING");
-    }
-
-    let env_cfg = cfg.unwrap();
-    match env_cfg.cache.azure {
-        Some(AzureCacheConfig {
-            ref connection_string,
-            ref storage_account,
-            ref endpoint,
-            ..
-        }) => {
-            assert_eq!(connection_string.as_deref(), Some("some-connection-string"));
-            assert!(storage_account.is_none());
-            assert!(endpoint.is_none());
-        }
-        None => unreachable!(),
-    }
-}
-
-#[test]
-#[cfg(feature = "azure")]
-fn test_azure_conflicting_auth_sources() {
-    let mut environment = Environment::default();
-    {
-        environment.set("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
-        environment.set("SCCACHE_AZURE_CONNECTION_STRING", "some-connection-string");
-        environment.set("SCCACHE_AZURE_STORAGE_ACCOUNT", "mystorageacct");
-    }
-
-    let cfg = config_from_environment(&environment);
-
-    {
-        environment.remove("SCCACHE_AZURE_BLOB_CONTAINER");
-        environment.remove("SCCACHE_AZURE_CONNECTION_STRING");
-        environment.remove("SCCACHE_AZURE_STORAGE_ACCOUNT");
-    }
-
-    let error = cfg.unwrap_err();
-    assert_eq!(
-        "Set either SCCACHE_AZURE_CONNECTION_STRING (shared key) or SCCACHE_AZURE_STORAGE_ACCOUNT / SCCACHE_AZURE_ENDPOINT (Entra ID), not both.",
-        error.to_string()
-    );
-}
-
-#[test]
-#[cfg(feature = "azure")]
-fn test_azure_conflicting_connection_string_and_endpoint() {
-    let mut environment = Environment::default();
-    // The other operand of the mutual-exclusivity check: connection string paired
-    // with an endpoint (rather than a storage account) must also be rejected.
-    {
-        environment.set("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
-        environment.set("SCCACHE_AZURE_CONNECTION_STRING", "some-connection-string");
-        environment.set(
-            "SCCACHE_AZURE_ENDPOINT",
-            "https://acct.blob.core.windows.net",
-        );
-    }
-
-    let cfg = config_from_environment(&environment);
-
-    {
-        environment.remove("SCCACHE_AZURE_BLOB_CONTAINER");
-        environment.remove("SCCACHE_AZURE_CONNECTION_STRING");
-        environment.remove("SCCACHE_AZURE_ENDPOINT");
-    }
-
-    let error = cfg.unwrap_err();
-    assert_eq!(
-        "Set either SCCACHE_AZURE_CONNECTION_STRING (shared key) or SCCACHE_AZURE_STORAGE_ACCOUNT / SCCACHE_AZURE_ENDPOINT (Entra ID), not both.",
-        error.to_string()
-    );
-}
-
-#[test]
-#[cfg(feature = "azure")]
-fn test_azure_no_auth_source_disables_backend() {
-    let mut environment = Environment::default();
-    {
-        environment.set("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
-    }
-
-    let cfg = config_from_environment(&environment);
-
-    {
-        environment.remove("SCCACHE_AZURE_BLOB_CONTAINER");
-    }
-
-    // A container with no auth source disables Azure (backwards compatible)
-    // rather than failing the whole config load.
-    let env_cfg = cfg.unwrap();
-    assert!(env_cfg.cache.azure.is_none());
-}
-
-#[test]
-#[cfg(feature = "azure")]
-fn test_azure_toml_endpoint_field() {
-    let toml = r#"
-[cache.azure]
-container = "c"
-key_prefix = "p"
-endpoint = "https://acct.blob.core.usgovcloudapi.net"
-"#;
-    let file_config: FileConfig = toml::from_str(toml).expect("Is valid toml.");
-    assert_eq!(
-        file_config.cache.azure,
-        Some(AzureCacheConfig {
-            connection_string: None,
-            container: "c".to_owned(),
-            key_prefix: "p".to_owned(),
-            storage_account: None,
-            endpoint: Some("https://acct.blob.core.usgovcloudapi.net".to_owned()),
-            rw_mode: CacheModeConfig::ReadWrite,
-        })
-    );
-}
-
-#[test]
-#[cfg(feature = "azure")]
-fn test_azure_toml_connection_string_field() {
-    let toml = r#"
-[cache.azure]
-container = "c"
-key_prefix = "p"
-connection_string = "conn"
-"#;
-    let file_config: FileConfig = toml::from_str(toml).expect("Is valid toml.");
-    assert_eq!(
-        file_config
-            .cache
-            .azure
-            .and_then(|a| a.connection_string)
-            .as_deref(),
-        Some("conn")
-    );
-}
-
-#[test]
-#[cfg(feature = "azure")]
-fn test_azure_toml_container_only_deserializes_with_no_auth() {
-    // A container-only block is valid TOML and leaves every auth source None
-    // (the file surface, unlike the env parser, does not warn-and-disable — the
-    // missing-auth error is raised later at operator build, see
-    // AzureBlobCache::build's test_build_requires_an_auth_source).
-    let toml = r#"
-[cache.azure]
-container = "c"
-key_prefix = "p"
-"#;
-    let file_config: FileConfig = toml::from_str(toml).expect("Is valid toml.");
-    assert_eq!(
-        file_config.cache.azure,
-        Some(AzureCacheConfig {
-            connection_string: None,
-            container: "c".to_owned(),
-            key_prefix: "p".to_owned(),
-            storage_account: None,
-            endpoint: None,
-            rw_mode: CacheModeConfig::ReadWrite,
-        })
-    );
-}
-
-#[test]
-#[cfg(feature = "gcs")]
-fn test_gcs_service_account() {
-    let mut environment = Environment::default();
-    {
-        environment.set("SCCACHE_GCS_BUCKET", "my-bucket");
-        environment.set("SCCACHE_GCS_SERVICE_ACCOUNT", "my@example.com");
-        environment.set("SCCACHE_GCS_RW_MODE", "READ_WRITE");
-    }
-
-    let cfg = config_from_environment(&environment);
-
-    {
-        environment.remove("SCCACHE_GCS_BUCKET");
-        environment.remove("SCCACHE_GCS_SERVICE_ACCOUNT");
-        environment.remove("SCCACHE_GCS_RW_MODE");
-    }
-
-    let env_cfg = cfg.unwrap();
-    match env_cfg.cache.gcs {
-        Some(GCSCacheConfig {
-            ref bucket,
-            service_account,
-            rw_mode,
-            ..
-        }) => {
-            assert_eq!(bucket, "my-bucket");
-            assert_eq!(service_account, Some("my@example.com".to_string()));
-            assert_eq!(rw_mode, CacheModeConfig::ReadWrite);
-        }
-        None => unreachable!(),
-    }
-}
-
-#[test]
 fn rejects_retired_client_archive_configuration() {
     for field in [
         "cache_dir = \"/tmp/archive\"",
@@ -3602,6 +1641,28 @@ fn rejects_retired_client_archive_configuration() {
 }
 
 #[test]
+fn rejects_retired_cache_configuration() {
+    for name in [
+        "disk",
+        "s3",
+        "redis",
+        "gcs",
+        "azure",
+        "gha",
+        "memcached",
+        "webdav",
+        "oss",
+        "cos",
+        "multilevel",
+    ] {
+        assert!(toml::from_str::<FileConfig>(&format!("[cache.{name}]")).is_err());
+    }
+    let mut environment = Environment::default();
+    environment.set("SCCACHE_BUCKET", "retired");
+    assert!(config_from_environment(&environment).is_err());
+}
+
+#[test]
 fn full_toml_parse() {
     const CONFIG_STR: &str = r#"
 server_startup_timeout_ms = 10000
@@ -3615,168 +1676,12 @@ type = "token"
 token = "secrettoken"
 
 
-[cache.azure]
-container = "azurecontainer"
-key_prefix = "azureprefix"
-storage_account = "azureaccount"
-
-[cache.disk]
-dir = "/tmp/.cache/sccache"
-size = 7516192768 # 7 GiBytes
-
-[cache.gcs]
-rw_mode = "READ_ONLY"
-# rw_mode = "READ_WRITE"
-cred_path = "/psst/secret/cred"
-bucket = "bucket"
-key_prefix = "prefix"
-service_account = "example_service_account"
-
-[cache.gha]
-enabled = true
-version = "sccache"
-
-[cache.memcached]
-# Deprecated alias for `endpoint`
-# url = "127.0.0.1:11211"
-endpoint = "tcp://127.0.0.1:11211"
-# Username and password for authentication
-username = "user"
-password = "passwd"
-expiration = 90000
-key_prefix = "/custom/prefix/if/need"
-
-[cache.redis]
-url = "redis://user:passwd@1.2.3.4:6379/?db=1"
-endpoint = "redis://127.0.0.1:6379"
-cluster_endpoints = "tcp://10.0.0.1:6379,redis://10.0.0.2:6379"
-username = "another_user"
-password = "new_passwd"
-db = 12
-expiration = 86400
-key_prefix = "/my/redis/cache"
-
-[cache.s3]
-bucket = "name"
-region = "us-east-2"
-endpoint = "s3-us-east-1.amazonaws.com"
-use_ssl = true
-key_prefix = "s3prefix"
-no_credentials = true
-server_side_encryption = false
-rw_mode = "READ_WRITE"
-
-[cache.webdav]
-endpoint = "http://127.0.0.1:8080"
-key_prefix = "webdavprefix"
-username = "webdavusername"
-password = "webdavpassword"
-token = "webdavtoken"
-disable_create_dir = true
-
-[cache.oss]
-bucket = "name"
-endpoint = "oss-us-east-1.aliyuncs.com"
-key_prefix = "ossprefix"
-no_credentials = true
-rw_mode = "READ_ONLY"
-
-[cache.cos]
-bucket = "name"
-endpoint = "cos.na-siliconvalley.myqcloud.com"
-key_prefix = "cosprefix"
 "#;
 
     let file_config: FileConfig = toml::from_str(CONFIG_STR).expect("Is valid toml.");
     assert_eq!(
         file_config,
         FileConfig {
-            cache: CacheConfigs {
-                azure: Some(AzureCacheConfig {
-                    connection_string: None,
-                    container: "azurecontainer".to_owned(),
-                    key_prefix: "azureprefix".to_owned(),
-                    storage_account: Some("azureaccount".to_owned()),
-                    endpoint: None,
-                    rw_mode: CacheModeConfig::ReadWrite,
-                }),
-                disk: Some(DiskCacheConfig {
-                    dir: PathBuf::from("/tmp/.cache/sccache"),
-                    size: 7 * 1024 * 1024 * 1024,
-                    preprocessor_cache_mode: PreprocessorCacheModeConfig::activated(),
-                    rw_mode: CacheModeConfig::ReadWrite,
-                }),
-                gcs: Some(GCSCacheConfig {
-                    bucket: "bucket".to_owned(),
-                    cred_path: Some("/psst/secret/cred".to_string()),
-                    service_account: Some("example_service_account".to_string()),
-                    rw_mode: CacheModeConfig::ReadOnly,
-                    key_prefix: "prefix".into(),
-                    credential_url: None,
-                }),
-                gha: Some(GHACacheConfig {
-                    enabled: true,
-                    version: "sccache".to_string(),
-
-                    rw_mode: CacheModeConfig::ReadWrite,
-                }),
-                redis: Some(RedisCacheConfig {
-                    url: Some("redis://user:passwd@1.2.3.4:6379/?db=1".to_owned()),
-                    endpoint: Some("redis://127.0.0.1:6379".to_owned()),
-                    cluster_endpoints: Some("tcp://10.0.0.1:6379,redis://10.0.0.2:6379".to_owned()),
-                    username: Some("another_user".to_owned()),
-                    password: Some("new_passwd".to_owned()),
-                    db: 12,
-                    ttl: 24 * 3600,
-                    key_prefix: "/my/redis/cache".into(),
-                    rw_mode: CacheModeConfig::ReadWrite,
-                }),
-                memcached: Some(MemcachedCacheConfig {
-                    url: "tcp://127.0.0.1:11211".to_owned(),
-                    username: Some("user".to_owned()),
-                    password: Some("passwd".to_owned()),
-                    expiration: 25 * 3600,
-                    key_prefix: "/custom/prefix/if/need".into(),
-                    rw_mode: CacheModeConfig::ReadWrite,
-                }),
-                s3: Some(S3CacheConfig {
-                    bucket: "name".to_owned(),
-                    region: Some("us-east-2".to_owned()),
-                    endpoint: Some("s3-us-east-1.amazonaws.com".to_owned()),
-                    use_ssl: Some(true),
-                    key_prefix: "s3prefix".into(),
-                    no_credentials: true,
-                    server_side_encryption: Some(false),
-                    server_side_encryption_aws_kms: None,
-                    server_side_encryption_kms_key_id: None,
-                    enable_virtual_host_style: None,
-                    rw_mode: CacheModeConfig::ReadWrite,
-                    capacity: None,
-                }),
-                webdav: Some(WebdavCacheConfig {
-                    endpoint: "http://127.0.0.1:8080".to_string(),
-                    key_prefix: "webdavprefix".into(),
-                    username: Some("webdavusername".to_string()),
-                    password: Some("webdavpassword".to_string()),
-                    token: Some("webdavtoken".to_string()),
-                    rw_mode: CacheModeConfig::ReadWrite,
-                    disable_create_dir: true,
-                }),
-                oss: Some(OSSCacheConfig {
-                    bucket: "name".to_owned(),
-                    endpoint: Some("oss-us-east-1.aliyuncs.com".to_owned()),
-                    key_prefix: "ossprefix".into(),
-                    no_credentials: true,
-                    rw_mode: CacheModeConfig::ReadOnly,
-                }),
-                cos: Some(COSCacheConfig {
-                    bucket: "name".to_owned(),
-                    endpoint: Some("cos.na-siliconvalley.myqcloud.com".to_owned()),
-                    key_prefix: "cosprefix".into(),
-                    rw_mode: CacheModeConfig::ReadWrite,
-                }),
-                multilevel: None,
-            },
             dist: DistConfig {
                 cluster: None,
                 auth: DistAuth::Token {
@@ -3865,36 +1770,6 @@ gc_batch = 1024
     let missing: server::Config =
         toml::from_str(CONFIG.split("[native_worker]").next().unwrap()).unwrap();
     assert!(missing.validate_native_store(false).is_err());
-}
-
-#[test]
-fn human_units_parse() {
-    const CONFIG_STR: &str = r#"
-[cache.disk]
-size = "7g"
-"#;
-
-    let file_config: FileConfig = toml::from_str(CONFIG_STR).expect("Is valid toml.");
-    assert_eq!(
-        file_config,
-        FileConfig {
-            cache: CacheConfigs {
-                disk: Some(DiskCacheConfig {
-                    size: 7 * 1024 * 1024 * 1024,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            dist: DistConfig::default(),
-            server_startup_timeout_ms: None,
-            basedirs: vec![],
-            client_side_mode: false,
-            shared_daemon: None,
-            compiler_aliases: Default::default(),
-            compile_limits: Default::default(),
-            traces: None,
-        }
-    );
 }
 
 #[test]
@@ -4097,116 +1972,6 @@ fn test_integration_env_variable_to_strip() {
     let input2 = b"# 1 \"/tmp/build/obj/file.o\"";
     let output2 = strip_basedirs(input2, &config.basedirs);
     assert_eq!(&*output2, b"# 1 \"obj/file.o\"");
-}
-
-#[test]
-fn test_cache_levels_parsing() {
-    // Test parsing cache levels from config
-    let config_str = r#"
-[cache.disk]
-dir = "/tmp/disk"
-size = 1024
-
-[cache.s3]
-bucket = "my-bucket"
-region = "us-west-2"
-no_credentials = false
-
-[cache.redis]
-endpoint = "redis://localhost"
-
-[cache.multilevel]
-chain = ["disk", "redis", "s3"]
-"#;
-
-    let file_config: FileConfig = toml::from_str(config_str).expect("Is valid toml");
-    assert!(file_config.cache.multilevel.is_some());
-    let ml_config = file_config.cache.multilevel.unwrap();
-    assert_eq!(ml_config.chain.len(), 3);
-    assert_eq!(ml_config.chain[0], "disk");
-    assert_eq!(ml_config.chain[1], "redis");
-    assert_eq!(ml_config.chain[2], "s3");
-}
-
-#[test]
-fn test_cache_levels_backward_compatibility() {
-    // Test that configs without levels still work (single cache selection)
-    let config_str = r#"
-[cache.s3]
-bucket = "my-bucket"
-region = "us-west-2"
-no_credentials = false
-"#;
-
-    let file_config: FileConfig = toml::from_str(config_str).expect("Is valid toml");
-    assert!(file_config.cache.multilevel.is_none());
-    assert!(file_config.cache.s3.is_some());
-}
-
-#[test]
-fn test_get_cache_levels_single_cache() {
-    let configs = CacheConfigs {
-        s3: Some(S3CacheConfig {
-            bucket: "test".to_string(),
-            region: None,
-            key_prefix: String::new(),
-            no_credentials: false,
-            endpoint: None,
-            use_ssl: None,
-            server_side_encryption: None,
-            server_side_encryption_aws_kms: None,
-            server_side_encryption_kms_key_id: None,
-            enable_virtual_host_style: None,
-            rw_mode: CacheModeConfig::ReadWrite,
-            capacity: None,
-        }),
-        ..Default::default()
-    };
-
-    let levels = configs.get_cache_levels().expect("Should get single cache");
-    assert_eq!(levels.len(), 1);
-}
-
-#[test]
-fn test_get_cache_levels_invalid_level() {
-    let configs = CacheConfigs {
-        multilevel: Some(MultiLevelConfig {
-            chain: vec!["unknown_cache".to_string()],
-            write_error_policy: WriteErrorPolicy::default(),
-            slow_write_concurrency: default_multilevel_slow_write_concurrency(),
-        }),
-        ..Default::default()
-    };
-
-    let result = configs.get_cache_levels();
-    assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("Unknown cache level")
-    );
-}
-
-#[test]
-fn test_get_cache_levels_missing_config() {
-    let configs = CacheConfigs {
-        multilevel: Some(MultiLevelConfig {
-            chain: vec!["s3".to_string()],
-            write_error_policy: WriteErrorPolicy::default(),
-            slow_write_concurrency: default_multilevel_slow_write_concurrency(),
-        }),
-        ..Default::default()
-    };
-
-    let result = configs.get_cache_levels();
-    assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("S3 cache not configured")
-    );
 }
 
 #[test]

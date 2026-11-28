@@ -15,22 +15,17 @@
 use crate::cache::FileObjectSource;
 #[cfg(feature = "dist-client")]
 use crate::compiler::DistPackagers;
-use crate::compiler::preprocessor_cache::{
-    PreprocessorCacheKey, preprocessor_cache_entry_hash_key,
-};
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, CompileCommandImpl,
     CompileTransport, Compiler, CompilerArguments, CompilerDiscovery, CompilerHasher, CompilerKind,
     GenerateHashKeyContext, HashResult, Language, SingleCompileCommand,
 };
-use crate::config::PreprocessorCacheModeConfig;
 use crate::dist;
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{
-    Digest, MetadataCtimeExt, TimeMacroFinder, Timestamp, decode_path, encode_path, hash_all,
-    run_input_output, strip_basedirs, strip_basedirs_from_arg,
+    Digest, decode_path, hash_all, run_input_output, strip_basedirs, strip_basedirs_from_arg,
 };
 use async_trait::async_trait;
 use fs_err as fs;
@@ -38,8 +33,6 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io;
-use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::LazyLock;
@@ -49,7 +42,6 @@ use anyhow::ensure;
 
 use super::CacheControl;
 use super::canonical_native::NativeCargoPaths;
-use super::preprocessor_cache::PreprocessorCacheEntry;
 
 /// A generic implementation of the `Compiler` trait for C/C++ compilers.
 #[derive(Clone)]
@@ -128,8 +120,6 @@ pub struct ParsedArguments {
     pub color_mode: ColorMode,
     /// arguments are incompatible with `rewrite_includes_only`
     pub suppress_rewrite_includes_only: bool,
-    /// Arguments are incompatible with preprocessor cache mode
-    pub too_hard_for_preprocessor_cache_mode: Option<OsString>,
 }
 
 #[cfg(test)]
@@ -161,7 +151,6 @@ impl ParsedArguments {
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
         }
     }
 }
@@ -405,7 +394,6 @@ impl ParsedArguments {
 /// A generic implementation of the `Compilation` trait for C/C++ compilers.
 struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
-    is_locally_preprocessed: bool,
     allow_dist: bool,
     native_resolution: Option<NativeCodegenResolution>,
     #[cfg(feature = "dist-client")]
@@ -449,7 +437,6 @@ pub struct CPreprocessContext<'a, T> {
     pub env_vars: &'a [(OsString, OsString)],
     pub may_dist: bool,
     pub rewrite_includes_only: bool,
-    pub preprocessor_cache_mode: bool,
 }
 
 pub struct CCompileContext<'a> {
@@ -692,7 +679,6 @@ where
             cache_control,
             ..
         } = context;
-        let start_of_compilation = std::time::SystemTime::now();
         let mut parsed_args = self.parsed_args.clone();
         if native_identity {
             parsed_args.suppress_rewrite_includes_only = true;
@@ -738,135 +724,13 @@ where
         } else {
             None
         };
-        // Create an argument vector containing both preprocessor and arch args, to
-        // use in creating a hash key
-        let mut preprocessor_and_arch_args = parsed_args.preprocessor_args.clone();
-        preprocessor_and_arch_args.extend(parsed_args.arch_args.clone());
-        // common_args is used in preprocessing too
-        preprocessor_and_arch_args.extend(parsed_args.common_args.clone());
-
         let absolute_input_path: Cow<'_, _> = if parsed_args.input.is_absolute() {
             Cow::Borrowed(&parsed_args.input)
         } else {
             Cow::Owned(cwd.join(&parsed_args.input))
         };
 
-        // Try to look for a cached preprocessing step for this compilation
-        // request.
-        let preprocessor_cache_mode_config = storage.preprocessor_cache_mode_config();
-        let too_hard_for_preprocessor_cache_mode =
-            parsed_args.too_hard_for_preprocessor_cache_mode.is_some();
-        if let Some(arg) = &parsed_args.too_hard_for_preprocessor_cache_mode {
-            debug!(
-                "generate_hash_key: Cannot use preprocessor cache because of {}",
-                crate::util::debug_display(arg)
-            );
-        }
-
-        let needs_preprocessing = parsed_args.language.needs_c_preprocessing();
-
-        let use_preprocessor_cache_mode = if needs_preprocessing {
-            let can_use_preprocessor_cache_mode = preprocessor_cache_mode_config
-                .use_preprocessor_cache_mode
-                && !too_hard_for_preprocessor_cache_mode
-                && canonical_native.is_none()
-                && !native_identity;
-
-            let mut use_preprocessor_cache_mode = can_use_preprocessor_cache_mode;
-
-            // Allow overrides from the env
-            for (key, val) in &env_vars {
-                if key == "SCCACHE_DIRECT" {
-                    if let Some(val) = val.to_str() {
-                        use_preprocessor_cache_mode = match val.to_lowercase().as_str() {
-                            "false" | "off" | "0" => false,
-                            _ => can_use_preprocessor_cache_mode,
-                        };
-                    }
-                    break;
-                }
-            }
-
-            if can_use_preprocessor_cache_mode && !use_preprocessor_cache_mode {
-                debug!(
-                    "generate_hash_key: Disabling preprocessor cache because SCCACHE_DIRECT=false"
-                );
-            }
-
-            use_preprocessor_cache_mode
-        } else {
-            debug!(
-                "generate_hash_key: Disabling preprocessor cache because {} language doesn't need C preprocessing",
-                parsed_args.language.as_str()
-            );
-            false
-        };
-
-        let mut preprocessor_key = if use_preprocessor_cache_mode {
-            preprocessor_cache_entry_hash_key(PreprocessorCacheKey {
-                compiler_digest: &self.executable_digest,
-                language: parsed_args.language,
-                arguments: &preprocessor_and_arch_args,
-                extra_hashes: &extra_hashes,
-                assembler_digest: assembler_digest.as_deref(),
-                env_vars: &env_vars,
-                input_file: &absolute_input_path,
-                plusplus: self.compiler.plusplus(),
-                config: preprocessor_cache_mode_config,
-                basedirs: storage.basedirs(),
-            })?
-        } else {
-            None
-        };
-
-        let (preprocessor_output, include_files) = if needs_preprocessing {
-            if let Some(preprocessor_key) = &preprocessor_key
-                && cache_control == CacheControl::Default
-                && let Some(mut seekable) = storage
-                    .get_preprocessor_cache_entry(preprocessor_key)
-                    .await
-                    .unwrap_or_else(|error| {
-                        debug!("Preprocessor cache lookup failed for {preprocessor_key}: {error}");
-                        None
-                    })
-                && let Some(preprocessor_cache_entry) =
-                    read_preprocessor_cache_entry(&mut seekable, preprocessor_key)
-            {
-                if let Some(key) =
-                    preprocessor_cache_entry.lookup_result_digest(preprocessor_cache_mode_config)
-                {
-                    debug!("Preprocessor cache hit: {preprocessor_key}");
-                    // A compiler binary may be a symlink to another and
-                    // so has the same digest, but that means
-                    // the toolchain will not contain the correct path
-                    // to invoke the compiler! Add the compiler
-                    // executable path to try and prevent this
-                    let weak_toolchain_key = format!(
-                        "{}-{}",
-                        self.executable.to_string_lossy(),
-                        self.executable_digest
-                    );
-                    return Ok(HashResult {
-                        key,
-                        compilation: Box::new(CCompilation {
-                            parsed_args: parsed_args.clone(),
-                            is_locally_preprocessed: false,
-                            allow_dist: true,
-                            native_resolution: native_resolution.clone(),
-                            #[cfg(feature = "dist-client")]
-                            preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON.to_vec(),
-                            executable: self.executable.clone(),
-                            compiler: self.compiler.to_owned(),
-                            cwd: cwd.clone(),
-                            env_vars: env_vars.clone(),
-                        }),
-                        weak_toolchain_key,
-                        cache_control,
-                    });
-                }
-                debug!("Preprocessor cache miss: {preprocessor_key}");
-            }
-
+        let preprocessor_output = if parsed_args.language.needs_c_preprocessing() {
             let result = self
                 .compiler
                 .preprocess(CPreprocessContext {
@@ -877,7 +741,6 @@ where
                     env_vars: &env_vars,
                     may_dist: may_dist || canonical_native.is_some(),
                     rewrite_includes_only,
-                    preprocessor_cache_mode: use_preprocessor_cache_mode,
                 })
                 .await;
             let out_pretty = parsed_args.output_pretty().into_owned();
@@ -889,7 +752,7 @@ where
             let outputs = parsed_args.outputs.clone();
             let args_cwd = cwd.clone();
 
-            let mut preprocessor_result = result.or_else(move |err| {
+            let preprocessor_result = result.or_else(move |err| {
                 // Errors remove all traces of potential output.
                 debug!("removing files {outputs:?}");
 
@@ -924,37 +787,16 @@ where
                 }
             })?;
 
-            // Remember include files needed in this preprocessing step
-            let mut include_files = HashMap::new();
-            if preprocessor_key.is_some() {
-                // TODO how to propagate stats and which stats?
-                if !process_preprocessed_file(
-                    &absolute_input_path,
-                    &cwd,
-                    &mut preprocessor_result.stdout,
-                    &mut include_files,
-                    preprocessor_cache_mode_config,
-                    start_of_compilation,
-                    &StandardFsAbstraction,
-                )? {
-                    debug!("Disabling preprocessor cache mode");
-                    preprocessor_key = None;
-                }
-            }
-
             trace!(
                 "[{}]: Preprocessor output is {} bytes",
                 parsed_args.output_pretty(),
                 preprocessor_result.stdout.len()
             );
 
-            (preprocessor_result.stdout, include_files)
+            preprocessor_result.stdout
         } else {
             // No preprocessing is supported - input is already preprocessed
-            (
-                std::fs::read(absolute_input_path.as_path())?,
-                HashMap::new(),
-            )
+            std::fs::read(absolute_input_path.as_path())?
         };
 
         let mut allow_dist = true;
@@ -1004,9 +846,6 @@ where
                 cache_control = CacheControl::ForceNoCache;
                 allow_dist = false;
             }
-            // Assembler-owned files are invisible to the C preprocessor. Never
-            // store a preprocessor-cache result that could bypass this scan.
-            preprocessor_key = None;
         }
 
         // Create an argument vector containing both common and arch args, to
@@ -1062,26 +901,6 @@ where
         .with_debug_compilation_dir(debug_compilation_dir.as_deref())
         .compute();
 
-        // Cache the preprocessing step
-        if let Some(preprocessor_key) = preprocessor_key
-            && !include_files.is_empty()
-        {
-            let mut preprocessor_cache_entry = PreprocessorCacheEntry::new();
-            let mut files: Vec<_> = include_files
-                .into_iter()
-                .map(|(path, digest)| (digest, path))
-                .collect();
-            files.sort_unstable_by(|a, b| a.1.cmp(&b.1));
-            preprocessor_cache_entry.add_result(start_of_compilation, &key, files);
-
-            if let Err(e) = storage
-                .put_preprocessor_cache_entry(&preprocessor_key, preprocessor_cache_entry)
-                .await
-            {
-                debug!("Failed to update preprocessor cache: {e}");
-            }
-        }
-
         // A compiler binary may be a symlink to another and so has the same digest, but that means
         // the toolchain will not contain the correct path to invoke the compiler! Add the compiler
         // executable path to try and prevent this
@@ -1094,7 +913,6 @@ where
             key,
             compilation: Box::new(CCompilation {
                 parsed_args,
-                is_locally_preprocessed: true,
                 allow_dist,
                 native_resolution,
                 #[cfg(feature = "dist-client")]
@@ -1609,532 +1427,8 @@ fn assembler_file_dependencies(
     AssemblerDependencyScan::Complete(dependencies)
 }
 
-const PRAGMA_GCC_PCH_PREPROCESS: &[u8] = b"pragma GCC pch_preprocess";
-const HASH_31_COMMAND_LINE_NEWLINE: &[u8] = b"# 31 \"<command-line>\"\n";
-const HASH_32_COMMAND_LINE_2_NEWLINE: &[u8] = b"# 32 \"<command-line>\" 2\n";
 const INCBIN_DIRECTIVE: &[u8] = b".incbin";
 const INCLUDE_DIRECTIVE: &[u8] = b".include";
-const COMPRESSED_CLANG_OFFLOAD_BUNDLE_MAGIC: &[u8] = b"CCOB";
-
-/// An entry that cannot be read, such as one truncated by a crash, is a miss
-/// rather than a failed compilation: the miss path overwrites it.
-fn read_preprocessor_cache_entry(
-    mut entry: impl io::Read,
-    key: &str,
-) -> Option<PreprocessorCacheEntry> {
-    let mut buf = vec![];
-    let result = entry
-        .read_to_end(&mut buf)
-        .map_err(Into::into)
-        .and_then(|_| PreprocessorCacheEntry::read(&buf));
-    match result {
-        Ok(entry) => Some(entry),
-        Err(e) => {
-            debug!("Ignoring unreadable preprocessor cache entry {key}: {e}");
-            None
-        }
-    }
-}
-
-/// Remember the include files in the preprocessor output if it can be cached.
-/// Returns `false` if preprocessor cache mode should be disabled.
-fn process_preprocessed_file(
-    input_file: &Path,
-    cwd: &Path,
-    bytes: &mut [u8],
-    included_files: &mut HashMap<PathBuf, String>,
-    config: PreprocessorCacheModeConfig,
-    time_of_compilation: std::time::SystemTime,
-    fs_impl: &impl PreprocessorFSAbstraction,
-) -> Result<bool> {
-    if bytes.starts_with(COMPRESSED_CLANG_OFFLOAD_BUNDLE_MAGIC) {
-        debug!("Found compressed Clang offload bundle in preprocessor output");
-        return Ok(false);
-    }
-
-    let mut start = 0;
-    let mut hash_start = 0;
-    let total_len = bytes.len();
-    let mut digest = Digest::new();
-    let mut normalized_include_paths: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
-    // There must be at least 7 characters (# 1 "x") left to potentially find an
-    // include file path.
-    while start < total_len.saturating_sub(7) {
-        let mut slice = &bytes[start..];
-        // Check if we look at a line containing the file name of an included file.
-        // At least the following formats exist (where N is a positive integer):
-        //
-        // GCC:
-        //
-        //   # N "file"
-        //   # N "file" N
-        //   #pragma GCC pch_preprocess "file"
-        //
-        // HP's compiler:
-        //
-        //   #line N "file"
-        //
-        // AIX's compiler:
-        //
-        //   #line N "file"
-        //   #line N
-        //
-        // Note that there may be other lines starting with '#' left after
-        // preprocessing as well, for instance "#    pragma".
-        if slice[0] == b'#'
-        // GCC:
-        && ((slice[1] == b' ' && slice[2] >= b'0' && slice[2] <= b'9')
-            // GCC precompiled header:
-            || slice[1..].starts_with(PRAGMA_GCC_PCH_PREPROCESS)
-            // HP/AIX:
-            || slice[1..].starts_with(b"line "))
-        && (start == 0 || bytes[start - 1] == b'\n')
-        {
-            match process_preprocessor_line(
-                PreprocessorLineContext {
-                    input_file,
-                    cwd,
-                    included_files,
-                    config,
-                    time_of_compilation,
-                    bytes,
-                    digest: &mut digest,
-                    normalized_include_paths: &mut normalized_include_paths,
-                    fs_impl,
-                },
-                start,
-                hash_start,
-            )? {
-                ControlFlow::Continue((s, h)) => {
-                    start = s;
-                    hash_start = h;
-                }
-                ControlFlow::Break((s, h, continue_preprocessor_cache_mode)) => {
-                    if !continue_preprocessor_cache_mode {
-                        return Ok(false);
-                    }
-                    start = s;
-                    hash_start = h;
-                }
-            }
-        } else if slice.starts_with(b"___________") && (start == 0 || bytes[start - 1] == b'\n') {
-            // Unfortunately the distcc-pump wrapper outputs standard output lines:
-            // __________Using distcc-pump from /usr/bin
-            // __________Using # distcc servers in pump mode
-            // __________Shutting down distcc-pump include server
-            digest.update(&bytes[hash_start..start]);
-            while start < total_len && slice[0] != b'\n' {
-                start += 1;
-                if start < total_len {
-                    slice = &bytes[start..];
-                }
-            }
-            slice = &bytes[start..];
-            if slice[0] == b'\n' {
-                start += 1;
-            }
-            hash_start = start;
-        } else {
-            start += 1;
-        }
-    }
-    digest.update(&bytes[hash_start..]);
-
-    Ok(true)
-}
-
-/// What to do after handling a preprocessor number line.
-/// The `Break` variant is `(start, hash_start, continue_preprocessor_cache_mode)`.
-/// The `Continue` variant is `(start, hash_start)`.
-type PreprocessedLineAction = ControlFlow<(usize, usize, bool), (usize, usize)>;
-
-struct PreprocessorLineContext<'a, F> {
-    input_file: &'a Path,
-    cwd: &'a Path,
-    included_files: &'a mut HashMap<PathBuf, String>,
-    config: PreprocessorCacheModeConfig,
-    time_of_compilation: std::time::SystemTime,
-    bytes: &'a mut [u8],
-    digest: &'a mut Digest,
-    normalized_include_paths: &'a mut HashMap<Vec<u8>, Option<Vec<u8>>>,
-    fs_impl: &'a F,
-}
-
-fn process_preprocessor_line<F>(
-    context: PreprocessorLineContext<'_, F>,
-    mut start: usize,
-    mut hash_start: usize,
-) -> Result<PreprocessedLineAction>
-where
-    F: PreprocessorFSAbstraction,
-{
-    let PreprocessorLineContext {
-        input_file,
-        cwd,
-        included_files,
-        config,
-        time_of_compilation,
-        bytes,
-        digest,
-        normalized_include_paths,
-        fs_impl,
-    } = context;
-    let total_len = bytes.len();
-    let mut slice = &bytes[start..];
-    // Workarounds for preprocessor linemarker bugs in GCC version 6.
-    if slice.get(2) == Some(&b'3') {
-        if slice.starts_with(HASH_31_COMMAND_LINE_NEWLINE) {
-            // Bogus extra line with #31, after the regular #1:
-            // Ignore the whole line, and continue parsing.
-            digest.update(&bytes[hash_start..start]);
-            while start < hash_start && slice[0] != b'\n' {
-                start += 1;
-            }
-            start += 1;
-            hash_start = start;
-            return Ok(ControlFlow::Break((start, hash_start, true)));
-        } else if slice.starts_with(HASH_32_COMMAND_LINE_2_NEWLINE) {
-            // Bogus wrong line with #32, instead of regular #1:
-            // Replace the line number with the usual one.
-            digest.update(&bytes[hash_start..start]);
-            start += 1;
-            bytes[start..=start + 2].copy_from_slice(b"# 1");
-            hash_start = start;
-            slice = &bytes[start..];
-        }
-    }
-    while start < total_len && slice[0] != b'"' && slice[0] != b'\n' {
-        start += 1;
-        if start < total_len {
-            slice = &bytes[start..];
-        }
-    }
-    slice = &bytes[start..];
-    if start < total_len && slice[0] == b'\n' {
-        // a newline before the quotation mark -> no match
-        return Ok(ControlFlow::Break((start, hash_start, true)));
-    }
-    start += 1;
-    if start >= total_len {
-        bail!("Failed to parse included file path");
-    }
-    // `start` points to the beginning of an include file path
-    digest.update(&bytes[hash_start..start]);
-    hash_start = start;
-    slice = &bytes[start..];
-    while start < total_len && slice[0] != b'"' {
-        start += 1;
-        if start < total_len {
-            slice = &bytes[start..];
-        }
-    }
-    if start == hash_start {
-        // Skip empty file name.
-        return Ok(ControlFlow::Break((start, hash_start, true)));
-    }
-    // Look for preprocessor flags, after the "filename".
-    let mut system = false;
-    let mut pointer = start + 1;
-    while pointer < total_len && bytes[pointer] != b'\n' {
-        if bytes[pointer] == b'3' {
-            // System header.
-            system = true;
-        }
-        pointer += 1;
-    }
-
-    // `hash_start` and `start` span the include file path.
-    let include_path = &bytes[hash_start..start];
-    // We need to normalize the path now since it's part of the
-    // hash and since we need to deduplicate the include files.
-    // We cache the results since they are often quite a bit repeated.
-    let include_path: &[u8] = if let Some(opt) = normalized_include_paths.get(include_path) {
-        opt.as_ref().map_or(include_path, |normalized| normalized)
-    } else {
-        let path_buf = decode_path(include_path)?;
-        let normalized = normalize_path(&path_buf);
-        if normalized == path_buf {
-            // `None` is a marker that the normalization is the same
-            normalized_include_paths.insert(include_path.to_owned(), None);
-            include_path
-        } else {
-            let mut encoded = Vec::with_capacity(include_path.len());
-            encode_path(&mut encoded, &normalized)?;
-            let normalized = normalized_include_paths
-                .entry(include_path.to_owned())
-                .or_insert_with(|| Some(encoded));
-            normalized.as_deref().unwrap_or(include_path)
-        }
-    };
-
-    if !remember_include_file(RememberIncludeContext {
-        path: include_path,
-        input_file,
-        cwd,
-        included_files,
-        digest,
-        system,
-        config,
-        time_of_compilation,
-        fs_impl,
-    })? {
-        return Ok(ControlFlow::Break((start, hash_start, false)));
-    }
-    // Everything of interest between hash_start and start has been hashed now.
-    hash_start = start;
-    Ok(ControlFlow::Continue((start, hash_start)))
-}
-
-/// Copied from cargo.
-///
-/// Normalize a path, removing things like `.` and `..`.
-///
-/// CAUTION: This does not resolve symlinks (unlike
-/// [`std::fs::canonicalize`]).
-pub fn normalize_path(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut components = path.components().peekable();
-    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().copied() {
-        components.next();
-        PathBuf::from(c.as_os_str())
-    } else {
-        PathBuf::new()
-    };
-
-    for component in components {
-        match component {
-            Component::Prefix(prefix) => ret.push(prefix.as_os_str()),
-            Component::RootDir => {
-                ret.push(component.as_os_str());
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                ret.pop();
-            }
-            Component::Normal(c) => {
-                ret.push(c);
-            }
-        }
-    }
-    ret
-}
-
-/// Limited abstraction of `std::fs::Metadata`, allowing us to create fake
-/// values during testing.
-#[derive(Debug, Eq, PartialEq, Clone)]
-struct PreprocessorFileMetadata {
-    is_dir: bool,
-    is_file: bool,
-    modified: Option<Timestamp>,
-    ctime_or_creation: Option<Timestamp>,
-}
-
-impl From<std::fs::Metadata> for PreprocessorFileMetadata {
-    fn from(meta: std::fs::Metadata) -> Self {
-        Self {
-            is_dir: meta.is_dir(),
-            is_file: meta.is_file(),
-            modified: meta.modified().ok().map(Into::into),
-            ctime_or_creation: meta.ctime_or_creation().ok(),
-        }
-    }
-}
-
-/// An abstraction to filesystem access for use during the preprocessor
-/// caching phase, to make testing easier.
-///
-/// This may help non-local preprocessor caching in the future, if it ends up
-/// being viable.
-trait PreprocessorFSAbstraction {
-    fn metadata(&self, path: impl AsRef<Path>) -> io::Result<PreprocessorFileMetadata> {
-        std::fs::metadata(path).map(Into::into)
-    }
-
-    fn open(&self, path: impl AsRef<Path>) -> io::Result<Box<dyn std::io::Read>> {
-        Ok(Box::new(std::fs::File::open(path)?))
-    }
-}
-
-/// Provides filesystem access with the expected standard library functions.
-struct StandardFsAbstraction;
-
-impl PreprocessorFSAbstraction for StandardFsAbstraction {}
-
-struct RememberIncludeContext<'a, F> {
-    path: &'a [u8],
-    input_file: &'a Path,
-    cwd: &'a Path,
-    included_files: &'a mut HashMap<PathBuf, String>,
-    digest: &'a mut Digest,
-    system: bool,
-    config: PreprocessorCacheModeConfig,
-    time_of_compilation: std::time::SystemTime,
-    fs_impl: &'a F,
-}
-
-// Returns false if the include file was "too new" (meaning modified during or
-// after the start of the compilation) and therefore should disable
-// the preprocessor cache mode, otherwise true.
-fn remember_include_file<F>(context: RememberIncludeContext<'_, F>) -> Result<bool>
-where
-    F: PreprocessorFSAbstraction,
-{
-    let RememberIncludeContext {
-        mut path,
-        input_file,
-        cwd,
-        included_files,
-        digest,
-        system,
-        config,
-        time_of_compilation,
-        fs_impl,
-    } = context;
-    // TODO if precompiled header.
-    if path.len() >= 2 && path[0] == b'<' && path[path.len() - 1] == b'>' {
-        // Typically <built-in> or <command-line>.
-        digest.update(path);
-        return Ok(true);
-    }
-
-    if system && config.skip_system_headers {
-        // Don't remember this system header, only hash its path.
-        digest.update(path);
-        return Ok(true);
-    }
-
-    let original_path = path;
-    // Canonicalize path for comparison; Clang uses ./header.h.
-    #[cfg(windows)]
-    {
-        if path.starts_with(br".\") || path.starts_with(b"./") {
-            path = &path[2..];
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        if path.starts_with(b"./") {
-            path = &path[2..];
-        }
-    }
-    let mut path = decode_path(path).context("failed to decode path")?;
-    if path.is_relative() {
-        path = cwd.join(path);
-    }
-    if path != cwd || config.hash_working_directory {
-        digest.update(original_path);
-    }
-
-    if included_files.contains_key(&path) {
-        // Already known include file
-        return Ok(true);
-    }
-
-    if path == input_file {
-        // Don't remember the input file.
-        return Ok(true);
-    }
-    let meta = match fs_impl.metadata(&path) {
-        Ok(meta) => meta,
-        Err(e) => {
-            debug!("Failed to stat include file {}: {e}", path.display());
-            return Ok(false);
-        }
-    };
-    if meta.is_dir {
-        // Ignore directory, typically $PWD.
-        return Ok(true);
-    }
-    if !meta.is_file {
-        // Device, pipe, socket or other strange creature.
-        debug!("Non-regular include file {}", path.display());
-        return Ok(false);
-    }
-
-    // TODO add an option to ignore some header files?
-    if include_is_too_new(&path, &meta, time_of_compilation) {
-        return Ok(false);
-    }
-
-    // Let's hash the include file content.
-    let file = match fs_impl.open(&path) {
-        Ok(file) => file,
-        Err(e) => {
-            debug!("Failed to open header file {}: {e}", path.display());
-            return Ok(false);
-        }
-    };
-
-    let (file_digest, finder) = if config.ignore_time_macros {
-        match Digest::reader_sync(file) {
-            Ok(file_digest) => (file_digest, TimeMacroFinder::new()),
-            Err(e) => {
-                debug!("Failed to read header file {}: {e}", path.display());
-                return Ok(false);
-            }
-        }
-    } else {
-        match Digest::reader_sync_time_macros(file) {
-            Ok((file_digest, finder)) => (file_digest, finder),
-            Err(e) => {
-                debug!("Failed to read header file {}: {e}", path.display());
-                return Ok(false);
-            }
-        }
-    };
-
-    if finder.found_time_macros() {
-        debug!("Time macro in header file {}", path.display());
-        return Ok(false);
-    }
-
-    included_files.insert(path, file_digest);
-
-    Ok(true)
-}
-
-/// Opt out of preprocessor cache mode because of a race condition.
-///
-/// The race condition consists of these events:
-///
-/// - the preprocessor is run
-/// - an include file is modified by someone
-/// - the new include file is hashed by sccache
-/// - the real compiler is run on the preprocessor's output, which contains
-///   data from the old header file
-/// - the wrong object file is stored in the cache.
-fn include_is_too_new(
-    path: &Path,
-    meta: &PreprocessorFileMetadata,
-    time_of_compilation: std::time::SystemTime,
-) -> bool {
-    // The comparison using >= is intentional, due to a possible race between
-    // starting compilation and writing the include file.
-    if let Some(mtime) = meta.modified
-        && mtime >= time_of_compilation.into()
-    {
-        debug!("Include file {} is too new", path.display());
-        return true;
-    }
-
-    // The same >= logic as above applies to the change time of the file.
-    if let Some(ctime) = meta.ctime_or_creation
-        && ctime >= time_of_compilation.into()
-    {
-        debug!("Include file {} is too new", path.display());
-        return true;
-    }
-
-    false
-}
-
-// Used as "preprocessed code" when no preprocessing was done so that compilation fails. That should never
-// happen though because, where necessary, the situation is detected and preprocessing is *then* done to
-// salvage the situation. Previously, an empty u8 vector was used, which is unfortunately a valid C and C++
-// compilation unit and caused errors that only surfaced when linking: the symbols expected from the
-// compilation unit were of course not produced.
-#[cfg(feature = "dist-client")]
-const PREPROCESSING_SKIPPED_COMPILE_POISON: &[u8] = b"([{SCCACHE -*-* INVALID_C_CPP_CODE([{\"";
 
 impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I> {
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
@@ -2224,10 +1518,6 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
             env_vars,
         });
         Ok((inputs_packager, toolchain_packager))
-    }
-
-    fn is_locally_preprocessed(&self) -> bool {
-        self.is_locally_preprocessed
     }
 
     fn outputs<'a>(&'a self) -> Box<dyn Iterator<Item = FileObjectSource> + 'a> {
@@ -2818,8 +2108,6 @@ impl<'a> HashKeyParams<'a> {
 
 #[cfg(test)]
 mod test {
-    use std::{collections::VecDeque, sync::Mutex};
-
     use super::*;
     use crate::mock_command::*;
     use crate::test::utils::*;
@@ -2848,7 +2136,7 @@ mod test {
         let creator = <ProcessCommandCreator as CommandCreatorSync>::new(
             &crate::jobserver::Client::new_num(2),
         );
-        let storage = Arc::new(MockStorage::new(None, true));
+        let storage = Arc::new(MockStorage::new());
         let work = tempfile::tempdir()?;
 
         for (name, source) in [
@@ -2918,7 +2206,6 @@ mod test {
                         },
                     ),
                 )?;
-                assert!(hash.compilation.is_locally_preprocessed());
                 let deps = std::fs::read_to_string(&depfile)?;
                 assert!(deps.contains(input.to_str().context("UTF-8 input")?));
                 assert!(!deps.contains("/__sccache/"));
@@ -2969,7 +2256,6 @@ mod test {
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
         }
     }
 
@@ -4005,445 +3291,5 @@ mod test {
         t("Hpp");
         t("Mm");
         t("Cu");
-    }
-
-    #[test]
-    fn test_process_preprocessed_file() {
-        env_logger::builder()
-            .is_test(true)
-            .filter_level(log::LevelFilter::Debug)
-            .try_init()
-            .ok();
-        let input_file = Path::new("tests/test.c");
-        let path = Path::new(file!())
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        // This should be portable since the only headers present in this
-        // output are system headers, which aren't interacted with
-        // on the filesystem if configured.
-        let path = path.join("tests/test.c.gcc-13.2.0-preproc");
-        let mut bytes = std::fs::read(path).unwrap();
-        let original_bytes = bytes.clone();
-        let mut include_files = HashMap::new();
-
-        let config = PreprocessorCacheModeConfig {
-            use_preprocessor_cache_mode: true,
-            skip_system_headers: true,
-            ..Default::default()
-        };
-        let success = process_preprocessed_file(
-            input_file,
-            Path::new(""),
-            &mut bytes,
-            &mut include_files,
-            config,
-            std::time::SystemTime::now(),
-            &StandardFsAbstraction,
-        )
-        .unwrap();
-        assert_eq!(&bytes, &original_bytes);
-        assert!(success);
-        assert_eq!(include_files.len(), 0);
-    }
-
-    #[test]
-    fn test_process_preprocessed_file_disables_cache_for_compressed_offload_bundle() {
-        let input_file = Path::new("tests/test.hip");
-        let mut bytes = b"CCOB\0\0\0\0\n# 1karg compressed payload".to_vec();
-        let original_bytes = bytes.clone();
-        let mut include_files = HashMap::new();
-
-        let config = PreprocessorCacheModeConfig {
-            use_preprocessor_cache_mode: true,
-            ..Default::default()
-        };
-        let success = process_preprocessed_file(
-            input_file,
-            Path::new(""),
-            &mut bytes,
-            &mut include_files,
-            config,
-            std::time::SystemTime::now(),
-            &PanicFs,
-        )
-        .unwrap();
-
-        assert_eq!(bytes, original_bytes);
-        assert!(!success);
-        assert!(include_files.is_empty());
-    }
-
-    #[test]
-    fn test_process_preprocessed_file_line_directive() {
-        let header = PathBuf::from("tests/test.h");
-        let fs_impl = TestFs {
-            metadata_results: Mutex::new(
-                [(
-                    header.clone(),
-                    PreprocessorFileMetadata {
-                        is_dir: false,
-                        is_file: true,
-                        modified: Some(Timestamp::new(12_341_234, 0)),
-                        ctime_or_creation: None,
-                    },
-                )]
-                .into_iter()
-                .collect(),
-            ),
-            open_results: Mutex::new(
-                [(
-                    header.clone(),
-                    Box::new(&b"contents"[..]) as Box<dyn std::io::Read>,
-                )]
-                .into_iter()
-                .collect(),
-            ),
-        };
-        let mut bytes = br#"#line 1 "tests/test.h"
-int value;
-"#
-        .to_vec();
-        let mut include_files = HashMap::new();
-
-        let success = process_preprocessed_file(
-            Path::new("tests/test.c"),
-            Path::new(""),
-            &mut bytes,
-            &mut include_files,
-            PreprocessorCacheModeConfig::activated(),
-            std::time::SystemTime::now(),
-            &fs_impl,
-        )
-        .unwrap();
-
-        assert!(success);
-        assert_eq!(
-            include_files.get(&header).map(String::as_str),
-            Some("a93900c371d997927c5bc568ea538bed59ae5c960021dcfe7b0b369da5267528")
-        );
-    }
-
-    /// A filesystem interface that only panics to test that we don't access it.
-    struct PanicFs;
-
-    impl PreprocessorFSAbstraction for PanicFs {
-        fn metadata(&self, path: impl AsRef<Path>) -> io::Result<PreprocessorFileMetadata> {
-            panic!("called metadata at {}", path.as_ref().display());
-        }
-
-        fn open(&self, path: impl AsRef<Path>) -> io::Result<Box<dyn std::io::Read>> {
-            panic!("called open at {}", path.as_ref().display());
-        }
-    }
-
-    /// A filesystem interface that gives back expected values.
-    struct TestFs {
-        metadata_results: Mutex<VecDeque<(PathBuf, PreprocessorFileMetadata)>>,
-        open_results: Mutex<VecDeque<(PathBuf, Box<dyn std::io::Read>)>>,
-    }
-
-    impl PreprocessorFSAbstraction for TestFs {
-        fn metadata(&self, path: impl AsRef<Path>) -> io::Result<PreprocessorFileMetadata> {
-            let (expected_path, meta) = self
-                .metadata_results
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("not enough 'metadata' results");
-            assert_eq!(expected_path, path.as_ref(), "{}", path.as_ref().display());
-            Ok(meta)
-        }
-
-        fn open(&self, path: impl AsRef<Path>) -> io::Result<Box<dyn std::io::Read>> {
-            let (expected_path, impls_read) = self
-                .open_results
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("not enough 'open' results");
-            assert_eq!(expected_path, path.as_ref(), "{}", path.as_ref().display());
-            Ok(impls_read)
-        }
-    }
-
-    // Short-circuit the parameters we don't need to change during tests
-    fn do_single_preprocessor_line_call(
-        line: &[u8],
-        include_files: &mut HashMap<PathBuf, String>,
-        fs_impl: &impl PreprocessorFSAbstraction,
-        skip_system_headers: bool,
-    ) -> PreprocessedLineAction {
-        let input_file = Path::new("tests/test.c");
-
-        let config = PreprocessorCacheModeConfig {
-            use_preprocessor_cache_mode: true,
-            skip_system_headers,
-            ..Default::default()
-        };
-
-        let mut bytes = line.to_vec();
-        let mut digest = Digest::new();
-        let mut normalized_include_paths = HashMap::new();
-        process_preprocessor_line(
-            PreprocessorLineContext {
-                input_file,
-                cwd: Path::new(""),
-                included_files: include_files,
-                config,
-                time_of_compilation: std::time::SystemTime::now(),
-                bytes: &mut bytes,
-                digest: &mut digest,
-                normalized_include_paths: &mut normalized_include_paths,
-                fs_impl,
-            },
-            0,
-            0,
-        )
-        .unwrap()
-    }
-
-    /// Test cases where we don't access the filesystem
-    #[test]
-    fn test_process_preprocessor_line_simple() {
-        env_logger::builder()
-            .is_test(true)
-            .filter_level(log::LevelFilter::Debug)
-            .try_init()
-            .ok();
-
-        let mut include_files = HashMap::new();
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 0 "tests/test.c""#,
-                &mut include_files,
-                &PanicFs,
-                true,
-            ),
-            ControlFlow::Continue((20, 20)),
-        );
-        assert_eq!(include_files.len(), 0);
-
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 0 "<built-in>""#,
-                &mut include_files,
-                &PanicFs,
-                true,
-            ),
-            ControlFlow::Continue((18, 18)),
-        );
-        assert_eq!(include_files.len(), 0);
-
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 0 "<command-line>""#,
-                &mut include_files,
-                &PanicFs,
-                true,
-            ),
-            ControlFlow::Continue((22, 22)),
-        );
-        assert_eq!(include_files.len(), 0);
-
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 0 "<command-line>" 2"#,
-                &mut include_files,
-                &PanicFs,
-                true,
-            ),
-            ControlFlow::Continue((22, 22)),
-        );
-        assert_eq!(include_files.len(), 0);
-
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 1 "tests/test.c""#,
-                &mut include_files,
-                &PanicFs,
-                true,
-            ),
-            ControlFlow::Continue((20, 20)),
-        );
-        assert_eq!(include_files.len(), 0);
-
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 1 "/usr/include/stdc-predef.h" 1 3 4"#,
-                &mut include_files,
-                &PanicFs,
-                true,
-            ),
-            ControlFlow::Continue((34, 34)),
-        );
-        assert_eq!(include_files.len(), 0);
-    }
-
-    /// Test cases where we test our tests...
-    #[test]
-    fn test_test_helpers() {
-        env_logger::builder()
-            .is_test(true)
-            .filter_level(log::LevelFilter::Debug)
-            .try_init()
-            .ok();
-
-        // Test PanicFs
-        let res = std::panic::catch_unwind(|| {
-            let mut include_files = HashMap::new();
-            assert_eq!(
-                do_single_preprocessor_line_call(
-                    br#"// # 1 "/usr/include/stdc-predef.h" 1 3 4"#,
-                    &mut include_files,
-                    &PanicFs,
-                    false,
-                ),
-                ControlFlow::Continue((34, 34)),
-            );
-        });
-        assert_eq!(
-            res.unwrap_err().downcast_ref::<String>().unwrap(),
-            "called metadata at /usr/include/stdc-predef.h"
-        );
-
-        // Test TestFs's safeguard
-        let res = std::panic::catch_unwind(|| {
-            let mut include_files = HashMap::new();
-            let fs_impl = TestFs {
-                metadata_results: Mutex::new(VecDeque::new()),
-                open_results: Mutex::new(VecDeque::new()),
-            };
-            assert_eq!(
-                do_single_preprocessor_line_call(
-                    br#"// # 33 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 3 4"#,
-                    &mut include_files,
-                    &fs_impl,
-                    false,
-                ),
-                ControlFlow::Continue((34, 34)),
-            );
-        });
-        assert_eq!(
-            res.unwrap_err().downcast_ref::<String>().unwrap(),
-            "not enough 'metadata' results"
-        );
-    }
-
-    /// Test cases where we test filesystem access
-    #[test]
-    fn test_process_preprocessor_line_fs_access() {
-        env_logger::builder()
-            .is_test(true)
-            .filter_level(log::LevelFilter::Debug)
-            .try_init()
-            .ok();
-
-        // Test "too new" include file
-        let mut include_files = HashMap::new();
-        let fs_impl = TestFs {
-            metadata_results: Mutex::new(
-                [(
-                    PathBuf::from("/usr/include/x86_64-linux-gnu/bits/libc-header-start.h"),
-                    PreprocessorFileMetadata {
-                        is_dir: false,
-                        is_file: true,
-                        modified: Some(Timestamp::new(i64::MAX - 1, 0)),
-                        ctime_or_creation: None,
-                    },
-                )]
-                .into_iter()
-                .collect(),
-            ),
-            open_results: Mutex::new(VecDeque::new()),
-        };
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 33 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 3 4"#,
-                &mut include_files,
-                &fs_impl,
-                false,
-            ),
-            // preprocessor cache mode is disabled
-            ControlFlow::Break((63, 9, false)),
-        );
-
-        // Test invalid include file is actually a dir
-        let mut include_files = HashMap::new();
-        let fs_impl = TestFs {
-            metadata_results: Mutex::new(
-                [(
-                    PathBuf::from("/usr/include/x86_64-linux-gnu/bits/libc-header-start.h"),
-                    PreprocessorFileMetadata {
-                        is_dir: true,
-                        is_file: false,
-                        modified: Some(Timestamp::new(12_341_234, 0)),
-                        ctime_or_creation: None,
-                    },
-                )]
-                .into_iter()
-                .collect(),
-            ),
-            open_results: Mutex::new(VecDeque::new()),
-        };
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 33 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 3 4"#,
-                &mut include_files,
-                &fs_impl,
-                false,
-            ),
-            // preprocessor cache mode is *not* disabled,
-            ControlFlow::Continue((63, 63)),
-        );
-        assert_eq!(include_files.len(), 0);
-
-        // Test correct include file
-        let mut include_files = HashMap::new();
-        let fs_impl = TestFs {
-            metadata_results: Mutex::new(
-                [(
-                    PathBuf::from("/usr/include/x86_64-linux-gnu/bits/libc-header-start.h"),
-                    PreprocessorFileMetadata {
-                        is_dir: false,
-                        is_file: true,
-                        modified: Some(Timestamp::new(12_341_234, 0)),
-                        ctime_or_creation: None,
-                    },
-                )]
-                .into_iter()
-                .collect(),
-            ),
-            open_results: Mutex::new(
-                [(
-                    PathBuf::from("/usr/include/x86_64-linux-gnu/bits/libc-header-start.h"),
-                    Box::new(&b"contents"[..]) as Box<dyn std::io::Read>,
-                )]
-                .into_iter()
-                .collect(),
-            ),
-        };
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 33 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 3 4"#,
-                &mut include_files,
-                &fs_impl,
-                false,
-            ),
-            ControlFlow::Continue((63, 63)),
-        );
-        assert_eq!(include_files.len(), 1);
-        assert_eq!(
-            include_files
-                .get(Path::new(
-                    "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h",
-                ))
-                .unwrap(),
-            // hash of `b"contents"`
-            "a93900c371d997927c5bc568ea538bed59ae5c960021dcfe7b0b369da5267528",
-        );
     }
 }

@@ -35,7 +35,6 @@ mod native;
 pub use native::{NativeCompilerClient, ResultIdentityPolicy};
 mod nvcc;
 mod nvhpc;
-mod preprocessor_cache;
 mod ptxas;
 mod response_files;
 mod rust;
@@ -49,7 +48,6 @@ mod counted_array;
 
 pub use crate::compiler::c::CCompilerKind;
 pub use crate::compiler::core::*;
-pub use crate::compiler::preprocessor_cache::PreprocessorCacheEntry;
 
 /// Only compiler information queries and explicit preprocessing may run in
 /// the caller namespace. Unsupported compilation/link commands are not queries.

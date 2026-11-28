@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cache::{IpcStorage, storage_from_config};
+use crate::cache::IpcStorage;
 use crate::client::{ServerConnection, connect_to_server, connect_with_retry};
 use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::ColorMode;
-use crate::config::{Config, default_disk_cache_dir};
+use crate::config::Config;
 use crate::jobserver::Client;
-use crate::lru_disk_cache::CACHEDIR_TAG_FILE_NAME;
 use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
 use crate::protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
 use crate::server::{self, DistInfo, ServerInfo, ServerStartup, ServerStats};
@@ -43,7 +42,6 @@ use std::time::Duration;
 use strip_ansi_escapes::Writer;
 use tokio::io::AsyncReadExt;
 use tokio::runtime::{Builder, Runtime};
-use walkdir::WalkDir;
 use which::which_in;
 
 use crate::errors::{Context, Result, anyhow, bail};
@@ -876,41 +874,13 @@ fn cancel_compile(id: String) -> Result<()> {
     Ok(())
 }
 
-fn show_stats(config: &Config, fmt: StatsFormat, advanced: bool) -> Result<()> {
+fn show_stats(_config: &Config, fmt: StatsFormat, advanced: bool) -> Result<()> {
     trace!("Command::ShowStats({fmt:?})");
-    let stats = match connect_to_server(&get_addr()) {
-        Ok(srv) => request_stats(srv).context("failed to get stats from server")?,
-        Err(error) if !auto_start_server_enabled() => {
-            return Err(error).context("managed sccache endpoint is unavailable");
-        }
-        Err(_) => {
-            let runtime = new_client_runtime()?;
-            let storage = storage_from_config(config, runtime.handle()).ok();
-            runtime.block_on(ServerInfo::new(ServerStats::default(), storage.as_deref()))?
-        }
-    };
+    let stats =
+        request_stats(connect_to_server(&get_addr()).context("native daemon unavailable")?)?;
     match fmt {
         StatsFormat::Text => stats.print(advanced),
         StatsFormat::Json => serde_json::to_writer(&mut io::stdout(), &stats)?,
-    }
-    Ok(())
-}
-
-fn debug_preprocessor_cache_entries() -> Result<()> {
-    trace!("Command::DebugPreprocessorCacheEntries");
-    let entries_dir = default_disk_cache_dir().join("preprocessor");
-    for entry in WalkDir::new(entries_dir).sort_by_file_name() {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() || entry.file_name() == CACHEDIR_TAG_FILE_NAME {
-            continue;
-        }
-        println!("=========================");
-        println!("Showing preprocessor entry file {}", path.display());
-        let contents = std::fs::read(path)?;
-        let entry = crate::compiler::PreprocessorCacheEntry::read(&contents)?;
-        println!("{entry:#?}");
-        println!("=========================");
     }
     Ok(())
 }
@@ -1082,7 +1052,6 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         Command::ShowStats(fmt, advanced) => show_stats(config, fmt, advanced)?,
         Command::ActiveCompiles => show_active_compiles()?,
         Command::CancelCompile(id) => cancel_compile(id)?,
-        Command::DebugPreprocessorCacheEntries => debug_preprocessor_cache_entries()?,
         Command::InternalStartServer => start_internal_server(config)?,
         Command::StartServer => start_server_command(startup_timeout)?,
         Command::StopServer => {

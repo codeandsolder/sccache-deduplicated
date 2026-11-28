@@ -1,6 +1,4 @@
-use crate::cache::CacheMode;
 use crate::compiler::ColorMode;
-use crate::config::PreprocessorCacheModeConfig;
 use crate::server::{DistInfo, ServerInfo, ServerStats};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -80,23 +78,8 @@ pub enum Response {
 pub const TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
 pub const NAMESPACE_PROTOCOL_VERSION: u32 = 9;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub enum StorageBlob {
-    Cache,
-    Preprocessor,
-}
-
 #[derive(Serialize, Deserialize)]
 pub enum TransferRequest {
-    Read {
-        kind: StorageBlob,
-        key: String,
-    },
-    BeginWrite {
-        kind: StorageBlob,
-        key: String,
-        len: u64,
-    },
     // Native action stream: only a connection that completed the native
     // handshake can start one. No scheduler tickets or credentials cross IPC.
     NativeStart,
@@ -113,16 +96,12 @@ pub enum TransferRequest {
         blob: crate::build_runtime::BlobRef,
     },
     IntermediateChunk,
-    WriteChunk(#[serde(with = "serde_bytes")] Vec<u8>),
-    FinishWrite,
-    ReadChunk,
     Abort,
 }
 
 #[derive(Serialize, Deserialize)]
 pub enum TransferReply {
     ReadStarted(Option<u64>),
-    WriteStarted,
     Chunk(#[serde(with = "serde_bytes")] Vec<u8>),
     Ack,
     IntermediateOpened(crate::build_runtime::wire::Ticket),
@@ -145,8 +124,6 @@ impl TransferRequest {
 impl std::fmt::Debug for TransferRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
-            Self::Read { .. } => "Read",
-            Self::BeginWrite { .. } => "BeginWrite",
             Self::NativeStart => "NativeStart",
             Self::NativeRead => "NativeRead",
             Self::NativeWrite(_) => "NativeWrite",
@@ -155,9 +132,6 @@ impl std::fmt::Debug for TransferRequest {
             Self::IntermediateAuthorize { .. } => "IntermediateAuthorize",
             Self::IntermediateRead { .. } => "IntermediateRead",
             Self::IntermediateChunk => "IntermediateChunk",
-            Self::WriteChunk(_) => "WriteChunk",
-            Self::FinishWrite => "FinishWrite",
-            Self::ReadChunk => "ReadChunk",
             Self::Abort => "Abort",
         };
         f.write_str(name)
@@ -168,7 +142,6 @@ impl std::fmt::Debug for TransferReply {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ReadStarted(len) => f.debug_tuple("ReadStarted").field(len).finish(),
-            Self::WriteStarted => f.write_str("WriteStarted"),
             Self::Chunk(bytes) => f.debug_tuple("Chunk").field(&bytes.len()).finish(),
             Self::Ack => f.write_str("Ack"),
             Self::IntermediateOpened(_) => f.write_str("IntermediateOpened"),
@@ -271,8 +244,6 @@ pub struct StorageHandshakeInfo {
     pub location: String,
     pub cache_type_name: String,
     pub basedirs: Vec<Vec<u8>>,
-    pub preprocessor_cache_mode_config: PreprocessorCacheModeConfig,
-    pub cache_mode: CacheMode,
     pub max_size: Option<u64>,
     pub namespace_protocol: u32,
     pub transfer_chunk_bytes: usize,
@@ -300,16 +271,14 @@ mod tests {
         let payload = (0..TRANSFER_CHUNK_BYTES)
             .map(|index| index.to_le_bytes()[0])
             .collect::<Vec<_>>();
-        for request in [
-            TransferRequest::NativeWrite(payload.clone()),
-            TransferRequest::WriteChunk(payload.clone()),
-        ] {
+        {
+            let request = TransferRequest::NativeWrite(payload.clone());
             let bytes = bincode::serialize(&Request::Transfer(request))?;
             assert!(bytes.len() <= payload.len() + 32);
             match bincode::deserialize(&bytes)? {
-                Request::Transfer(
-                    TransferRequest::NativeWrite(decoded) | TransferRequest::WriteChunk(decoded),
-                ) => assert_eq!(decoded, payload),
+                Request::Transfer(TransferRequest::NativeWrite(decoded)) => {
+                    assert_eq!(decoded, payload)
+                }
                 _ => anyhow::bail!("unexpected decoded transfer request"),
             }
         }

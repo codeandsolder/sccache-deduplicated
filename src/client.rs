@@ -19,7 +19,7 @@ use crate::util;
 use anyhow::ensure;
 use backon::BlockingRetryable;
 use byteorder::{BigEndian, ByteOrder};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -61,65 +61,6 @@ impl ServerConnection {
             Response::Transfer(reply) => reply.map_err(|error| anyhow!("{error}")),
             other => self.invalidate(Err(anyhow!("unexpected transfer response: {other:?}"))),
         }
-    }
-
-    /// Read exactly the advertised number of bytes using bounded frames.
-    pub(crate) fn download(
-        &mut self,
-        mut remaining: u64,
-        chunk_bytes: usize,
-        mut output: impl Write,
-    ) -> Result<()> {
-        let result = (|| {
-            while remaining > 0 {
-                let TransferReply::Chunk(chunk) = self.transfer(TransferRequest::ReadChunk)? else {
-                    bail!("expected a download chunk");
-                };
-                ensure!(
-                    !chunk.is_empty()
-                        && chunk.len() <= chunk_bytes
-                        && chunk.len() as u64 <= remaining,
-                    "invalid download chunk size"
-                );
-                output.write_all(&chunk)?;
-                remaining -= chunk.len() as u64;
-            }
-            Ok(())
-        })();
-        if result.is_err() && !self.closed.is_cancelled() {
-            let _ = self.transfer(TransferRequest::Abort);
-        }
-        result
-    }
-
-    /// Upload exactly the advertised number of bytes. The caller commits a
-    /// complete upload with the operation appropriate for its content type.
-    pub(crate) fn upload(
-        &mut self,
-        mut remaining: u64,
-        chunk_bytes: usize,
-        mut input: impl Read,
-    ) -> Result<()> {
-        let result = (|| {
-            let mut chunk = vec![0; chunk_bytes];
-            while remaining > 0 {
-                let len = usize::try_from(remaining.min(chunk_bytes as u64))?;
-                input.read_exact(&mut chunk[..len])?;
-                ensure!(
-                    matches!(
-                        self.transfer(TransferRequest::WriteChunk(chunk[..len].to_vec()))?,
-                        TransferReply::Ack
-                    ),
-                    "expected upload acknowledgment"
-                );
-                remaining -= len as u64;
-            }
-            Ok(())
-        })();
-        if result.is_err() && !self.closed.is_cancelled() {
-            let _ = self.transfer(TransferRequest::Abort);
-        }
-        result
     }
 
     pub(crate) fn session_health(&self) -> CancellationToken {
