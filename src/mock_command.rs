@@ -356,16 +356,17 @@ impl CommandCreatorSync for ProcessCommandCreator {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 use std::os::unix::process::ExitStatusExt;
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 use std::os::windows::process::ExitStatusExt;
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub type ExitStatusValue = i32;
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 pub type ExitStatusValue = u32;
 
+#[cfg(test)]
 pub fn exit_status(v: ExitStatusValue) -> ExitStatus {
     ExitStatus::from_raw(v)
 }

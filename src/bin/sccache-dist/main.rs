@@ -303,12 +303,14 @@ fn run(command: Command) -> Result<i32> {
         }
         Command::NativeProvisionPackage {
             client_config,
+            archive,
             identity,
             expected_size,
             locator,
         } => provision_package(&client_config, archive, identity, expected_size, locator),
         Command::NativeProvisionRust {
             client_config,
+            archive,
             source,
             manifest_output,
         } => {
@@ -339,6 +341,7 @@ fn run(command: Command) -> Result<i32> {
         Command::NativeSyncSystem {
             client_config,
             paths,
+            cache_dir,
             jobs,
         } => {
             let client = package_client(&client_config)?;
