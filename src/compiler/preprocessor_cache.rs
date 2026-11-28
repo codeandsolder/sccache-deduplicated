@@ -44,7 +44,7 @@ use super::c::{
 
 /// The current format is 1 header byte for the version + bincode encoding
 /// of the [`PreprocessorCacheEntry`] struct.
-const FORMAT_VERSION: u8 = 3;
+const FORMAT_VERSION: u8 = 4;
 const MAX_PREPROCESSOR_CACHE_ENTRIES: usize = 100;
 const MAX_PREPROCESSOR_CACHE_FILE_INFO_ENTRIES: usize = 10000;
 

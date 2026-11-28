@@ -20,6 +20,8 @@ Hash the compiler, language/driver mode, semantic options, preprocessed program
 hash the actual selected frontend and specs file, not its installation tree.
 Native CPU identity uses the resolved target flags instead of the full driver
 transcript. Source basenames remain where they identify object contents.
+Hash declared environment dependencies as effective name/value assignments;
+ordering and overridden assignments are not semantic inputs.
 
 Do not hash native debug compilation directories, directory spellings in line
 markers, debug/file/macro prefix-map operands, or independent output destinations.
@@ -37,7 +39,11 @@ Native nightly dep-info reports binary dependencies; stable compilers and
 proc-macro compilations discover successful file reads in the dependency probe,
 rather than treating a package tree as a dependency. The trace tool is part of
 the managed runtime. Fixed system runtime files and probe scratch are not
-project dependencies.
+project dependencies. The compiler version banner is discovery data, not an
+additional digest input. Explicit externs are keyed once by name, modifiers
+and content, independently of filename ordering or repeated discovery.
+Metadata-only results do not depend on unselected linkable siblings of rmeta
+inputs; the execution packager can still deliver those siblings.
 
 Standard Cargo build paths used by compiler environment observations are
 normalized for both key and execution. The build-script output root is

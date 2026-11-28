@@ -147,8 +147,8 @@ pub struct Rust {
     host: String,
     /// The verbose version for this rustc.
     ///
-    /// Hash calculation will take this version into consideration to prevent
-    /// cached object broken after version bump.
+    /// Used for compiler capability discovery; executable and library
+    /// content digests identify the compiler result.
     ///
     /// Looks like the following:
     ///
@@ -349,7 +349,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"10";
+const CACHE_VERSION: &[u8] = b"11";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -742,6 +742,29 @@ fn hashes_in_canonical_path_order(
         .collect::<Vec<_>>();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
     pairs.into_iter().map(|(_, hash)| hash).collect()
+}
+
+/// Binary dep-info and traced reads can report an explicit extern again.
+/// Its name-to-content binding already identifies it; only independently
+/// discovered inputs belong in the source group. Keep the original file
+/// list for the execution manifest.
+fn rust_source_key_hashes(
+    paths: &[PathBuf],
+    hashes: Vec<String>,
+    externs: &[PathBuf],
+    canonical: Option<&CanonicalRustPaths>,
+) -> Vec<String> {
+    let explicit = externs
+        .iter()
+        .flat_map(|path| iter::once(path.clone()).chain(path.canonicalize().ok()))
+        .collect::<HashSet<_>>();
+    let (paths, hashes): (Vec<_>, Vec<_>) = paths
+        .iter()
+        .cloned()
+        .zip(hashes)
+        .filter(|(path, _)| !explicit.contains(path))
+        .unzip();
+    hashes_in_canonical_path_order(&paths, hashes, canonical)
 }
 
 const RUST_SHADOW_LOG_ENV: &str = "SCCACHE_RUST_SHADOW_LOG";
@@ -1158,11 +1181,8 @@ fn rust_extern_bindings(
 }
 
 fn hash_rust_extern_bindings(digest: &mut Digest, bindings: &[(String, String)]) {
-    // No-extern keys retain their existing identity. Every explicit binding
-    // receives a distinct domain, so old ambiguous results cannot be reused.
-    if bindings.is_empty() {
-        return;
-    }
+    // The binding is the input, not the physical file's position in a
+    // sorted list of paths. Names and modifiers retain their meaning.
     digest.delimiter(b"rust-extern-bindings-v1");
     digest.update(&(bindings.len() as u128).to_le_bytes());
     for (name, hash) in bindings {
@@ -3220,6 +3240,7 @@ where
                 source_files.extend(rust_selected_binary_companions(
                     &source_files,
                     &self.parsed_args.crate_link_paths,
+                    self.parsed_args.metadata_only_output.is_none(),
                 )?);
             }
             if let Some(config_dir) = clippy_config_dir(&self.executable, &env_vars, &cwd) {
@@ -3441,16 +3462,22 @@ where
             )
         });
 
-        let source_hashes =
-            hashes_in_canonical_path_order(&source_files, source_hashes, canonical_paths.as_ref());
+        let source_hashes = if precise_dependencies {
+            rust_source_key_hashes(
+                &source_files,
+                source_hashes,
+                &abs_externs,
+                canonical_paths.as_ref(),
+            )
+        } else {
+            hashes_in_canonical_path_order(&source_files, source_hashes, canonical_paths.as_ref())
+        };
         let extern_bindings = rust_extern_bindings(
             &self.parsed_args.arguments,
             &cwd,
             &abs_externs,
             &extern_hashes,
         )?;
-        let extern_hashes =
-            hashes_in_canonical_path_order(&abs_externs, extern_hashes, canonical_paths.as_ref());
         let staticlib_hashes = hashes_in_canonical_path_order(
             &abs_staticlibs,
             staticlib_hashes,
@@ -3598,8 +3625,6 @@ where
         // 7. The digest of the content of the target json file specified via `--target` (if any).
         m.audit_field("sccache.key.sources");
         hash_rust_input_group(&mut m, b"rust-sources-v1", &source_hashes);
-        m.audit_field("sccache.key.externs");
-        hash_rust_input_group(&mut m, b"rust-externs-v1", &extern_hashes);
         m.audit_field("sccache.key.extern_bindings");
         hash_rust_extern_bindings(&mut m, &extern_bindings);
         m.audit_field("sccache.key.static_libraries");
@@ -3727,9 +3752,8 @@ where
         if !native_discovery {
             hash_cwd.hash(&mut HashToDigest { digest: &mut m });
         }
-        // 10. The version of the compiler.
-        m.audit_field("sccache.key.compiler_version");
-        self.version.hash(&mut HashToDigest { digest: &mut m });
+        // The driver and shared-library contents already identify the
+        // compiler. Its version banner is discovery data, not another input.
 
         if let Some(metadata) = &self.parsed_args.split_link_metadata
             && !outputs.contains(metadata)
@@ -4879,10 +4903,13 @@ fn rlib_stub_hash(path: &Path) -> Result<Option<[u8; 16]>> {
 
 /// Include only matching linkable/metadata companions of compiler-selected
 /// libraries. The compiler's dependency list supersedes name-only scanning.
+/// Metadata-only compilation does not consume an otherwise unselected
+/// linkable sibling. The packager may still deliver complete artifacts.
 #[cfg(feature = "dist-client")]
 fn rust_selected_binary_companions(
     inputs: &[PathBuf],
     search_paths: &[PathBuf],
+    include_linkable_companions: bool,
 ) -> Result<Vec<PathBuf>> {
     let mut companions = BTreeSet::new();
     for input in inputs {
@@ -4892,7 +4919,7 @@ fn rust_selected_binary_companions(
                     companions.insert(path);
                 }
             }
-            Some(RMETA_EXTENSION) => {
+            Some(RMETA_EXTENSION) if include_linkable_companions => {
                 let mut header = [0; 40];
                 let mut file = fs::File::open(input)?;
                 if file.read_exact(&mut header).is_err() {
@@ -5271,7 +5298,7 @@ impl RustInputsPackager {
 
         let (companions, crate_libraries) = if precise_dependencies {
             (
-                rust_selected_binary_companions(&inputs, &crate_link_paths)?,
+                rust_selected_binary_companions(&inputs, &crate_link_paths, true)?,
                 Vec::new(),
             )
         } else {
@@ -7358,6 +7385,21 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             dependency_probe_input(&stub, &[]).expect("select companion"),
             Cow::Owned::<Path>(full.clone())
         );
+        assert!(
+            rust_selected_binary_companions(std::slice::from_ref(&full), &[], false)
+                .expect("metadata-only companions")
+                .is_empty()
+        );
+        assert_eq!(
+            rust_selected_binary_companions(std::slice::from_ref(&full), &[], true)
+                .expect("linkable companions"),
+            vec![stub.clone()]
+        );
+        assert_eq!(
+            rust_selected_binary_companions(std::slice::from_ref(&stub), &[], false)
+                .expect("metadata required by stub"),
+            vec![full.clone()]
+        );
         let deps = reader
             .discover_rlib_deps(&env_vars, &full)
             .expect("probe full metadata");
@@ -7692,6 +7734,14 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                     ),
                     Argument::Raw("b".into()),
                     Argument::WithValue(
+                        "--extern",
+                        ArgData::Extern(ArgExtern {
+                            name: "bar".into(),
+                            path: "bar.rlib".into(),
+                        }),
+                        ArgDisposition::Separated,
+                    ),
+                    Argument::WithValue(
                         "--cfg",
                         ArgData::PassThrough("abc".into()),
                         ArgDisposition::Separated,
@@ -7774,7 +7824,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             b"rust-sources-v1",
             &[empty_digest.clone(), empty_digest.clone()],
         );
-        hash_rust_input_group(&mut m, b"rust-externs-v1", &[empty_digest]);
+        hash_rust_extern_bindings(&mut m, &[("bar".into(), empty_digest)]);
         hash_rust_input_group(&mut m, b"rust-staticlibs-v1", &[libbaz_a_digest]);
         hash_rust_input_group(&mut m, b"rust-target-json-v1", &[]);
         // Env vars
@@ -7785,7 +7835,6 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         m.update(b"=");
         OsStr::new("foo").hash(&mut HashToDigest { digest: &mut m });
         f.tempdir.path().hash(&mut HashToDigest { digest: &mut m });
-        TEST_RUSTC_VERSION.hash(&mut HashToDigest { digest: &mut m });
         let digest = m.finish();
         assert_eq!(res.key, digest);
         let mut out = res.compilation.outputs().map(|k| k.key).collect::<Vec<_>>();
@@ -7844,10 +7893,10 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
 
         let mut by_source = Digest::new();
         hash_rust_input_group(&mut by_source, b"rust-sources-v1", &source);
-        hash_rust_input_group(&mut by_source, b"rust-externs-v1", &[]);
+        hash_rust_extern_bindings(&mut by_source, &[]);
         let mut by_extern = Digest::new();
         hash_rust_input_group(&mut by_extern, b"rust-sources-v1", &[]);
-        hash_rust_input_group(&mut by_extern, b"rust-externs-v1", &external);
+        hash_rust_extern_bindings(&mut by_extern, &[("external".into(), external[0].clone())]);
         assert_ne!(by_source.finish(), by_extern.finish());
     }
 
@@ -9347,6 +9396,7 @@ version='2.0.0'
                 |dir| {
                     create_file(dir, "a.rlib", |mut f| f.write_all(b"first"))?;
                     create_file(dir, "b.rlib", |mut f| f.write_all(b"second"))?;
+                    create_file(dir, "z.rlib", |mut f| f.write_all(b"first"))?;
                     Ok(())
                 },
                 false,
@@ -9360,6 +9410,25 @@ version='2.0.0'
         assert_ne!(
             original,
             key(&["--extern", "a=b.rlib", "--extern", "b=a.rlib"])
+        );
+        assert_eq!(
+            original,
+            key(&["--extern", "a=z.rlib", "--extern", "b=b.rlib"]),
+            "renaming an extern must not change its position in the result key"
+        );
+    }
+
+    #[test]
+    fn rust_selected_sources_do_not_repeat_explicit_extern_bindings() {
+        let paths = [PathBuf::from("src.rs"), PathBuf::from("liba.rlib")];
+        let hashes = vec!["source".into(), "extern".into()];
+        assert_eq!(
+            rust_source_key_hashes(&paths, hashes.clone(), &paths[1..], None),
+            vec!["source".to_owned()]
+        );
+        assert_eq!(
+            rust_source_key_hashes(&paths, hashes, &[], None),
+            vec!["extern".to_owned(), "source".to_owned()]
         );
     }
 

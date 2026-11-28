@@ -35,7 +35,7 @@ use crate::util::{
 use async_trait::async_trait;
 use fs_err as fs;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
@@ -2932,7 +2932,7 @@ pub(super) fn hashed_input_file_name(language: Language, input: &Path) -> Option
 }
 
 /// The cache is versioned by the inputs to `HashKeyParams::compute`.
-pub const CACHE_VERSION: &[u8] = b"15";
+pub const CACHE_VERSION: &[u8] = b"16";
 
 /// Environment variables that are factored into the cache key.
 static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
@@ -3001,24 +3001,23 @@ pub(super) fn hash_input_file_name_marker(m: &mut Digest, present: bool) {
     m.update(&[u8::from(present)]);
 }
 
-/// Hash only the declared compiler environment dependencies, preserving
-/// ordering, duplicates, field boundaries and arbitrary OS string bytes.
+/// Hash the effective compiler environment dependencies, not the order
+/// of the caller's environment vector or superseded assignments.
 pub(super) fn hash_cached_env_vars(
     m: &mut Digest,
     env_vars: &[(OsString, OsString)],
     dependencies: &HashSet<&'static OsStr>,
 ) {
-    m.delimiter(b"c-cached-env-v1");
-    let count = env_vars
+    m.delimiter(b"c-cached-env-v2");
+    let effective = env_vars
         .iter()
         .filter(|(name, _)| dependencies.contains(name.as_os_str()))
-        .count();
-    m.update(&(count as u128).to_le_bytes());
-    for (name, value) in env_vars {
-        if dependencies.contains(name.as_os_str()) {
-            hash_length_prefixed(m, name.as_encoded_bytes());
-            hash_length_prefixed(m, value.as_encoded_bytes());
-        }
+        .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
+        .collect::<BTreeMap<_, _>>();
+    m.update(&(effective.len() as u128).to_le_bytes());
+    for (name, value) in effective {
+        hash_length_prefixed(m, name.as_encoded_bytes());
+        hash_length_prefixed(m, value.as_encoded_bytes());
     }
 }
 
@@ -4229,6 +4228,28 @@ mod test {
                 .compute()
         };
         assert_ne!(key(&collapsed), key(&split));
+    }
+
+    #[test]
+    fn test_hash_key_environment_uses_effective_assignments() {
+        let base: [(OsString, OsString); 2] = [
+            ("SCCACHE_C_CUSTOM_CACHE_BUSTER".into(), "one".into()),
+            ("MACOSX_DEPLOYMENT_TARGET".into(), "two".into()),
+        ];
+        let reversed = [base[1].clone(), base[0].clone()];
+        let overwritten = [
+            ("SCCACHE_C_CUSTOM_CACHE_BUSTER".into(), "discarded".into()),
+            base[1].clone(),
+            base[0].clone(),
+        ];
+        let key = |env: &[(OsString, OsString)]| {
+            HashKeyParams::new("compiler", Language::C, &[], b"input")
+                .with_env_vars(env)
+                .compute()
+        };
+        assert_eq!(key(&base), key(&reversed));
+        assert_eq!(key(&base), key(&overwritten));
+        assert_ne!(key(&base), key(&overwritten[..2]));
     }
 
     #[test]
