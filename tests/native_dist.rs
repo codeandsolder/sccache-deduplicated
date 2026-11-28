@@ -3188,7 +3188,7 @@ fn run_packed_archive_audit(
                 }
             }
         }
-        bail!("missing packed native object")
+        anyhow::bail!("missing packed native object")
     };
     make_archive("crs")?;
     let ((key, kind), first) = compile()?;
