@@ -120,13 +120,26 @@ pub struct SpaceStatus {
 }
 
 impl NativeStore {
+    pub(super) fn staging_limit(&self, policy: SpacePolicy) -> Result<u64> {
+        if let Some(limit) = policy.max_resident_bytes {
+            return Ok(limit);
+        }
+        let stat = rustix::fs::statvfs(&self.inner.root)?;
+        let capacity = stat
+            .f_blocks
+            .checked_mul(stat.f_frsize)
+            .context("filesystem capacity overflow")?;
+        Ok(capacity.saturating_sub(policy.min_available_bytes))
+    }
+
     pub(crate) fn check_transfer_capacity(&self, bytes: u64) -> Result<()> {
         if let Some(policy) = self.inner.space_policy {
+            let limit = self.staging_limit(policy)?;
             ensure!(
-                bytes <= policy.resident_limit(),
+                bytes <= limit,
                 StageSpaceTooLarge {
                     requested: bytes,
-                    limit: policy.resident_limit(),
+                    limit
                 }
             );
         }
@@ -327,6 +340,7 @@ impl NativeStore {
     ) -> Result<SpaceReport> {
         // The soft watermarks maintain a ready buffer for new work. A larger
         // observed request can ask the next pass for additional headroom.
+        let staging_limit = self.staging_limit(policy)?;
         let resident_target = policy.target_resident_bytes.map_or(u64::MAX, |target| {
             target.min(policy.resident_limit().saturating_sub(incoming))
         });
@@ -346,7 +360,7 @@ impl NativeStore {
         let mut evicted_roots = 0;
         // A transient inability to admit the requested reservation cannot be
         // solved by eviction if active writers alone exceed the ceiling.
-        if reserved <= policy.resident_limit().saturating_sub(incoming)
+        if reserved <= staging_limit.saturating_sub(incoming)
             && (free.saturating_sub(reserved) < available_target || resident > resident_target)
         {
             #[cfg(target_os = "linux")]
@@ -357,7 +371,7 @@ impl NativeStore {
             )?;
             (free, resident, reserved) = observe()?;
             for candidate in candidates {
-                if reserved > policy.resident_limit().saturating_sub(incoming)
+                if reserved > staging_limit.saturating_sub(incoming)
                     || (free.saturating_sub(reserved) >= available_target
                         && resident <= resident_target)
                 {
@@ -786,16 +800,17 @@ impl StageBudget {
             self.reserved = self.reserved.max(size);
             return Ok(());
         };
-        ensure!(
-            size <= policy.resident_limit(),
-            StageSpaceTooLarge {
-                requested: size,
-                limit: policy.resident_limit(),
-            }
-        );
         if self.reserved >= size {
             return Ok(());
         }
+        let limit = self.store.staging_limit(policy)?;
+        ensure!(
+            size <= limit,
+            StageSpaceTooLarge {
+                requested: size,
+                limit
+            }
+        );
         let extra = size - self.reserved;
         let mut state = self
             .store
@@ -823,7 +838,7 @@ impl StageBudget {
                 reserved: state.reserved,
                 resident,
                 available,
-                limit: policy.resident_limit(),
+                limit,
                 evicted: 0,
             }
             .into());

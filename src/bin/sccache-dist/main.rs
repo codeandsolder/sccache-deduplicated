@@ -381,7 +381,8 @@ fn run(command: Command) -> Result<i32> {
             index,
             schema,
             without,
-        } => audit_index(&index, schema.as_deref(), &without),
+            action_key,
+        } => audit_index(&index, schema.as_deref(), &without, action_key.as_deref()),
         Command::ClusterInit { directory } => cluster_init(&directory),
         Command::ClusterId { directory } => cluster_id(&directory),
         Command::ClusterRevoke { directory, peer } => cluster_revoke(&directory, peer),
@@ -557,9 +558,24 @@ fn attest_installation(
     Ok(0)
 }
 
-fn audit_index(index: &Path, schema: Option<&str>, without: &[String]) -> Result<i32> {
+fn audit_index(
+    index: &Path,
+    schema: Option<&str>,
+    without: &[String],
+    action_key: Option<&str>,
+) -> Result<i32> {
     let audit = sccache::build_runtime::NativeIndexAudit::open(index)?;
-    if let Some(schema) = schema {
+    if let Some(key) = action_key {
+        let digest = blake3::Hash::from_hex(key)?;
+        let result = audit.action_result(sccache::build_runtime::ActionKey(*digest.as_bytes()))?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "action_key": key,
+                "result": result.map(|id| blake3::Hash::from_bytes(id.0).to_hex().to_string()),
+            })
+        );
+    } else if let Some(schema) = schema {
         let comparison = audit.compare(schema, without)?;
         println!(
             "{}",

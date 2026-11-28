@@ -1031,3 +1031,18 @@ fn quota_only_policy_retains_logical_content_until_physical_pressure() -> Result
     assert!(report.minimum_satisfied);
     Ok(())
 }
+
+#[test]
+fn quota_only_policy_rejects_impossible_uncompressed_staging() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut limit = policy();
+    limit.max_resident_bytes = None;
+    limit.target_resident_bytes = None;
+    let store = NativeStore::open_managed(dir.path(), limit)?;
+    let capacity = store.staging_limit(limit)?;
+    assert!(matches!(
+        store.reserve_staging(capacity.saturating_add(1)),
+        Err(error) if error.is::<StageSpaceTooLarge>()
+    ));
+    Ok(())
+}

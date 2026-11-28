@@ -1365,9 +1365,11 @@ impl NativeStore {
                             .context("staging budget overflow")?;
                         // A small managed worker must be able to stage a
                         // small object even with a budget below one chunk.
-                        let reservation = self.inner.space_policy.map_or(reservation, |policy| {
-                            reservation.min(policy.resident_limit())
-                        });
+                        let reservation = if let Some(policy) = self.inner.space_policy {
+                            reservation.min(self.staging_limit(policy)?)
+                        } else {
+                            reservation
+                        };
                         ensure!(
                             size <= reservation,
                             "native staged content exceeds resident budget"
