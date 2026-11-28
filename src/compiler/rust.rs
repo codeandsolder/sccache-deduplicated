@@ -2562,6 +2562,8 @@ pub(super) struct NativeLinkDiscovery {
     pub flavor: Option<String>,
     pub search_paths: Vec<PathBuf>,
     pub link_arguments: Vec<String>,
+    #[cfg(test)]
+    pub external_linker: bool,
 }
 
 #[cfg(all(feature = "dist-client", target_os = "linux"))]
@@ -2569,7 +2571,20 @@ pub(super) fn native_link_discovery(args: &[OsString]) -> Result<NativeLinkDisco
     let mut discovery = NativeLinkDiscovery::default();
     for argument in ArgsIter::new(args.iter().cloned(), &ARGS[..]).with_double_dashes() {
         let argument = argument?;
+        #[cfg(test)]
+        {
+            discovery.external_linker |=
+                matches!(&argument, Argument::UnknownFlag(flag) if flag == "--test");
+        }
         match argument.get_data() {
+            #[cfg(test)]
+            Some(CrateType(types)) => {
+                discovery.external_linker |= types.cdylib
+                    || types
+                        .others
+                        .iter()
+                        .any(|kind| matches!(kind.as_str(), "bin" | "dylib" | "proc-macro"));
+            }
             Some(Target(target)) => discovery.target = Some(target.clone().into_arg_os_string()),
             Some(LinkPath(ArgLinkPath { kind, path })) if kind == "native" || kind == "all" => {
                 discovery.search_paths.push(path.clone())

@@ -490,6 +490,25 @@ impl RustLinkStages {
         arguments
     }
 
+    /// Override the executable, not the linker flavor. Preserve the
+    /// compiler's option ordering and place the override before a trailing
+    /// end-of-options marker.
+    #[cfg(test)]
+    pub(crate) fn capture_arguments(&self, artifact: &Path, relay: &Path) -> Vec<OsString> {
+        let mut arguments = self.link_arguments(artifact);
+        let position = if self.arguments.input > 0
+            && self.arguments.original[self.arguments.input - 1] == "--"
+        {
+            self.arguments.input + 1
+        } else {
+            arguments.len()
+        };
+        let mut linker = OsString::from("-Clinker=");
+        linker.push(relay);
+        arguments.insert(position, linker);
+        arguments
+    }
+
     /// Locate the compiler-produced .rlink in the generated output delta.
     /// Neither the crate name, the codegen-unit count nor file naming is
     /// guessed. The returned path refers to the original logical namespace.
@@ -731,6 +750,11 @@ impl NativeLinkWorkspace {
 
     pub(crate) fn link_arguments(&self, artifact: &Path) -> Vec<OsString> {
         self.stages.link_arguments(artifact)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_arguments(&self, artifact: &Path, relay: &Path) -> Vec<OsString> {
+        self.stages.capture_arguments(artifact, relay)
     }
 
     pub(crate) fn codegen_directory(&self) -> &Path {

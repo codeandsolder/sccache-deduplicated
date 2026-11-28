@@ -86,11 +86,7 @@ impl LinkInputs {
         }
     }
 
-    pub(super) fn prepare(
-        &self,
-        cache: &SourceDigestCache,
-        client: Option<&super::NativeCompilerClient>,
-    ) -> Result<Vec<PreparedTree>> {
+    fn target_spec(&self) -> Result<(super::super::rust::NativeLinkDiscovery, serde_json::Value)> {
         let options = super::super::rust::native_link_discovery(&self.arguments)?;
         let mut query = vec![
             OsString::from("-Z"),
@@ -111,6 +107,54 @@ impl LinkInputs {
             &self.compiler,
             &query.iter().map(OsString::as_os_str).collect::<Vec<_>>(),
         )?)?;
+        Ok((options, spec))
+    }
+
+    #[cfg(test)]
+    pub(super) fn relay_basename(&self) -> Result<Option<OsString>> {
+        let (options, spec) = self.target_spec()?;
+        if !options.external_linker {
+            return Ok(None);
+        }
+        let flavor = options
+            .flavor
+            .as_deref()
+            .or_else(|| {
+                spec.get("linker-flavor")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .context("target does not declare linker flavor")?;
+        let name = options
+            .linker
+            .as_deref()
+            .or_else(|| {
+                spec.get("linker")
+                    .and_then(serde_json::Value::as_str)
+                    .map(OsStr::new)
+            })
+            .unwrap_or_else(|| {
+                if flavor.ends_with("-cc") {
+                    OsStr::new("cc")
+                } else if flavor.contains("lld") || flavor.starts_with("wasm") {
+                    OsStr::new("rust-lld")
+                } else {
+                    OsStr::new("ld")
+                }
+            });
+        Ok(Some(
+            Path::new(name)
+                .file_name()
+                .context("linker has no basename")?
+                .to_owned(),
+        ))
+    }
+
+    pub(super) fn prepare(
+        &self,
+        cache: &SourceDigestCache,
+        client: Option<&super::NativeCompilerClient>,
+    ) -> Result<Vec<PreparedTree>> {
+        let (options, spec) = self.target_spec()?;
         let flavor = options
             .flavor
             .as_deref()

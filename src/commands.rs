@@ -1166,7 +1166,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
 mod test {
     use super::*;
     use crate::jobserver::Client;
-    use crate::mock_command::{CommandCreator, MockChild, MockCommandCreator, exit_status};
+    use crate::mock_command::{CommandCreator, MockCommandCreator};
     use crate::net::Connection;
     use std::sync::{Arc, Mutex};
 

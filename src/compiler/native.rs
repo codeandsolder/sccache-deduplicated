@@ -780,6 +780,8 @@ impl CompilerPlan {
 /// Split a Rust action without changing its logical cwd, argument ordering,
 /// target, or environment. The private delivery directories are independent
 /// of all of those key fields.
+#[cfg(test)]
+mod link_capture;
 mod link_inputs;
 
 struct NativeLink {
@@ -1373,12 +1375,69 @@ mod tests {
                     file, encoding,
                 )?))
             });
-            let (link_plan, artifact) = link.plan(
-                &plan,
-                manifest,
-                &provider,
-                link.linker_inputs(&SourceDigestCache::default(), None)?,
-            )?;
+            let cache = SourceDigestCache::default();
+            let (mut link_plan, artifact) = link.plan(&plan, manifest, &provider, Vec::new())?;
+            // Exercise the capture action without the external linker closure.
+            // No host linker is available to this execution.
+            if let Some(basename) = link.inputs.relay_basename()? {
+                let (capture, capture_plan) = link_capture::LinkCapture::configure(
+                    link_plan.clone(),
+                    &link.workspace,
+                    &artifact,
+                    &basename,
+                    &cwd,
+                    &cache,
+                )?;
+                let leases = capture_plan
+                    .inputs
+                    .iter()
+                    .map(|tree| tree.import(&store).map(Arc::new))
+                    .collect::<Result<Vec<_>>>()?;
+                let captured = execute(
+                    &capture_plan.spec,
+                    &store,
+                    &ExecutionPolicy {
+                        platform,
+                        bubblewrap: "/usr/bin/bwrap".into(),
+                        scratch: cwd.clone(),
+                        timeout: Duration::from_secs(60),
+                        max_result_bytes: 64 * 1024 * 1024,
+                    },
+                    &leases,
+                    None,
+                    || Ok(()),
+                    |_| {},
+                )?;
+                ensure!(captured.status().success(), "isolated link planning failed");
+                let manifest = captured
+                    .successful_result()
+                    .context("missing link planning result")?;
+                capture_plan
+                    .spec
+                    .action_request()?
+                    .validate_result(manifest)?;
+                for (name, destination) in &capture_plan.destinations {
+                    let Artifact::GeneratedTree(tree) = &manifest.outputs[name] else {
+                        anyhow::bail!("expected captured invocation tree");
+                    };
+                    let staged = materialize_tree(
+                        tree,
+                        destination.parent().context("stage parent")?,
+                        |blob, path| {
+                            std::io::copy(
+                                &mut captured.open_blob(blob.id)?,
+                                &mut std::fs::File::create(path)?,
+                            )?;
+                            Ok(())
+                        },
+                    )?;
+                    staged.publish(destination)?;
+                }
+                let invocation = capture.read()?;
+                ensure!(!invocation.arguments.is_empty(), "empty linker invocation");
+                ensure!(invocation.cwd.is_absolute(), "invalid linker cwd");
+            }
+            link_plan.extend_inputs(link.linker_inputs(&cache, None)?)?;
             let leases = link_plan
                 .inputs
                 .iter()

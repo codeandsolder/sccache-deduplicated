@@ -1658,7 +1658,6 @@ mod test {
     use crate::mock_command::*;
     use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
-    use fs::File;
     use std::sync::Arc;
     use test_case::test_case;
 

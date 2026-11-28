@@ -100,6 +100,7 @@ fn output_provably_changed(old: &std::fs::Metadata, new: &std::fs::Metadata) -> 
 
 /// Files present before the actual compiler runs. A locally generated depfile
 /// is already an output of this invocation, so exclude it from the snapshot.
+#[cfg(test)]
 pub(crate) fn snapshot_existing_outputs(
     objects: &[FileObjectSource],
     locally_preprocessed: bool,

@@ -54,8 +54,6 @@ use std::pin::Pin;
 use std::process::{ExitStatus, Output};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-#[cfg(feature = "dist-client")]
-use std::time::Instant;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
