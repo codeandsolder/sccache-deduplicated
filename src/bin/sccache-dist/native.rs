@@ -11,7 +11,7 @@ use anyhow::{Result, ensure};
 use sccache::{
     build_runtime::{
         BlobResidency, CapturedExecution, ContentId, ExecutionPolicy, NativeStore,
-        PackageImportLimits, PackageTransferCost, ResidentInputs, wire::WorkerTiming,
+        PackageImportLimits, PackageTransferCost, ResidentInputs, SpaceReport, wire::WorkerTiming,
     },
     config::server::NativeWorkerConfig,
     dist::{
@@ -152,26 +152,34 @@ impl NativeWorker {
         self.artifact_grace.is_some()
     }
 
-    pub(super) fn maintain_local_store(&self) -> Result<()> {
-        if let Some(grace) = &self.artifact_grace {
-            grace.reap();
-            match self.store.maintain_space() {
-                Ok(Some(report)) if !report.minimum_satisfied => {
+    pub(super) async fn wait_for_local_maintenance(&self, previous: Option<SpaceReport>) {
+        self.store.wait_for_space_maintenance(previous).await;
+    }
+
+    pub(super) fn maintain_local_store(&self) -> Result<Option<SpaceReport>> {
+        let Some(grace) = &self.artifact_grace else {
+            return Ok(None);
+        };
+        grace.reap();
+        match self.store.maintain_space() {
+            Ok(report) => {
+                if let Some(report) = report
+                    && !report.minimum_satisfied
+                {
                     debug!("native worker cache space pressure: {report:?}");
                 }
-                Ok(_) => {}
-                Err(error) => {
-                    if self.store.index_requires_restart() {
-                        error!(
-                            "native worker index requires reopening; terminating for supervised recovery: {error:#}"
-                        );
-                        std::process::exit(1);
-                    }
-                    return Err(error);
+                Ok(report)
+            }
+            Err(error) => {
+                if self.store.index_requires_restart() {
+                    error!(
+                        "native worker index requires reopening; terminating for supervised recovery: {error:#}"
+                    );
+                    std::process::exit(1);
                 }
+                Err(error)
             }
         }
-        Ok(())
     }
 
     pub(super) fn pin_resident_inputs(

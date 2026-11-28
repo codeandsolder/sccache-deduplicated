@@ -962,6 +962,61 @@ fn maintenance_replenishes_headroom_before_admission_pressure() -> Result<()> {
 }
 
 #[test]
+fn productive_reclamation_accelerates_as_the_buffer_fills_and_stalls_back_off() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let pinned = publish(&store, "pinned")?;
+    let _pin = store.lookup(pinned)?.context("missing pinned result")?;
+    for name in ["aaa", "bbb"] {
+        publish(&store, name)?;
+    }
+    let mut limit = policy();
+    limit.max_evictions_per_pass = 1;
+
+    let moderate = store.reclaim(limit, || Ok(10), 0, || Ok(160))?;
+    assert_eq!(moderate.evicted_roots, 1);
+    assert!(moderate.minimum_satisfied);
+    assert!(!moderate.target_satisfied);
+    assert_eq!(moderate.next_pass_after, Duration::from_millis(525));
+
+    let urgent = store.reclaim(limit, || Ok(10), 0, || Ok(110))?;
+    assert_eq!(urgent.evicted_roots, 1);
+    assert!(urgent.minimum_satisfied);
+    assert!(!urgent.target_satisfied);
+    assert_eq!(urgent.next_pass_after, URGENT_MAINTENANCE);
+
+    let stalled = store.reclaim(limit, || Ok(10), 0, || Ok(90))?;
+    assert_eq!(stalled.evicted_roots, 0);
+    assert!(!stalled.minimum_satisfied);
+    assert_eq!(stalled.next_pass_after, IDLE_MAINTENANCE);
+    assert!(store.lookup(pinned)?.is_some());
+
+    let healthy = store.reclaim(limit, || Ok(0), 0, || Ok(200))?;
+    assert!(healthy.target_satisfied);
+    assert_eq!(healthy.next_pass_after, IDLE_MAINTENANCE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn admission_consuming_the_ready_buffer_wakes_idle_maintenance() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut limit = policy();
+    limit.max_resident_bytes = Some(20);
+    limit.target_resident_bytes = Some(10);
+    let store = NativeStore::open_managed(dir.path(), dir.path(), limit)?;
+    let previous = store.maintain_space()?.context("missing policy")?;
+    assert!(previous.target_satisfied);
+    let _reservation = store.reserve_staging(12)?;
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        store.wait_for_space_maintenance(Some(previous)),
+    )
+    .await
+    .context("reservation did not wake maintenance")?;
+    Ok(())
+}
+
+#[test]
 fn reservations_that_cannot_fit_do_not_evict_resident_content() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let mut limit = policy();

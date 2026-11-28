@@ -92,7 +92,8 @@ impl PartialEq for ReferenceBlobProvider {
 }
 impl Eq for ReferenceBlobProvider {}
 
-/// A descriptor-based resolver for explicitly authorized immutable references.
+/// An identity-only descriptor resolver for explicitly authorized immutable
+/// references. The descriptor pins the inode but cannot be used to read bytes.
 /// Returning None selects ordinary verified file capture.
 pub type ReferenceResolver<'a> =
     dyn Fn(&File, &Path) -> Result<Option<(BlobRef, ReferenceBlobProvider)>> + 'a;
@@ -295,7 +296,13 @@ impl MappedTree {
                     path,
                     metadata: policy,
                 } => {
-                    let (file, stat) = open_source(&path)?;
+                    let (file, stat) = if resolver.is_some() {
+                        let file = open_input_descriptor(&path, false)?;
+                        let stat = regular_source_stat(&file)?;
+                        (file, stat)
+                    } else {
+                        open_source(&path)?
+                    };
                     let reference = resolver.map_or(Ok(None), |resolve| resolve(&file, &path))?;
                     let blob = if let Some((blob, provider)) = &reference {
                         ensure!(
@@ -306,6 +313,13 @@ impl MappedTree {
                         add_reference(&mut references, *blob, provider.clone())?;
                         *blob
                     } else {
+                        let file = if resolver.is_some() {
+                            let data = open_input_data(&file)?;
+                            unchanged(&stat, &fstat(&data)?)?;
+                            data
+                        } else {
+                            file
+                        };
                         match cache {
                             Some(cache) => cache.digest(&path, &file, &stat)?,
                             None => hash_open_source(&file, &stat)?,
@@ -387,6 +401,43 @@ fn mapped_file_metadata(stat: &Stat, policy: MappedMetadata) -> Result<TreeMetad
     })
 }
 
+fn regular_source_stat(file: &File) -> Result<Stat> {
+    let stat = fstat(file)?;
+    ensure!(
+        FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile,
+        "capture source is not a regular file"
+    );
+    Ok(stat)
+}
+
+/// Pin a regular input inode for reference discovery without opening its data.
+/// # Errors
+/// Returns an error for an inaccessible path or a non-regular file.
+pub fn open_input_descriptor(path: &Path, follow_symlinks: bool) -> Result<File> {
+    let mut flags = OFlags::PATH | OFlags::CLOEXEC;
+    if !follow_symlinks {
+        flags |= OFlags::NOFOLLOW;
+    }
+    let file = File::from(openat(CWD, path, flags, Mode::empty())?);
+    regular_source_stat(&file)?;
+    Ok(file)
+}
+
+/// Open the bytes of a previously pinned regular inode, not its original path.
+/// # Errors
+/// Returns an error for inaccessible data or a changed inode.
+pub fn open_input_data(identity: &File) -> Result<File> {
+    let before = regular_source_stat(identity)?;
+    let file = File::from(openat(
+        CWD,
+        crate::source::descriptor_path(identity),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?);
+    unchanged(&before, &regular_source_stat(&file)?)?;
+    Ok(file)
+}
+
 fn open_source(path: &Path) -> Result<(File, Stat)> {
     let file = File::from(openat(
         CWD,
@@ -394,11 +445,7 @@ fn open_source(path: &Path) -> Result<(File, Stat)> {
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )?);
-    let stat = fstat(&file)?;
-    ensure!(
-        FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile,
-        "capture source is not a regular file"
-    );
+    let stat = regular_source_stat(&file)?;
     Ok((file, stat))
 }
 
@@ -612,6 +659,28 @@ mod tests {
         io::Read,
         os::unix::fs::{PermissionsExt, symlink},
     };
+
+    #[test]
+    fn input_descriptor_keeps_identity_after_path_replacement() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("input");
+        fs::write(&path, b"original")?;
+        let identity = open_input_descriptor(&path, false)?;
+        fs::rename(&path, dir.path().join("old"))?;
+        fs::write(&path, b"replacement")?;
+        let mut contents = Vec::new();
+        open_input_data(&identity)?.read_to_end(&mut contents)?;
+        assert_eq!(contents, b"original");
+        let alias = dir.path().join("alias");
+        symlink(&path, &alias)?;
+        assert!(open_input_descriptor(&alias, false).is_err());
+        let identity = open_input_descriptor(&alias, true)?;
+        assert_eq!(
+            hash_descriptor(&open_input_data(&identity)?)?.id,
+            ContentId::of(b"replacement")
+        );
+        Ok(())
+    }
 
     #[test]
     fn selected_tree_retains_only_selected_content_and_ancestors() -> Result<()> {
