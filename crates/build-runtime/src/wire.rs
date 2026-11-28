@@ -94,6 +94,12 @@ impl std::fmt::Debug for Ticket {
     }
 }
 
+/// Server-confirmed idle lifetime after a successful renewal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseRenewal {
+    pub valid_for: std::time::Duration,
+}
+
 /// Identity of the authenticated party permitted to publish a result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Publisher {

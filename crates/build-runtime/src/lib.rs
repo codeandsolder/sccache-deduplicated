@@ -60,9 +60,9 @@ mod session;
 #[cfg(all(unix, feature = "store"))]
 pub use session::{
     AdmissionStats, DeliveryReceipt, ManifestStatus, NativeContentPending, NativeDownload,
-    NativeInputRejected, NativeServiceBusy, NativeSessions, NativeUpload, PeerInputClaim,
-    RecoveryStatus, SchedulePreparation, ScheduleReservation, SessionLimits, SessionStatus,
-    TicketStatus,
+    NativeInputRejected, NativeLeaseRejected, NativeServiceBusy, NativeSessions, NativeUpload,
+    PeerInputClaim, RecoveryStatus, SchedulePreparation, ScheduleReservation, SessionLimits,
+    SessionStatus, TicketStatus,
 };
 #[cfg(all(unix, feature = "store"))]
 mod store;

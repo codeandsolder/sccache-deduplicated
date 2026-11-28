@@ -803,6 +803,24 @@ pub struct NativeSessions {
     live_traces: live::LiveTraces,
 }
 
+/// A definitive lease rejection, distinct from a busy or unavailable service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeLeaseRejected {
+    Expired,
+    Unauthorized,
+}
+
+impl std::fmt::Display for NativeLeaseRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Expired => "unknown or expired native lease",
+            Self::Unauthorized => "native lease owner mismatch",
+        })
+    }
+}
+
+impl std::error::Error for NativeLeaseRejected {}
+
 /// A bounded service slot is occupied. Clients can retry without changing
 /// identities or starting additional downloads.
 #[derive(Debug)]
@@ -935,7 +953,7 @@ impl NativeSessions {
         self.sessions()?
             .get(&ticket)
             .cloned()
-            .context("unknown or expired native ticket")
+            .ok_or_else(|| NativeLeaseRejected::Expired.into())
     }
 
     fn register(&self, kind: Kind, publisher: Publisher, phase: Phase) -> Result<Ticket> {
@@ -966,10 +984,9 @@ impl NativeSessions {
     }
 
     fn touch(&self, session: &mut Session) -> Result<()> {
-        ensure!(
-            session.allocating.is_some() || session.expires > Instant::now(),
-            "native ticket expired"
-        );
+        if session.allocating.is_none() && session.expires <= Instant::now() {
+            return Err(NativeLeaseRejected::Expired.into());
+        }
         session.expires = self.deadline();
         Ok(())
     }
@@ -978,10 +995,9 @@ impl NativeSessions {
         if session.allocating.is_some() {
             return Err(NativeServiceBusy.into());
         }
-        ensure!(
-            session.publisher == publisher,
-            "native publisher does not own ticket"
-        );
+        if session.publisher != publisher {
+            return Err(NativeLeaseRejected::Unauthorized.into());
+        }
         self.touch(session)
     }
 
@@ -990,7 +1006,9 @@ impl NativeSessions {
             Kind::Action => Publisher::Client,
             Kind::Tree => session.publisher,
         };
-        ensure!(reader == expected, "native reader does not own ticket");
+        if reader != expected {
+            return Err(NativeLeaseRejected::Unauthorized.into());
+        }
         self.touch(session)
     }
 
@@ -1353,7 +1371,7 @@ impl NativeSessions {
     ///
     /// # Errors
     /// Returns an error if the ticket expired or belongs to another publisher.
-    pub fn renew(&self, ticket: Ticket, publisher: Publisher) -> Result<()> {
+    pub fn renew(&self, ticket: Ticket, publisher: Publisher) -> Result<crate::wire::LeaseRenewal> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         if publisher == Publisher::Client && state.allocating.is_some() {
@@ -1364,7 +1382,10 @@ impl NativeSessions {
             self.authorize_reader(&mut state, publisher)
         } else {
             self.authorize(&mut state, publisher)
-        }
+        }?;
+        Ok(crate::wire::LeaseRenewal {
+            valid_for: self.limits.idle_timeout,
+        })
     }
 
     fn upload_slot(&self, source: UploadSource) -> Result<UploadSlot> {

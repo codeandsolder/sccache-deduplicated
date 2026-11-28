@@ -898,7 +898,7 @@ fn compile(
 struct WorkerLease {
     client: NativeCacheClient,
     ticket: Ticket,
-    renewals: Option<super::renewal::Renewals>,
+    renewals: Option<super::renewal::Renewal>,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -954,8 +954,8 @@ impl WorkerLease {
                     Err(error) => return Err(error),
                 }
             }
-            let renewals = super::renewal::Renewals::start(lease.client.clone(), interval)?;
-            renewals.add(ticket)?;
+            let renewals = super::renewal::Renewal::start(lease.client.clone(), ticket, interval)?;
+
             Ok(renewals)
         }
         .await;

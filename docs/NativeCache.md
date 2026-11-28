@@ -371,8 +371,18 @@ counterfactual results do not include ZFS block compression, original-package
 decode CPU, cache admission stalls, concurrent pinning or external snapshots.
 
 The worker advertises the BLAKE3 digest of the exact platform contract.
-Clients use the same digest in `ExecutionSpec.platform`. The renewal
-interval must be shorter than the scheduler idle timeout.
+Clients use the same digest in `ExecutionSpec.platform`. The configured renewal interval is a maximum cadence. Every successful
+renewal returns the scheduler's actual idle lease lifetime; the client
+renews no later than one third of that lifetime. Each guard owns one lease.
+A delayed request or missed cadence is not a lease expiry: temporary
+transport failures and service overload are retried with bounded request
+timeouts and backoff. Only a definitive scheduler rejection (lost/expired
+lease or invalid ownership) terminates the lease. Other authenticated
+operations can extend a lease, so a client-side elapsed timer cannot prove
+expiration. If confirmed validity becomes uncertain, diagnostics report
+the transport failure while attempts continue; the ordinary build/action
+deadlines still apply. A restarted scheduler rejects old in-memory leases
+with HTTP 410, requiring a new build session.
 
 On ZFS workers, the native CAS directory and execution scratch **must be
 on the same ZFS dataset** for block cloning. The worker verifies this at

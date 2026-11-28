@@ -31,10 +31,11 @@ use super::{SchedulerRequester, role_error};
 use crate::{
     build_runtime::{
         ActionMode, ArchiveLength, BlobEncoding, BlobRef, Direction, ExecutionSpec,
-        NativeContentPending, NativeInputRejected, NativeServiceBusy, NativeSessions, NativeStore,
-        NetworkMeter, NetworkSnapshot, PackageCatalog, PackageIdentity, PackageImportLimits,
-        PackagePreparation, PackageSource, Peer, SchedulePreparation, ScheduleReservation,
-        StagedBlob, TreeId, TreeManifest, VerifiedPackage,
+        NativeContentPending, NativeInputRejected, NativeLeaseRejected, NativeServiceBusy,
+        NativeSessions, NativeStore, NetworkMeter, NetworkSnapshot, PackageCatalog,
+        PackageIdentity, PackageImportLimits, PackagePreparation, PackageSource, Peer,
+        SchedulePreparation, ScheduleReservation, StagedBlob, TreeId, TreeManifest,
+        VerifiedPackage,
         wire::{BlobRecipient, BlobSource, BlobSourcePlan, Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
@@ -1034,6 +1035,24 @@ fn native_response(operation: &str, result: Result<Response>) -> Response {
         Err(error) if error.is::<NativeServiceBusy>() => {
             (StatusCode::SERVICE_UNAVAILABLE, "native service busy").into_response()
         }
+        Err(error) if matches!(operation, "renew" | "retain_renew") => {
+            match error.downcast_ref::<NativeLeaseRejected>() {
+                Some(NativeLeaseRejected::Expired) => {
+                    (StatusCode::GONE, "native lease lost").into_response()
+                }
+                Some(NativeLeaseRejected::Unauthorized) => {
+                    (StatusCode::FORBIDDEN, "native lease owner mismatch").into_response()
+                }
+                None => {
+                    error!("Native cache {operation} failed: {error:#}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "native renewal service failed",
+                    )
+                        .into_response()
+                }
+            }
+        }
         Err(error) => {
             // Do not return host paths, auth tokens or raw internal metadata
             // to callers. The service log carries diagnostic context.
@@ -1183,10 +1202,10 @@ fn dispatch(
             sessions.retain_result(group, action, result, request.id())?;
             encode(&(), limit)
         }
-        "retain_renew" if publisher == Publisher::Client => {
-            sessions.renew_retention(metadata(request, limit)?, request.id())?;
-            encode(&(), limit)
-        }
+        "retain_renew" if publisher == Publisher::Client => encode(
+            &sessions.renew_retention(metadata(request, limit)?, request.id())?,
+            limit,
+        ),
         "retain_close" if publisher == Publisher::Client => {
             sessions.close_retention(metadata(request, limit)?, request.id())?;
             encode(&(), limit)
@@ -1298,10 +1317,10 @@ fn dispatch(
             );
             Ok(response)
         }
-        "renew" => {
-            sessions.renew(metadata(request, limit)?, publisher)?;
-            encode(&(), limit)
-        }
+        "renew" => encode(
+            &sessions.renew(metadata(request, limit)?, publisher)?,
+            limit,
+        ),
         "fail" => {
             sessions.fail(metadata(request, limit)?, publisher)?;
             encode(&(), limit)

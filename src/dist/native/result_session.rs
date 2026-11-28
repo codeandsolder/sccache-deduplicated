@@ -1,5 +1,5 @@
 //! A build-scoped lease for immutable intermediate artifacts.
-use super::{NativeCacheClient, renewal::Renewals};
+use super::{NativeCacheClient, renewal::Renewal};
 use crate::build_runtime::{BlobRef, ContentId, ResultManifest, wire::Ticket};
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, fs::File, sync::Mutex, time::Duration};
@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, fs::File, sync::Mutex, time::Duration};
 pub struct NativeResultSession {
     client: NativeCacheClient,
     group: Ticket,
-    renewals: Option<Renewals>,
+    renewals: Option<Renewal>,
     blobs: Mutex<BTreeMap<ContentId, u64>>,
 }
 
@@ -20,8 +20,8 @@ impl NativeResultSession {
             renewals: None,
             blobs: Mutex::new(BTreeMap::new()),
         };
-        let renewals = Renewals::start_retention(session.client.clone(), interval)?;
-        renewals.add(group)?;
+        let renewals = Renewal::start_retention(session.client.clone(), group, interval)?;
+
         session.renewals = Some(renewals);
         Ok(session)
     }

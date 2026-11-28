@@ -1,49 +1,51 @@
-//! One renewal loop for a set of live tickets. Membership is independent of
-//! network I/O so admitting another tree never waits for a renewal request.
+//! A renewal guard owns one scheduler lease. The scheduler alone decides
+//! whether the lease is lost; a missed client-side timer is not an expiry.
 
 use std::{
-    collections::BTreeSet,
     future::Future,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
-use futures::{StreamExt, stream};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::build_runtime::wire::Ticket;
+use crate::build_runtime::wire::{LeaseRenewal, Ticket};
 
 use super::{NativeCacheClient, retryable_transport_error};
 
-#[derive(Default)]
-struct State {
-    tickets: BTreeSet<Ticket>,
-    failure: Option<String>,
-}
-
-pub(super) struct Renewals {
-    state: Arc<Mutex<State>>,
+pub(super) struct Renewal {
+    failure: Arc<Mutex<Option<String>>>,
     stop: CancellationToken,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
 }
 
-impl Renewals {
-    pub(super) fn start(client: NativeCacheClient, interval: Duration) -> Result<Self> {
-        Self::start_operation(client, interval, "renew")
+impl Renewal {
+    pub(super) fn start(
+        client: NativeCacheClient,
+        ticket: Ticket,
+        interval: Duration,
+    ) -> Result<Self> {
+        Self::start_operation(client, ticket, interval, "renew")
     }
 
-    pub(super) fn start_retention(client: NativeCacheClient, interval: Duration) -> Result<Self> {
-        Self::start_operation(client, interval, "retain_renew")
+    pub(super) fn start_retention(
+        client: NativeCacheClient,
+        ticket: Ticket,
+        interval: Duration,
+    ) -> Result<Self> {
+        Self::start_operation(client, ticket, interval, "retain_renew")
     }
 
     fn start_operation(
         client: NativeCacheClient,
+        ticket: Ticket,
         interval: Duration,
         operation: &'static str,
     ) -> Result<Self> {
-        Self::spawn(interval, move |ticket, timeout| {
+        let timeout = client.timeout.min(Duration::from_secs(10));
+        Self::spawn(interval, timeout, move |timeout| {
             let client = client.clone();
             async move {
                 client
@@ -53,63 +55,48 @@ impl Renewals {
         })
     }
 
-    fn spawn<F, Fut>(interval: Duration, renew: F) -> Result<Self>
+    fn spawn<F, Fut>(interval: Duration, timeout: Duration, renew: F) -> Result<Self>
     where
-        F: Fn(Ticket, Duration) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
+        F: Fn(Duration) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<LeaseRenewal>> + Send + 'static,
     {
         ensure!(
-            !interval.is_zero(),
-            "native renewal interval must be nonzero"
+            !interval.is_zero() && !timeout.is_zero(),
+            "invalid native renewal timing"
         );
-        let state = Arc::new(Mutex::new(State::default()));
+        let failure = Arc::new(Mutex::new(None));
         let stop = CancellationToken::new();
-        let shared = Arc::clone(&state);
+        let shared = Arc::clone(&failure);
         let cancelled = stop.clone();
         let task = crate::http_client::io_runtime()?.spawn(async move {
             tokio::select! {
                 biased;
-                result = renewal_loop(&shared, interval, renew) => result,
+                result = renewal_loop(interval, timeout, renew) => {
+                    if let Err(error) = result {
+                        *shared.lock().map_err(|_| anyhow!("native renewal state poisoned"))? =
+                            Some(format!("{error:#}"));
+                    }
+                    Ok(())
+                },
                 () = cancelled.cancelled() => Ok(()),
             }
         });
         Ok(Self {
-            state,
+            failure,
             stop,
             task: Some(task),
         })
     }
 
-    pub(super) fn add(&self, ticket: Ticket) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("native renewal state poisoned"))?;
-        state.tickets.insert(ticket);
-        drop(state);
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(super) fn remove(&self, ticket: Ticket) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("native renewal state poisoned"))?;
-        state.tickets.remove(&ticket);
-        drop(state);
-        Ok(())
-    }
-
     pub(super) fn check(&self) -> Result<()> {
-        let state = self
-            .state
+        let failure = self
+            .failure
             .lock()
             .map_err(|_| anyhow!("native renewal state poisoned"))?;
-        if let Some(error) = &state.failure {
+        if let Some(error) = &*failure {
             return Err(anyhow!("native scheduler lease renewal failed: {error}"));
         }
-        drop(state);
+        drop(failure);
         Ok(())
     }
 
@@ -126,10 +113,8 @@ impl Renewals {
     }
 }
 
-impl Drop for Renewals {
+impl Drop for Renewal {
     fn drop(&mut self) {
-        // Cancellation interrupts pending transport futures and timers. A
-        // destructor never waits for a network deadline or joins a thread.
         self.stop.cancel();
         if let Err(error) = self.check() {
             debug!("native renewal loop ended: {error:#}");
@@ -137,172 +122,224 @@ impl Drop for Renewals {
     }
 }
 
-// Renewals are deadline-critical. Bound fanout independently of blob I/O;
-// the server reserves a dedicated control lane.
-const MAX_CONCURRENT_RENEWALS: usize = 64;
+fn retryable_renewal_error(error: &anyhow::Error) -> bool {
+    if let Some(status) = error
+        .downcast_ref::<wreq::Error>()
+        .and_then(wreq::Error::status)
+    {
+        return status.is_server_error() || status == http::StatusCode::TOO_MANY_REQUESTS;
+    }
+    retryable_transport_error(error)
+}
 
-async fn renewal_loop<F, Fut>(state: &Mutex<State>, interval: Duration, renew: F) -> Result<()>
+fn describe_rejection(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<wreq::Error>().and_then(wreq::Error::status) {
+        Some(http::StatusCode::GONE) => error.context("scheduler no longer owns this lease (expired or restarted); restart the affected build"),
+        Some(http::StatusCode::FORBIDDEN) => error.context("scheduler rejected lease ownership"),
+        _ => error.context("scheduler renewal rejected"),
+    }
+}
+
+async fn renewal_loop<F, Fut>(interval: Duration, timeout: Duration, renew: F) -> Result<()>
 where
-    F: Fn(Ticket, Duration) -> Fut + Sync,
-    Fut: Future<Output = Result<()>>,
+    F: Fn(Duration) -> Fut,
+    Fut: Future<Output = Result<LeaseRenewal>>,
 {
-    let mut next = Instant::now() + interval;
+    let mut confirmed_until = None;
+    let mut delay = Duration::from_millis(100);
+    let mut degraded_since = None;
+    let mut warned = false;
     loop {
-        tokio::time::sleep_until(next).await;
-        let mut pending = state
-            .lock()
-            .map_err(|_| anyhow!("native renewal state poisoned"))?
-            .tickets
-            .clone();
-        let deadline = next
-            .checked_add(interval)
-            .context("native renewal deadline overflow")?;
-        let mut delay = Duration::from_millis(25);
-        while !pending.is_empty() {
-            let mut retry = BTreeSet::new();
-            let mut requests = std::pin::pin!(
-                stream::iter(pending)
-                    .map(|ticket| {
-                        let renew = &renew;
-                        async move {
-                            let timeout = deadline
-                                .saturating_duration_since(Instant::now())
-                                .min(Duration::from_secs(2));
-                            let result = if timeout.is_zero() {
-                                Err(anyhow!("native renewal retry budget exhausted"))
-                            } else {
-                                tokio::time::timeout(timeout, renew(ticket, timeout))
-                                    .await
-                                    .unwrap_or_else(|_| {
-                                        Err(std::io::Error::from(std::io::ErrorKind::TimedOut)
-                                            .into())
-                                    })
-                            };
-                            (ticket, result)
-                        }
-                    })
-                    .buffer_unordered(MAX_CONCURRENT_RENEWALS)
-            );
-            while let Some((ticket, result)) = requests.next().await {
-                if let Err(error) = result {
-                    let mut state = state
-                        .lock()
-                        .map_err(|_| anyhow!("native renewal state poisoned"))?;
-                    if !state.tickets.contains(&ticket) {
-                        continue;
-                    }
-                    if retryable_transport_error(&error) && Instant::now() < deadline {
-                        debug!("retrying native lease renewal: {error:#}");
-                        retry.insert(ticket);
-                    } else {
-                        state.failure = Some(format!("{error:#}"));
-                        return Ok(());
-                    }
+        // Renew immediately on creation, including retention groups. A fresh
+        // reply advertises the server's actual idle timeout. Use the send time
+        // as a conservative lower bound on confirmed validity, never a proof
+        // of expiration (ordinary operations may also extend a lease).
+        let sent = Instant::now();
+        let attempt_timeout = confirmed_until
+            .map(|until: Instant| until.saturating_duration_since(sent))
+            .filter(|remaining| !remaining.is_zero())
+            .map_or(timeout, |remaining| timeout.min(remaining));
+        let result = tokio::time::timeout(attempt_timeout, renew(attempt_timeout))
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "native renewal request timed out",
+                )
+                .into())
+            });
+        match result {
+            Ok(reply) => {
+                let lifetime = reply.valid_for;
+                ensure!(
+                    !lifetime.is_zero(),
+                    "scheduler advertised zero lease lifetime"
+                );
+                confirmed_until = Some(
+                    sent.checked_add(lifetime)
+                        .context("native lease lifetime overflow")?,
+                );
+                if let Some(since) = degraded_since.take() {
+                    debug!(
+                        "native lease renewal recovered after {:?}",
+                        Instant::now() - since
+                    );
                 }
+                warned = false;
+                delay = Duration::from_millis(100);
+                // The configured interval is an upper bound, not a deadline.
+                // Keep at least two thirds of the advertised lifetime for
+                // recovery, even when the server has a shorter lease policy.
+                let cadence = interval.min(lifetime / 3).max(Duration::from_nanos(1));
+                tokio::time::sleep_until(
+                    sent.checked_add(cadence)
+                        .context("native renewal cadence overflow")?
+                        .max(Instant::now()),
+                )
+                .await;
             }
-            pending = retry;
-            if !pending.is_empty() {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                tokio::time::sleep(delay.min(remaining)).await;
-                delay = (delay * 2).min(Duration::from_millis(250));
+            Err(error) if retryable_renewal_error(&error) => {
+                let since = *degraded_since.get_or_insert(sent);
+                let now = Instant::now();
+                if !warned
+                    && (confirmed_until.is_some_and(|until| now >= until)
+                        || now - since >= interval)
+                {
+                    warn!(
+                        "native lease renewal delayed; retrying until the scheduler confirms or rejects the lease: {error:#}"
+                    );
+                    warned = true;
+                } else {
+                    debug!("retrying native lease renewal: {error:#}");
+                }
+                let remaining = confirmed_until
+                    .map(|until| until.saturating_duration_since(now))
+                    .filter(|remaining| !remaining.is_zero());
+                let pause = remaining.map_or(delay, |remaining| delay.min(remaining));
+                tokio::time::sleep(pause).await;
+                delay = (delay * 2).min(Duration::from_secs(2));
             }
+            Err(error) => return Err(describe_rejection(error)),
         }
-        // Schedule from the original deadline instead of accumulating time
-        // spent renewing. Skip missed ticks, but never create a catch-up burst.
-        next = (next + interval).max(Instant::now());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[test]
-    fn renews_all_members_until_released() -> Result<()> {
-        let (observed, events) = mpsc::channel();
-        let renewals = Renewals::spawn(Duration::from_millis(100), move |ticket, _| {
-            std::future::ready(observed.send(ticket).map_err(Into::into))
-        })?;
-        let first = Ticket([1; 32]);
-        let second = Ticket([2; 32]);
-        renewals.add(first)?;
-        renewals.add(second)?;
-        let mut seen = BTreeSet::new();
-        while seen.len() != 2 {
-            seen.insert(events.recv_timeout(Duration::from_secs(2))?);
+    fn reply(seconds: u64) -> LeaseRenewal {
+        LeaseRenewal {
+            valid_for: Duration::from_secs(seconds),
         }
-        renewals.remove(first)?;
-        renewals.remove(second)?;
-        renewals.finish()?;
-        assert_eq!(seen, BTreeSet::from([first, second]));
-        Ok(())
     }
 
-    #[test]
-    fn transient_renewal_failure_recovers_without_losing_other_tickets() -> Result<()> {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let first = Ticket([1; 32]);
-        let second = Ticket([2; 32]);
-        let failed = AtomicBool::new(false);
-        let (observed, events) = mpsc::channel();
-        let renewals = Renewals::spawn(Duration::from_millis(200), move |ticket, _| {
-            std::future::ready(if ticket == first && !failed.swap(true, Ordering::SeqCst) {
+    #[tokio::test(start_paused = true)]
+    async fn outage_longer_than_renewal_interval_recovers() {
+        let calls = AtomicUsize::new(0);
+        let start = Instant::now();
+        let result = renewal_loop(Duration::from_secs(15), Duration::from_secs(10), |_| {
+            let call = calls.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(if call == 0 {
+                Ok(reply(120))
+            } else if Instant::now() - start < Duration::from_secs(45) {
                 Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into())
+            } else if Instant::now() - start < Duration::from_secs(60) {
+                Ok(reply(120))
             } else {
-                observed.send(ticket).map_err(Into::into)
+                Err(anyhow!("authoritative rejection"))
             })
-        })?;
-        renewals.add(first)?;
-        renewals.add(second)?;
-        assert_eq!(events.recv_timeout(Duration::from_secs(2))?, second);
-        assert_eq!(events.recv_timeout(Duration::from_secs(2))?, first);
-        renewals.check()?;
-        renewals.finish()?;
-        Ok(())
+        })
+        .await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("authoritative rejection"));
+        assert!(Instant::now() - start >= Duration::from_secs(60));
+        assert!(calls.load(Ordering::Relaxed) > 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_renewal_retries_without_a_confirmed_lifetime() {
+        let start = Instant::now();
+        let recovered = AtomicUsize::new(0);
+        let result = renewal_loop(Duration::from_secs(2), Duration::from_secs(5), |_| {
+            std::future::ready(if Instant::now() - start < Duration::from_secs(8) {
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into())
+            } else if recovered.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(reply(30))
+            } else {
+                Err(anyhow!("terminal"))
+            })
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(recovered.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uncertain_expiry_is_not_fabricated_lease_loss() {
+        let start = Instant::now();
+        let result = renewal_loop(Duration::from_secs(15), Duration::from_secs(10), |_| {
+            std::future::ready(if Instant::now() == start {
+                Ok(reply(6))
+            } else if Instant::now() - start < Duration::from_secs(20) {
+                Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into())
+            } else {
+                Err(anyhow!("scheduler lost the lease"))
+            })
+        })
+        .await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("scheduler lost the lease"));
+        assert!(Instant::now() - start >= Duration::from_secs(20));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cadence_tracks_short_scheduler_lifetime() {
+        let start = Instant::now();
+        let result = renewal_loop(Duration::from_secs(15), Duration::from_secs(10), |_| {
+            std::future::ready(if Instant::now() == start {
+                Ok(reply(6))
+            } else {
+                Err(anyhow!("terminal"))
+            })
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(Instant::now() - start, Duration::from_secs(2));
     }
 
     #[test]
-    fn stalled_ticket_does_not_hold_up_other_members_or_shutdown() -> Result<()> {
-        let first = Ticket([1; 32]);
-        let second = Ticket([2; 32]);
-        let (observed, events) = mpsc::channel();
-        let renewals = Renewals::spawn(Duration::from_secs(2), move |ticket, _| {
-            let observed = observed.clone();
-            async move {
-                observed.send(ticket)?;
-                if ticket == first {
-                    std::future::pending::<()>().await;
-                }
-                Ok(())
-            }
+    fn stalled_lease_is_independent_and_shutdown_is_nonblocking() -> Result<()> {
+        let (observed, events) = std::sync::mpsc::channel();
+        let stalled = Renewal::spawn(Duration::from_secs(15), Duration::from_secs(10), |_| {
+            std::future::pending()
         })?;
-        renewals.add(first)?;
-        renewals.add(second)?;
-        let mut seen = BTreeSet::new();
-        seen.insert(events.recv_timeout(Duration::from_secs(4))?);
-        seen.insert(events.recv_timeout(Duration::from_millis(500))?);
-        assert_eq!(seen, BTreeSet::from([first, second]));
-        let start = std::time::Instant::now();
-        renewals.finish()?;
-        assert!(start.elapsed() < Duration::from_millis(500));
-        Ok(())
-    }
-
-    #[test]
-    fn renewal_error_survives_shutdown() -> Result<()> {
-        let (observed, events) = mpsc::channel();
-        let renewals = Renewals::spawn(Duration::from_millis(100), move |_, _| {
-            std::future::ready(
-                observed
-                    .send(())
-                    .map_err(anyhow::Error::from)
-                    .and(Err(anyhow!("lost lease"))),
-            )
-        })?;
-        renewals.add(Ticket([3; 32]))?;
+        let healthy = Renewal::spawn(
+            Duration::from_secs(15),
+            Duration::from_secs(10),
+            move |_| std::future::ready(observed.send(()).map(|()| reply(120)).map_err(Into::into)),
+        )?;
         events.recv_timeout(Duration::from_secs(2))?;
-        assert!(renewals.finish().is_err());
+        let start = std::time::Instant::now();
+        stalled.finish()?;
+        healthy.finish()?;
+        assert!(start.elapsed() < Duration::from_secs(1));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_error_survives_shutdown() -> Result<()> {
+        let guard = Renewal::spawn(Duration::from_secs(15), Duration::from_secs(10), |_| {
+            std::future::ready(Err(anyhow!("lost lease")))
+        })?;
+        let start = std::time::Instant::now();
+        while guard.check().is_ok() {
+            ensure!(
+                start.elapsed() < Duration::from_secs(2),
+                "renewal rejection not observed"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(format!("{:#}", guard.finish().unwrap_err()).contains("lost lease"));
         Ok(())
     }
 }

@@ -297,6 +297,56 @@ fn with_native_service(
     outcome
 }
 
+#[test]
+fn renewal_replies_advertise_lifetime_and_distinguish_lease_rejection() -> Result<()> {
+    use crate::build_runtime::wire::{LeaseRenewal, Ticket};
+    with_native_service(|endpoint, _, _, _| {
+        let client = make_client(endpoint, "client-token")?;
+        let group = client.open_retention()?;
+        let (http, url) = endpoint.raw(&endpoint.client)?;
+        let runtime = crate::http_client::io_runtime()?;
+        let renew = |operation: &str, ticket: Ticket| -> Result<wreq::Response> {
+            Ok(runtime.block_on(
+                http.post(
+                    url.join(&format!("/api/v5/native/client/{operation}"))?
+                        .as_str(),
+                )
+                .header("Content-Type", "application/octet-stream")
+                .body(codec().serialize(&ticket)?)
+                .timeout(Duration::from_secs(5))
+                .send(),
+            )?)
+        };
+        let response = renew("retain_renew", group)?;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let reply: LeaseRenewal = codec().deserialize(&runtime.block_on(response.bytes())?)?;
+        assert_eq!(reply.valid_for, limits().idle_timeout);
+        client.close_retention(group)?;
+        assert_eq!(
+            renew("retain_renew", group)?.status(),
+            http::StatusCode::GONE
+        );
+        assert_eq!(
+            renew("renew", Ticket([0; 32]))?.status(),
+            http::StatusCode::GONE
+        );
+        Ok(())
+    })?;
+    assert_eq!(
+        native_response("renew", Err(NativeLeaseRejected::Unauthorized.into())).status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        native_response("renew", Err(NativeServiceBusy.into())).status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        native_response("retain_renew", Err(anyhow::anyhow!("internal failure"))).status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    Ok(())
+}
+
 fn verify_compressed_download(
     endpoint: &TestEndpoint,
     ticket: crate::build_runtime::wire::Ticket,

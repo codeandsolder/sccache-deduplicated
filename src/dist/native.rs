@@ -997,9 +997,8 @@ impl NativeCacheClient {
             .await?;
         let ticket = read.ticket;
         let result = async {
-            self.control_with_timeout_async::<_, ()>("renew", &ticket, self.timeout).await?;
-            let renewals = renewal::Renewals::start(self.clone(), delivery.renewal_interval)?;
-            renewals.add(ticket)?;
+            let renewals = renewal::Renewal::start(self.clone(), ticket, delivery.renewal_interval)?;
+
             let check = &|| { action_check()?; renewals.check() };
             check()?;
             ensure!(read.manifest.id()? == id, "native tree download identity mismatch");
@@ -1527,7 +1526,8 @@ impl NativeCacheClient {
     /// # Errors
     /// Returns an error for expired or unauthorized tickets.
     pub fn renew(&self, ticket: Ticket) -> Result<()> {
-        self.control("renew", &ticket)
+        self.control::<_, crate::build_runtime::wire::LeaseRenewal>("renew", &ticket)
+            .map(|_| ())
     }
 
     /// Open a build-scoped immutable result retention lease.
@@ -1560,7 +1560,8 @@ impl NativeCacheClient {
     /// # Errors
     /// Returns an error for an expired or unauthorized lease.
     pub fn renew_retention(&self, group: Ticket) -> Result<()> {
-        self.control("retain_renew", &group)
+        self.control::<_, crate::build_runtime::wire::LeaseRenewal>("retain_renew", &group)
+            .map(|_| ())
     }
 
     /// Release the build lease and its retained content.
@@ -1617,9 +1618,8 @@ impl NativeCacheClient {
         interval: Duration,
         operation: impl FnOnce(&LeaseCheck<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.renew(ticket)?;
-        let renewals = renewal::Renewals::start(self.clone(), interval)?;
-        renewals.add(ticket)?;
+        let renewals = renewal::Renewal::start(self.clone(), ticket, interval)?;
+
         let result = operation(&|| renewals.check());
         let renewed = renewals.finish();
         result.and_then(|value| renewed.map(|()| value))
