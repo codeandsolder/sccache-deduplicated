@@ -45,6 +45,7 @@ pub(crate) fn native_directory_metadata() -> Result<crate::build_runtime::TreeMe
 pub enum ToolchainScope {
     Default,
     RustCompiler,
+    RustOpaque,
     PreprocessedC,
 }
 

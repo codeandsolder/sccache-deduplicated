@@ -614,6 +614,7 @@ fn prepare_toolchain(
 ) -> Result<PreparedTree> {
     let scope = match (policy, opaque_compiler_extension(command, inputs)) {
         (ResultIdentityPolicy::Rust, false) => pkg::ToolchainScope::RustCompiler,
+        (ResultIdentityPolicy::Rust, true) => pkg::ToolchainScope::RustOpaque,
         (ResultIdentityPolicy::PreprocessedC, false) => pkg::ToolchainScope::PreprocessedC,
         _ => pkg::ToolchainScope::Default,
     };
@@ -636,6 +637,27 @@ fn prepare_toolchain(
         }
     }
     if scope == pkg::ToolchainScope::PreprocessedC {
+        // Diagnostics are produced under one reproducible locale/terminal
+        // contract. The local preprocessor has already consumed source-level
+        // environment and include search.
+        command.environment.retain(|name, _| {
+            !name.starts_with(b"LC_")
+                && ![
+                    b"LANG".as_slice(),
+                    b"LANGUAGE",
+                    b"TZ",
+                    b"TERM",
+                    b"COLORTERM",
+                ]
+                .contains(&name.as_slice())
+        });
+        for (name, value) in [
+            (b"LANG".as_slice(), b"C".as_slice()),
+            (b"LC_ALL", b"C"),
+            (b"TZ", b"UTC"),
+        ] {
+            command.environment.insert(name.to_vec(), value.to_vec());
+        }
         // The native worker receives fully preprocessed input. Include
         // search already ran locally; these variables are not runtime inputs.
         for name in [
