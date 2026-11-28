@@ -3306,6 +3306,65 @@ fn run_rust_delivery_audit(
     Ok(())
 }
 
+fn run_rust_cwd_remap_audit(
+    service: &LocalService,
+    source: &Path,
+    rustc: &Path,
+    config: &Path,
+) -> Result<()> {
+    let one = source.join("remap-one");
+    let two = source.join("remap-two");
+    for directory in [&one, &two] {
+        fs::create_dir_all(directory.join("out"))?;
+        fs::write(directory.join("cwd.rs"), b"pub fn value() -> u32 { 42 }")?;
+    }
+    let user_mapping = format!("--remap-path-prefix={}=/explicit", one.display());
+    let compile = |directory: &Path, explicit: bool| -> Result<((String, String), Vec<u8>)> {
+        let mut command = service.command(env!("CARGO_BIN_EXE_sccache"));
+        command
+            .arg(rustc)
+            .args([
+                "--crate-name",
+                "cwd_audit",
+                "--crate-type",
+                "rlib",
+                "--edition=2024",
+                "--emit=link",
+                "--out-dir",
+                "out",
+                "cwd.rs",
+            ])
+            .arg(&user_mapping);
+        if explicit {
+            command.arg("-Zremap-cwd-prefix=/explicit");
+        }
+        let output = command
+            .current_dir(directory)
+            .env("SCCACHE_CONF", config)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
+            .output()?;
+        Ok((
+            action_report(&output)?,
+            fs::read(directory.join("out/libcwd_audit.rlib"))?,
+        ))
+    };
+    let ((first, kind), a) = compile(&one, false)?;
+    assert_eq!(kind, "worker");
+    let ((second, kind), b) = compile(&two, false)?;
+    assert_eq!(kind, "worker");
+    assert_ne!(first, second);
+    assert_ne!(a, b);
+    let ((same, kind), restored) = compile(&one, false)?;
+    assert_eq!((same, kind), (first, "hit".into()));
+    assert_eq!(restored, a);
+    let ((fixed, kind), c) = compile(&one, true)?;
+    assert_eq!(kind, "worker");
+    let ((same, kind), d) = compile(&two, true)?;
+    assert_eq!((same, kind), (fixed, "hit".into()));
+    assert_eq!(c, d);
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires Linux Bubblewrap, GCC, Rust toolchain and ldd"]
 fn native_rust_bundled_archive_identity_follows_search_precedence() -> Result<()> {
@@ -3452,6 +3511,7 @@ fn native_rust_bundled_archive_identity_follows_search_precedence() -> Result<()
     assert_eq!(second, third);
     run_packed_archive_audit(&service, &source, &rustc, &config)?;
     run_rust_delivery_audit(&service, &source, &rustc, &config)?;
+    run_rust_cwd_remap_audit(&service, &source, &rustc, &config)?;
     service.stop()?;
     fleet.finish()?;
     Ok(())
