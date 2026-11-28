@@ -612,15 +612,6 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
     fn kind(&self) -> CompilerKind {
         CompilerKind::C(self.compiler.kind())
     }
-    #[cfg(feature = "dist-client")]
-    fn get_toolchain_packager(&self) -> Box<dyn pkg::ToolchainPackager> {
-        Box::new(CToolchainPackager {
-            executable: self.executable.clone(),
-            kind: self.compiler.kind(),
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-            env_vars: Vec::new(),
-        })
-    }
     fn parse_arguments(
         &self,
         arguments: &[OsString],
@@ -2264,10 +2255,6 @@ struct CInputsPackager {
 
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for CInputsPackager {
-    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<()> {
-        (*self).discover()?.write_archive(wtr, |_, _| Ok(None))
-    }
-
     #[cfg(target_os = "linux")]
     fn native_mapping(self: Box<Self>) -> Result<pkg::NativeInputPlan> {
         (*self).discover()?.into_native_input_plan(|_| false)
@@ -2309,140 +2296,6 @@ struct CToolchainPackager {
 }
 
 #[cfg(all(
-    feature = "dist-client",
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-fn gcc_program_search_fingerprint(
-    search_output: &[u8],
-    cwd: &Path,
-    path_env: Option<&OsStr>,
-) -> Result<String> {
-    use std::os::unix::ffi::OsStrExt;
-
-    fn record_path(digest: &mut Digest, path: &Path) -> Result<bool> {
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::MetadataExt;
-
-        digest.delimiter(path.as_os_str().as_bytes());
-        let metadata = match fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                digest.update(b"absent");
-                return Ok(false);
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("Could not inspect GCC helper {}", path.display()));
-            }
-        };
-        digest.update(b"present");
-        for field in [
-            metadata.dev(),
-            metadata.ino(),
-            metadata.len(),
-            metadata.mode().into(),
-            metadata.mtime().cast_unsigned(),
-            metadata.mtime_nsec().cast_unsigned(),
-            metadata.ctime().cast_unsigned(),
-            metadata.ctime_nsec().cast_unsigned(),
-        ] {
-            digest.update(&field.to_le_bytes());
-        }
-        Ok(metadata.is_dir())
-    }
-
-    let program_line = search_output
-        .split(|&byte| byte == b'\n')
-        .find_map(|line| line.strip_prefix(b"programs: "))
-        .context("GCC -print-search-dirs omitted program search paths")?;
-    let installation_directory = search_output
-        .split(|&byte| byte == b'\n')
-        .find_map(|line| line.strip_prefix(b"install: "));
-    let mut digest = Digest::new();
-    digest.delimiter(b"gcc-toolchain-helper-search-v2");
-    for bytes in program_line
-        .split(|&byte| byte == b':')
-        .chain(installation_directory)
-    {
-        let bytes = bytes.strip_prefix(b"=").unwrap_or(bytes);
-        if bytes.is_empty() {
-            continue;
-        }
-        let directory = PathBuf::from(OsStr::from_bytes(bytes));
-        let directory = if directory.is_absolute() {
-            directory
-        } else {
-            cwd.join(directory)
-        };
-        if !record_path(&mut digest, &directory)? {
-            continue;
-        }
-        let mut entries = fs::read_dir(&directory)?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<io::Result<Vec<_>>>()?;
-        entries.sort_unstable();
-        for entry in entries {
-            record_path(&mut digest, &entry)?;
-        }
-    }
-    // GCC may fall back to PATH after its own program search directories.
-    // Include all known helper names without enumerating an entire /usr/bin.
-    if let Some(path_env) = path_env {
-        for dir in std::env::split_paths(path_env) {
-            let dir = if dir.is_absolute() {
-                dir
-            } else {
-                cwd.join(dir)
-            };
-            for helper in [
-                "as",
-                "objcopy",
-                "ld",
-                "cc1",
-                "cc1plus",
-                "collect2",
-                "lto-wrapper",
-                "lto1",
-            ] {
-                record_path(&mut digest, &dir.join(helper))?;
-            }
-        }
-    }
-    Ok(digest.finish())
-}
-
-#[cfg(all(
-    test,
-    feature = "dist-client",
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-#[test]
-fn gcc_program_search_fingerprint_tracks_helper_changes() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let dir = temp.path().join("gcc-tools");
-    fs::create_dir(&dir)?;
-    let search = format!(
-        "install: ignored\nprograms: ={}\nlibraries: ignored\n",
-        dir.display()
-    );
-    let fingerprint = || gcc_program_search_fingerprint(search.as_bytes(), temp.path(), None);
-
-    let initial = fingerprint()?;
-    assert_eq!(initial, fingerprint()?);
-    fs::write(dir.join("as"), b"assembler version 1")?;
-    let with_assembler = fingerprint()?;
-    assert_ne!(initial, with_assembler);
-    fs::write(dir.join("as"), b"assembler version 2 with new size")?;
-    let with_new_assembler = fingerprint()?;
-    assert_ne!(with_assembler, with_new_assembler);
-    fs::write(dir.join("ld"), b"linker")?;
-    assert_ne!(with_new_assembler, fingerprint()?);
-    Ok(())
-}
-
-#[cfg(all(
     test,
     feature = "dist-client",
     target_os = "linux",
@@ -2466,23 +2319,19 @@ fn real_cross_gcc_package_preserves_executable_helper_search_path() -> Result<()
     assert!(assembler.is_absolute() && assembler.is_file());
 
     let temp = tempfile::tempdir()?;
-    let archive_path = temp.path().join("toolchain.tar.gz");
     let packager = CToolchainPackager {
         executable,
         kind: CCompilerKind::Gcc,
         cwd: temp.path().to_owned(),
         env_vars: Vec::new(),
     };
-    let cache_key = pkg::ToolchainPackager::cache_key_extension(&packager)?;
-    assert_eq!(
-        cache_key,
-        pkg::ToolchainPackager::cache_key_extension(&packager)?,
-        "unchanged GCC helper dependencies must have a stable cache key"
-    );
-    pkg::ToolchainPackager::write_pkg(Box::new(packager), fs::File::create(&archive_path)?)?;
-
-    let root = temp.path().join("unpacked");
-    crate::compression::deflate::unpack_gzip(fs::File::open(archive_path)?, &root)?;
+    let store = crate::build_runtime::NativeStore::open(&temp.path().join("store"))?;
+    let tree =
+        pkg::ToolchainPackager::native_mapping(Box::new(packager), pkg::ToolchainScope::Default)?
+            .prepare()?
+            .import(&store)?;
+    let view = tree.materialize(temp.path())?;
+    let root = view.root();
     assert!(
         root.join(assembler.strip_prefix("/")?).is_file(),
         "packaged GCC assembler must resolve using the driver's original path"
@@ -2496,36 +2345,6 @@ fn real_cross_gcc_package_preserves_executable_helper_search_path() -> Result<()
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 impl pkg::DiscoverToolchain for CToolchainPackager {
-    fn key_extension(&self) -> Result<Option<String>> {
-        // The compiler binary can be unchanged while its assembler, linker,
-        // internal phases or search directories are being installed or updated.
-        // One GCC driver query and metadata checks are cheaper than repackaging
-        // on every distributed compile.
-        if self.kind != CCompilerKind::Gcc {
-            return Ok(Some("c-toolchain-lexical-paths-v2".to_owned()));
-        }
-        let output = process::Command::new(&self.executable)
-            .arg("-print-search-dirs")
-            .current_dir(&self.cwd)
-            .envs(self.env_vars.iter().cloned())
-            .output()
-            .with_context(|| format!("Could not inspect GCC {}", self.executable.display()))?;
-        if !output.status.success() {
-            bail!("GCC failed while reporting toolchain search directories");
-        }
-        let path_env = self
-            .env_vars
-            .iter()
-            .find(|(key, _)| key.as_os_str() == OsStr::new("PATH"))
-            .map(|(_, value)| value.clone())
-            .or_else(|| std::env::var_os("PATH"));
-        Ok(Some(gcc_program_search_fingerprint(
-            &output.stdout,
-            &self.cwd,
-            path_env.as_deref(),
-        )?))
-    }
-
     fn package_builder(self, _scope: pkg::ToolchainScope) -> Result<pkg::ToolchainPackageBuilder> {
         use std::os::unix::ffi::OsStringExt;
 
@@ -3160,73 +2979,6 @@ mod test {
         args.common_args.clear();
         args.preprocessor_args = preprocessor_args;
         args
-    }
-
-    #[test]
-    #[cfg(feature = "dist-client")]
-    fn test_dist_input_packager_preserves_parent_path_resolution() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        std::fs::create_dir_all(root.join("arch/arm64/kvm")).unwrap();
-        std::fs::create_dir_all(root.join("virt/kvm")).unwrap();
-        std::fs::write(
-            root.join("virt/kvm/eventfd.c"),
-            b"int f(void) { return 0; }\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("asm/a/b")).unwrap();
-        std::fs::write(root.join("asm/blob.bin"), b"blob").unwrap();
-
-        let input_path = root.join("arch/arm64/kvm/../../../virt/kvm/eventfd.c");
-        let extra_input_path = root.join("asm/a/b/../../blob.bin");
-        let mut path_transformer = dist::PathTransformer::new();
-        path_transformer.add_root_mapping(root.to_owned(), "/work");
-        let packager = CInputsPackager {
-            input_path,
-            path_transformer,
-            preprocessed_input: b"int f(void) { return 0; }\n".to_vec(),
-            extra_dist_files: Vec::new(),
-            extra_hash_files: vec![extra_input_path],
-        };
-        let mut package = Vec::new();
-        pkg::InputsPackager::write_inputs(Box::new(packager), &mut package).unwrap();
-
-        let mut archive = tar::Archive::new(std::io::Cursor::new(&package));
-        let paths: std::collections::BTreeSet<_> = archive
-            .entries()
-            .unwrap()
-            .map(|entry| entry.unwrap().path().unwrap().into_owned())
-            .collect();
-        assert_eq!(
-            paths,
-            std::collections::BTreeSet::from([
-                PathBuf::from("work/arch"),
-                PathBuf::from("work/arch/arm64"),
-                PathBuf::from("work/arch/arm64/kvm"),
-                PathBuf::from("work/virt/kvm/eventfd.c"),
-                PathBuf::from("work/asm/a"),
-                PathBuf::from("work/asm/a/b"),
-                PathBuf::from("work/asm/blob.bin"),
-            ])
-        );
-        assert!(paths.iter().all(|path| {
-            !path
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-        }));
-
-        let worker_root = tempfile::tempdir().unwrap();
-        let mut archive = tar::Archive::new(std::io::Cursor::new(package));
-        archive.unpack(worker_root.path()).unwrap();
-        let worker_input = worker_root
-            .path()
-            .join("work/arch/arm64/kvm/../../../virt/kvm/eventfd.c");
-        assert_eq!(
-            std::fs::read(worker_input).unwrap(),
-            b"int f(void) { return 0; }\n"
-        );
-        let worker_extra = worker_root.path().join("work/asm/a/b/../../blob.bin");
-        assert_eq!(std::fs::read(worker_extra).unwrap(), b"blob");
     }
 
     #[cfg(all(feature = "dist-client", feature = "native-store", target_os = "linux"))]

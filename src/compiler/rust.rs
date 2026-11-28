@@ -269,9 +269,6 @@ pub struct RustCompilation {
     crate_link_paths: Vec<PathBuf>,
     /// The crate name being compiled.
     crate_name: String,
-    /// Whether only dependency metadata (not native objects) is needed.
-    #[cfg(feature = "dist-client")]
-    can_trim_rlibs: bool,
     /// The current working directory
     cwd: PathBuf,
     /// The environment variables
@@ -1485,16 +1482,6 @@ where
 {
     fn kind(&self) -> CompilerKind {
         CompilerKind::Rust
-    }
-    #[cfg(feature = "dist-client")]
-    fn get_toolchain_packager(&self) -> Box<dyn pkg::ToolchainPackager> {
-        Box::new(RustToolchainPackager {
-            sysroot: self.sysroot.clone(),
-            canonical: false,
-            host: None,
-            target: None,
-            dlltool_files: Vec::new(),
-        })
     }
     /// Parse `arguments` as rustc command-line arguments, determine if
     /// we can cache the result of compilation. This is only intended to
@@ -3717,17 +3704,6 @@ where
                 outputs,
                 crate_link_paths: self.parsed_args.crate_link_paths.clone(),
                 crate_name: self.parsed_args.crate_name.clone(),
-                #[cfg(feature = "dist-client")]
-                can_trim_rlibs: !self.parsed_args.split_link
-                    && (self.parsed_args.metadata_only_output.is_some()
-                        || matches!(
-                            self.parsed_args.crate_types,
-                            CrateTypes {
-                                rlib: true,
-                                staticlib: false,
-                                cdylib: false,
-                            }
-                        )),
                 cwd,
                 env_vars,
                 env_dep_names,
@@ -4056,7 +4032,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             inputs,
             crate_link_paths,
             sysroot,
-            can_trim_rlibs,
+
             rlib_dep_reader,
             env_vars,
             env_dep_names,
@@ -4109,7 +4085,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             env_vars,
             input_dirs,
             crate_link_paths,
-            can_trim_rlibs,
+
             inputs,
             #[cfg(target_os = "linux")]
             codegen_only: native_link.map_or_else(Default::default, |layout| layout.codegen_only),
@@ -4155,82 +4131,11 @@ struct RustInputsPackager {
     env_vars: Vec<(OsString, OsString)>,
     input_dirs: Vec<PathBuf>,
     crate_link_paths: Vec<PathBuf>,
-    can_trim_rlibs: bool,
+
     inputs: Vec<PathBuf>,
     codegen_only: std::collections::BTreeSet<PathBuf>,
     path_transformer: dist::PathTransformer,
     rlib_dep_reader: Option<Arc<RlibDepReader>>,
-}
-
-#[cfg(feature = "dist-client")]
-fn can_trim_this(input_path: &Path) -> bool {
-    trace!(
-        "can_trim_this: input_path={}",
-        crate::util::debug_display(input_path)
-    );
-    // A dependency that also emits a linkable artifact is handed to its
-    // dependents as a whole rlib rather than as metadata, so trimming it to
-    // metadata strands the remote compile.
-    // https://bugzilla.mozilla.org/show_bug.cgi?id=1760743
-    input_path.extension().is_some_and(|e| e == RLIB_EXTENSION)
-        && !has_link_artifact_sibling(input_path)
-}
-
-/// Whether `rlib` sits beside a staticlib, cdylib or dylib built from the same crate.
-#[cfg(feature = "dist-client")]
-fn has_link_artifact_sibling(rlib: &Path) -> bool {
-    const LINK_EXTENSIONS: &[&str] = &["a", "so", "dylib", "dll", "wasm"];
-    let (Some(dir), Some(stem)) = (rlib.parent(), rlib.file_stem().and_then(|s| s.to_str())) else {
-        return false;
-    };
-    // Only some of the artifacts carry the `lib` prefix the rlib has.
-    let unprefixed = stem.strip_prefix("lib").unwrap_or(stem);
-    LINK_EXTENSIONS.iter().any(|ext| {
-        dir.join(format!("{stem}.{ext}")).exists()
-            || dir.join(format!("{unprefixed}.{ext}")).exists()
-    })
-}
-
-#[test]
-#[cfg(feature = "dist-client")]
-fn test_can_trim_this() {
-    use crate::test::utils::create_file;
-    let tempdir = tempfile::Builder::new()
-        .prefix("sccache_test")
-        .tempdir()
-        .unwrap();
-    let tempdir = tempdir.path();
-
-    // With only one rlib file we should be fine
-    let rlib_file = create_file(tempdir, "libtest.rlib", |_f| Ok(())).unwrap();
-    assert!(can_trim_this(&rlib_file));
-
-    // Adding an ar from a staticlib (i.e., crate-type = ["staticlib", "rlib"]
-    // we need to refuse to allow trimming
-    let _ar_file = create_file(tempdir, "libtest.a", |_f| Ok(())).unwrap();
-    assert!(!can_trim_this(&rlib_file));
-
-    // Same for a cdylib, whose artifact shares the rlib's stem
-    let tempdir = tempfile::Builder::new()
-        .prefix("sccache_test")
-        .tempdir()
-        .unwrap();
-    let tempdir = tempdir.path();
-    let rlib_file = create_file(tempdir, "libtest.rlib", |_f| Ok(())).unwrap();
-    assert!(can_trim_this(&rlib_file));
-    let _so_file = create_file(tempdir, "libtest.so", |_f| Ok(())).unwrap();
-    assert!(!can_trim_this(&rlib_file));
-
-    // A wasm cdylib is the same case, minus the `lib` prefix
-    let tempdir = tempfile::Builder::new()
-        .prefix("sccache_test")
-        .tempdir()
-        .unwrap();
-    let tempdir = tempdir.path();
-    let rlib_file = create_file(tempdir, "libtest.rlib", |_f| Ok(())).unwrap();
-    assert!(can_trim_this(&rlib_file));
-    let _wasm_file = create_file(tempdir, "test.wasm", |_f| Ok(())).unwrap();
-    assert!(!can_trim_this(&rlib_file));
 }
 
 /// Extract the crate name and extension from a library file path in a crate
@@ -4337,9 +4242,10 @@ fn test_lexical_parent_traversal_dirs() {
 }
 
 #[test]
-#[cfg(feature = "dist-client")]
+#[cfg(all(feature = "dist-client", target_os = "linux"))]
 fn test_rust_inputs_packager_preserves_manifest_at_canonical_path() -> Result<()> {
     use crate::dist::pkg::InputsPackager;
+    use std::os::unix::ffi::OsStrExt;
 
     let tempdir = tempfile::Builder::new()
         .prefix("sccache_manifest_dist")
@@ -4380,23 +4286,20 @@ version = "6.1.0"
             OsString::from("fast_image_resize"),
         )],
         crate_link_paths: vec![],
-        can_trim_rlibs: true,
+
         inputs,
         path_transformer,
         rlib_dep_reader: None,
         input_dirs: vec![],
     };
 
-    let mut package = Vec::new();
-    Box::new(packager).write_inputs(&mut package)?;
-
-    let mut archive = tar::Archive::new(std::io::Cursor::new(package));
-    let mut paths = Vec::new();
-    for entry in archive.entries()? {
-        let entry = entry?;
-        paths.push(entry.path()?.into_owned());
-    }
-
+    let tree = Box::new(packager).native_mapping()?.mapping.prepare()?;
+    let paths = tree
+        .manifest()
+        .entries
+        .keys()
+        .map(|path| PathBuf::from(std::ffi::OsStr::from_bytes(path.as_bytes())))
+        .collect::<Vec<_>>();
     assert!(paths.contains(&PathBuf::from(
         "cargo/registry/src/fast_image_resize-6.1.0/src/lib.rs"
     )));
@@ -4410,9 +4313,10 @@ version = "6.1.0"
 }
 
 #[test]
-#[cfg(feature = "dist-client")]
-fn test_dist_archive_includes_clippy_config_files_and_empty_directory() -> Result<()> {
+#[cfg(all(feature = "dist-client", target_os = "linux"))]
+fn test_native_tree_includes_clippy_config_files_and_empty_directory() -> Result<()> {
     use crate::dist::pkg::InputsPackager;
+    use std::os::unix::ffi::OsStrExt;
     let temp = tempfile::tempdir()?;
     let policy = temp.path().join("policy");
     fs::create_dir_all(&policy)?;
@@ -4436,7 +4340,7 @@ fn test_dist_archive_includes_clippy_config_files_and_empty_directory() -> Resul
             env_vars: vec![],
             input_dirs: vec![policy.clone()],
             crate_link_paths: vec![],
-            can_trim_rlibs: true,
+
             inputs: if empty {
                 vec![]
             } else {
@@ -4445,13 +4349,13 @@ fn test_dist_archive_includes_clippy_config_files_and_empty_directory() -> Resul
             path_transformer: transformer,
             rlib_dep_reader: None,
         };
-        let mut bytes = Vec::new();
-        Box::new(packager).write_inputs(&mut bytes)?;
-        let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
-        let paths = archive
-            .entries()?
-            .map(|entry| Ok(entry?.path()?.into_owned()))
-            .collect::<Result<Vec<_>>>()?;
+        let tree = Box::new(packager).native_mapping()?.mapping.prepare()?;
+        let paths = tree
+            .manifest()
+            .entries
+            .keys()
+            .map(|path| PathBuf::from(std::ffi::OsStr::from_bytes(path.as_bytes())))
+            .collect::<Vec<_>>();
         assert!(paths.iter().any(|p| p == Path::new("clippy-config")));
         if !empty {
             for name in ["clippy.toml", ".clippy.toml"] {
@@ -4643,9 +4547,10 @@ fn rust_dependency_candidates(
 }
 
 #[test]
-#[cfg(feature = "dist-client")]
+#[cfg(all(feature = "dist-client", target_os = "linux"))]
 fn test_dist_dependency_inspection_failure_keeps_all_candidates() -> Result<()> {
     use crate::dist::pkg::InputsPackager as _;
+    use std::os::unix::ffi::OsStrExt;
     let tmp = tempfile::tempdir()?;
     let deps = tmp.path().join("deps");
     fs::create_dir(&deps)?;
@@ -4677,21 +4582,22 @@ fn test_dist_dependency_inspection_failure_keeps_all_candidates() -> Result<()> 
         env_vars,
         input_dirs: vec![],
         crate_link_paths: vec![deps],
-        can_trim_rlibs: true,
+
         inputs,
         path_transformer: transformer,
         rlib_dep_reader: Some(reader),
     };
-    let mut bytes = Vec::new();
-    Box::new(packager).write_inputs(&mut bytes)?;
-    let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+    let tree = Box::new(packager).native_mapping()?.mapping.prepare()?;
     let mut packaged = HashMap::new();
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
-        let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes)?;
-        assert!(packaged.insert(path, bytes).is_none());
+    for (path, entry) in &tree.manifest().entries {
+        if let crate::build_runtime::TreeEntry::File { blob, .. } = entry {
+            let mut bytes = Vec::new();
+            tree.open_blob(blob.id)?.read_to_end(&mut bytes)?;
+            packaged.insert(
+                PathBuf::from(std::ffi::OsStr::from_bytes(path.as_bytes())),
+                bytes,
+            );
+        }
     }
     assert_eq!(packaged.len(), 2);
     assert_eq!(
@@ -4734,7 +4640,7 @@ fn native_rust_inputs_retain_complete_dependency_artifacts() -> Result<()> {
         env_vars: Vec::new(),
         input_dirs: Vec::new(),
         crate_link_paths: vec![deps],
-        can_trim_rlibs: true,
+
         inputs: vec![explicit],
         path_transformer: transformer,
         rlib_dep_reader: None,
@@ -4796,7 +4702,7 @@ fn canonical_native_generated_inputs_have_stable_metadata_across_leases() -> Res
             env_vars: Vec::new(),
             input_dirs: Vec::new(),
             crate_link_paths: Vec::new(),
-            can_trim_rlibs: false,
+
             inputs: vec![source_file.clone(), artifact.clone()],
             path_transformer: transformer,
             rlib_dep_reader: None,
@@ -4840,56 +4746,8 @@ fn canonical_native_generated_inputs_have_stable_metadata_across_leases() -> Res
     Ok(())
 }
 
-#[test]
-#[cfg(feature = "dist-client")]
-fn test_dist_rlib_trimming_preserves_recognized_metadata() -> Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let path = tmp.path().join("libtest.rlib");
-    {
-        let file = fs::File::create(&path)?;
-        let mut builder = ar::Builder::new(file);
-        builder.append(&ar::Header::new(b"code.o".to_vec(), 4), &b"code"[..])?;
-        builder.append(
-            &ar::Header::new(b"rust.metadata.bin".to_vec(), 4),
-            &b"meta"[..],
-        )?;
-    }
-    let payload = rlib_metadata_archive(&mut fs::File::open(&path)?)?
-        .context("expected to trim recognized metadata")?;
-    let mut trimmed = ar::Archive::new(std::io::Cursor::new(payload));
-    {
-        let mut entry = trimmed.next_entry().context("missing metadata member")??;
-        assert_eq!(entry.header().identifier(), b"rust.metadata.bin");
-        let mut data = Vec::new();
-        entry.read_to_end(&mut data)?;
-        assert_eq!(data, b"meta");
-    }
-    assert!(trimmed.next_entry().is_none());
-    Ok(())
-}
-
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for RustInputsPackager {
-    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<()> {
-        let can_trim_rlibs = self.can_trim_rlibs;
-        (*self).discover()?.write_archive(wtr, |input_path, file| {
-            if can_trim_rlibs && can_trim_this(input_path) {
-                match rlib_metadata_archive(file) {
-                    Ok(Some(metadata_ar)) => return Ok(Some(metadata_ar)),
-                    Ok(None) => debug!(
-                        "No recognized metadata member in {}; transferring full rlib",
-                        input_path.display()
-                    ),
-                    Err(error) => debug!(
-                        "Unable to trim {}: {error:#}; transferring full rlib",
-                        input_path.display()
-                    ),
-                }
-            }
-            Ok(None)
-        })
-    }
-
     // The native store shares complete dependency artifacts across actions,
     // including metadata and linkable code. Do not introduce a second
     // representation of rlibs merely to reduce a per-job archive.
@@ -4916,7 +4774,7 @@ impl RustInputsPackager {
     fn discover(self) -> Result<pkg::CompilerInputs> {
         let Self {
             crate_link_paths,
-            can_trim_rlibs: _,
+
             inputs,
             codegen_only,
             path_transformer,
@@ -4965,23 +4823,6 @@ impl RustInputsPackager {
         }
         Ok(plan)
     }
-}
-
-#[cfg(feature = "dist-client")]
-fn rlib_metadata_archive(file: &mut fs::File) -> Result<Option<Vec<u8>>> {
-    let mut archive = ar::Archive::new(file);
-    while let Some(entry) = archive.next_entry() {
-        let mut entry = entry?;
-        if entry.header().identifier() == b"rust.metadata.bin" {
-            let mut metadata = Vec::new();
-            {
-                let mut builder = ar::Builder::new(&mut metadata);
-                builder.append(&entry.header().clone(), &mut entry)?;
-            }
-            return Ok(Some(metadata));
-        }
-    }
-    Ok(None)
 }
 
 #[cfg(feature = "dist-client")]
@@ -5102,7 +4943,7 @@ fn test_rustlib_entries_keep_host_requested_target_and_unknown_extensions() -> R
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[test]
-fn test_dist_toolchain_archive_contains_only_required_installed_targets() -> Result<()> {
+fn test_native_toolchain_contains_only_required_installed_targets() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let sysroot = temp.path().join("sysroot");
     let bin = sysroot.join(BINS_DIR);
@@ -5124,8 +4965,6 @@ fn test_dist_toolchain_archive_contains_only_required_installed_targets() -> Res
     fs::write(lib.join("other_runtime"), b"needed")?;
     fs::copy("/bin/true", bin.join("rustc"))?;
     fs::copy("/bin/true", bin.join("clippy-driver"))?;
-    let archive_path = temp.path().join("toolchain.tar.gz");
-    let writer = fs::File::create(&archive_path)?;
     let packager = RustToolchainPackager {
         sysroot,
         canonical: true,
@@ -5133,13 +4972,16 @@ fn test_dist_toolchain_archive_contains_only_required_installed_targets() -> Res
         target: Some(target.to_owned()),
         dlltool_files: Vec::new(),
     };
-    pkg::ToolchainPackager::write_pkg(Box::new(packager), writer)?;
-    let reader = fs::File::open(archive_path)?;
-    let mut archive = tar::Archive::new(crate::compression::deflate::InflateReader::gzip(reader)?);
-    let paths = archive
-        .entries()?
-        .map(|entry| -> Result<PathBuf> { Ok(entry?.path()?.into_owned()) })
-        .collect::<Result<Vec<_>>>()?;
+    let tree =
+        pkg::ToolchainPackager::native_mapping(Box::new(packager), pkg::ToolchainScope::Default)?
+            .prepare()?;
+    use std::os::unix::ffi::OsStrExt;
+    let paths = tree
+        .manifest()
+        .entries
+        .keys()
+        .map(|path| PathBuf::from(std::ffi::OsStr::from_bytes(path.as_bytes())))
+        .collect::<Vec<_>>();
     let includes = |fragment: &str| {
         paths
             .iter()
@@ -7799,7 +7641,6 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 crate_link_paths: vec![],
                 crate_name: "model_alb_xspice_ffi".into(),
                 #[cfg(feature = "dist-client")]
-                can_trim_rlibs: true,
                 cwd: cwd.clone(),
                 env_vars: Vec::new(),
                 env_dep_names: HashSet::new(),
@@ -7916,7 +7757,6 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             crate_link_paths: vec![],
             crate_name: "foo".into(),
             #[cfg(feature = "dist-client")]
-            can_trim_rlibs: true,
             cwd: build,
             env_vars: env,
             env_dep_names: HashSet::new(),
@@ -8173,7 +8013,6 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             crate_link_paths: vec![],
             crate_name: "foo".to_owned(),
             #[cfg(feature = "dist-client")]
-            can_trim_rlibs: true,
             cwd: temp.path().to_owned(),
             env_vars: vec![(
                 OsString::from("CARGO"),
@@ -8249,7 +8088,6 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             crate_link_paths: vec![],
             crate_name: "foo".to_owned(),
             #[cfg(feature = "dist-client")]
-            can_trim_rlibs: true,
             cwd: temp.path().to_owned(),
             env_vars: vec![(
                 OsString::from("CARGO"),

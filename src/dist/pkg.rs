@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use fs_err as fs;
-use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::str;
 
@@ -48,35 +47,6 @@ pub enum ToolchainScope {
 }
 
 pub trait ToolchainPackager: Send {
-    /// Additional identity of files and search paths used to build this package.
-    ///
-    /// Toolchains such as GCC depend on executables outside the compiler binary.
-    /// Their changes must invalidate a previously stored weak-to-strong mapping.
-    /// The default leaves other toolchain packagers' existing keys unchanged.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the package dependencies cannot be inspected.
-    fn cache_key_extension(&self) -> Result<Option<String>> {
-        Ok(None)
-    }
-
-    /// Discover the actual package inventory in the calling namespace before
-    /// requesting a reservation. The prepared package carries the same files
-    /// used to derive its identity, without transient namespace identifiers.
-    /// # Errors
-    /// Returns an error if automatic preparation is unsupported or discovery fails.
-    fn prepare_namespace(self: Box<Self>) -> Result<(String, Box<dyn ToolchainPackager>)> {
-        bail!("namespace toolchain preparation is unsupported")
-    }
-
-    /// Write the packaged toolchain to `f`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if packaging or writing the toolchain fails.
-    fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()>;
-
     /// Discover the files and logical paths of a native toolchain.
     ///
     /// # Errors
@@ -90,16 +60,12 @@ pub trait ToolchainPackager: Send {
     }
 }
 
-/// Compiler-specific discovery shared by the archive and native transports.
+/// Compiler-specific discovery of native toolchain inputs.
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub(crate) trait DiscoverToolchain: Send + Sized {
-    fn key_extension(&self) -> Result<Option<String>> {
-        Ok(None)
-    }
-
     fn package_builder(self, scope: ToolchainScope) -> Result<ToolchainPackageBuilder>;
 }
 
@@ -108,20 +74,6 @@ pub(crate) trait DiscoverToolchain: Send + Sized {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 impl<T: DiscoverToolchain> ToolchainPackager for T {
-    fn cache_key_extension(&self) -> Result<Option<String>> {
-        self.key_extension()
-    }
-
-    fn prepare_namespace(self: Box<Self>) -> Result<(String, Box<dyn ToolchainPackager>)> {
-        self.package_builder(ToolchainScope::Default)?
-            .prepare_namespace()
-    }
-
-    fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
-        self.package_builder(ToolchainScope::Default)?
-            .write_compressed_tar(f)
-    }
-
     fn native_mapping(
         self: Box<Self>,
         scope: ToolchainScope,
@@ -138,13 +90,6 @@ pub struct NativeInputPlan {
 }
 
 pub trait InputsPackager: Send {
-    /// Write packaged compiler inputs.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if packaging or writing an input fails.
-    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<()>;
-
     /// Discover compiler input files directly in the native content namespace.
     ///
     /// # Errors
@@ -159,17 +104,8 @@ pub trait InputsPackager: Send {
 )))]
 mod toolchain_imp {
     use super::ToolchainPackager;
-    use fs_err as fs;
-
-    use crate::errors::{Result, bail};
-
-    // Distributed client, but an unsupported platform for toolchain packaging so
-    // create a failing implementation that will conflict with any others.
-    impl<T: Send> ToolchainPackager for T {
-        fn write_pkg(self: Box<Self>, _f: fs::File) -> Result<()> {
-            bail!("Automatic packaging not supported on this platform")
-        }
-    }
+    // Unsupported platforms have no native toolchain mapping.
+    impl<T: Send> ToolchainPackager for T {}
 }
 
 #[cfg(all(
@@ -180,7 +116,6 @@ mod toolchain_imp {
     use super::SimplifyPath;
     use fs_err as fs;
     use std::collections::BTreeMap;
-    use std::io::Write;
     use std::path::{Component, Path, PathBuf};
     use walkdir::WalkDir;
 
@@ -351,104 +286,6 @@ mod toolchain_imp {
             Ok(())
         }
 
-        /// Fingerprint the files actually selected for the archive. Mount and
-        /// namespace IDs are irrelevant: two bind mounts of the same files
-        /// must share a package. The boot ID scopes device/inode metadata to
-        /// its lifetime; archive paths and emitted symlink targets also matter.
-        fn identity(&self) -> Result<String> {
-            use crate::util::Digest;
-            use std::os::unix::fs::MetadataExt;
-
-            let mut digest = Digest::new();
-            digest.delimiter(b"toolchain-archive-inventory-v1");
-            let boot_id = fs::read("/proc/sys/kernel/random/boot_id").ok();
-            if let Some(boot_id) = &boot_id {
-                digest.delimiter(b"local-file-metadata");
-                digest.delimiter(boot_id);
-            } else {
-                // A caller can have a minimal /proc mount. In that case use
-                // content identity, rather than persisting ambiguous inode IDs.
-                digest.delimiter(b"file-content");
-            }
-            for (archive, physical) in &self.dir_set {
-                digest.delimiter(b"directory");
-                digest.delimiter(archive.as_os_str().as_encoded_bytes());
-                digest.update(&fs::metadata(physical)?.mode().to_le_bytes());
-            }
-            for (archive, physical) in &self.file_set {
-                digest.delimiter(b"regular");
-                digest.delimiter(archive.as_os_str().as_encoded_bytes());
-                let metadata = fs::metadata(physical)?;
-                digest.update(&metadata.mode().to_le_bytes());
-                if boot_id.is_some() {
-                    for field in [
-                        metadata.dev(),
-                        metadata.ino(),
-                        metadata.len(),
-                        metadata.mtime().cast_unsigned(),
-                        metadata.mtime_nsec().cast_unsigned(),
-                        metadata.ctime().cast_unsigned(),
-                        metadata.ctime_nsec().cast_unsigned(),
-                    ] {
-                        digest.update(&field.to_le_bytes());
-                    }
-                } else {
-                    digest.delimiter(Digest::reader_sync(fs::File::open(physical)?)?.as_bytes());
-                }
-            }
-            for (archive, target) in &self.symlinks {
-                digest.delimiter(b"symlink");
-                digest.delimiter(archive.as_os_str().as_encoded_bytes());
-                digest.delimiter(target.as_os_str().as_encoded_bytes());
-            }
-            Ok(digest.finish())
-        }
-
-        /// Freeze the selected package inventory for an IPC reservation.
-        ///
-        /// # Errors
-        /// A selected file or its metadata cannot be read.
-        pub fn prepare_namespace(self) -> Result<(String, Box<dyn super::ToolchainPackager>)> {
-            let identity = self.identity()?;
-            Ok((
-                identity.clone(),
-                Box::new(PreparedNamespacePackage {
-                    builder: self,
-                    identity,
-                }),
-            ))
-        }
-
-        /// Write the package as a deterministic compressed tar archive.
-        ///
-        /// # Errors
-        ///
-        /// Returns an error if archive construction or compression fails.
-        pub fn write_compressed_tar<W: Write + Send + 'static>(&self, writer: W) -> Result<()> {
-            use crate::compression::deflate::ParallelGzipWriter;
-
-            let mut builder = tar::Builder::new(ParallelGzipWriter::new(writer)?);
-            builder.mode(tar::HeaderMode::Deterministic);
-
-            for (tar_path, dir_path) in &self.dir_set {
-                builder.append_dir(tar_path, dir_path)?;
-            }
-            for (tar_path, file_path) in &self.file_set {
-                let file = &mut fs::File::open(file_path)?;
-                builder.append_file(tar_path, file.file_mut())?;
-            }
-            for (from_path, to_path) in &self.symlinks {
-                let mut header = tar::Header::new_gnu();
-                header.set_entry_type(tar::EntryType::Symlink);
-                header.set_size(0);
-                // Leave `to_path` as absolute, assuming the tar will be used in a chroot-like
-                // environment.
-                builder.append_link(&mut header, tar_safe_path(from_path.clone()), to_path)?;
-            }
-            builder.into_inner()?.finish()?;
-            Ok(())
-        }
-
         /// Convert discovered toolchain paths directly into native CAS inputs.
         ///
         /// # Errors
@@ -516,27 +353,6 @@ mod toolchain_imp {
         }
     }
 
-    struct PreparedNamespacePackage {
-        builder: ToolchainPackageBuilder,
-        identity: String,
-    }
-
-    impl super::ToolchainPackager for PreparedNamespacePackage {
-        fn write_pkg(self: Box<Self>, file: fs::File) -> Result<()> {
-            use anyhow::ensure;
-            ensure!(
-                self.builder.identity()? == self.identity,
-                "toolchain changed before packaging"
-            );
-            self.builder.write_compressed_tar(file)?;
-            ensure!(
-                self.builder.identity()? == self.identity,
-                "toolchain changed during packaging"
-            );
-            Ok(())
-        }
-    }
-
     impl Default for ToolchainPackageBuilder {
         fn default() -> Self {
             Self::new()
@@ -544,92 +360,46 @@ mod toolchain_imp {
     }
 
     #[test]
-    fn namespace_package_identity_tracks_inventory_not_mount_alias() -> Result<()> {
+    fn native_package_identity_tracks_content_not_mount_alias() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let first = temp.path().join("first");
         let second = temp.path().join("second");
         fs::create_dir(&first)?;
         fs::create_dir(&second)?;
         fs::write(first.join("compiler"), b"compiler bytes")?;
-        fs::hard_link(first.join("compiler"), second.join("compiler"))?;
-
-        let inventory = |root: &Path| -> Result<ToolchainPackageBuilder> {
+        fs::copy(first.join("compiler"), second.join("compiler"))?;
+        let inventory = |root: &Path| -> Result<_> {
             let mut builder = ToolchainPackageBuilder::new();
             builder.add_root_mapping(root.to_owned(), PathBuf::from("/toolchain"));
             builder.add_file(root.join("compiler"))?;
-            Ok(builder)
+            builder.into_native_mapping()?.prepare()
         };
-        let (key, prepared) = inventory(&first)?.prepare_namespace()?;
-        let (alias, _) = inventory(&second)?.prepare_namespace()?;
-        assert_eq!(key, alias);
-
-        // The same package selection at a different physical inode must not
-        // silently use a stale archive after a namespace replaces a tool.
-        fs::remove_file(second.join("compiler"))?;
+        let original = inventory(&first)?;
+        assert_eq!(original.id(), inventory(&second)?.id());
         fs::write(second.join("compiler"), b"different compiler")?;
-        assert_ne!(key, inventory(&second)?.identity()?);
-
-        fs::write(first.join("compiler"), b"modified compiler")?;
-        let archive = fs::File::create(temp.path().join("archive.tar.gz"))?;
-        assert!(prepared.write_pkg(archive).is_err());
+        assert_ne!(original.id(), inventory(&second)?.id());
         Ok(())
     }
 
     #[test]
-    fn packaged_cross_toolchain_preserves_gcc_lexical_helper_paths() -> Result<()> {
+    fn native_cross_toolchain_preserves_gcc_lexical_helper_paths() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let toolchain = temp.path().join("toolchain");
-        std::fs::create_dir_all(toolchain.join("bin"))?;
-        std::fs::create_dir_all(toolchain.join("lib/gcc/cross-target/1"))?;
-        std::fs::create_dir_all(toolchain.join("cross-target/bin"))?;
-        std::fs::write(toolchain.join("cross-target/bin/as"), b"fake assembler")?;
-
-        // GCC resolves this exact spelling at runtime, not its normalized path.
-        // No specs/headers in the archived tree should be needed to materialize
-        // the intermediate lib/gcc directory.
+        fs::create_dir_all(toolchain.join("bin"))?;
+        fs::create_dir_all(toolchain.join("lib/gcc/cross-target/1"))?;
+        fs::create_dir_all(toolchain.join("cross-target/bin"))?;
+        fs::write(toolchain.join("cross-target/bin/as"), b"fake assembler")?;
         let reported =
             toolchain.join("bin/../lib/gcc/cross-target/1/../../../../cross-target/bin/as");
-        assert!(reported.is_file());
-
         let mut builder = ToolchainPackageBuilder::new();
         builder.add_file(reported.clone())?;
-        let archive_path = temp.path().join("toolchain.tar.gz");
-        builder.write_compressed_tar(fs::File::create(&archive_path)?)?;
-
-        let root = temp.path().join("unpacked");
-        crate::compression::deflate::unpack_gzip(fs::File::open(&archive_path)?, &root)?;
-        assert!(root.join(reported.strip_prefix("/")?).is_file());
-        assert!(
-            root.join(toolchain.strip_prefix("/")?)
-                .join("lib/gcc/cross-target/1")
-                .is_dir(),
-            "the compiler's lexical search directory must exist after extraction"
+        let store = crate::build_runtime::NativeStore::open(&temp.path().join("store"))?;
+        let tree = builder.into_native_mapping()?.prepare()?.import(&store)?;
+        let view = tree.materialize(temp.path())?;
+        assert_eq!(
+            fs::read(view.root().join(reported.strip_prefix("/")?))?,
+            b"fake assembler"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn parallel_gzip_toolchain_round_trips_multiple_blocks() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let artifact = temp.path().join("compiler.bin");
-        // Mix incompressible regions and repeated regions across block boundaries.
-        let mut state = 0x1234_5678_u32;
-        let mut data = Vec::with_capacity(2 * 1024 * 1024);
-        for _ in 0..(1024 * 1024) {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            data.push(state.to_le_bytes()[0]);
-        }
-        data.extend_from_within(..);
-        fs::write(&artifact, &data)?;
-        let archive_path = temp.path().join("toolchain.tar.gz");
-        let mut builder = ToolchainPackageBuilder::new();
-        builder.add_file(artifact.clone())?;
-        builder.write_compressed_tar(fs::File::create(&archive_path)?)?;
-        let root = temp.path().join("unpacked");
-        crate::compression::deflate::unpack_gzip(fs::File::open(&archive_path)?, &root)?;
-        assert_eq!(fs::read(root.join(artifact.strip_prefix("/")?))?, data);
         Ok(())
     }
 
@@ -683,50 +453,6 @@ mod toolchain_imp {
             .map(ToOwned::to_owned)
             .unwrap_or(path)
     }
-}
-
-/// Build a tar header for `src`, using the absolute archive path `dest`.
-///
-/// # Errors
-///
-/// Returns an error if `dest` is not absolute or the tar header cannot be populated.
-pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
-    let metadata_res = fs::metadata(src);
-
-    let mut file_header = tar::Header::new_ustar();
-    // TODO: test this works
-    if let Ok(metadata) = metadata_res {
-        // TODO: if the source file is a symlink, I think this does bad things
-        file_header.set_metadata(&metadata);
-    } else {
-        warn!(
-            "Couldn't get metadata of file {}, falling back to some defaults",
-            src.display()
-        );
-        file_header.set_mode(0o644);
-        file_header.set_uid(0);
-        file_header.set_gid(0);
-        file_header.set_mtime(0);
-        file_header.set_device_major(0)?;
-        file_header.set_device_minor(0)?;
-        file_header.set_entry_type(tar::EntryType::file());
-    }
-
-    // tar-rs imposes that `set_path` takes a relative path.
-    if !dest.starts_with('/') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "archive destination path must be absolute",
-        ));
-    }
-    let dest = dest.trim_start_matches('/');
-    // `set_path` converts its argument to a Path and back to bytes on Windows, so this is
-    // a bit of an inefficient round-trip. Windows path separators will also be normalised
-    // to be like Unix, and the path is (now) relative so there should be no funny results
-    // due to Windows
-    // TODO: should really use a `set_path_str` or similar
-    file_header.set_path(dest)?;
-    Ok(file_header)
 }
 
 /// Return the directory prefixes that must exist to preserve lexical `..` traversal.
@@ -836,22 +562,6 @@ impl InputArchivePaths {
         self.add_mapped_directory(path.clone())?;
         self.archive_path(&path)
     }
-
-    /// Emit supporting entries after all files, so extraction never writes
-    /// through a symlink that was just created by this archive.
-    pub(crate) fn append_support_entries<W: io::Write>(
-        self,
-        builder: &mut tar::Builder<W>,
-    ) -> Result<()> {
-        for (remote, local) in self.directories {
-            builder.append_dir(remote.trim_start_matches('/'), local)?;
-        }
-        #[cfg(unix)]
-        if let Some(layout) = self.physical {
-            layout.append_support_entries(builder)?;
-        }
-        Ok(())
-    }
 }
 
 /// Physical-layout Rust inputs must retain the paths by which the compiler
@@ -949,29 +659,11 @@ impl PhysicalInputLayout {
         }
         Ok(resolved)
     }
-
-    /// Add the empty traversal directories and the original symlink spellings.
-    /// The caller must emit physical files first. Absolute symlink destinations
-    /// are interpreted inside the worker chroot, as for packaged toolchains.
-    fn append_support_entries<W: io::Write>(self, builder: &mut tar::Builder<W>) -> Result<()> {
-        for path in self.directories {
-            let member = path.strip_prefix("/")?;
-            builder.append_dir(member, &path)?;
-        }
-        for (path, target) in self.links {
-            let mut header = tar::Header::new_gnu();
-            header.set_entry_type(tar::EntryType::Symlink);
-            header.set_mode(0o777);
-            header.set_size(0);
-            builder.append_link(&mut header, path.strip_prefix("/")?, target)?;
-        }
-        Ok(())
-    }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 #[test]
-fn physical_archive_preserves_aliases_and_parent_traversal() -> Result<()> {
+fn physical_native_tree_preserves_aliases_and_parent_traversal() -> Result<()> {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir()?;
@@ -995,25 +687,19 @@ fn physical_archive_preserves_aliases_and_parent_traversal() -> Result<()> {
     let lexical = root.join("project/link/../policy");
     let file = lexical.join("clippy.toml");
 
-    let mut paths = InputArchivePaths::new(crate::dist::PathTransformer::new());
-    paths.directory(&lexical)?;
-    paths.directory(&root.join("project/empty"))?;
-    let (local, remote) = paths.file(&file)?;
-    assert_eq!(local, policy.join("actual.toml"));
-    assert_eq!((local.clone(), remote.clone()), paths.file(&local)?);
-    let mut bytes = Vec::new();
-    let mut archive = tar::Builder::new(&mut bytes);
-    archive.append_file(
-        Path::new(&remote).strip_prefix("/")?,
-        fs::File::open(&local)?.file_mut(),
-    )?;
-    paths.append_support_entries(&mut archive)?;
-    archive.into_inner()?;
-
-    let extracted = tempfile::tempdir()?;
-    tar::Archive::new(bytes.as_slice()).unpack(extracted.path())?;
+    let mut inputs = CompilerInputs::new(crate::dist::PathTransformer::new());
+    inputs.directory(&lexical)?;
+    inputs.directory(&root.join("project/empty"))?;
+    inputs.file(&file, None)?;
+    inputs.file(&policy.join("actual.toml"), None)?;
+    let store = crate::build_runtime::NativeStore::open(&root.join("store"))?;
+    let tree = inputs
+        .into_native_mapping(|_| false)?
+        .prepare()?
+        .import(&store)?;
+    let view = tree.materialize(&root)?;
     let in_archive =
-        |path: &Path| -> Result<PathBuf> { Ok(extracted.path().join(path.strip_prefix("/")?)) };
+        |path: &Path| -> Result<PathBuf> { Ok(view.root().join(path.strip_prefix("/")?)) };
     assert_eq!(fs::read(in_archive(&file)?)?, b"actual policy");
     assert!(in_archive(&root.join("project/empty"))?.is_dir());
     assert!(in_archive(&root.join("actual/deep"))?.is_dir());
@@ -1035,7 +721,7 @@ fn physical_archive_preserves_aliases_and_parent_traversal() -> Result<()> {
 
 #[cfg(all(test, unix))]
 #[test]
-fn physical_archive_rejects_missing_traversal_and_symlink_loops() -> Result<()> {
+fn physical_input_rejects_missing_traversal_and_symlink_loops() -> Result<()> {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir()?;

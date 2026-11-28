@@ -1408,6 +1408,16 @@ mod test {
         .wait()
         .unwrap();
 
+        for command in groups.iter().flatten() {
+            assert!(command.cwd.is_absolute());
+            assert!(
+                command
+                    .env_vars
+                    .iter()
+                    .any(|(key, value)| key == "PATH" && value == bin_dir.path().as_os_str())
+            );
+        }
+
         let device_group = groups
             .iter()
             .find(|group| {

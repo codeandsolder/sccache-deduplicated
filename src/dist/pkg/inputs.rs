@@ -1,15 +1,13 @@
-//! One compiler input plan for archive emission and native CAS capture.
-//! Dependency discovery and path topology do not depend on the transport.
+//! Compiler input discovery and path topology for native CAS capture.
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},
-    io::{self, Seek},
     path::{Path, PathBuf},
 };
 
 use fs_err as fs;
 
-use super::{InputArchivePaths, make_tar_header};
+use super::InputArchivePaths;
 use crate::{
     dist::PathTransformer,
     errors::{Result, anyhow},
@@ -76,37 +74,6 @@ impl CompilerInputs {
                 entry.get_mut().codegen_only &= codegen_only;
             }
         }
-        Ok(())
-    }
-
-    pub fn write_archive(
-        self,
-        writer: &mut dyn io::Write,
-        mut transform: impl FnMut(&Path, &mut fs::File) -> Result<Option<Vec<u8>>>,
-    ) -> Result<()> {
-        let mut archive = tar::Builder::new(writer);
-        for (destination, input) in self.files {
-            let mut header = make_tar_header(&input.source, &destination)?;
-            if let Some(bytes) = input.generated {
-                header.set_size(u64::try_from(bytes.len())?);
-                header.set_cksum();
-                archive.append(&header, bytes.as_slice())?;
-                continue;
-            }
-            let mut file = fs::File::open(&input.source)?;
-            if let Some(bytes) = transform(&input.source, &mut file)? {
-                header.set_size(u64::try_from(bytes.len())?);
-                header.set_cksum();
-                archive.append(&header, bytes.as_slice())?;
-            } else {
-                file.rewind()?;
-                header.set_size(file.metadata()?.len());
-                header.set_cksum();
-                archive.append(&header, file)?;
-            }
-        }
-        self.paths.append_support_entries(&mut archive)?;
-        archive.into_inner()?;
         Ok(())
     }
 

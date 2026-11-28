@@ -72,8 +72,6 @@ pub enum Command {
     DistStatus,
     /// Perform a login to authenticate for distributed compilation.
     DistAuth,
-    /// Package a toolchain for distributed compilation (executable, out)
-    PackageToolchain(PathBuf, PathBuf),
     /// Run a compiler command.
     Compile {
         /// The binary to execute.
@@ -170,11 +168,6 @@ fn get_clap_command() -> clap::Command {
             flag_infer_long("dist-status")
                 .help("show status of the distributed client")
                 .action(ArgAction::SetTrue),
-            flag_infer_long("package-toolchain")
-                .help("package toolchain for distributed compilation")
-                .value_parser(clap::value_parser!(PathBuf))
-                .num_args(2)
-                .value_names(["EXE", "OUT"]),
             flag_infer_long("stats-format")
                 .help("set output format of statistics")
                 .value_name("FMT")
@@ -199,7 +192,6 @@ fn get_clap_command() -> clap::Command {
                     "start-server",
                     "stop-server",
                     "zero-stats",
-                    "package-toolchain",
                     "CMD",
                 ])
                 .required(true),
@@ -211,25 +203,6 @@ fn stats_format(matches: &clap::ArgMatches) -> Result<StatsFormat> {
         .get_one::<StatsFormat>("stats-format")
         .copied()
         .ok_or_else(|| anyhow!("stats format missing despite clap default"))
-}
-
-fn package_toolchain_command(matches: &clap::ArgMatches) -> Result<Command> {
-    let mut values = matches
-        .get_many::<PathBuf>("package-toolchain")
-        .ok_or_else(|| anyhow!("package-toolchain requires executable and output paths"))?
-        .cloned();
-
-    let exe = values
-        .next()
-        .ok_or_else(|| anyhow!("package-toolchain executable is missing"))?;
-    let out = values
-        .next()
-        .ok_or_else(|| anyhow!("package-toolchain output path is missing"))?;
-    if values.next().is_some() {
-        bail!("package-toolchain received more than two values");
-    }
-
-    Ok(Command::PackageToolchain(exe, out))
 }
 
 fn compile_command(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Command> {
@@ -290,8 +263,6 @@ fn command_from_matches(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Comm
         Ok(Command::DistAuth)
     } else if matches.get_flag("dist-status") {
         Ok(Command::DistStatus)
-    } else if matches.contains_id("package-toolchain") {
-        package_toolchain_command(matches)
     } else if matches.contains_id("CMD") {
         compile_command(matches, cwd)
     } else {

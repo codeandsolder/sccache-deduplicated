@@ -430,9 +430,6 @@ where
 {
     /// Return the kind of compiler.
     fn kind(&self) -> CompilerKind;
-    /// Retrieve a packager
-    #[cfg(feature = "dist-client")]
-    fn get_toolchain_packager(&self) -> Box<dyn pkg::ToolchainPackager>;
     /// Determine whether `arguments` are supported by this compiler.
     fn parse_arguments(
         &self,

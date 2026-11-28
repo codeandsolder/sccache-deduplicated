@@ -6,7 +6,7 @@ use std::{
     collections::BTreeSet,
     fs::File,
     future::Future,
-    io::{self, Read},
+    io,
     net::{SocketAddr, TcpListener},
     sync::{Arc, OnceLock, RwLock},
     time::{Duration, Instant},
@@ -27,14 +27,10 @@ use sccache_cluster_identity::{
     AuthenticatedPeer, ClusterListener, PeerId, Role, SchedulerEnrollment,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio_util::io::{StreamReader, SyncIoBridge};
 
 use crate::{
     build_runtime::TransferMeter,
-    dist::cluster_routes::{
-        Transfer,
-        interface::{self, TrackedReader},
-    },
+    dist::cluster_routes::{Transfer, interface},
     dist::native::ingress::compute,
     errors::{Context, Result},
 };
@@ -114,22 +110,6 @@ impl Request {
         self.header("Content-Length")
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0)
-    }
-
-    pub(super) fn data(&self) -> Option<Box<dyn Read + Send>> {
-        match self.body.borrow_mut().take()? {
-            RequestBody::Network(body) => {
-                let reader =
-                    SyncIoBridge::new(StreamReader::new(Box::pin(idle_bounded_body(body))));
-                Some(Box::new(TrackedReader::new(
-                    reader,
-                    Some(self.path.local),
-                    Transfer::Download(self.body_length()),
-                    Some(self.path),
-                )))
-            }
-            RequestBody::Buffered(_) => None,
-        }
     }
 
     pub(super) fn body_stream(

@@ -37,8 +37,6 @@ use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
-#[cfg(feature = "dist-client")]
-use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1001,35 +999,6 @@ fn show_dist_status(startup_timeout: Option<Duration>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "dist-client")]
-fn package_toolchain(executable: PathBuf, out: PathBuf) -> Result<()> {
-    use crate::compiler;
-
-    trace!("Command::PackageToolchain({})", executable.display());
-    let runtime = new_client_runtime()?;
-    let jobserver = Client::new();
-    let creator = ProcessCommandCreator::new(&jobserver);
-    let args: Vec<_> = env::args_os().collect();
-    let env: Vec<_> = env::vars_os().collect();
-    let out_file = File::create(out)?;
-    let cwd = env::current_dir().context("failed to determine current directory")?;
-    let pool = runtime.handle().clone();
-    runtime.block_on(async move {
-        compiler::get_compiler_info(
-            creator,
-            &executable,
-            &cwd,
-            &args,
-            &env,
-            &pool,
-            compiler::CompilerDiscovery::default(),
-        )
-        .await
-        .map(|compiler| compiler.0.get_toolchain_packager())
-        .and_then(|packager| packager.write_pkg(out_file))
-    })
-}
-
 fn run_compile_command(
     config: &Config,
     startup_timeout: Option<Duration>,
@@ -1136,12 +1105,6 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             "Distributed compilation not compiled in, please rebuild with the dist-client feature"
         ),
         Command::DistStatus => show_dist_status(startup_timeout)?,
-        #[cfg(feature = "dist-client")]
-        Command::PackageToolchain(executable, out) => package_toolchain(executable, out)?,
-        #[cfg(not(feature = "dist-client"))]
-        Command::PackageToolchain(_executable, _out) => bail!(
-            "Toolchain packaging not compiled in, please rebuild with the dist-client feature"
-        ),
         Command::Compile {
             exe,
             cmdline,
