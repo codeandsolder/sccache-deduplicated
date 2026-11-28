@@ -1202,10 +1202,6 @@ fn dispatch(
             sessions.retain_result(group, action, result, request.id())?;
             encode(&(), limit)
         }
-        "retain_renew" if publisher == Publisher::Client => encode(
-            &sessions.renew_retention(metadata(request, limit)?, request.id())?,
-            limit,
-        ),
         "retain_close" if publisher == Publisher::Client => {
             sessions.close_retention(metadata(request, limit)?, request.id())?;
             encode(&(), limit)
@@ -1317,10 +1313,21 @@ fn dispatch(
             );
             Ok(response)
         }
-        "renew" => encode(
-            &sessions.renew(metadata(request, limit)?, publisher)?,
-            limit,
-        ),
+        "renew" | "retain_renew" if operation == "renew" || publisher == Publisher::Client => {
+            let ticket = match metadata(request, limit) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    debug!("invalid native renewal request: {error:#}");
+                    return Ok(StatusCode::BAD_REQUEST.into_response());
+                }
+            };
+            let reply = if operation == "renew" {
+                sessions.renew(ticket, publisher)?
+            } else {
+                sessions.renew_retention(ticket, request.id())?
+            };
+            encode(&reply, limit)
+        }
         "fail" => {
             sessions.fail(metadata(request, limit)?, publisher)?;
             encode(&(), limit)

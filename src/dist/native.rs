@@ -1525,9 +1525,8 @@ impl NativeCacheClient {
     ///
     /// # Errors
     /// Returns an error for expired or unauthorized tickets.
-    pub fn renew(&self, ticket: Ticket) -> Result<()> {
-        self.control::<_, crate::build_runtime::wire::LeaseRenewal>("renew", &ticket)
-            .map(|_| ())
+    pub fn renew(&self, ticket: Ticket) -> Result<crate::build_runtime::wire::LeaseRenewal> {
+        self.control("renew", &ticket)
     }
 
     /// Open a build-scoped immutable result retention lease.
@@ -1559,9 +1558,11 @@ impl NativeCacheClient {
     /// Renew a build lease in one RPC regardless of its artifact count.
     /// # Errors
     /// Returns an error for an expired or unauthorized lease.
-    pub fn renew_retention(&self, group: Ticket) -> Result<()> {
-        self.control::<_, crate::build_runtime::wire::LeaseRenewal>("retain_renew", &group)
-            .map(|_| ())
+    pub fn renew_retention(
+        &self,
+        group: Ticket,
+    ) -> Result<crate::build_runtime::wire::LeaseRenewal> {
+        self.control("retain_renew", &group)
     }
 
     /// Release the build lease and its retained content.

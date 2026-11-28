@@ -97,6 +97,10 @@ impl Renewal {
             return Err(anyhow!("native scheduler lease renewal failed: {error}"));
         }
         drop(failure);
+        ensure!(
+            self.stop.is_cancelled() || self.task.as_ref().is_none_or(|task| !task.is_finished()),
+            "native renewal task terminated unexpectedly"
+        );
         Ok(())
     }
 
@@ -215,7 +219,10 @@ where
                 let remaining = confirmed_until
                     .map(|until| until.saturating_duration_since(now))
                     .filter(|remaining| !remaining.is_zero());
-                let pause = remaining.map_or(delay, |remaining| delay.min(remaining));
+                // Desynchronize independent builds recovering from the same
+                // scheduler interruption without changing healthy cadence.
+                let jittered = delay / 2 + (delay / 2) * u32::from(rand::random::<u8>()) / 255;
+                let pause = remaining.map_or(jittered, |remaining| jittered.min(remaining));
                 tokio::time::sleep(pause).await;
                 delay = (delay * 2).min(Duration::from_secs(2));
             }
