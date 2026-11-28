@@ -215,8 +215,10 @@ pub struct ParsedArguments {
     externs: Vec<PathBuf>,
     /// The directories searched for rlibs
     crate_link_paths: Vec<PathBuf>,
-    /// Static libraries linked to in the compile.
-    staticlibs: Vec<PathBuf>,
+    /// Static libraries whose bytes can be bundled into the output.
+    staticlibs: Vec<StaticLibraryRequest>,
+    /// Native search paths, in compiler search order.
+    static_link_paths: Vec<PathBuf>,
     /// The crate name passed to --crate-name.
     crate_name: String,
     /// The crate types that will be generated
@@ -723,6 +725,121 @@ where
         );
     }
     Ok(outstr.lines().map(std::borrow::ToOwned::to_owned).collect())
+}
+
+const STATIC_ARCHIVE_PROBE_NAME: &str = "sccache_native_archive_probe";
+
+#[derive(Debug)]
+struct StaticArchiveNaming {
+    prefix: String,
+    suffix: String,
+    target_libdir: PathBuf,
+}
+
+impl StaticArchiveNaming {
+    fn parse(output: &[u8]) -> Result<Self> {
+        let output = std::str::from_utf8(output).context("invalid rustc archive naming output")?;
+        let mut lines = output.lines();
+        let (prefix, suffix) = lines
+            .next()
+            .and_then(|line| line.split_once(STATIC_ARCHIVE_PROBE_NAME))
+            .context("rustc did not report a static archive filename")?;
+        let target_libdir = lines
+            .next()
+            .map(PathBuf::from)
+            .context("rustc did not report a target libdir")?;
+        anyhow::ensure!(
+            lines.next().is_none(),
+            "unexpected rustc archive naming output"
+        );
+        Ok(Self {
+            prefix: prefix.to_owned(),
+            suffix: suffix.to_owned(),
+            target_libdir,
+        })
+    }
+
+    fn select(
+        &self,
+        request: &StaticLibraryRequest,
+        paths: &[PathBuf],
+        cwd: &Path,
+    ) -> Option<PathBuf> {
+        let names = if request.verbatim {
+            vec![request.name.clone()]
+        } else {
+            let preferred = format!("{}{}{}", self.prefix, request.name, self.suffix);
+            let unix = format!("lib{}.a", request.name);
+            if preferred == unix {
+                vec![preferred]
+            } else {
+                vec![preferred, unix]
+            }
+        };
+        // rustc checks each directory in order and the target's naming
+        // convention before its Unix fallback within that directory.
+        paths.iter().find_map(|path| {
+            let directory = path
+                .to_str()
+                .and_then(|path| path.strip_prefix("@RUSTC_BUILTIN"))
+                .map_or_else(
+                    || cwd.join(path),
+                    |suffix| self.target_libdir.join("builtin").join(suffix),
+                );
+            names
+                .iter()
+                .map(|name| directory.join(name))
+                .find(|path| path.exists())
+        })
+    }
+}
+
+impl ParsedArguments {
+    async fn selected_staticlibs<T: CommandCreatorSync>(
+        &self,
+        creator: &T,
+        executable: &Path,
+        cwd: &Path,
+        env: &[(OsString, OsString)],
+    ) -> Result<Vec<Option<PathBuf>>> {
+        if self.staticlibs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut arguments = vec![
+            "--print".into(),
+            "file-names".into(),
+            "--print".into(),
+            "target-libdir".into(),
+            "--crate-name".into(),
+            STATIC_ARCHIVE_PROBE_NAME.into(),
+            "--crate-type".into(),
+            "staticlib".into(),
+            "-".into(),
+        ];
+        arguments.extend(
+            self.arguments
+                .iter()
+                .filter(|argument| match argument.get_data() {
+                    Some(Target(_)) => true,
+                    Some(Unstable(ArgUnstable { opt, .. })) => opt == "unstable-options",
+                    _ => false,
+                })
+                .flat_map(|argument| argument.iter_os_strings()),
+        );
+        let mut command = creator.clone().new_command_sync(executable);
+        command
+            .args(&arguments)
+            .env_clear()
+            .envs(env.to_vec())
+            .current_dir(cwd);
+        let output = run_input_output(command, Some(Vec::new())).await?;
+        let naming = StaticArchiveNaming::parse(&output.stdout)?;
+        Ok(self
+            .staticlibs
+            .iter()
+            .map(|request| naming.select(request, &self.static_link_paths, cwd))
+            .collect())
+    }
 }
 
 fn hashes_in_canonical_path_order(
@@ -2056,6 +2173,12 @@ impl IntoArg for ArgCrateTypes {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StaticLibraryRequest {
+    name: String,
+    verbatim: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct ArgLinkLibrary {
     kind: Option<String>,
@@ -2418,7 +2541,7 @@ fn parse_arguments(
                     crate_link_paths.push(cwd.join(path));
                 }
                 if kind == "native" || kind == "all" {
-                    static_link_paths.push(cwd.join(path));
+                    static_link_paths.push(path.clone());
                 }
             }
             Some(Emit(value)) => {
@@ -2636,30 +2759,13 @@ fn parse_arguments(
         None
     };
 
-    // Locate all static libs specified on the commandline.
+    // Metadata does not bundle machine code; split native linking owns its
+    // own archive inputs. Defer archive lookup until the selected compiler
+    // can report the target's actual filename convention.
     let staticlibs = static_lib_names
         .into_iter()
-        .filter(|(_, bundle, _)| !split_link && (*bundle || crate_types.cdylib))
-        .flat_map(|(name, _, verbatim)| {
-            // Search target-dependent filename alternatives instead of
-            // assuming the compiler uses the host archive convention.
-            let names = if verbatim {
-                vec![name]
-            } else {
-                vec![
-                    format!("lib{name}.a"),
-                    format!("{name}.lib"),
-                    format!("{name}.a"),
-                ]
-            };
-            static_link_paths.iter().flat_map(move |path| {
-                names
-                    .iter()
-                    .map(|name| path.join(name))
-                    .filter(|path| path.is_file())
-                    .collect::<Vec<_>>()
-            })
-        })
+        .filter(|(_, bundle, _)| !metadata_only && !split_link && (*bundle || crate_types.cdylib))
+        .map(|(name, _, verbatim)| StaticLibraryRequest { name, verbatim })
         .collect();
     // We'll figure out the source files and outputs later in
     // `generate_hash_key` where we can run rustc.
@@ -2673,6 +2779,7 @@ fn parse_arguments(
         externs,
         crate_link_paths,
         staticlibs,
+        static_link_paths,
         crate_name,
         dep_info: dep_info.map(std::convert::Into::into),
         gcno: gcno.map(std::convert::Into::into),
@@ -3313,11 +3420,14 @@ where
             self.parsed_args.crate_name,
             self.parsed_args.staticlibs.len()
         );
-        let abs_staticlibs = self
+        let selected_staticlibs = self
             .parsed_args
-            .staticlibs
+            .selected_staticlibs(creator, &self.executable, &cwd, &env_vars)
+            .await?;
+        let abs_staticlibs = selected_staticlibs
             .iter()
-            .map(|s| cwd.join(s))
+            .flatten()
+            .cloned()
             .collect::<Vec<_>>();
         let staticlib_hashes = hash_all_archives(&abs_staticlibs, pool);
 
@@ -3478,11 +3588,21 @@ where
             &abs_externs,
             &extern_hashes,
         )?;
-        let staticlib_hashes = hashes_in_canonical_path_order(
-            &abs_staticlibs,
-            staticlib_hashes,
-            canonical_paths.as_ref(),
-        );
+        // Preserve the request-to-archive association, not filesystem sort
+        // order. Empty slots cannot alias another library's contents.
+        let mut archive_digests = staticlib_hashes.into_iter();
+        let staticlib_hashes = selected_staticlibs
+            .iter()
+            .map(|path| {
+                if path.is_some() {
+                    archive_digests
+                        .next()
+                        .context("missing selected archive digest")
+                } else {
+                    Ok(String::new())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
         let mut m = Digest::audited("rust-frontend");
@@ -3628,7 +3748,7 @@ where
         m.audit_field("sccache.key.extern_bindings");
         hash_rust_extern_bindings(&mut m, &extern_bindings);
         m.audit_field("sccache.key.static_libraries");
-        hash_rust_input_group(&mut m, b"rust-staticlibs-v1", &staticlib_hashes);
+        hash_rust_input_group(&mut m, b"rust-selected-staticlibs-v2", &staticlib_hashes);
         m.audit_field("sccache.key.target_json");
         hash_rust_input_group(&mut m, b"rust-target-json-v1", &target_json_hash);
         // 8. Environment variables: Hash all environment variables listed in the rustc dep-info
@@ -6802,7 +6922,14 @@ LLVM version: 15.0.2
             "--out-dir",
             "out"
         );
-        let expected = if hashed { vec![lib] } else { vec![] };
+        let expected = if hashed {
+            vec![StaticLibraryRequest {
+                name: "bar".into(),
+                verbatim: false,
+            }]
+        } else {
+            vec![]
+        };
         assert_eq!(h.staticlibs, expected);
     }
 
@@ -6828,7 +6955,130 @@ LLVM version: 15.0.2
             "--out-dir",
             "out"
         );
-        assert_eq!(h.staticlibs, [lib]);
+        let naming = StaticArchiveNaming {
+            prefix: "lib".into(),
+            suffix: ".a".into(),
+            target_libdir: PathBuf::new(),
+        };
+        assert_eq!(h.staticlibs.len(), 1);
+        assert_eq!(
+            naming.select(&h.staticlibs[0], &h.static_link_paths, f.tempdir.path()),
+            Some(lib)
+        );
+    }
+
+    #[test]
+    fn native_archive_selection_uses_target_naming_and_search_order() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        for dir in ["one", "two", "target/builtin/third"] {
+            fs::create_dir_all(root.join(dir))?;
+        }
+        for file in [
+            "one/libprobe.a",
+            "one/probe.lib",
+            "one/probe.a",
+            "two/probe.lib",
+            "two/archive.custom",
+            "target/builtin/third/libbuiltin.a",
+        ] {
+            fs::write(root.join(file), b"archive")?;
+        }
+        let naming = StaticArchiveNaming::parse(
+            format!(
+                "sccache_native_archive_probe.lib\n{}\n",
+                root.join("target").display()
+            )
+            .as_bytes(),
+        )?;
+        let request = StaticLibraryRequest {
+            name: "probe".into(),
+            verbatim: false,
+        };
+        let paths = [PathBuf::from("one"), PathBuf::from("two")];
+        assert_eq!(
+            naming.select(&request, &paths, root),
+            Some(root.join("one/probe.lib"))
+        );
+        fs::remove_file(root.join("one/probe.lib"))?;
+        assert_eq!(
+            naming.select(&request, &paths, root),
+            Some(root.join("one/libprobe.a"))
+        );
+        fs::remove_file(root.join("one/libprobe.a"))?;
+        assert_eq!(
+            naming.select(&request, &paths, root),
+            Some(root.join("two/probe.lib"))
+        );
+        let request = StaticLibraryRequest {
+            name: "archive.custom".into(),
+            verbatim: true,
+        };
+        assert_eq!(
+            naming.select(&request, &paths, root),
+            Some(root.join("two/archive.custom"))
+        );
+        let request = StaticLibraryRequest {
+            name: "builtin".into(),
+            verbatim: false,
+        };
+        assert_eq!(
+            naming.select(&request, &[PathBuf::from("@RUSTC_BUILTINthird")], root),
+            Some(root.join("target/builtin/third/libbuiltin.a"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rust_archive_key_ignores_shadowed_archives_and_metadata_only_inputs() {
+        let f = TestFixture::new();
+        let base = [
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "link",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "-lstatic=probe",
+        ];
+        let key = |directories: &[&'static str], emit, first: u8, second: u8| {
+            let mut args = base.to_vec();
+            args[5] = emit;
+            args.extend_from_slice(directories);
+            hash_key(
+                &f,
+                &args,
+                &[],
+                |root| {
+                    for (directory, byte) in [("one", first), ("two", second)] {
+                        let dir = root.join(directory);
+                        fs::create_dir_all(&dir)?;
+                        create_file(&dir, "libprobe.a", |file| {
+                            let mut archive = ar::Builder::new(file);
+                            archive
+                                .append(&ar::Header::new(b"probe.o".to_vec(), 1), &[byte][..])?;
+                            Ok(())
+                        })?;
+                    }
+                    Ok(())
+                },
+                false,
+            )
+        };
+        let forward = ["-Lnative=one", "-Lnative=two"];
+        let reverse = ["-Lnative=two", "-Lnative=one"];
+        let original = key(&forward, "link", 1, 2);
+        assert_eq!(original, key(&forward, "link", 1, 3));
+        assert_ne!(original, key(&forward, "link", 4, 2));
+        assert_ne!(original, key(&reverse, "link", 1, 2));
+        assert_eq!(original, key(&reverse, "link", 2, 1));
+        assert_eq!(
+            key(&forward, "metadata", 1, 2),
+            key(&reverse, "metadata", 3, 4)
+        );
     }
 
     #[test]
@@ -6852,7 +7102,13 @@ LLVM version: 15.0.2
             "--out-dir",
             "out"
         );
-        assert_eq!(h.staticlibs, [lib]);
+        assert_eq!(
+            h.staticlibs,
+            [StaticLibraryRequest {
+                name: "bar".into(),
+                verbatim: false
+            }]
+        );
     }
 
     #[test]
@@ -7636,6 +7892,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 externs: vec![],
                 crate_link_paths: vec![],
                 staticlibs: vec![],
+                static_link_paths: vec![],
                 crate_name: "foo".into(),
                 crate_types: CrateTypes {
                     rlib: true,
@@ -7750,7 +8007,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 output_dir: "foo/".into(),
                 externs: vec!["bar.rlib".into()],
                 crate_link_paths: vec![],
-                staticlibs: vec![f.tempdir.path().join("libbaz.a")],
+                staticlibs: vec![StaticLibraryRequest {
+                    name: "baz".into(),
+                    verbatim: false,
+                }],
+                static_link_paths: vec![f.tempdir.path().to_owned()],
                 crate_name: "foo".into(),
                 crate_types: CrateTypes {
                     rlib: true,
@@ -7769,6 +8030,10 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             },
         });
         let creator = new_creator();
+        mock_file_names(
+            &creator,
+            &["libsccache_native_archive_probe.a", "/toolchain/lib"],
+        );
         mock_dep_info(&creator, &["foo.rs", "bar.rs"]);
         mock_file_names(&creator, &["foo.rlib", "foo.a"]);
         let runtime = single_threaded_runtime();
@@ -7825,7 +8090,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             &[empty_digest.clone(), empty_digest.clone()],
         );
         hash_rust_extern_bindings(&mut m, &[("bar".into(), empty_digest)]);
-        hash_rust_input_group(&mut m, b"rust-staticlibs-v1", &[libbaz_a_digest]);
+        hash_rust_input_group(&mut m, b"rust-selected-staticlibs-v2", &[libbaz_a_digest]);
         hash_rust_input_group(&mut m, b"rust-target-json-v1", &[]);
         // Env vars
         OsStr::new("CARGO_BLAH").hash(&mut HashToDigest { digest: &mut m });
@@ -8048,6 +8313,12 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let runtime = single_threaded_runtime();
         let pool = runtime.handle().clone();
 
+        if !hasher.parsed_args.staticlibs.is_empty() {
+            mock_file_names(
+                &creator,
+                &["libsccache_native_archive_probe.a", "/toolchain/lib"],
+            );
+        }
         mock_dep_info(&creator, &["foo.rs"]);
         if hasher.parsed_args.metadata_only_output.is_none() {
             mock_file_names(&creator, &["foo.rlib"]);

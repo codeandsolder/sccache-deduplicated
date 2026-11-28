@@ -47,6 +47,11 @@ requests native CPU or tuning; successfully lowered explicit target arguments
 already identify the worker compilation.
 Metadata-only results do not depend on unselected linkable siblings of rmeta
 inputs; the execution packager can still deliver those siblings.
+Bundled native archives are resolved per library request using the compiler-reported
+target filename convention and ordered native search directories. Shadowed
+archives, unrelated filename conventions, and archives not used by metadata-only
+compilation do not participate. Selected archive digests retain the request
+order, including missing slots; archive locations do not identify results.
 
 Standard Cargo build paths used by compiler environment observations are
 normalized for both key and execution. The build-script output root is

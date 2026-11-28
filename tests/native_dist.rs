@@ -2825,6 +2825,117 @@ fn native_compiler_semantic_reuse_across_ephemeral_inputs() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires Linux Bubblewrap, GCC, Rust toolchain and ldd"]
+fn native_rust_bundled_archive_identity_follows_search_precedence() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("native-rust-archives-")
+        .tempdir_in("/tmp")?;
+    let root = temp.path().canonicalize()?;
+    let fleet = Fleet::start(&root, BTreeMap::new())?;
+    let mut service = LocalService::start(&root, &fleet, None)?;
+    let config = root.join("direct.toml");
+    fs::write(&config, "client_side_mode = false\n")?;
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()?;
+    ensure!(sysroot.status.success(), "could not discover test sysroot");
+    let rustc = PathBuf::from(String::from_utf8(sysroot.stdout)?.trim()).join("bin/rustc");
+    let source = root.join("compile");
+    for directory in ["one", "two", "build"] {
+        fs::create_dir_all(source.join(directory))?;
+    }
+    fs::write(
+        source.join("probe.c"),
+        b"int native_value(void) { return 42; }",
+    )?;
+    fs::write(
+        source.join("probe.rs"),
+        b"pub fn rust_value() -> u32 { 42 }",
+    )?;
+    let object = service
+        .command(env!("CARGO_BIN_EXE_sccache"))
+        .args(["/usr/bin/gcc", "-c", "probe.c", "-o", "probe.o"])
+        .current_dir(&source)
+        .env("SCCACHE_CONF", &config)
+        .output()?;
+    ensure!(
+        object.status.success(),
+        "C fixture compilation failed: {}",
+        String::from_utf8_lossy(&object.stderr)
+    );
+    let bytes = fs::read(source.join("probe.o"))?;
+    let archive = |dir: &str, name: &str| -> Result<()> {
+        let mut builder = ar::Builder::new(File::create(source.join(dir).join("libprobe.a"))?);
+        builder.append(
+            &ar::Header::new(name.as_bytes().to_vec(), u64::try_from(bytes.len())?),
+            bytes.as_slice(),
+        )?;
+        Ok(())
+    };
+    archive("one", "first.o")?;
+    archive("two", "second.o")?;
+    let compile = |order: [&str; 2], emit: &str| -> Result<((String, String), Vec<u8>)> {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .arg(&rustc)
+            .args([
+                "--crate-name",
+                "probe",
+                "--crate-type",
+                "rlib",
+                "--emit",
+                emit,
+                "--out-dir",
+                "build",
+                "-lstatic=probe",
+                "probe.rs",
+            ])
+            .args(order.map(|dir| format!("-Lnative={dir}")))
+            .current_dir(&source)
+            .env("SCCACHE_CONF", &config)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
+            .output()?;
+        let report = action_report(&output)?;
+        let name = if emit == "metadata" {
+            "libprobe.rmeta"
+        } else {
+            "libprobe.rlib"
+        };
+        Ok((report, fs::read(source.join("build").join(name))?))
+    };
+    let has_member = |bytes: &[u8], name: &[u8]| -> Result<bool> {
+        let mut archive = ar::Archive::new(bytes);
+        while let Some(entry) = archive.next_entry() {
+            if entry?.header().identifier() == name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    let ((first_key, source_kind), first) = compile(["one", "two"], "link")?;
+    assert_eq!(source_kind, "worker");
+    assert!(has_member(&first, b"first.o")?);
+    archive("two", "shadowed.o")?;
+    let ((same, source_kind), bytes) = compile(["one", "two"], "link")?;
+    assert_eq!((same, source_kind), (first_key.clone(), "hit".into()));
+    assert_eq!(first, bytes);
+    let ((second_key, source_kind), second) = compile(["two", "one"], "link")?;
+    assert_eq!(source_kind, "worker");
+    assert_ne!(first_key, second_key);
+    assert!(has_member(&second, b"shadowed.o")?);
+    assert!(!has_member(&second, b"first.o")?);
+    let ((metadata_key, _), metadata) = compile(["one", "two"], "metadata")?;
+    archive("one", "modified.o")?;
+    archive("two", "also_modified.o")?;
+    let ((same, source_kind), bytes) = compile(["two", "one"], "metadata")?;
+    assert_eq!((same, source_kind), (metadata_key, "hit".into()));
+    assert_eq!(metadata, bytes);
+    service.stop()?;
+    fleet.finish()?;
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires Linux Bubblewrap, GCC and ldd"]
 fn colocated_native_worker_shares_one_store_and_commits_results() -> Result<()> {
     let temp = tempfile::tempdir()?;
