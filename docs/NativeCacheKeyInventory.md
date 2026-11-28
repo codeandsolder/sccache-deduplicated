@@ -69,7 +69,11 @@ normalized for both key and execution. The build-script output root is
 variables. Retain the actual package identity where ordinary proc macros use it,
 compiler switches supplied through the environment, and Clippy policy and flags.
 Resolve duplicate environment assignments before discovery, hashing or execution;
-explicit observations are not repeated in the native compiler environment group.
+explicit observations are not repeated in the native compiler or Clippy environment
+group. Dep-info preserves unset versus empty values as a typed observation;
+key only the observed value, not a second copy of the caller environment.
+Managed build-path observations use the realized canonical environment,
+including synthesized Cargo build-directory defaults.
 Keep Rust metadata/output-name salts: changing `-C extra-filename` was verified
 to change both rlib and rmeta contents even with identical metadata salt.
 

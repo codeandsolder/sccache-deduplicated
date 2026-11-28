@@ -353,7 +353,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"14";
+const CACHE_VERSION: &[u8] = b"15";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -373,7 +373,7 @@ struct RustDepInfoRequest<'a, T> {
 /// dep-info locally instead of restoring one from a cache entry or build server.
 async fn get_source_files_and_env_deps<T>(
     request: RustDepInfoRequest<'_, T>,
-) -> Result<(Vec<PathBuf>, Vec<(OsString, OsString)>, String)>
+) -> Result<ParsedDepFile>
 where
     T: CommandCreatorSync,
 {
@@ -509,7 +509,8 @@ fn read_opened_inputs(
         .collect())
 }
 
-type ParsedDepFile = (Vec<PathBuf>, Vec<(OsString, OsString)>, String);
+type EnvDependencies = Vec<(OsString, Option<OsString>)>;
+type ParsedDepFile = (Vec<PathBuf>, EnvDependencies, String);
 type CpuCacheKey = (PathBuf, String, String);
 type CpuProfileCache = std::sync::Mutex<HashMap<CpuCacheKey, String>>;
 type CpuCfgFeatureCache = std::sync::Mutex<HashMap<CpuCacheKey, BTreeSet<String>>>;
@@ -614,20 +615,56 @@ where
     deps
 }
 
-fn parse_env_dep_info(dep_info: &str) -> Vec<(OsString, OsString)> {
-    let mut env_deps = Vec::new();
-    for line in dep_info.lines() {
-        if let Some(env_dep) = line.strip_prefix("# env-dep:") {
-            let mut split = env_dep.splitn(2, '=');
-            match (split.next(), split.next()) {
-                (Some(var), Some(val)) => {
-                    env_deps.push((unescape_dep_env(var).into(), unescape_dep_env(val).into()));
-                }
-                _ => env_deps.push((unescape_dep_env(env_dep).into(), "".into())),
-            }
-        }
+fn parse_env_dep_info(dep_info: &str) -> EnvDependencies {
+    dep_info
+        .lines()
+        .filter_map(|line| {
+            let entry = line.strip_prefix("# env-dep:")?;
+            let (name, value) = entry
+                .split_once('=')
+                .map_or((entry, None), |(name, value)| (name, Some(value)));
+            Some((
+                unescape_dep_env(name).into(),
+                value.map(|value| unescape_dep_env(value).into()),
+            ))
+        })
+        .collect()
+}
+
+/// Hash one typed observation per name, including absence. Canonical compiler
+/// build paths are observations of the realized execution environment rather
+/// than of the host path used during discovery.
+fn observed_environment_key(
+    name: &OsStr,
+    observed: Option<&OsStr>,
+    canonical_execution: Option<&[(OsString, OsString)]>,
+) -> Option<OsString> {
+    if super::canonical_paths::compiler_build_path_variable(name)
+        && let Some(environment) = canonical_execution
+    {
+        environment
+            .iter()
+            .rev()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    } else {
+        observed.map(OsStr::to_owned)
     }
-    env_deps
+}
+
+fn hash_observed_environment(
+    digest: &mut Digest,
+    dependencies: &[(OsString, Option<OsString>)],
+    canonical_execution: Option<&[(OsString, OsString)]>,
+) {
+    digest.delimiter(b"rust-observed-environment-v3");
+    digest.update(&(dependencies.len() as u128).to_le_bytes());
+    for (name, observed) in dependencies {
+        name.hash(&mut HashToDigest { digest });
+        observed_environment_key(name, observed.as_deref(), canonical_execution)
+            .as_deref()
+            .hash(&mut HashToDigest { digest });
+    }
 }
 
 /// Undo rustc's escaping of `\`, newlines and carriage returns
@@ -1216,20 +1253,23 @@ fn rust_shadow_digest(value: &std::ffi::OsStr) -> String {
 }
 
 fn rust_shadow_env_value(
-    name: &std::ffi::OsStr,
-    raw: &std::ffi::OsStr,
-    canonical: Option<&CanonicalRustPaths>,
+    name: &OsStr,
+    raw: Option<&OsStr>,
+    key: Option<&OsStr>,
 ) -> RustShadowEnvValue {
-    let key = canonical.map_or_else(
-        || raw.to_owned(),
-        |canonical| canonical.env_value_to_canonical(name, raw),
-    );
     let show_text = RustEnvironmentPath::classify(name).disclose_in_shadow();
+    let text = |value: Option<&OsStr>| {
+        value
+            .filter(|_| show_text)
+            .map(|value| value.to_string_lossy().into_owned())
+    };
+    let digest =
+        |value: Option<&OsStr>| value.map_or_else(|| "unset".to_owned(), rust_shadow_digest);
     RustShadowEnvValue {
-        raw_text: show_text.then(|| raw.to_string_lossy().into_owned()),
-        raw_blake3: rust_shadow_digest(raw),
-        key_text: show_text.then(|| key.to_string_lossy().into_owned()),
-        key_blake3: rust_shadow_digest(&key),
+        raw_text: text(raw),
+        raw_blake3: digest(raw),
+        key_text: text(key),
+        key_blake3: digest(key),
     }
 }
 
@@ -3917,43 +3957,29 @@ where
         m.audit_field("sccache.key.observed_environment");
         env_deps.sort();
         env_deps.dedup();
-        if canonical_paths.is_none() && !env_deps.is_empty() {
-            // Earlier physical-layout distributed builds could rewrite explicit
-            // observations. Do not reuse those entries. Keep normal canonical
-            // keys stable (including observed CARGO_PKG_VERSION metadata).
-            m.update(b"observed-rust-environment-v2");
-        }
-        for (var, val) in &env_deps {
-            if native_discovery
-                && super::canonical_paths::compiler_build_path_variable(var)
-                && let Some(paths) = canonical_paths.as_ref()
-            {
-                var.hash(&mut HashToDigest { digest: &mut m });
-                let observed = env_vars
-                    .iter()
-                    .rev()
-                    .find(|(name, _)| name == var)
-                    .map(|(_, value)| paths.env_value_to_canonical(var, value));
-                observed
-                    .as_deref()
-                    .hash(&mut HashToDigest { digest: &mut m });
-                continue;
-            }
-            var.hash(&mut HashToDigest { digest: &mut m });
-            m.update(b"=");
-            val.hash(&mut HashToDigest { digest: &mut m });
-            // dep-info spells unset and empty differently but the parser
-            // represents both as empty strings. Hash actual membership and
-            // values wherever the old text representation is insufficient.
-            let actual = env_vars
-                .iter()
-                .rev()
-                .find(|(name, _)| name == var)
-                .map(|(_, value)| value);
-            if canonical_paths.is_none() || val.is_empty() || actual != Some(val) {
-                m.update(b"exact-env-dependency-v1");
-                actual.hash(&mut HashToDigest { digest: &mut m });
-            }
+        let canonical_execution =
+            canonical_paths
+                .as_ref()
+                .filter(|_| native_discovery)
+                .map(|paths| {
+                    let execution = compiler_execution_environment(
+                        &env_vars,
+                        &env_dep_names,
+                        is_clippy_driver(&self.executable),
+                    );
+                    // Preserve explicit observations other than managed build paths,
+                    // exactly as the eventual native worker invocation does.
+                    let preserve = env_dep_names
+                        .iter()
+                        .filter(|name| !super::canonical_paths::compiler_build_path_variable(name))
+                        .cloned()
+                        .collect();
+                    paths.env_to_canonical_preserving(&execution, &preserve)
+                });
+        // Empty sets add no identity. rustc reports unset and empty distinctly;
+        // neither the caller environment nor an old-layout salt is necessary.
+        if !env_deps.is_empty() {
+            hash_observed_environment(&mut m, &env_deps, canonical_execution.as_deref());
         }
         let mut env_vars: Vec<_> = env_vars
             .iter()
@@ -4013,10 +4039,11 @@ where
             // above, and the actual policy files are hashed as source inputs.
             for (var, val) in env_vars.iter().filter(|(k, _)| {
                 if native_discovery {
-                    matches!(
-                        k.to_str(),
-                        Some("CLIPPY_ARGS" | "CLIPPY_DISABLE_DOCS_LINKS")
-                    )
+                    !env_deps.iter().any(|(name, _)| name == k)
+                        && matches!(
+                            k.to_str(),
+                            Some("CLIPPY_ARGS" | "CLIPPY_DISABLE_DOCS_LINKS")
+                        )
                 } else {
                     k.starts_with("CLIPPY_")
                 }
@@ -4156,8 +4183,16 @@ where
                 .iter()
                 .map(|(name, value)| RustShadowEnv {
                     name: name.to_string_lossy().into_owned(),
-                    // Explicit env-deps are hashed exactly as observed.
-                    value: rust_shadow_env_value(name, value, None),
+                    value: rust_shadow_env_value(
+                        name,
+                        value.as_deref(),
+                        observed_environment_key(
+                            name,
+                            value.as_deref(),
+                            canonical_execution.as_deref(),
+                        )
+                        .as_deref(),
+                    ),
                 })
                 .collect::<Vec<_>>();
 
@@ -4166,7 +4201,14 @@ where
                 .filter(|(name, _)| rust_cache_hashes_cargo_env(name))
                 .map(|(name, value)| RustShadowEnv {
                     name: name.to_string_lossy().into_owned(),
-                    value: rust_shadow_env_value(name, value, canonical),
+                    value: rust_shadow_env_value(
+                        name,
+                        Some(value),
+                        Some(&canonical.map_or_else(
+                            || value.clone(),
+                            |paths| paths.env_value_to_canonical(name, value),
+                        )),
+                    ),
                 })
                 .collect::<Vec<_>>();
 
@@ -7490,10 +7532,44 @@ bar.rs:
         assert_eq!(
             parse_env_dep_info(deps),
             [
-                ("OUT_DIR".into(), r"C:\dir\out".into()),
-                ("X".into(), "a\nb\rc=d".into()),
-                ("Y".into(), "".into()),
+                ("OUT_DIR".into(), Some(r"C:\dir\out".into())),
+                ("X".into(), Some("a\nb\rc=d".into())),
+                ("Y".into(), None),
             ]
+        );
+    }
+
+    #[test]
+    fn observed_environment_uses_presence_and_realized_build_paths() {
+        let key = |dep_info: &str, execution: Option<&[(OsString, OsString)]>| {
+            let mut digest = Digest::new();
+            let mut deps = parse_env_dep_info(dep_info);
+            deps.sort();
+            deps.dedup();
+            hash_observed_environment(&mut digest, &deps, execution);
+            digest.finish()
+        };
+        assert_ne!(key("# env-dep:X", None), key("# env-dep:X=", None));
+        assert_ne!(key("# env-dep:X=", None), key("# env-dep:X=1", None));
+        assert_eq!(
+            key("# env-dep:X=1", None),
+            key("# env-dep:X=1\n# env-dep:X=1", None)
+        );
+        let execution = [("CARGO_BUILD_BUILD_DIR".into(), "/intermediate".into())];
+        assert_eq!(
+            key("# env-dep:CARGO_BUILD_BUILD_DIR", Some(&execution)),
+            key(
+                "# env-dep:CARGO_BUILD_BUILD_DIR=/host/lease",
+                Some(&execution)
+            )
+        );
+        assert_ne!(
+            key("# env-dep:CARGO_BUILD_BUILD_DIR", Some(&execution)),
+            key("# env-dep:CARGO_BUILD_BUILD_DIR", Some(&[]))
+        );
+        assert_ne!(
+            key("# env-dep:X=1", Some(&execution)),
+            key("# env-dep:X=2", Some(&execution))
         );
     }
 
