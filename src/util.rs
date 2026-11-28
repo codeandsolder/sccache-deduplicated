@@ -642,8 +642,8 @@ fn hash_fat_archive<A: FatArch>(
     digest.delimiter(b"fat-archive-v2");
     let mut external_members = Vec::new();
     for arch in arches {
-        digest.update(&arch.cputype().to_le_bytes());
-        digest.update(&arch.cpusubtype().to_le_bytes());
+        digest.update(&arch.cputype().0.to_le_bytes());
+        digest.update(&arch.cpusubtype().0.to_le_bytes());
         let slice = hash_regular_archive(path, arch.data(data)?)?;
         digest.update(slice.digest.as_bytes());
         external_members.extend(slice.external_members);
@@ -1906,7 +1906,7 @@ mod tests {
             output.extend(FAT_MAGIC.to_be_bytes());
             output.extend(2u32.to_be_bytes());
             let mut offset = 48u32;
-            for (cpu, bytes) in [(CPU_TYPE_X86_64, &x86), (CPU_TYPE_ARM64, &arm)] {
+            for (cpu, bytes) in [(CPU_TYPE_X86_64.0, &x86), (CPU_TYPE_ARM64.0, &arm)] {
                 let size = u32::try_from(bytes.len())?;
                 for field in [cpu, 0, offset, size, 0] {
                     output.extend(field.to_be_bytes());
