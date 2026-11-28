@@ -1492,6 +1492,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     )?;
     let source_tree = mapping.prepare()?;
     let spec = ExecutionSpec {
+        discovery: None,
         compiler_result: None,
         working_inputs: Default::default(),
         scratch: Default::default(),
@@ -1952,6 +1953,7 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
         fs::remove_file(&input)?;
     }
     let mut spec = ExecutionSpec {
+        discovery: None,
         compiler_result: None,
         working_inputs: Default::default(),
         scratch: Default::default(),

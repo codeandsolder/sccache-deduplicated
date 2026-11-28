@@ -66,6 +66,12 @@ fn live_and_replay_mounts_preserve_aliases_and_hash_only_read_files() -> Result<
     );
     mounted.unmount()?;
     let discovered = live.finish()?;
+    let bundle = discovered.publish(&store)?;
+    assert_eq!(
+        DiscoveryBundle::load(&bundle, 1024 * 1024)?,
+        *discovered.bundle()
+    );
+    assert!(DiscoveryBundle::load(&bundle, 1).is_err());
     let transcript = discovered.transcript();
     let content = transcript
         .observations()
@@ -91,7 +97,7 @@ fn live_and_replay_mounts_preserve_aliases_and_hash_only_read_files() -> Result<
         .context("unrelated content invalidated transcript")?;
     assert_eq!(refreshed.seal()?.fingerprint()?, transcript.fingerprint()?);
 
-    let replay = DiscoverySession::new(store.clone(), NoOrigin, Some(transcript.clone()))?;
+    let replay = DiscoverySession::new(store.clone(), NoOrigin, Some(discovered.bundle().clone()))?;
     let mounted = replay.mount(path(b"/inputs")?, scratch.path())?;
     let root = mounted.root();
     assert_eq!(fs::read_dir(root)?.count(), 5);
@@ -113,7 +119,7 @@ fn live_and_replay_mounts_preserve_aliases_and_hash_only_read_files() -> Result<
         transcript.fingerprint()?
     );
 
-    let invalid = DiscoverySession::new(store, NoOrigin, Some(transcript.clone()))?;
+    let invalid = DiscoverySession::new(store, NoOrigin, Some(discovered.bundle().clone()))?;
     let mounted = invalid.mount(path(b"/inputs")?, scratch.path())?;
     assert_eq!(
         fs::metadata(mounted.root().join("unobserved"))

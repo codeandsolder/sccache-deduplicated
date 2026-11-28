@@ -1191,6 +1191,7 @@ mod result_tests {
         }
         let intermediate = intermediate.prepare()?;
         let spec = ExecutionSpec {
+            discovery: None,
             compiler_result: None,
             working_inputs: Default::default(),
             scratch: Default::default(),

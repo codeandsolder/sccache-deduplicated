@@ -126,6 +126,7 @@ impl NativeWorker {
                 bubblewrap: config.bubblewrap,
                 scratch: config.scratch,
                 timeout: Duration::from_secs(config.execution_timeout_secs),
+                max_discovery_metadata_bytes: config.max_metadata_bytes,
                 max_result_bytes: config.max_result_bytes,
             },
             renewal_interval: Duration::from_secs(config.renewal_interval_secs),

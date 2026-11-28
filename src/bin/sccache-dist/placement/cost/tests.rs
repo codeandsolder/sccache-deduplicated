@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 fn spec(args: &[&str]) -> anyhow::Result<ExecutionSpec> {
     let root = TreeId([0; 32]);
     Ok(ExecutionSpec {
+        discovery: None,
         compiler_result: None,
         working_inputs: Default::default(),
         scratch: Default::default(),

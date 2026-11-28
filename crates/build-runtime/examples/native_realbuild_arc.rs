@@ -184,6 +184,7 @@ mod linux {
         platform: ContentId,
     ) -> Result<ExecutionSpec> {
         Ok(ExecutionSpec {
+            discovery: None,
             compiler_result: None,
             working_inputs: Default::default(),
             scratch: Default::default(),
@@ -266,6 +267,7 @@ mod linux {
             bubblewrap: compiler_sandbox.to_owned(),
             scratch: temp_root.to_owned(),
             timeout: Duration::from_secs(90),
+            max_discovery_metadata_bytes: 64 * 1024 * 1024,
             max_result_bytes: 64 * 1024 * 1024,
         };
         for index in 0..REPETITIONS {

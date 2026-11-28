@@ -168,6 +168,14 @@ pub struct CompilerResultIdentity {
     pub environment: ContentId,
 }
 
+/// A sealed discovery package delivered as an ordinary immutable input
+/// tree, replayed at its exact declared mountpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoverySpec {
+    pub tree: TreeId,
+    pub mounts: BTreeSet<BuildPath>,
+}
+
 /// All declared inputs to a Linux native build.
 ///
 /// Platform is a versioned execution-contract digest supplied by deployment
@@ -177,6 +185,7 @@ pub struct CompilerResultIdentity {
 /// actual files, and scratch, output and namespace policy are schema-fixed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionSpec {
+    pub discovery: Option<DiscoverySpec>,
     pub compiler_result: Option<CompilerResultIdentity>,
     /// Root-relative destinations of recipe layers whose files belong to this
     /// action's generated output tree. Other input files remain immutable.
@@ -214,6 +223,39 @@ impl ExecutionSpec {
                     .any(|other| other != target && target.within(other.as_bytes())),
                 "overlapping build mounts"
             );
+        }
+        if let Some(discovery) = &self.discovery {
+            ensure!(
+                self.compiler_result.is_none(),
+                "discovery replay requires exact action identity"
+            );
+            ensure!(!discovery.mounts.is_empty(), "empty discovery mount set");
+            for path in &discovery.mounts {
+                path.validate()?;
+                ensure!(
+                    path.as_bytes() != b"/"
+                        && ![b"/proc".as_slice(), b"/dev", b"/tmp"]
+                            .iter()
+                            .any(|reserved| path.within(reserved)),
+                    "reserved discovery mount"
+                );
+                ensure!(!self.mounts.keys().chain(self.scratch.iter()).any(|other| path.within(other.as_bytes()) || other.within(path.as_bytes())), "discovery mount overlaps another input or scratch");
+                ensure!(
+                    !discovery
+                        .mounts
+                        .iter()
+                        .any(|other| other != path && path.within(other.as_bytes())),
+                    "overlapping discovery mounts"
+                );
+                ensure!(
+                    !self
+                        .outputs
+                        .values()
+                        .any(|output| output.path.within(path.as_bytes())
+                            || path.within(output.path.as_bytes())),
+                    "discovery mount overlaps an output"
+                );
+            }
         }
         for path in &self.scratch {
             path.validate()?;
@@ -354,6 +396,13 @@ impl ExecutionSpec {
             );
             trees.insert(*tree);
         }
+        if let Some(discovery) = &self.discovery {
+            trees.insert(discovery.tree);
+            components.insert(
+                "input/discovery-replay".into(),
+                ContentId(typed_digest(b"native-discovery-replay-v1\0", discovery)?),
+            );
+        }
         let mut required_outputs = BTreeMap::new();
         let mut optional_outputs = BTreeMap::new();
         for (name, output) in &self.outputs {
@@ -433,6 +482,7 @@ mod tests {
 
     fn spec() -> Result<ExecutionSpec> {
         Ok(ExecutionSpec {
+            discovery: None,
             compiler_result: None,
             working_inputs: Default::default(),
             scratch: Default::default(),

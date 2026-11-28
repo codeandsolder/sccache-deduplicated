@@ -2758,6 +2758,7 @@ mod scheduler_tests {
             receiver: None,
             delivery_profile: None,
             spec: ExecutionSpec {
+                discovery: None,
                 compiler_result: None,
                 working_inputs: Default::default(),
                 scratch: Default::default(),

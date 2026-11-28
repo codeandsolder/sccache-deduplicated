@@ -4,7 +4,7 @@
 //! and admitted to the ordinary verified CAS before exposing any bytes.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs,
     io::{Read, Seek, SeekFrom},
@@ -22,8 +22,8 @@ use fuser::{
 };
 
 use super::{
-    DiscoveryInode, DiscoveryKind, DiscoveryMetadata, DiscoveryOrigin, DiscoveryQuery,
-    DiscoveryReplay, DiscoveryReply, DiscoveryTranscript,
+    DiscoveryBundle, DiscoveryInode, DiscoveryKind, DiscoveryMetadata, DiscoveryOrigin,
+    DiscoveryQuery, DiscoveryReplay, DiscoveryReply, DiscoveryTranscript,
 };
 use crate::{BlobReader, BlobRef, BuildPath, ContentId, NativeStore, TreeLease, TreeTimestamp};
 
@@ -65,6 +65,22 @@ impl DiscoveryTransport for DiscoveryOrigin {
     }
 }
 
+/// Final replay has all bytes in its admitted immutable input tree. It
+/// cannot request origin metadata or additional content.
+struct SealedTransport;
+
+impl DiscoveryTransport for SealedTransport {
+    fn query(&mut self, _: &DiscoveryQuery) -> Result<DiscoveryReply> {
+        anyhow::bail!("sealed discovery replay cannot query the origin")
+    }
+    fn seal(&mut self, _: &DiscoveryTranscript) -> Result<()> {
+        anyhow::bail!("sealed discovery replay cannot seal live observations")
+    }
+    fn open_blob(&mut self, _: BlobRef) -> Result<Box<dyn Read + Send>> {
+        anyhow::bail!("sealed discovery replay input blob missing from CAS")
+    }
+}
+
 enum Mode {
     Record(DiscoveryTranscript),
     Replay(DiscoveryReplay),
@@ -76,6 +92,8 @@ struct State {
     store: NativeStore,
     content: BTreeMap<ContentId, TreeLease>,
     failure: Option<String>,
+    roots: BTreeSet<BuildPath>,
+    expected_roots: Option<BTreeSet<BuildPath>>,
 }
 
 impl State {
@@ -167,11 +185,14 @@ impl DiscoverySession {
     pub fn new(
         store: NativeStore,
         transport: impl DiscoveryTransport + 'static,
-        replay: Option<DiscoveryTranscript>,
+        replay: Option<DiscoveryBundle>,
     ) -> Result<Self> {
-        let mode = match replay {
-            Some(transcript) => Mode::Replay(DiscoveryReplay::new(transcript)?),
-            None => Mode::Record(DiscoveryTranscript::default()),
+        let (mode, expected_roots) = match replay {
+            Some(bundle) => (
+                Mode::Replay(DiscoveryReplay::new(bundle.transcript().clone())?),
+                Some(bundle.roots().clone()),
+            ),
+            None => (Mode::Record(DiscoveryTranscript::default()), None),
         };
         Ok(Self(Arc::new(Mutex::new(State {
             transport: Box::new(transport),
@@ -179,7 +200,16 @@ impl DiscoverySession {
             store,
             content: BTreeMap::new(),
             failure: None,
+            roots: BTreeSet::new(),
+            expected_roots,
         }))))
+    }
+
+    /// Construct a replay that can only access the admitted CAS contents.
+    /// # Errors
+    /// Returns an error for an invalid discovery package.
+    pub fn replay(store: NativeStore, bundle: DiscoveryBundle) -> Result<Self> {
+        Self::new(store, SealedTransport, Some(bundle))
     }
 
     /// Mount a logical directory under a private worker scratch directory.
@@ -235,6 +265,13 @@ impl DiscoverySession {
             "discovery filesystem failed: {}",
             state.failure.as_deref().unwrap_or_default()
         );
+        ensure!(
+            state
+                .expected_roots
+                .as_ref()
+                .is_none_or(|roots| roots == &state.roots),
+            "replay did not mount the complete observed namespace"
+        );
         let transcript = match state.mode {
             Mode::Record(transcript) => {
                 let transcript = transcript.canonical()?;
@@ -244,7 +281,7 @@ impl DiscoverySession {
             Mode::Replay(replay) => replay.finish()?,
         };
         Ok(DiscoveredInputs {
-            transcript,
+            bundle: DiscoveryBundle::new(state.roots, transcript)?,
             content: state.content,
         })
     }
@@ -252,14 +289,33 @@ impl DiscoverySession {
 
 /// A sealed dependency transcript and its verified, pinned CAS content.
 pub struct DiscoveredInputs {
-    transcript: DiscoveryTranscript,
+    bundle: DiscoveryBundle,
     content: BTreeMap<ContentId, TreeLease>,
 }
 
 impl DiscoveredInputs {
     #[must_use]
     pub const fn transcript(&self) -> &DiscoveryTranscript {
-        &self.transcript
+        self.bundle.transcript()
+    }
+
+    #[must_use]
+    pub const fn bundle(&self) -> &DiscoveryBundle {
+        &self.bundle
+    }
+
+    /// Publish the observation record and its existing content references
+    /// through the ordinary CAS tree transaction. No blob is copied.
+    /// # Errors
+    /// Returns an error for foreign content leases or failed publication.
+    pub fn publish(&self, store: &NativeStore) -> Result<TreeLease> {
+        ensure!(
+            self.content.values().all(|lease| lease.belongs_to(store)),
+            "discovered content belongs to a different store"
+        );
+        let (encoded, manifest) = self.bundle.encode()?;
+        let record = store.stage(encoded.as_slice())?;
+        store.publish_tree_pinned(&manifest, vec![record])
     }
 
     /// # Errors
@@ -643,6 +699,17 @@ impl DiscoveryFs {
         let mut locked = state
             .lock()
             .map_err(|_| anyhow::anyhow!("discovery session poisoned"))?;
+        ensure!(
+            locked
+                .expected_roots
+                .as_ref()
+                .is_none_or(|roots| roots.contains(&scope)),
+            "unobserved discovery mount"
+        );
+        ensure!(
+            locked.roots.insert(scope.clone()),
+            "duplicate discovery mount"
+        );
         let reply = locked.observe(DiscoveryQuery::Lookup(scope.clone()))?;
         let DiscoveryReply::Directory(metadata) = reply else {
             anyhow::bail!("discovery mount root is not a directory");

@@ -31,6 +31,10 @@ use crate::{
 };
 
 #[cfg(feature = "store")]
+mod bundle;
+#[cfg(feature = "store")]
+pub use bundle::DiscoveryBundle;
+#[cfg(feature = "store")]
 mod filesystem;
 #[cfg(feature = "store")]
 pub use filesystem::{DiscoveredInputs, DiscoveryMount, DiscoverySession, DiscoveryTransport};

@@ -31,6 +31,7 @@ use crate::{
     Artifact, BlobEncoding, BlobRef, BuildPath, ContentId, ExecutionSpec, MountedTree, NativeStore,
     OutputKind, ResultManifest, StageBudget, StagedBlob, TreeEntry, TreeId, TreeLease,
     TreeManifest, TreePath,
+    discovery::{DiscoveryBundle, DiscoveryMount, DiscoverySession},
     sandbox::{MountAccess, SandboxInvocation, SandboxPath, SandboxPlan},
     store::CapturedStage,
 };
@@ -46,6 +47,7 @@ pub struct ExecutionPolicy {
     pub scratch: PathBuf,
     pub timeout: Duration,
     pub max_result_bytes: u64,
+    pub max_discovery_metadata_bytes: u64,
 }
 
 /// Actual execution boundaries, including failures before output capture.
@@ -362,6 +364,7 @@ struct PreparedBuild {
     plan: SandboxPlan,
     outputs: BTreeMap<String, OutputLocation>,
     _views: BTreeMap<BuildPath, MountedTree>,
+    discovery: Option<(DiscoverySession, Vec<DiscoveryMount>)>,
 }
 
 fn host_path(bytes: &[u8]) -> &Path {
@@ -574,9 +577,10 @@ impl PreparedBuild {
     fn prepare(
         spec: &ExecutionSpec,
         store: &NativeStore,
-        scratch: &Path,
+        policy: &ExecutionPolicy,
         inputs: &[Arc<TreeLease>],
     ) -> Result<Self> {
+        let scratch = &policy.scratch;
         let inputs = admitted_inputs(spec, store, inputs)?;
         let root_point = BuildPath::new(b"/".to_vec())?;
         let mut leases: BTreeMap<BuildPath, Arc<TreeLease>> = spec
@@ -602,6 +606,21 @@ impl PreparedBuild {
             b"/dev",
         ]) {
             require_directory(root, host_path(&path[1..]))?;
+        }
+        // A replay mount must not hide declared immutable files. The root
+        // supplies only its mountpoint; all visible entries are observed.
+        if let Some(discovery) = &spec.discovery {
+            for path in &discovery.mounts {
+                let relative = &path.as_bytes()[1..];
+                require_directory(root, host_path(relative))?;
+                ensure!(
+                    !root.manifest().entries.keys().any(|entry| entry
+                        .as_bytes()
+                        .strip_prefix(relative)
+                        .is_some_and(|suffix| suffix.starts_with(b"/"))),
+                    "discovery mount hides immutable root inputs"
+                );
+            }
         }
         let writable = writable_locations(spec, &leases)?;
         // Reuse immutable native-ZFS CoW tree views (or compressed FUSE
@@ -664,6 +683,31 @@ impl PreparedBuild {
             )?;
         }
         bind_file_overlays(&mut plan, &views)?;
+        let discovery = if let Some(discovery) = &spec.discovery {
+            let lease = inputs
+                .get(&discovery.tree)
+                .context("missing admitted discovery package")?;
+            let bundle = DiscoveryBundle::load(lease, policy.max_discovery_metadata_bytes)?;
+            ensure!(
+                bundle.roots() == &discovery.mounts,
+                "discovery package mount set differs from action"
+            );
+            let session = DiscoverySession::replay(store.clone(), bundle)?;
+            let mut mounts = Vec::new();
+            for point in &discovery.mounts {
+                let mount = session.mount(point.clone(), scratch)?;
+                plan.bind(
+                    mount.root(),
+                    SandboxPath::new(host_path(point.as_bytes()))?,
+                    MountAccess::ReadOnly,
+                )?;
+                mounts.push(mount);
+            }
+            Some((session, mounts))
+        } else {
+            None
+        };
+
         let immutable_root = if spec.working_inputs.is_empty() {
             None
         } else {
@@ -685,7 +729,17 @@ impl PreparedBuild {
             plan,
             outputs,
             _views: views,
+            discovery,
         })
+    }
+    fn finish_discovery(&mut self) -> Result<()> {
+        if let Some((session, mounts)) = self.discovery.take() {
+            for mount in mounts {
+                mount.unmount()?;
+            }
+            session.finish()?;
+        }
+        Ok(())
     }
 }
 
@@ -735,14 +789,7 @@ fn admitted_inputs(
     store: &NativeStore,
     inputs: &[Arc<TreeLease>],
 ) -> Result<BTreeMap<TreeId, Arc<TreeLease>>> {
-    let required: BTreeSet<_> = spec
-        .root
-        .recipe
-        .layers
-        .iter()
-        .map(|layer| layer.tree)
-        .chain(spec.mounts.values().copied())
-        .collect();
+    let required = spec.action_request()?.input_trees;
     let mut admitted = BTreeMap::new();
     for lease in inputs {
         ensure!(
@@ -821,7 +868,7 @@ pub fn execute(
     );
     let started = Instant::now();
     progress()?;
-    let build = PreparedBuild::prepare(spec, store, &policy.scratch, inputs)?;
+    let mut build = PreparedBuild::prepare(spec, store, policy, inputs)?;
     let invocation = SandboxInvocation::from_spec(&spec.command)?;
     let stdout = tempfile::tempfile_in(&policy.scratch)?;
     let mut stderr = tempfile::tempfile_in(&policy.scratch)?;
@@ -857,6 +904,7 @@ pub fn execute(
             String::from_utf8_lossy(&diagnostic)
         )));
     }
+    build.finish_discovery()?;
     let process = running.elapsed();
     phase(ExecutionPhase::Capture);
     progress()?;

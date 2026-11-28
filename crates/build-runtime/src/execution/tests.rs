@@ -164,6 +164,7 @@ fn shell_output_fixture(
     script: &[u8],
 ) -> Result<(ExecutionSpec, ExecutionPolicy)> {
     let spec = ExecutionSpec {
+        discovery: None,
         compiler_result: None,
         working_inputs: Default::default(),
         scratch: Default::default(),
@@ -194,6 +195,7 @@ fn shell_output_fixture(
         bubblewrap: "/usr/bin/bwrap".into(),
         scratch: parent.to_owned(),
         timeout: Duration::from_secs(20),
+        max_discovery_metadata_bytes: 64 * 1024 * 1024,
         max_result_bytes: 1024,
     };
     Ok((spec, policy))
@@ -355,6 +357,7 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
     let src = store.publish_tree(&original_manifest, vec![input])?;
     let platform = ContentId::of(b"test platform");
     let mut spec = ExecutionSpec {
+        discovery: None,
         compiler_result: None,
         working_inputs: Default::default(),
         scratch: Default::default(),
@@ -377,6 +380,7 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
         bubblewrap: "/usr/bin/bwrap".into(),
         scratch: dir.path().into(),
         timeout: Duration::from_secs(10),
+        max_discovery_metadata_bytes: 64 * 1024 * 1024,
         max_result_bytes: 1024,
     };
     let result = execute_test(&spec, &store, &policy, None, || Ok(()))?;
@@ -572,6 +576,7 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
         encoding: crate::BlobEncoding::ZstdChunks,
     };
     let spec = ExecutionSpec {
+        discovery: None,
         compiler_result: None,
         working_inputs: Default::default(),
         scratch: Default::default(),
@@ -882,5 +887,57 @@ fn dependent_action_consumes_owned_inputs_and_preserves_immutable_inputs() -> Re
     assert_eq!(blob.id, ContentId::of(b"object-external"));
     link.command.arguments[1] = b"printf invalid > /out/library".to_vec();
     assert!(execute_test(&link, &store, &policy, None, || Ok(())).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires host Bubblewrap and FUSE"]
+fn sealed_discovery_is_an_ordinary_action_input() -> Result<()> {
+    use crate::{
+        DiscoverySpec,
+        discovery::{DiscoveryLimits, DiscoveryOrigin, DiscoverySession},
+    };
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(&dir.path().join("store"))?;
+    let root = shell_root(&store)?;
+    let source = dir.path().join("origin");
+    fs::create_dir(&source)?;
+    fs::write(source.join("input"), b"observed bytes\n")?;
+    fs::write(source.join("unrelated"), b"not observed")?;
+    let scope = BuildPath::new(b"/src".to_vec())?;
+    let mut origin = DiscoveryOrigin::new(DiscoveryLimits {
+        max_queries: 32,
+        max_dirents: 32,
+        max_content_bytes: 4096,
+    })?;
+    origin.add_root(scope.clone(), &source)?;
+    let session = DiscoverySession::new(store.clone(), origin, None)?;
+    let mount = session.mount(scope.clone(), dir.path())?;
+    assert_eq!(fs::read(mount.root().join("input"))?, b"observed bytes\n");
+    mount.unmount()?;
+    let discovered = session.finish()?;
+    let package = discovered.publish(&store)?;
+    let (mut spec, policy) = shell_output_fixture(
+        dir.path(),
+        root,
+        ContentId::of(b"discovery-replay-test"),
+        b"IFS= read -r word < /src/input; printf '%s' \"$word\" > /out/nested/object",
+    )?;
+    let original = spec.action_request()?.action_fingerprint()?.key()?;
+    spec.discovery = Some(DiscoverySpec {
+        tree: package.id(),
+        mounts: BTreeSet::from([scope]),
+    });
+    let request = spec.action_request()?;
+    assert!(request.input_trees.contains(&package.id()));
+    assert_ne!(original, request.action_fingerprint()?.key()?);
+    // Replay cannot access the live origin, even if it is now different.
+    fs::write(source.join("input"), b"modified origin\n")?;
+    assert_eq!(
+        read_shell_output(&spec, &store, &policy)?,
+        b"observed bytes"
+    );
+    spec.command.arguments[1] = b"if test -e /src/unrelated; then :; fi; IFS= read -r word < /src/input; printf '%s' \"$word\" > /out/nested/object".to_vec();
+    assert!(execute_test(&spec, &store, &policy, None, || Ok(())).is_err());
     Ok(())
 }

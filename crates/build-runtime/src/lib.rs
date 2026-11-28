@@ -30,7 +30,8 @@ pub use space_policy::SpacePolicy;
 mod spec;
 pub use recipe::{TreeLayer, TreeRecipe};
 pub use spec::{
-    BuildPath, CommandSpec, CompilerResultIdentity, ExecutionRoot, ExecutionSpec, OutputSpec,
+    BuildPath, CommandSpec, CompilerResultIdentity, DiscoverySpec, ExecutionRoot, ExecutionSpec,
+    OutputSpec,
 };
 mod tree;
 pub mod wire;

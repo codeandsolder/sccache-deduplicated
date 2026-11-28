@@ -912,6 +912,7 @@ impl CompilerPlan {
         let compiler_result =
             result_policy.identity(key, &command, inputs[0].id(), inputs[1].manifest())?;
         let spec = ExecutionSpec {
+            discovery: None,
             compiler_result,
             working_inputs: Default::default(),
             scratch: Default::default(),
@@ -1525,6 +1526,7 @@ mod tests {
                 bubblewrap: "/usr/bin/bwrap".into(),
                 scratch: cwd.clone(),
                 timeout: Duration::from_secs(60),
+                max_discovery_metadata_bytes: 64 * 1024 * 1024,
                 max_result_bytes: 64 * 1024 * 1024,
             },
             &leases,
@@ -1588,6 +1590,7 @@ mod tests {
                         bubblewrap: "/usr/bin/bwrap".into(),
                         scratch: cwd.clone(),
                         timeout: Duration::from_secs(60),
+                        max_discovery_metadata_bytes: 64 * 1024 * 1024,
                         max_result_bytes: 64 * 1024 * 1024,
                     },
                     &leases,
@@ -1649,6 +1652,7 @@ mod tests {
                     bubblewrap: "/usr/bin/bwrap".into(),
                     scratch: cwd.clone(),
                     timeout: Duration::from_secs(60),
+                    max_discovery_metadata_bytes: 64 * 1024 * 1024,
                     max_result_bytes: 64 * 1024 * 1024,
                 },
                 &leases,
