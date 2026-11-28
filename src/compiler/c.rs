@@ -469,7 +469,6 @@ impl CCompileContext<'_> {
             arguments,
             env_vars: self.env_vars.to_owned(),
             cwd: self.cwd.to_owned(),
-            share_jobserver: false,
         }
     }
 }
@@ -2270,8 +2269,8 @@ impl pkg::InputsPackager for CInputsPackager {
     }
 
     #[cfg(target_os = "linux")]
-    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        (*self).discover()?.into_native_mapping(|_| false)
+    fn native_mapping(self: Box<Self>) -> Result<pkg::NativeInputPlan> {
+        (*self).discover()?.into_native_input_plan(|_| false)
     }
 }
 
@@ -3250,6 +3249,7 @@ mod test {
         };
         let store = NativeStore::open(&temp.path().join("store"))?;
         let tree = pkg::InputsPackager::native_mapping(Box::new(packager))?
+            .mapping
             .prepare()?
             .import(&store)?;
         let view = tree.materialize(temp.path())?;

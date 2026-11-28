@@ -298,7 +298,6 @@ struct CanonicalRustCompileCommand {
 }
 
 #[cfg(target_os = "linux")]
-#[async_trait]
 impl CompileCommandImpl for CanonicalRustCompileCommand {
     fn get_executable(&self) -> PathBuf {
         self.toolchain_executable.clone()
@@ -314,23 +313,6 @@ impl CompileCommandImpl for CanonicalRustCompileCommand {
 
     fn get_cwd(&self) -> PathBuf {
         self.cwd.clone()
-    }
-
-    async fn execute<T>(
-        &self,
-        _: &crate::server::SccacheService<T>,
-        creator: &T,
-    ) -> Result<process::Output>
-    where
-        T: CommandCreatorSync,
-    {
-        let mut cmd = creator.clone().new_command_sync("/usr/bin/bwrap");
-        cmd.args(&self.runner_arguments)
-            .env_clear()
-            .envs(self.env_vars.clone())
-            .current_dir("/");
-        cmd.share_jobserver();
-        run_input_output(cmd, None).await
     }
 }
 
@@ -3687,12 +3669,41 @@ where
 
         #[cfg(all(feature = "dist-client", target_os = "linux"))]
         let native_link = self.parsed_args.split_link.then(|| {
+            let mut retained = abs_externs
+                .iter()
+                .chain(&abs_staticlibs)
+                .chain(&target_json_files)
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            // Path-valued compiler options can also appear in dep-info.
+            // Treat any value that actually names a discovered file as a
+            // separate input role rather than inferring it from a suffix.
+            for argument in &arguments {
+                let value = match argument.get_data() {
+                    Some(CodeGen(ArgCodegen {
+                        value: Some(value), ..
+                    }))
+                    | Some(Unstable(ArgUnstable {
+                        value: Some(value), ..
+                    })) => Some(PathBuf::from(value)),
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    retained.insert(cwd.join(value));
+                }
+            }
+            let codegen_only = source_files
+                .iter()
+                .filter(|path| !retained.contains(*path))
+                .cloned()
+                .collect();
             super::rust_link::NativeLinkLayout::new(
                 self.parsed_args
                     .dep_info
                     .as_ref()
                     .map(|name| cwd.join(&self.parsed_args.output_dir).join(name)),
                 env_vars.clone(),
+                codegen_only,
             )
         });
         Ok(HashResult {
@@ -3813,7 +3824,6 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                         .collect(),
                     env_vars: env_vars.to_owned(),
                     cwd: cwd.to_owned(),
-                    share_jobserver: true,
                 }))
             },
             |canonical| {
@@ -4056,6 +4066,8 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             arguments,
             executable,
             cwd,
+            #[cfg(target_os = "linux")]
+            native_link,
             ..
         } = *{ self };
         let mut input_dirs = Vec::new();
@@ -4099,6 +4111,10 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             crate_link_paths,
             can_trim_rlibs,
             inputs,
+            #[cfg(target_os = "linux")]
+            codegen_only: native_link.map_or_else(Default::default, |layout| layout.codegen_only),
+            #[cfg(not(target_os = "linux"))]
+            codegen_only: Default::default(),
             path_transformer,
             rlib_dep_reader,
         });
@@ -4141,6 +4157,7 @@ struct RustInputsPackager {
     crate_link_paths: Vec<PathBuf>,
     can_trim_rlibs: bool,
     inputs: Vec<PathBuf>,
+    codegen_only: std::collections::BTreeSet<PathBuf>,
     path_transformer: dist::PathTransformer,
     rlib_dep_reader: Option<Arc<RlibDepReader>>,
 }
@@ -4357,6 +4374,7 @@ version = "6.1.0"
     assert!(inputs.contains(&protocol));
 
     let packager = RustInputsPackager {
+        codegen_only: Default::default(),
         env_vars: vec![(
             OsString::from("CARGO_PKG_NAME"),
             OsString::from("fast_image_resize"),
@@ -4414,6 +4432,7 @@ fn test_dist_archive_includes_clippy_config_files_and_empty_directory() -> Resul
         let mut transformer = dist::PathTransformer::new();
         transformer.add_root_mapping(policy.clone(), "/clippy-config");
         let packager = RustInputsPackager {
+            codegen_only: Default::default(),
             env_vars: vec![],
             input_dirs: vec![policy.clone()],
             crate_link_paths: vec![],
@@ -4654,6 +4673,7 @@ fn test_dist_dependency_inspection_failure_keeps_all_candidates() -> Result<()> 
     let mut transformer = dist::PathTransformer::new();
     transformer.add_root_mapping(tmp.path().to_owned(), "/target");
     let packager = RustInputsPackager {
+        codegen_only: Default::default(),
         env_vars,
         input_dirs: vec![],
         crate_link_paths: vec![deps],
@@ -4710,6 +4730,7 @@ fn native_rust_inputs_retain_complete_dependency_artifacts() -> Result<()> {
     let mut transformer = dist::PathTransformer::new();
     transformer.add_root_mapping(source, "/work");
     let packager = RustInputsPackager {
+        codegen_only: Default::default(),
         env_vars: Vec::new(),
         input_dirs: Vec::new(),
         crate_link_paths: vec![deps],
@@ -4721,6 +4742,7 @@ fn native_rust_inputs_retain_complete_dependency_artifacts() -> Result<()> {
     let store = NativeStore::open(&tmp.path().join("store"))?;
     let tree = Box::new(packager)
         .native_mapping()?
+        .mapping
         .prepare()?
         .import(&store)?;
     let view = tree.materialize(tmp.path())?;
@@ -4770,6 +4792,7 @@ fn canonical_native_generated_inputs_have_stable_metadata_across_leases() -> Res
         transformer.add_root_mapping(source.clone(), "/build");
         transformer.add_root_mapping(generated, "/intermediate");
         let packager = RustInputsPackager {
+            codegen_only: Default::default(),
             env_vars: Vec::new(),
             input_dirs: Vec::new(),
             crate_link_paths: Vec::new(),
@@ -4778,7 +4801,7 @@ fn canonical_native_generated_inputs_have_stable_metadata_across_leases() -> Res
             path_transformer: transformer,
             rlib_dep_reader: None,
         };
-        let mapping = Box::new(packager).native_mapping()?;
+        let mapping = Box::new(packager).native_mapping()?.mapping;
         let prepared = if reference {
             mapping.prepare_with_references(&|_, path| {
                 Ok((path == artifact).then(|| {
@@ -4871,7 +4894,7 @@ impl pkg::InputsPackager for RustInputsPackager {
     // including metadata and linkable code. Do not introduce a second
     // representation of rlibs merely to reduce a per-job archive.
     #[cfg(target_os = "linux")]
-    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
+    fn native_mapping(self: Box<Self>) -> Result<pkg::NativeInputPlan> {
         // A canonical Cargo output root is a generated-input namespace. Its
         // physical mtime describes delivery/freshness, not the sandbox input.
         // Normalize the actual remote inode timestamp, not just the key;
@@ -4882,7 +4905,7 @@ impl pkg::InputsPackager for RustInputsPackager {
             .filter(|(_, logical)| matches!(logical.as_str(), "/intermediate" | "/target"))
             .map(|(_, logical)| PathBuf::from(logical))
             .collect::<std::collections::BTreeSet<_>>();
-        (*self).discover()?.into_native_mapping(|logical| {
+        (*self).discover()?.into_native_input_plan(|logical| {
             generated_roots.iter().any(|root| logical.starts_with(root))
         })
     }
@@ -4895,6 +4918,7 @@ impl RustInputsPackager {
             crate_link_paths,
             can_trim_rlibs: _,
             inputs,
+            codegen_only,
             path_transformer,
             rlib_dep_reader,
             env_vars,
@@ -4910,7 +4934,19 @@ impl RustInputsPackager {
         let crate_libraries =
             rust_dependency_candidates(&crate_link_paths, dependency_names.as_ref())?;
         let mut plan = pkg::CompilerInputs::new(path_transformer);
-        for input_path in inputs.into_iter().chain(companions).chain(crate_libraries) {
+        for (input_path, source_only) in inputs
+            .into_iter()
+            .map(|path| {
+                let source_only = codegen_only.contains(&path);
+                (path, source_only)
+            })
+            .chain(
+                companions
+                    .into_iter()
+                    .chain(crate_libraries)
+                    .map(|path| (path, false)),
+            )
+        {
             if !super::CAN_DIST_DYLIBS
                 && input_path
                     .extension()
@@ -4918,7 +4954,11 @@ impl RustInputsPackager {
             {
                 bail!("Cannot distribute dylib input {}", input_path.display());
             }
-            plan.file(&input_path, None)?;
+            if source_only {
+                plan.codegen_file(&input_path)?;
+            } else {
+                plan.file(&input_path, None)?;
+            }
         }
         for directory in input_dirs {
             plan.directory(&directory)?;

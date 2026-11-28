@@ -19,6 +19,7 @@ use crate::{
 struct InputFile {
     source: PathBuf,
     generated: Option<Vec<u8>>,
+    codegen_only: bool,
 }
 
 pub struct CompilerInputs {
@@ -39,19 +40,40 @@ impl CompilerInputs {
     }
 
     pub fn file(&mut self, path: &Path, generated: Option<Vec<u8>>) -> Result<()> {
+        self.file_with_role(path, generated, false)
+    }
+
+    /// The frontend discovered this file through codegen-only dependency
+    /// discovery. Any independent declaration as a link input overrides
+    /// this role, even when two spellings resolve to the same file.
+    pub fn codegen_file(&mut self, path: &Path) -> Result<()> {
+        self.file_with_role(path, None, true)
+    }
+
+    fn file_with_role(
+        &mut self,
+        path: &Path,
+        generated: Option<Vec<u8>>,
+        codegen_only: bool,
+    ) -> Result<()> {
         let (source, destination) = self.paths.file(path)?;
-        let input = InputFile { source, generated };
+        let input = InputFile {
+            source,
+            generated,
+            codegen_only,
+        };
         match self.files.entry(destination) {
             Entry::Vacant(entry) => {
                 entry.insert(input);
             }
-            Entry::Occupied(entry) => {
-                if entry.get() != &input {
+            Entry::Occupied(mut entry) => {
+                if entry.get().source != input.source || entry.get().generated != input.generated {
                     return Err(anyhow!(
                         "conflicting compiler input paths at {}",
                         entry.key()
                     ));
                 }
+                entry.get_mut().codegen_only &= codegen_only;
             }
         }
         Ok(())
@@ -93,6 +115,14 @@ impl CompilerInputs {
         self,
         normalize_timestamp: impl Fn(&Path) -> bool,
     ) -> Result<crate::build_runtime::MappedTree> {
+        Ok(self.into_native_input_plan(normalize_timestamp)?.mapping)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn into_native_input_plan(
+        self,
+        normalize_timestamp: impl Fn(&Path) -> bool,
+    ) -> Result<super::NativeInputPlan> {
         use crate::build_runtime::{
             MappedMetadata, MappedTree, TreeMetadata, TreePath, TreeTimestamp,
         };
@@ -100,6 +130,7 @@ impl CompilerInputs {
 
         let directories = super::native_directory_metadata()?;
         let mut mapping = MappedTree::new(directories);
+        let mut codegen_only = std::collections::BTreeSet::new();
         let relative = |path: &Path| -> Result<TreePath> {
             TreePath::new(path.strip_prefix("/")?.as_os_str().as_bytes().to_vec())
         };
@@ -107,6 +138,9 @@ impl CompilerInputs {
             let logical = Path::new(&destination);
             let normalize = normalize_timestamp(logical);
             let path = relative(logical)?;
+            if input.codegen_only {
+                codegen_only.insert(path.clone());
+            }
             let source = input.source.canonicalize()?;
             if let Some(bytes) = input.generated {
                 let metadata = fs::metadata(&source)?;
@@ -149,6 +183,46 @@ impl CompilerInputs {
                 )?;
             }
         }
-        Ok(mapping)
+        Ok(super::NativeInputPlan {
+            mapping,
+            codegen_only,
+        })
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::build_runtime::TreePath;
+
+    #[test]
+    fn independently_declared_input_overrides_codegen_only_role() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        fs::write(root.join("source.rs"), b"source")?;
+        fs::write(root.join("shared"), b"shared")?;
+        fs::create_dir(root.join("sub"))?;
+        let mut transformer = PathTransformer::new();
+        transformer.add_root_mapping(root.clone(), "/workspace");
+        let mut inputs = CompilerInputs::new(transformer);
+        inputs.codegen_file(&root.join("source.rs"))?;
+        inputs.codegen_file(&root.join("sub/../shared"))?;
+        inputs.file(&root.join("shared"), None)?;
+        inputs.codegen_file(&root.join("shared"))?;
+        let plan = inputs.into_native_input_plan(|_| false)?;
+        assert_eq!(
+            plan.codegen_only,
+            [TreePath::new(b"workspace/source.rs".to_vec())?]
+                .into_iter()
+                .collect()
+        );
+        let prepared = plan.mapping.prepare()?;
+        assert!(
+            prepared
+                .manifest()
+                .entries
+                .contains_key(&TreePath::new(b"workspace/shared".to_vec())?)
+        );
+        Ok(())
     }
 }

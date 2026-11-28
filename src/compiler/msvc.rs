@@ -2899,7 +2899,7 @@ mod test {
         assert!(dist_command.is_some());
         #[cfg(not(feature = "dist-client"))]
         assert!(dist_command.is_none());
-        assert_compile_command_executes(&command)?;
+        assert_compile_command_declared(&command)?;
         assert_eq!(
             if existing_pdb {
                 Cacheable::No

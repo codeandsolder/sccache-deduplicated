@@ -771,7 +771,7 @@ mod test {
                 native_resolution: None,
             })
             .unwrap();
-        assert_compile_command_executes(&command)?;
+        assert_compile_command_declared(&command)?;
         assert_eq!(Cacheable::Yes, cacheable);
         Ok(())
     }

@@ -635,7 +635,7 @@ mod test {
                 native_resolution: None,
             })
             .unwrap();
-        assert_compile_command_executes(&command)?;
+        assert_compile_command_declared(&command)?;
         assert_eq!(Cacheable::Yes, cacheable);
         Ok(())
     }
@@ -664,7 +664,7 @@ mod test {
             ovec!["-c", "foo.cu", "-o", "foo.o", "--threads", "2"],
             command.arguments
         );
-        assert_compile_command_executes(&command)?;
+        assert_compile_command_declared(&command)?;
         assert_eq!(Cacheable::Yes, cacheable);
         Ok(())
     }

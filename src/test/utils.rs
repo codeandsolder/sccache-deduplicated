@@ -87,19 +87,22 @@ pub fn new_creator() -> Arc<Mutex<MockCommandCreator>> {
     Arc::new(Mutex::new(MockCommandCreator::new(&client)))
 }
 
-/// Run one generated compiler command against a single successful mock process.
-pub fn assert_compile_command_executes(
+/// Check the generated command is a real, explicit declaration.
+pub fn assert_compile_command_declared(
     command: &impl crate::compiler::CompileCommandImpl,
 ) -> Result<()> {
-    let creator = new_creator();
-    let runtime = single_threaded_runtime();
-    let storage = Arc::new(super::mock_storage::MockStorage::new(None, false));
-    let service =
-        crate::server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
-    next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
-    let output = runtime.block_on(command.execute(&service, &creator))?;
-    assert!(output.status.success());
-    assert_eq!(0, creator.lock().unwrap().children.len());
+    anyhow::ensure!(
+        !command.get_executable().as_os_str().is_empty(),
+        "missing compiler executable"
+    );
+    anyhow::ensure!(
+        !command.get_arguments().is_empty(),
+        "missing compiler arguments"
+    );
+    anyhow::ensure!(
+        command.get_cwd().is_absolute(),
+        "compiler cwd is not absolute"
+    );
     Ok(())
 }
 

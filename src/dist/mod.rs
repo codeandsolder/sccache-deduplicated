@@ -495,8 +495,6 @@ pub fn try_compile_command_to_dist(
         arguments,
         env_vars,
         cwd,
-        // The jobserver is a local resource; a remote worker has its own.
-        share_jobserver: _,
     } = command;
     Some(CompileCommand {
         umask: crate::util::current_umask(),

@@ -95,17 +95,6 @@ pub fn main() {
             }
         });
     }
-    #[cfg(target_os = "linux")]
-    if let Some(result) = rust_link::capture_if_relay() {
-        std::process::exit(match result {
-            Ok(()) => 0,
-            Err(error) => {
-                eprintln!("sccache link capture: {error:#}");
-                1
-            }
-        });
-    }
-
     init_logging();
 
     #[cfg(target_os = "linux")]

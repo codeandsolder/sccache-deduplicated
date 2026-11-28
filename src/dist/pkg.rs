@@ -130,6 +130,13 @@ impl<T: DiscoverToolchain> ToolchainPackager for T {
     }
 }
 
+/// Native input contents and the frontend's explicit codegen-only roles.
+#[cfg(target_os = "linux")]
+pub struct NativeInputPlan {
+    pub mapping: crate::build_runtime::MappedTree,
+    pub codegen_only: std::collections::BTreeSet<crate::build_runtime::TreePath>,
+}
+
 pub trait InputsPackager: Send {
     /// Write packaged compiler inputs.
     ///
@@ -143,7 +150,7 @@ pub trait InputsPackager: Send {
     /// # Errors
     /// Returns an error for unavailable sources or conflicting logical paths.
     #[cfg(target_os = "linux")]
-    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree>;
+    fn native_mapping(self: Box<Self>) -> Result<NativeInputPlan>;
 }
 
 #[cfg(not(all(

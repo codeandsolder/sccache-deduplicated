@@ -87,17 +87,10 @@ pub const CAN_DIST_DYLIBS: bool = true;
 ))]
 pub const CAN_DIST_DYLIBS: bool = false;
 
-#[async_trait]
 pub trait CompileCommand<T>: Send + Sync + 'static
 where
     T: CommandCreatorSync,
 {
-    async fn execute(
-        &self,
-        service: &server::SccacheService<T>,
-        creator: &T,
-    ) -> Result<process::Output>;
-
     fn get_executable(&self) -> PathBuf;
     fn get_arguments(&self) -> Vec<OsString>;
     fn get_env_vars(&self) -> Vec<(OsString, OsString)>;
@@ -124,7 +117,6 @@ where
     }
 }
 
-#[async_trait]
 impl<T, I> CompileCommand<T> for CCompileCommand<I>
 where
     T: CommandCreatorSync,
@@ -142,30 +134,13 @@ where
     fn get_cwd(&self) -> PathBuf {
         self.cmd.get_cwd()
     }
-
-    async fn execute(
-        &self,
-        service: &server::SccacheService<T>,
-        creator: &T,
-    ) -> Result<process::Output> {
-        self.cmd.execute(service, creator).await
-    }
 }
 
-#[async_trait]
 pub trait CompileCommandImpl: Send + Sync + 'static {
     fn get_executable(&self) -> PathBuf;
     fn get_arguments(&self) -> Vec<OsString>;
     fn get_env_vars(&self) -> Vec<(OsString, OsString)>;
     fn get_cwd(&self) -> PathBuf;
-
-    async fn execute<T>(
-        &self,
-        service: &server::SccacheService<T>,
-        creator: &T,
-    ) -> Result<process::Output>
-    where
-        T: CommandCreatorSync;
 }
 
 #[derive(Debug)]
@@ -174,17 +149,8 @@ pub struct SingleCompileCommand {
     pub arguments: Vec<OsString>,
     pub env_vars: Vec<(OsString, OsString)>,
     pub cwd: PathBuf,
-    /// Whether this compiler participates in the GNU make jobserver.
-    ///
-    /// Deliberately a field rather than a defaulted builder method: the
-    /// compiler then makes every frontend answer, so a new one cannot
-    /// silently get this wrong. Getting it wrong in the `true` direction
-    /// costs a `fork` per compile; in the `false` direction it costs `rustc`
-    /// its parallelism limit, which is what the jobserver exists to enforce.
-    pub share_jobserver: bool,
 }
 
-#[async_trait]
 impl CompileCommandImpl for SingleCompileCommand {
     fn get_executable(&self) -> PathBuf {
         self.executable.clone()
@@ -197,45 +163,6 @@ impl CompileCommandImpl for SingleCompileCommand {
     }
     fn get_cwd(&self) -> PathBuf {
         self.cwd.clone()
-    }
-
-    async fn execute<T>(
-        &self,
-        _: &server::SccacheService<T>,
-        creator: &T,
-    ) -> Result<process::Output>
-    where
-        T: CommandCreatorSync,
-    {
-        let Self {
-            executable,
-            arguments,
-            env_vars,
-            cwd,
-            share_jobserver,
-        } = self;
-        // Resolve compiler avoiding ccache wrappers to prevent double-caching.
-        let resolved_executable = resolve_compiler_avoiding_wrapper(executable, env_vars);
-        let prepared = if is_rustc_like(&resolved_executable) {
-            Some(super::rust_response::prepare(
-                &resolved_executable,
-                arguments,
-            )?)
-        } else {
-            None
-        };
-        let spawn_arguments = prepared
-            .as_ref()
-            .map_or(arguments.as_slice(), |prepared| prepared.args.as_ref());
-        let mut cmd = creator.clone().new_command_sync(&resolved_executable);
-        cmd.args(spawn_arguments)
-            .env_clear()
-            .envs(env_vars.clone())
-            .current_dir(cwd);
-        if *share_jobserver {
-            cmd.share_jobserver();
-        }
-        run_input_output(cmd, None).await
     }
 }
 

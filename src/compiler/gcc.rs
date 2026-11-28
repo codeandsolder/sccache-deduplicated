@@ -3144,7 +3144,7 @@ mod test {
             dist_command.is_some(),
             cfg!(feature = "dist-client") && verbose.is_none()
         );
-        assert_compile_command_executes(&command)?;
+        assert_compile_command_declared(&command)?;
         assert_eq!(Cacheable::Yes, cacheable);
         Ok(())
     }

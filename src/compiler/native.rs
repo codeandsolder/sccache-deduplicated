@@ -638,6 +638,7 @@ struct CompilerPlan {
     spec: ExecutionSpec,
     inputs: Vec<PreparedTree>,
     destinations: BTreeMap<String, PathBuf>,
+    codegen_only: BTreeSet<TreePath>,
 }
 
 impl CompilerPlan {
@@ -704,11 +705,65 @@ impl CompilerPlan {
         cache: &SourceDigestCache,
         client: Option<&NativeCompilerClient>,
     ) -> Result<()> {
+        let mut required = BTreeSet::new();
         for invocation in captures {
             let generated = self.generated_paths(&invocation)?;
-            self.extend_inputs(inputs.prepare_captured(&invocation, &generated, cache, client)?)?;
+            let additional = inputs.prepare_captured(&invocation, &generated, cache, client)?;
+            for tree in &additional {
+                required.extend(tree.manifest().entries.keys().cloned());
+            }
+            self.extend_inputs(additional)?;
+        }
+        if !self.spec.command.arguments.iter().any(|arg| {
+            arg.windows(b"codegen-backend".len())
+                .any(|part| part == b"codegen-backend")
+        }) {
+            self.project_link_sources(&required)?;
         }
         Ok(())
+    }
+
+    /// Preserve the actual linker dependency selection and all independently
+    /// declared non-source inputs. Drop codegen-only file entries from the
+    /// original compiler input layer without reopening or transferring them.
+    fn project_link_sources(&mut self, required: &BTreeSet<TreePath>) -> Result<()> {
+        if self.codegen_only.is_empty() {
+            return Ok(());
+        }
+        let source = &self.inputs[1];
+        let previous = source.id();
+        let paths = source
+            .manifest()
+            .entries
+            .keys()
+            .filter(|path| !self.codegen_only.contains(*path) || required.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        let projected = source.select_paths(paths)?;
+        if previous == projected.id() {
+            return Ok(());
+        }
+        let mut recipe = self.spec.root.recipe.clone();
+        let layer = recipe
+            .layers
+            .get_mut(1)
+            .context("missing compiler input layer")?;
+        ensure!(
+            layer.tree == previous && layer.source.is_none() && layer.destination.is_none(),
+            "unexpected compiler input layer"
+        );
+        layer.tree = projected.id();
+        self.inputs[1] = projected;
+        self.spec.root = ExecutionRoot::resolve(
+            recipe,
+            &self
+                .inputs
+                .iter()
+                .map(|tree| (tree.id(), tree.manifest()))
+                .collect(),
+        )?;
+        self.spec.compiler_result = None;
+        self.spec.validate()
     }
 
     /// Extend a completed root using its existing snapshot as the authority.
@@ -830,7 +885,10 @@ impl CompilerPlan {
                 .map(|(name, value)| (name.into_bytes(), value.into_bytes()))
                 .collect(),
         };
-        let mapped = inputs.native_mapping()?;
+        let pkg::NativeInputPlan {
+            mapping: mapped,
+            codegen_only,
+        } = inputs.native_mapping()?;
         let inputs = if let Some(native) = native {
             mapped.prepare_with_references(&|file, _| native.reference(file))?
         } else {
@@ -885,6 +943,7 @@ impl CompilerPlan {
             spec,
             inputs,
             destinations,
+            codegen_only,
         })
     }
 }
@@ -1585,6 +1644,20 @@ mod tests {
                     staged.publish(destination)?;
                 }
                 link_plan.complete_link_inputs(&link.inputs, capture.read()?, &cache, None)?;
+                let source_path = TreePath::new(
+                    cwd.join(name)
+                        .strip_prefix("/")?
+                        .as_os_str()
+                        .as_bytes()
+                        .to_vec(),
+                )?;
+                assert!(plan.codegen_only.contains(&source_path));
+                assert!(
+                    !link_plan.inputs[1]
+                        .manifest()
+                        .entries
+                        .contains_key(&source_path)
+                );
             }
             let leases = link_plan
                 .inputs
