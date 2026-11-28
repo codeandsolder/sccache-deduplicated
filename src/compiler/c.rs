@@ -736,7 +736,7 @@ where
             extra_hashes.push(resolution.fingerprint.clone());
         } else if let Err(error) = &native_resolution {
             warn!(
-                "Failed to resolve native C/C++ codegen identity; bypassing cache for this compile: {error:#}"
+                "Failed to resolve native C/C++ codegen identity; native action cannot be prepared: {error:#}"
             );
             cache_control = CacheControl::ForceNoCache;
         }

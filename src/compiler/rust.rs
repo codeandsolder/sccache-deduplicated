@@ -237,6 +237,7 @@ pub struct ParsedArguments {
     emit: HashSet<String>,
     /// Metadata-only invocations produce this file regardless of crate type.
     metadata_only_output: Option<String>,
+    native_linked: bool,
     split_link: bool,
     split_link_metadata: Option<String>,
     /// The value of any `--color` option passed on the commandline.
@@ -1532,15 +1533,24 @@ where
         _env_vars: &[(OsString, OsString)],
         policy: CompilerCachePolicy,
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
-        let split_native_links = cfg!(all(target_os = "linux", feature = "dist-client"))
+        let native_link_policy = if cfg!(all(target_os = "linux", feature = "dist-client"))
             && policy == CompilerCachePolicy::Native
             && !is_clippy_driver(&self.executable)
-            && self
+        {
+            if self
                 .version
                 .lines()
                 .next()
-                .is_some_and(|version| version.contains("-nightly"));
-        match parse_arguments(arguments, cwd, split_native_links) {
+                .is_some_and(|version| version.contains("-nightly"))
+            {
+                NativeLinkPolicy::Split
+            } else {
+                NativeLinkPolicy::Whole
+            }
+        } else {
+            NativeLinkPolicy::Unsupported
+        };
+        match parse_arguments(arguments, cwd, native_link_policy) {
             CompilerArguments::Ok(args) => CompilerArguments::Ok(Box::new(RustHasher {
                 executable: self.executable.clone(), // if rustup exists, this must already contain the true resolved compiler path
                 host: self.host.clone(),
@@ -2088,6 +2098,13 @@ counted_array!(static ARGS: [ArgInfo<ArgData>; _] = [
     flag!("-vV", NotCompilationFlag),
 ]);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeLinkPolicy {
+    Unsupported,
+    Whole,
+    Split,
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "single-pass argument parser keeps interdependent flag state and ordering visible; splitting would require a state bag threaded through helpers"
@@ -2095,7 +2112,7 @@ counted_array!(static ARGS: [ArgInfo<ArgData>; _] = [
 fn parse_arguments(
     arguments: &[OsString],
     cwd: &Path,
-    split_native_links: bool,
+    native_link_policy: NativeLinkPolicy,
 ) -> CompilerArguments<ParsedArguments> {
     let mut args = vec![];
 
@@ -2318,15 +2335,18 @@ fn parse_arguments(
         || crate_types.staticlib
         || crate_types.cdylib
         || other_crate_types.contains("bin");
-    let split_link = split_native_links
+    let linked = emit.contains("link")
         && !metadata_only
-        && emit.contains("link")
+        && (native_leaf
+            || other_crate_types
+                .iter()
+                .any(|kind| matches!(kind.as_str(), "dylib" | "proc-macro")));
+    let native_linked = linked && native_link_policy != NativeLinkPolicy::Unsupported;
+    let split_link = native_linked
+        && native_link_policy == NativeLinkPolicy::Split
         && native_leaf
         && !metadata_bearing;
-    if split_native_links && !metadata_only && metadata_bearing && native_leaf {
-        cannot_cache!("mixed Rust metadata and native link outputs");
-    }
-    if !metadata_only && !split_link {
+    if !metadata_only && !native_linked {
         // General linked Rust artifacts remain non-cacheable: their native
         // linker inputs are opaque. A test harness always links an executable,
         // irrespective of an explicit crate type.
@@ -2435,6 +2455,7 @@ fn parse_arguments(
         gcno: gcno.map(std::convert::Into::into),
         emit,
         metadata_only_output,
+        native_linked,
         split_link,
         split_link_metadata,
         color_mode,
@@ -2790,7 +2811,7 @@ where
             Ok(plan) => plan,
             Err(error) => {
                 warn!(
-                    "Rust codegen auxiliary dependency discovery failed; bypassing cache: {error:#}"
+                    "Rust codegen auxiliary dependency discovery failed; native action cannot be prepared: {error:#}"
                 );
                 effective_cache_control = CacheControl::ForceNoCache;
                 allow_dist = false;
@@ -2813,7 +2834,7 @@ where
                     Ok(profile) => profile,
                     Err(error) => {
                         warn!(
-                            "Failed to resolve rustc native CPU profile; bypassing cache and distributed compilation: {error:#}"
+                            "Failed to resolve rustc native CPU profile; native action cannot be prepared: {error:#}"
                         );
                         effective_cache_control = CacheControl::ForceNoCache;
                         allow_dist = false;
@@ -2830,7 +2851,7 @@ where
             if target != self.host {
                 allow_dist = false;
                 warn!(
-                    "distributed Rust native CPU request targets {target}; compiling locally because native resolution is only proven for host target {}",
+                    "distributed Rust native CPU request targets {target}; native action rejected because native resolution is only proven for host target {}",
                     self.host
                 );
             } else if let Some(profile) = resolved_native_profile.as_ref()
@@ -2886,21 +2907,21 @@ where
                                     Err(error) => {
                                         allow_dist = false;
                                         warn!(
-                                            "Failed to resolve rustc baseline target features for {baseline_cpu}; compiling native request locally: {error:#}"
+                                            "Failed to resolve rustc baseline target features for {baseline_cpu}; native action rejected: {error:#}"
                                         );
                                     }
                                 }
                             } else {
                                 allow_dist = false;
                                 warn!(
-                                    "rustc default CPU profile did not contain an explicit CPU name; compiling native request locally"
+                                    "rustc default CPU profile did not contain an explicit CPU name; native action rejected"
                                 );
                             }
                         }
                         (Err(error), _) | (_, Err(error)) => {
                             allow_dist = false;
                             warn!(
-                                "Failed to resolve a safe explicit rustc native feature set for {cpu}; compiling locally: {error:#}"
+                                "Failed to resolve a safe explicit rustc native feature set for {cpu}; native action rejected: {error:#}"
                             );
                         }
                     }
@@ -2914,7 +2935,7 @@ where
             } else {
                 allow_dist = false;
                 warn!(
-                    "rustc native CPU profile did not contain an explicit CPU name; compiling locally"
+                    "rustc native CPU profile did not contain an explicit CPU name; native action rejected"
                 );
             }
         }
@@ -3668,13 +3689,14 @@ where
         }
 
         #[cfg(all(feature = "dist-client", target_os = "linux"))]
-        let native_link = self.parsed_args.split_link.then(|| {
+        let native_link = self.parsed_args.native_linked.then(|| {
             super::rust_link::NativeLinkLayout::new(
                 self.parsed_args
                     .dep_info
                     .as_ref()
                     .map(|name| cwd.join(&self.parsed_args.output_dir).join(name)),
                 env_vars.clone(),
+                self.parsed_args.split_link,
             )
         });
         Ok(HashResult {
@@ -3689,7 +3711,7 @@ where
                 crate_link_paths: self.parsed_args.crate_link_paths.clone(),
                 crate_name: self.parsed_args.crate_name.clone(),
                 #[cfg(feature = "dist-client")]
-                can_trim_rlibs: !self.parsed_args.split_link
+                can_trim_rlibs: !self.parsed_args.native_linked
                     && (self.parsed_args.metadata_only_output.is_some()
                         || matches!(
                             self.parsed_args.crate_types,
@@ -5669,24 +5691,29 @@ mod test {
         if test_harness {
             args.push("--test".into());
         }
-        match parse_arguments(&args, Path::new("."), true) {
-            CompilerArguments::Ok(parsed) => {
-                assert_eq!(parsed.split_link, expected);
-                if expected {
+        for policy in [NativeLinkPolicy::Whole, NativeLinkPolicy::Split] {
+            match parse_arguments(&args, Path::new("."), policy) {
+                CompilerArguments::Ok(parsed) => {
                     assert_eq!(
-                        parsed.split_link_metadata.as_deref(),
-                        Some("libprobe.rmeta")
+                        parsed.split_link,
+                        expected && policy == NativeLinkPolicy::Split
                     );
+                    assert_eq!(parsed.native_linked, crate_type != "rlib" || test_harness);
+                    if parsed.split_link {
+                        assert_eq!(
+                            parsed.split_link_metadata.as_deref(),
+                            Some("libprobe.rmeta")
+                        );
+                    }
                 }
+                other => panic!("unexpected native policy outcome {other:?}"),
             }
-            CompilerArguments::CannotCache(_, _) if !expected => {}
-            other => panic!("unexpected native policy outcome {other:?}"),
         }
     }
 
     fn _parse_arguments(arguments: &[String]) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
-        parse_arguments(&arguments, ".".as_ref(), false)
+        parse_arguments(&arguments, ".".as_ref(), NativeLinkPolicy::Unsupported)
     }
 
     macro_rules! parses {
@@ -5906,7 +5933,7 @@ LLVM version: 15.0.2
         ] {
             let args = args.iter().map(OsString::from).collect::<Vec<_>>();
             assert_eq!(
-                parse_arguments(&args, Path::new("."), false),
+                parse_arguments(&args, Path::new("."), NativeLinkPolicy::Unsupported),
                 CompilerArguments::NotCompilation
             );
         }
@@ -6012,7 +6039,8 @@ LLVM version: 15.0.2
                 }
                 args.extend(["--emit", "dep-info,metadata"]);
                 let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
-                let CompilerArguments::Ok(parsed) = parse_arguments(&args, Path::new("."), false)
+                let CompilerArguments::Ok(parsed) =
+                    parse_arguments(&args, Path::new("."), NativeLinkPolicy::Unsupported)
                 else {
                     panic!("metadata-only compile rejected: {args:?}");
                 };
@@ -6994,7 +7022,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             ]
             .map(OsString::from);
             let CompilerArguments::Ok(parsed_args) =
-                parse_arguments(&args, f.tempdir.path(), false)
+                parse_arguments(&args, f.tempdir.path(), NativeLinkPolicy::Unsupported)
             else {
                 bail!("could not parse metadata compile for {crate_type}");
             };
@@ -7093,6 +7121,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 dep_info: Some("foo-abc.d".into()),
                 emit,
                 metadata_only_output: None,
+                native_linked: false,
                 split_link: false,
                 split_link_metadata: None,
                 color_mode: ColorMode::Auto,
@@ -7200,6 +7229,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 dep_info: None,
                 emit,
                 metadata_only_output: None,
+                native_linked: false,
                 split_link: false,
                 split_link_metadata: None,
                 color_mode: ColorMode::Auto,
@@ -7456,10 +7486,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         F: Fn(&Path) -> Result<()>,
     {
         let oargs = args.iter().map(OsString::from).collect::<Vec<OsString>>();
-        let parsed_args = match parse_arguments(&oargs, f.tempdir.path(), false) {
-            CompilerArguments::Ok(parsed_args) => parsed_args,
-            o => panic!("Got unexpected parse result: {o:?}"),
-        };
+        let parsed_args =
+            match parse_arguments(&oargs, f.tempdir.path(), NativeLinkPolicy::Unsupported) {
+                CompilerArguments::Ok(parsed_args) => parsed_args,
+                o => panic!("Got unexpected parse result: {o:?}"),
+            };
         // Just use empty files for sources.
         {
             let src = &"foo.rs";
@@ -7723,10 +7754,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 "src/lib.rs",
             ]
             .map(OsString::from);
-            let parsed = match parse_arguments(&requested_arguments, &cwd, false) {
-                CompilerArguments::Ok(parsed) => parsed,
-                other => bail!("unexpected parse result: {other:?}"),
-            };
+            let parsed =
+                match parse_arguments(&requested_arguments, &cwd, NativeLinkPolicy::Unsupported) {
+                    CompilerArguments::Ok(parsed) => parsed,
+                    other => bail!("unexpected parse result: {other:?}"),
+                };
             let compilation = RustCompilation {
                 executable: clippy.clone(),
                 host: "x86_64-unknown-linux-gnu".into(),
@@ -7824,7 +7856,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 "out".into(),
             ],
             &build,
-            false,
+            NativeLinkPolicy::Unsupported,
         ) {
             CompilerArguments::Ok(parsed) => parsed,
             other => bail!("unexpected parse result: {other:?}"),
@@ -7954,10 +7986,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             "target-cpu=native",
         ];
         let oargs = raw.iter().map(OsString::from).collect::<Vec<_>>();
-        let parsed_args = match parse_arguments(&oargs, f.tempdir.path(), false) {
-            CompilerArguments::Ok(parsed_args) => parsed_args,
-            other => bail!("unexpected parse result: {other:?}"),
-        };
+        let parsed_args =
+            match parse_arguments(&oargs, f.tempdir.path(), NativeLinkPolicy::Unsupported) {
+                CompilerArguments::Ok(parsed_args) => parsed_args,
+                other => bail!("unexpected parse result: {other:?}"),
+            };
 
         let creator = new_creator();
         let runtime = single_threaded_runtime();
@@ -8094,7 +8127,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 OsString::from("out"),
             ],
             temp.path(),
-            false,
+            NativeLinkPolicy::Unsupported,
         ) {
             CompilerArguments::Ok(parsed) => parsed,
             other => bail!("unexpected parse result: {other:?}"),
@@ -8170,7 +8203,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 OsString::from("out"),
             ],
             temp.path(),
-            false,
+            NativeLinkPolicy::Unsupported,
         ) {
             CompilerArguments::Ok(parsed) => parsed,
             other => bail!("unexpected parse result: {other:?}"),
@@ -8246,10 +8279,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 "lib",
             ];
             let oargs = args.iter().map(OsString::from).collect::<Vec<_>>();
-            let parsed_args = match parse_arguments(&oargs, f.tempdir.path(), false) {
-                CompilerArguments::Ok(parsed_args) => parsed_args,
-                other => panic!("Got unexpected parse result: {other:?}"),
-            };
+            let parsed_args =
+                match parse_arguments(&oargs, f.tempdir.path(), NativeLinkPolicy::Unsupported) {
+                    CompilerArguments::Ok(parsed_args) => parsed_args,
+                    other => panic!("Got unexpected parse result: {other:?}"),
+                };
             let mut hasher = Box::new(RustHasher {
                 executable: "rustc".into(),
                 host: "x86-64-unknown-unknown-unknown".to_owned(),
@@ -8397,10 +8431,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             "lib",
         ];
         let oargs = raw.iter().map(OsString::from).collect::<Vec<_>>();
-        let parsed_args = match parse_arguments(&oargs, f.tempdir.path(), false) {
-            CompilerArguments::Ok(parsed_args) => parsed_args,
-            other => bail!("unexpected parse result: {other:?}"),
-        };
+        let parsed_args =
+            match parse_arguments(&oargs, f.tempdir.path(), NativeLinkPolicy::Unsupported) {
+                CompilerArguments::Ok(parsed_args) => parsed_args,
+                other => bail!("unexpected parse result: {other:?}"),
+            };
 
         let creator = new_creator();
         let mut dependencies = vec!["foo.rs"];
@@ -9232,7 +9267,7 @@ version='2.0.0'
             .unwrap();
         let arg = format!("@{}", td.path().join("args").display());
         let args: Vec<OsString> = vec![OsString::from(arg)];
-        let result = parse_arguments(&args, td.path(), false);
+        let result = parse_arguments(&args, td.path(), NativeLinkPolicy::Unsupported);
         let parsed = match result {
             CompilerArguments::Ok(args) => args,
             o => panic!("Got unexpected parse result: {o:?}"),
@@ -9247,7 +9282,7 @@ version='2.0.0'
         // Do not generate a cache key from arguments rustc cannot expand.
         let cwd = Path::new("/nonexistent");
         let args: Vec<OsString> = vec![OsString::from("@missing_file")];
-        let result = parse_arguments(&args, cwd, false);
+        let result = parse_arguments(&args, cwd, NativeLinkPolicy::Unsupported);
         assert!(matches!(result, CompilerArguments::CannotCache(..)));
     }
 }

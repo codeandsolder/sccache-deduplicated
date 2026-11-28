@@ -2868,10 +2868,10 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         "direct native compiler path failed"
     );
     let stats = service.stats()?;
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 6);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 10);
     assert_eq!(stats.forced_recaches, 2);
-    assert_eq!(stats.cache_hits.all(), 6);
-    assert_eq!(stats.cache_misses.all(), 6);
+    assert_eq!(stats.cache_hits.all(), 7);
+    assert_eq!(stats.cache_misses.all(), 10);
     assert_eq!(stats.dist_errors, 0);
 
     let visible = root.join("visible");
@@ -2896,8 +2896,8 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     );
     let stats = service.stats()?;
     let namespace_compiles = stats.dist_compiles.values().sum::<usize>();
-    assert!((11..=12).contains(&namespace_compiles));
-    assert_eq!(stats.cache_hits.all() + stats.cache_misses.all(), 24);
+    assert!((19..=20).contains(&namespace_compiles));
+    assert_eq!(stats.cache_hits.all() + stats.cache_misses.all(), 34);
     assert_eq!(stats.forced_recaches, 4);
     assert_eq!(stats.dist_errors, 0);
     assert!(private.join("build/probe.o").is_file());

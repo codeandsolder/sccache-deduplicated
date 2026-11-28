@@ -1,9 +1,6 @@
 use crate::cache::CacheMode;
 use crate::compiler::ColorMode;
 use crate::config::PreprocessorCacheModeConfig;
-use crate::dist::{
-    CompileCommand, JobId, SchedulerStatusResult, ServerId, SubmitToolchainResult, Toolchain,
-};
 use crate::server::{DistInfo, ServerInfo, ServerStats};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -100,29 +97,6 @@ pub enum TransferRequest {
         key: String,
         len: u64,
     },
-    LookupToolchain {
-        compiler: std::path::PathBuf,
-        key: String,
-    },
-    BeginToolchain {
-        compiler: std::path::PathBuf,
-        key: String,
-        len: u64,
-    },
-    Allocate {
-        toolchain: Toolchain,
-    },
-    SubmitToolchain {
-        job: JobId,
-    },
-    BeginRun {
-        job: JobId,
-        len: u64,
-    },
-    Status,
-    WorkerLabel {
-        server: ServerId,
-    },
     // Native action stream: only a connection that completed the native
     // handshake can start one. No scheduler tickets or credentials cross IPC.
     NativeStart,
@@ -150,16 +124,6 @@ pub enum TransferReply {
     ReadStarted(Option<u64>),
     WriteStarted,
     Chunk(#[serde(with = "serde_bytes")] Vec<u8>),
-    Toolchain(Option<Toolchain>),
-    Allocation {
-        server: ServerId,
-        job: JobId,
-        need_toolchain: bool,
-    },
-    AllocationFailed(String),
-    Submitted(SubmitToolchainResult),
-    Status(SchedulerStatusResult),
-    WorkerLabel(String),
     Ack,
     IntermediateOpened(crate::build_runtime::wire::Ticket),
 }
@@ -183,13 +147,6 @@ impl std::fmt::Debug for TransferRequest {
         let name = match self {
             Self::Read { .. } => "Read",
             Self::BeginWrite { .. } => "BeginWrite",
-            Self::LookupToolchain { .. } => "LookupToolchain",
-            Self::BeginToolchain { .. } => "BeginToolchain",
-            Self::Allocate { .. } => "Allocate",
-            Self::SubmitToolchain { .. } => "SubmitToolchain",
-            Self::BeginRun { .. } => "BeginRun",
-            Self::Status => "Status",
-            Self::WorkerLabel { .. } => "WorkerLabel",
             Self::NativeStart => "NativeStart",
             Self::NativeRead => "NativeRead",
             Self::NativeWrite(_) => "NativeWrite",
@@ -213,24 +170,10 @@ impl std::fmt::Debug for TransferReply {
             Self::ReadStarted(len) => f.debug_tuple("ReadStarted").field(len).finish(),
             Self::WriteStarted => f.write_str("WriteStarted"),
             Self::Chunk(bytes) => f.debug_tuple("Chunk").field(&bytes.len()).finish(),
-            Self::Toolchain(_) => f.write_str("Toolchain"),
-            Self::Allocation { .. } => f.write_str("Allocation"),
-            Self::AllocationFailed(_) => f.write_str("AllocationFailed"),
-            Self::Submitted(_) => f.write_str("Submitted"),
-            Self::Status(_) => f.write_str("Status"),
-            Self::WorkerLabel(_) => f.write_str("WorkerLabel"),
             Self::Ack => f.write_str("Ack"),
             Self::IntermediateOpened(_) => f.write_str("IntermediateOpened"),
         }
     }
-}
-
-/// Serialized at the start of the input stream, followed by the raw input
-/// archive. All of it is chunked, including unusually large argument vectors.
-#[derive(Serialize, Deserialize)]
-pub struct NamespaceRunSpec {
-    pub command: CompileCommand,
-    pub outputs: Vec<String>,
 }
 
 /// Possible responses from the server for a `Compile` request.
@@ -332,7 +275,6 @@ pub struct StorageHandshakeInfo {
     pub max_size: Option<u64>,
     pub namespace_protocol: u32,
     pub transfer_chunk_bytes: usize,
-    pub dist_rewrite_includes_only: Option<bool>,
     pub native: Option<NativeNamespacePolicy>,
 }
 

@@ -787,8 +787,8 @@ where
 /// Run a compile in client-side mode: the compile pipeline executes in this
 /// process, and only cache I/O is forwarded to the daemon via `conn`.
 ///
-/// Shares `resolve_compile_result` with the daemon-IPC path so local-fallback
-/// execution is not duplicated.
+/// Shares `resolve_compile_result` with the daemon-IPC path so compiler query
+/// execution has a single policy.
 pub fn do_compile_client_side<C>(
     jobserver: &Client,
     runtime: &Runtime,

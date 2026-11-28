@@ -652,14 +652,20 @@ impl PrivateOutputTree {
 pub struct NativeLinkLayout {
     pub(crate) dep_info: Option<PathBuf>,
     pub(crate) environment: Vec<(OsString, OsString)>,
+    pub(crate) split: bool,
 }
 
 #[cfg(feature = "dist-client")]
 impl NativeLinkLayout {
-    pub(crate) fn new(dep_info: Option<PathBuf>, environment: Vec<(OsString, OsString)>) -> Self {
+    pub(crate) fn new(
+        dep_info: Option<PathBuf>,
+        environment: Vec<(OsString, OsString)>,
+        split: bool,
+    ) -> Self {
         Self {
             dep_info,
             environment,
+            split,
         }
     }
 }

@@ -7,10 +7,6 @@ use crate::protocol::{StorageBlob, TransferReply, TransferRequest};
 use anyhow::ensure;
 use bytes::Bytes;
 use std::io::Read;
-#[cfg(feature = "dist-client")]
-use std::io::{Seek, SeekFrom};
-#[cfg(feature = "dist-client")]
-use tokio::io::AsyncWriteExt;
 
 fn validate_storage_key(key: &str) -> Result<()> {
     ensure!(
@@ -23,92 +19,20 @@ fn validate_storage_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-enum UploadKind {
-    Storage {
-        kind: StorageBlob,
-        key: String,
-    },
-    #[cfg(feature = "dist-client")]
-    Toolchain {
-        compiler: std::path::PathBuf,
-        key: String,
-    },
-    #[cfg(feature = "dist-client")]
-    Run {
-        job: crate::dist::JobId,
-    },
-}
-
-enum UploadData {
-    Memory(Vec<u8>),
-    #[cfg(feature = "dist-client")]
-    File(tokio::fs::File),
-}
-
 enum Transfer {
     Idle,
     Download(Bytes),
     Upload {
-        kind: UploadKind,
+        kind: StorageBlob,
+        key: String,
         remaining: u64,
-        data: UploadData,
+        data: Vec<u8>,
     },
-}
-
-#[cfg(feature = "dist-client")]
-#[derive(Default)]
-pub(super) struct ToolchainReservations {
-    keys: tokio::sync::Mutex<
-        std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
-    >,
-}
-
-#[cfg(feature = "dist-client")]
-impl ToolchainReservations {
-    async fn reserve(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = {
-            let mut keys = self.keys.lock().await;
-            keys.retain(|_, lock| lock.strong_count() != 0);
-            keys.get(key)
-                .and_then(std::sync::Weak::upgrade)
-                .unwrap_or_else(|| {
-                    let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
-                    keys.insert(key.to_owned(), std::sync::Arc::downgrade(&lock));
-                    lock
-                })
-        };
-        lock.lock_owned().await
-    }
-}
-
-#[cfg(feature = "dist-client")]
-struct Reservation {
-    compiler: std::path::PathBuf,
-    key: String,
-    max_size: u64,
-    _guard: tokio::sync::OwnedMutexGuard<()>,
-}
-
-#[cfg(feature = "dist-client")]
-struct Allocation {
-    job: crate::dist::JobAlloc,
-    toolchain: crate::dist::Toolchain,
-    ready: bool,
 }
 
 pub(super) struct TransferSession {
     state: Transfer,
     chunk_bytes: usize,
-    #[cfg(feature = "dist-client")]
-    dist: Option<std::sync::Arc<dyn crate::dist::Client>>,
-    #[cfg(feature = "dist-client")]
-    toolchain: Option<crate::dist::Toolchain>,
-    #[cfg(feature = "dist-client")]
-    allocation: Option<Allocation>,
-    #[cfg(feature = "dist-client")]
-    reservations: std::sync::Arc<ToolchainReservations>,
-    #[cfg(feature = "dist-client")]
-    reservation: Option<Reservation>,
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
     native: Option<std::sync::Arc<crate::compiler::NativeCompilerClient>>,
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
@@ -122,23 +46,10 @@ pub(super) struct TransferSession {
 }
 
 impl TransferSession {
-    pub(super) fn new(
-        chunk_bytes: usize,
-        #[cfg(feature = "dist-client")] reservations: std::sync::Arc<ToolchainReservations>,
-    ) -> Self {
+    pub(super) fn new(chunk_bytes: usize) -> Self {
         Self {
             state: Transfer::Idle,
             chunk_bytes,
-            #[cfg(feature = "dist-client")]
-            dist: None,
-            #[cfg(feature = "dist-client")]
-            toolchain: None,
-            #[cfg(feature = "dist-client")]
-            allocation: None,
-            #[cfg(feature = "dist-client")]
-            reservations,
-            #[cfg(feature = "dist-client")]
-            reservation: None,
             #[cfg(all(feature = "dist-client", target_os = "linux"))]
             native: None,
             #[cfg(all(feature = "dist-client", target_os = "linux"))]
@@ -157,21 +68,6 @@ impl TransferSession {
         request: &super::SccacheRequest,
         limits: super::activity::CompileLimits,
     ) -> std::time::Duration {
-        #[cfg(feature = "dist-client")]
-        if matches!(
-            (&self.state, request),
-            (
-                Transfer::Upload {
-                    kind: UploadKind::Run { .. },
-                    ..
-                },
-                super::Message::WithoutBody(crate::protocol::Request::Transfer(
-                    TransferRequest::FinishWrite
-                ))
-            )
-        ) {
-            return limits.budget(super::activity::Phase::RunDistributed);
-        }
         let _ = request;
         limits.budget(super::activity::Phase::IdentifyToolchain)
     }
@@ -180,37 +76,10 @@ impl TransferSession {
         self.chunk_bytes
     }
 
-    pub(super) async fn initialize_distribution(
-        &mut self,
-        client: &super::DistClientContainer,
-    ) -> Option<bool> {
-        #[cfg(feature = "dist-client")]
-        {
-            // Only the daemon initializes scheduler credentials and connections.
-            #[cfg(target_os = "linux")]
-            {
-                self.native.clone_from(&client.native);
-                if self.native.is_some() {
-                    self.dist = None;
-                    return None;
-                }
-            }
-            self.dist = match client.get_client().await {
-                Ok(client) => client,
-                Err(error) => {
-                    warn!("Namespace distribution unavailable: {error:#}");
-                    None
-                }
-            };
-            self.dist
-                .as_ref()
-                .map(|client| client.rewrite_includes_only())
-        }
-        #[cfg(not(feature = "dist-client"))]
-        {
-            let _ = client;
-            None
-        }
+    pub(super) fn initialize_distribution(&mut self, client: &super::DistClientContainer) {
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        self.native.clone_from(&client.native);
+        let _ = client;
     }
 
     pub(super) fn native_policy(&self) -> Option<crate::protocol::NativeNamespacePolicy> {
@@ -360,11 +229,6 @@ impl TransferSession {
             self.native_exchange = None;
             self.intermediate_read = None;
         }
-        #[cfg(feature = "dist-client")]
-        {
-            self.reservation = None;
-            self.allocation = None;
-        }
     }
 
     fn begin_download(&mut self, data: Option<Bytes>) -> TransferReply {
@@ -375,22 +239,16 @@ impl TransferSession {
         TransferReply::ReadStarted(len)
     }
 
-    async fn begin_upload(&mut self, kind: UploadKind, len: u64) -> Result<TransferReply> {
+    fn begin_upload(&mut self, kind: StorageBlob, key: String, len: u64) -> Result<TransferReply> {
         ensure!(
             matches!(self.state, Transfer::Idle),
             "another transfer is active"
         );
-        let data = match &kind {
-            UploadKind::Storage { .. } => UploadData::Memory(Vec::new()),
-            #[cfg(feature = "dist-client")]
-            _ => UploadData::File(tokio::fs::File::from_std(
-                tokio::task::spawn_blocking(tempfile::tempfile).await??,
-            )),
-        };
         self.state = Transfer::Upload {
             kind,
+            key,
             remaining: len,
-            data,
+            data: Vec::new(),
         };
         Ok(TransferReply::WriteStarted)
     }
@@ -406,7 +264,7 @@ impl TransferSession {
         Ok(TransferReply::Chunk(chunk))
     }
 
-    async fn write_chunk(&mut self, chunk: Vec<u8>) -> Result<TransferReply> {
+    fn write_chunk(&mut self, chunk: Vec<u8>) -> Result<TransferReply> {
         let Transfer::Upload {
             remaining, data, ..
         } = &mut self.state
@@ -419,16 +277,9 @@ impl TransferSession {
         );
         let len = chunk.len() as u64;
         ensure!(len <= *remaining, "upload exceeds declared size");
-        match data {
-            UploadData::Memory(bytes) => {
-                bytes
-                    .try_reserve(chunk.len())
-                    .context("upload does not fit in memory")?;
-                bytes.extend_from_slice(&chunk);
-            }
-            #[cfg(feature = "dist-client")]
-            UploadData::File(file) => file.write_all(&chunk).await?,
-        }
+        data.try_reserve(chunk.len())
+            .context("upload does not fit in memory")?;
+        data.extend_from_slice(&chunk);
         *remaining -= len;
         Ok(TransferReply::Ack)
     }
@@ -436,6 +287,7 @@ impl TransferSession {
     async fn finish_upload(&mut self, storage: &dyn Storage) -> Result<TransferReply> {
         let Transfer::Upload {
             kind,
+            key,
             remaining,
             data,
         } = std::mem::replace(&mut self.state, Transfer::Idle)
@@ -443,35 +295,7 @@ impl TransferSession {
             bail!("no upload is active");
         };
         ensure!(remaining == 0, "incomplete upload");
-        match (kind, data) {
-            (UploadKind::Storage { kind, key }, UploadData::Memory(bytes)) => {
-                store_blob(storage, kind, &key, bytes).await
-            }
-            #[cfg(feature = "dist-client")]
-            (UploadKind::Toolchain { compiler, key }, UploadData::File(file)) => {
-                let reservation = self
-                    .reservation
-                    .take()
-                    .context("no toolchain reservation is active")?;
-                ensure!(
-                    reservation.key == key && reservation.compiler == compiler,
-                    "toolchain reservation mismatch"
-                );
-                let tc = self
-                    .dist_client()?
-                    .import_namespace_toolchain(compiler, key, rewind_file(file).await?)
-                    .await?;
-                drop(reservation);
-                self.toolchain = Some(tc.clone());
-                Ok(TransferReply::Toolchain(Some(tc)))
-            }
-            #[cfg(feature = "dist-client")]
-            (UploadKind::Run { job }, UploadData::File(file)) => {
-                self.finish_run(job, rewind_file(file).await?).await
-            }
-            #[cfg(feature = "dist-client")]
-            _ => bail!("upload kind does not match its buffer"),
-        }
+        store_blob(storage, kind, &key, data).await
     }
 
     async fn handle_request(
@@ -505,215 +329,17 @@ impl TransferSession {
                 if let Some(capacity) = storage.max_size().await? {
                     ensure!(len <= capacity, "upload exceeds cache capacity");
                 }
-                self.begin_upload(UploadKind::Storage { kind, key }, len)
-                    .await
+                self.begin_upload(kind, key, len)
             }
             TransferRequest::ReadChunk => self.read_chunk(),
-            TransferRequest::WriteChunk(chunk) => self.write_chunk(chunk).await,
+            TransferRequest::WriteChunk(chunk) => self.write_chunk(chunk),
             TransferRequest::FinishWrite => self.finish_upload(storage).await,
             TransferRequest::Abort => {
                 self.abort();
                 Ok(TransferReply::Ack)
             }
-            request => {
-                #[cfg(feature = "dist-client")]
-                {
-                    self.handle_dist(request).await
-                }
-                #[cfg(not(feature = "dist-client"))]
-                {
-                    let _ = request;
-                    bail!("distributed compilation is not enabled");
-                }
-            }
+            _ => bail!("native scheduler configuration required"),
         }
-    }
-
-    #[cfg(feature = "dist-client")]
-    fn dist_client(&self) -> Result<std::sync::Arc<dyn crate::dist::Client>> {
-        self.dist
-            .clone()
-            .context("namespace distribution is not available")
-    }
-
-    #[cfg(feature = "dist-client")]
-    async fn handle_dist(&mut self, request: TransferRequest) -> Result<TransferReply> {
-        use crate::dist::{AllocJobResult, SubmitToolchainResult};
-        ensure!(
-            matches!(self.state, Transfer::Idle),
-            "another transfer is active"
-        );
-        let client = self.dist_client()?;
-        match request {
-            TransferRequest::LookupToolchain { compiler, key } => {
-                self.lookup_toolchain(compiler, key).await
-            }
-            TransferRequest::BeginToolchain { compiler, key, len } => {
-                validate_storage_key(&key)?;
-                ensure!(self.allocation.is_none(), "a job is already allocated");
-                self.validate_reservation(&compiler, &key, len)?;
-                self.begin_upload(UploadKind::Toolchain { compiler, key }, len)
-                    .await
-            }
-            TransferRequest::Allocate { toolchain } => {
-                ensure!(self.allocation.is_none(), "a job is already allocated");
-                ensure!(
-                    self.toolchain.as_ref() == Some(&toolchain),
-                    "toolchain not prepared by this session"
-                );
-                match client.do_alloc_job(toolchain.clone()).await? {
-                    AllocJobResult::Success {
-                        job_alloc,
-                        need_toolchain,
-                    } => {
-                        let reply = TransferReply::Allocation {
-                            server: job_alloc.server_id,
-                            job: job_alloc.job_id,
-                            need_toolchain,
-                        };
-                        self.allocation = Some(Allocation {
-                            job: job_alloc,
-                            toolchain,
-                            ready: !need_toolchain,
-                        });
-                        Ok(reply)
-                    }
-                    AllocJobResult::Fail { msg } => Ok(TransferReply::AllocationFailed(msg)),
-                }
-            }
-            TransferRequest::SubmitToolchain { job } => {
-                let allocation = self
-                    .allocation
-                    .as_mut()
-                    .context("no allocation is active")?;
-                ensure!(
-                    allocation.job.job_id == job && !allocation.ready,
-                    "unexpected toolchain submission"
-                );
-                let result = client
-                    .do_submit_toolchain(allocation.job.clone(), allocation.toolchain.clone())
-                    .await?;
-                allocation.ready = matches!(result, SubmitToolchainResult::Success);
-                Ok(TransferReply::Submitted(result))
-            }
-            TransferRequest::BeginRun { job, len } => {
-                let allocation = self
-                    .allocation
-                    .as_ref()
-                    .context("no allocation is active")?;
-                ensure!(
-                    allocation.job.job_id == job && allocation.ready,
-                    "job not ready"
-                );
-                self.begin_upload(UploadKind::Run { job }, len).await
-            }
-            TransferRequest::Status => Ok(TransferReply::Status(client.do_get_status().await?)),
-            TransferRequest::WorkerLabel { server } => Ok(TransferReply::WorkerLabel(
-                client.worker_label(server).await,
-            )),
-            _ => bail!("invalid distributed transfer operation"),
-        }
-    }
-
-    #[cfg(feature = "dist-client")]
-    fn validate_reservation(&self, compiler: &std::path::Path, key: &str, len: u64) -> Result<()> {
-        let Reservation {
-            compiler: reserved_compiler,
-            key: reserved_key,
-            max_size,
-            ..
-        } = self
-            .reservation
-            .as_ref()
-            .context("toolchain upload was not reserved")?;
-        ensure!(
-            reserved_key == key && reserved_compiler == compiler,
-            "toolchain reservation mismatch"
-        );
-        ensure!(
-            len <= *max_size,
-            "toolchain exceeds daemon archive capacity"
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "dist-client")]
-    async fn lookup_toolchain(
-        &mut self,
-        compiler: std::path::PathBuf,
-        key: String,
-    ) -> Result<TransferReply> {
-        let client = self.dist_client()?;
-        validate_storage_key(&key)?;
-        ensure!(self.allocation.is_none(), "a job is already allocated");
-        ensure!(
-            self.reservation.is_none(),
-            "a toolchain is already reserved"
-        );
-        let (mut tc, max_size) = client
-            .lookup_namespace_toolchain(compiler.clone(), key.clone())
-            .await?;
-        if tc.is_none() {
-            let guard = self.reservations.reserve(&key).await;
-            (tc, _) = client
-                .lookup_namespace_toolchain(compiler.clone(), key.clone())
-                .await?;
-            if tc.is_none() {
-                self.reservation = Some(Reservation {
-                    compiler,
-                    key,
-                    max_size,
-                    _guard: guard,
-                });
-            }
-        }
-        self.toolchain.clone_from(&tc);
-        Ok(TransferReply::Toolchain(tc))
-    }
-
-    #[cfg(feature = "dist-client")]
-    async fn finish_run(
-        &mut self,
-        job: crate::dist::JobId,
-        mut file: std::fs::File,
-    ) -> Result<TransferReply> {
-        let allocation = self.allocation.take().context("no allocation is active")?;
-        ensure!(
-            allocation.job.job_id == job && allocation.ready,
-            "job not ready"
-        );
-        let (spec, file) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let spec: crate::protocol::NamespaceRunSpec = bincode::deserialize_from(&mut file)?;
-            Ok((spec, file))
-        })
-        .await??;
-        let result = self
-            .dist_client()?
-            .do_run_job(
-                allocation.job,
-                spec.command,
-                spec.outputs,
-                Box::new(FileInputs(file)),
-            )
-            .await?;
-        let bytes = tokio::task::spawn_blocking(move || bincode::serialize(&result)).await??;
-        Ok(self.begin_download(Some(bytes.into())))
-    }
-}
-
-#[cfg(feature = "dist-client")]
-struct FileInputs(std::fs::File);
-
-#[cfg(feature = "dist-client")]
-impl crate::dist::pkg::InputsPackager for FileInputs {
-    #[cfg(target_os = "linux")]
-    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        bail!("namespace archive transport cannot supply a native input mapping")
-    }
-
-    fn write_inputs(mut self: Box<Self>, output: &mut dyn std::io::Write) -> Result<()> {
-        std::io::copy(&mut self.0, output)?;
-        Ok(())
     }
 }
 
@@ -732,17 +358,6 @@ async fn read_blob(storage: &dyn Storage, kind: StorageBlob, key: &str) -> Resul
             None => Ok(None),
         },
     }
-}
-
-#[cfg(feature = "dist-client")]
-async fn rewind_file(mut file: tokio::fs::File) -> Result<std::fs::File> {
-    file.flush().await?;
-    let mut file = file.into_std().await;
-    tokio::task::spawn_blocking(move || -> Result<_> {
-        file.seek(SeekFrom::Start(0))?;
-        Ok(file)
-    })
-    .await?
 }
 
 async fn store_blob(
@@ -823,7 +438,7 @@ mod tests {
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
     #[tokio::test]
     async fn abort_releases_intermediate_read_descriptor() -> Result<()> {
-        let mut session = TransferSession::new(4096, Arc::new(ToolchainReservations::default()));
+        let mut session = TransferSession::new(4096);
         session.intermediate_read = Some((tokio::fs::File::from_std(tempfile::tempfile()?), 8));
         assert!(matches!(
             session

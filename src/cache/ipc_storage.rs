@@ -94,7 +94,7 @@ impl IpcStorage {
             crate::build_runtime::DescriptorDigestProvider,
         >,
     ) -> crate::server::DistClientContainer {
-        use crate::server::{DistClientContainer, DistClientState};
+        use crate::server::DistClientContainer;
         #[cfg(target_os = "linux")]
         if let Some(policy) = &self.handshake.native {
             return DistClientContainer::new_native(
@@ -109,19 +109,8 @@ impl IpcStorage {
             );
         }
 
-        self.handshake.dist_rewrite_includes_only.map_or_else(
-            DistClientContainer::new_disabled,
-            |rewrite| {
-                DistClientContainer::new_with_state(DistClientState::Broker(Arc::new(
-                    crate::dist::broker::NamespaceClient::new(
-                        self.conn(),
-                        self.handshake.transfer_chunk_bytes,
-                        rewrite,
-                        config.toolchains.clone(),
-                    ),
-                )))
-            },
-        )
+        let _ = config;
+        DistClientContainer::new_disabled()
     }
 
     async fn read_blob(&self, kind: StorageBlob, key: &str) -> Result<Option<Bytes>> {

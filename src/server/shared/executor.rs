@@ -175,7 +175,7 @@ async fn compile(
         catalogs,
     } = job;
     // Use the attested real executable for both cacheable work and the
-    // daemon-owned fallback; a strict launcher must not resubmit the job.
+    // daemon-owned compiler query; a strict launcher must not resubmit the job.
     compile.exe = aliases.resolve(compile.exe.into())?.into_os_string();
     let storage = IpcStorage::connect(ServerConnection::new(Box::new(broker))?).await?;
     let conn = storage.conn();

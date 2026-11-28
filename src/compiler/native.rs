@@ -641,6 +641,34 @@ struct CompilerPlan {
 }
 
 impl CompilerPlan {
+    fn extend_inputs(&mut self, additional: Vec<PreparedTree>) -> Result<()> {
+        let mut recipe = self.spec.root.recipe.clone();
+        for prepared in additional {
+            if !self
+                .inputs
+                .iter()
+                .any(|existing| existing.id() == prepared.id())
+            {
+                recipe.layers.push(TreeLayer {
+                    tree: prepared.id(),
+                    source: None,
+                    destination: None,
+                });
+                self.inputs.push(prepared);
+            }
+        }
+        self.spec.root = ExecutionRoot::resolve(
+            recipe,
+            &self
+                .inputs
+                .iter()
+                .map(|tree| (tree.id(), tree.manifest()))
+                .collect(),
+        )?;
+        self.spec.compiler_result = None;
+        self.spec.validate()
+    }
+
     fn prepare(
         command: dist::CompileCommand,
         cwd: &Path,
@@ -944,6 +972,7 @@ fn prepare_dispatch(
     cwd: &Path,
     scratch: &mut Option<tempfile::TempDir>,
     split: &mut Option<NativeLink>,
+    whole_link: &mut Option<link_inputs::LinkInputs>,
 ) -> Result<(Vec<NativeOutput>, dist::PathTransformer, DistPackagers)> {
     super::core::validate_dist_environment_dependencies(
         remote,
@@ -953,7 +982,10 @@ fn prepare_dispatch(
         .outputs()
         .filter(|output| output.key != "d")
         .collect::<Vec<_>>();
-    let outputs = if let Some(layout) = compilation.native_link_layout() {
+    let outputs = if let Some(layout) = compilation
+        .native_link_layout()
+        .filter(|layout| layout.split)
+    {
         let directory = tempfile::Builder::new()
             .prefix("sccache-native-link-")
             .tempdir()?;
@@ -970,6 +1002,19 @@ fn prepare_dispatch(
         *split = Some(link);
         outputs
     } else {
+        if let Some(link) = compilation.native_link_layout() {
+            *whole_link = Some(link_inputs::LinkInputs::new(
+                transformer.to_local(&remote.executable)?,
+                cwd.to_owned(),
+                link.environment.clone(),
+                &transformer,
+                remote
+                    .arguments
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect(),
+            ));
+        }
         expected
             .into_iter()
             .map(|output| NativeOutput::file(cwd, output))
@@ -1028,6 +1073,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
     // Hold the private delivery directories until split-link completion.
     let mut scratch = None;
     let mut split = None;
+    let mut whole_link = None;
     let (outputs, layout, packagers) = prepare_dispatch(
         compilation,
         &mut remote,
@@ -1035,11 +1081,12 @@ pub(super) async fn compile<T: CommandCreatorSync>(
         &cwd,
         &mut scratch,
         &mut split,
+        &mut whole_link,
     )?;
     let preparation_client = Arc::clone(&client);
     let plan = pool
         .spawn_blocking(move || {
-            CompilerPlan::prepare(
+            let mut plan = CompilerPlan::prepare(
                 remote,
                 &cwd,
                 outputs,
@@ -1050,7 +1097,14 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                     &preparation_client.toolchain_digests,
                     Some(&preparation_client),
                 ),
-            )
+            )?;
+            if let Some(link) = whole_link {
+                plan.extend_inputs(link.prepare(
+                    &preparation_client.toolchain_digests,
+                    Some(&preparation_client),
+                )?)?;
+            }
+            Ok::<_, anyhow::Error>(plan)
         })
         .await??;
     crate::server::activity::phase(crate::server::activity::Phase::RunDistributed);

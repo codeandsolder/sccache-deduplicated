@@ -31,8 +31,6 @@ use crate::errors::Result;
 #[cfg(unix)]
 use crate::errors::bail;
 
-#[cfg(feature = "dist-client")]
-pub(crate) mod broker;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 mod cache;
 #[cfg(feature = "dist-client")]

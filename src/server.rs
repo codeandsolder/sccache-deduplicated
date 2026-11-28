@@ -22,8 +22,6 @@ use crate::compiler::{
 use crate::config;
 use crate::config::{CompilerAliases, Config};
 use crate::dist;
-#[cfg(feature = "dist-client")]
-use crate::dist::Client as _;
 use crate::jobserver::Client;
 use crate::mock_command::{CommandCreatorSync, ProcessCommandCreator};
 use crate::protocol::{
@@ -47,8 +45,6 @@ use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::{self, Write};
 use std::marker::Unpin;
-#[cfg(feature = "dist-client")]
-use std::mem;
 #[cfg(target_os = "android")]
 use std::os::android::net::SocketAddrExt;
 #[cfg(target_os = "linux")]
@@ -173,8 +169,6 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// If the dist client couldn't be created, retry creation at this number
 /// of seconds from now (or later)
-#[cfg(feature = "dist-client")]
-const DIST_CLIENT_RECREATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Result of background server startup.
 #[derive(Debug, Serialize, Deserialize)]
@@ -234,76 +228,13 @@ fn get_signal(_status: ExitStatus) -> Option<i32> {
 }
 
 pub struct DistClientContainer {
-    // The actual dist client state
-    #[cfg(feature = "dist-client")]
-    state: futures::lock::Mutex<DistClientState>,
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
     native: Option<Arc<crate::compiler::NativeCompilerClient>>,
 }
 
-#[cfg(feature = "dist-client")]
-pub struct DistClientConfig {
-    // Reusable items tied to an SccacheServer instance
-    pool: tokio::runtime::Handle,
-
-    // From the static dist configuration
-    scheduler_url: Option<config::HTTPUrl>,
-    cluster: Option<sccache_peer_identity::PeerConfig>,
-    auth: config::DistAuth,
-    cache_dir: PathBuf,
-    toolchain_cache_size: u64,
-    toolchains: Vec<config::DistToolchainConfig>,
-    rewrite_includes_only: bool,
-}
-
-#[cfg(feature = "dist-client")]
-pub enum DistClientState {
-    #[cfg(feature = "dist-client")]
-    Some(Box<DistClientConfig>, Arc<dyn dist::Client>),
-    Broker(Arc<dyn dist::Client>),
-    #[cfg(feature = "dist-client")]
-    FailWithMessage(Box<DistClientConfig>, String),
-    #[cfg(feature = "dist-client")]
-    RetryCreateAt(Box<DistClientConfig>, Instant),
-    Disabled,
-}
-
-#[cfg(not(feature = "dist-client"))]
 impl DistClientContainer {
-    #[cfg(not(feature = "dist-client"))]
     fn new(config: &Config, _: &tokio::runtime::Handle) -> Self {
-        if config.dist.scheduler_url.is_some() {
-            warn!(
-                "Scheduler address configured but dist feature disabled, disabling distributed sccache"
-            );
-        }
-        Self {}
-    }
-
-    pub fn new_disabled() -> Self {
-        Self {}
-    }
-
-    #[cfg(feature = "dist-client")]
-    pub fn new_with_state(_: DistClientState) -> Self {
-        Self {}
-    }
-
-    pub async fn reset_state(&self) {}
-
-    pub async fn get_status(&self) -> DistInfo {
-        DistInfo::Disabled("dist-client feature not selected".to_string())
-    }
-
-    async fn get_client(&self) -> Result<Option<Arc<dyn dist::Client>>> {
-        Ok(None)
-    }
-}
-
-#[cfg(feature = "dist-client")]
-impl DistClientContainer {
-    fn new(config: &Config, pool: &tokio::runtime::Handle) -> Self {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
         if let Some(native) = &config.dist.native {
             return Self::new_native(crate::compiler::NativeCompilerClient::new(
                 native.clone(),
@@ -314,222 +245,35 @@ impl DistClientContainer {
                 &config.dist.native_installation_catalogs,
             ));
         }
-
-        // A missing native configuration is an explicit disabled state.
-        // Never create a legacy archive client or its local cache.
-        let _ = pool;
+        let _ = config;
         Self::new_disabled()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
     #[must_use = "the returned container owns native compiler state"]
     pub fn new_native(client: crate::compiler::NativeCompilerClient) -> Self {
         Self {
-            state: futures::lock::Mutex::new(DistClientState::Disabled),
             native: Some(Arc::new(client)),
-        }
-    }
-
-    #[cfg(feature = "dist-client")]
-    #[must_use = "the returned client owns the supplied distribution state"]
-    pub const fn new_with_state(state: DistClientState) -> Self {
-        Self {
-            state: futures::lock::Mutex::new(state),
-            #[cfg(target_os = "linux")]
-            native: None,
         }
     }
 
     #[must_use = "the returned client represents disabled distribution"]
     pub const fn new_disabled() -> Self {
         Self {
-            state: futures::lock::Mutex::new(DistClientState::Disabled),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
             native: None,
         }
     }
 
-    pub async fn reset_state(&self) {
-        let mut guard = self.state.lock().await;
-        let state = &mut *guard;
-        match mem::replace(state, DistClientState::Disabled) {
-            DistClientState::Some(cfg, _)
-            | DistClientState::FailWithMessage(cfg, _)
-            | DistClientState::RetryCreateAt(cfg, _) => {
-                warn!("State reset. Will recreate");
-                *state = DistClientState::RetryCreateAt(cfg, Instant::now());
-            }
-            DistClientState::Broker(client) => *state = DistClientState::Broker(client),
-            DistClientState::Disabled => (),
-        }
-        drop(guard);
-    }
-
     pub async fn get_status(&self) -> DistInfo {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
         if let Some(native) = &self.native {
             return native.status().await;
         }
-
-        let mut guard = self.state.lock().await;
-        let state = &mut *guard;
-        Self::maybe_recreate_state(state).await;
-        let (client, scheduler_url) = match state {
-            DistClientState::Disabled => return DistInfo::Disabled("disabled".to_string()),
-            DistClientState::FailWithMessage(cfg, _) => {
-                return DistInfo::NotConnected(
-                    cfg.scheduler_url.clone(),
-                    "enabled, auth not configured".to_string(),
-                );
-            }
-            DistClientState::RetryCreateAt(cfg, time) => {
-                return DistInfo::NotConnected(
-                    cfg.scheduler_url.clone(),
-                    format!(
-                        "enabled, not connected, will retry in {:.1}s",
-                        time.saturating_duration_since(Instant::now()).as_secs_f32()
-                    ),
-                );
-            }
-            DistClientState::Some(cfg, client) => (Arc::clone(client), cfg.scheduler_url.clone()),
-            DistClientState::Broker(client) => (Arc::clone(client), None),
-        };
-        drop(guard);
-
-        client.do_get_status().await.map_or_else(
-            |_| {
-                DistInfo::NotConnected(
-                    scheduler_url.clone(),
-                    "could not communicate with scheduler".to_string(),
-                )
-            },
-            |res| DistInfo::SchedulerStatus(scheduler_url.clone(), res),
-        )
+        DistInfo::Disabled("native scheduler not configured".to_string())
     }
 
-    async fn get_client(&self) -> Result<Option<Arc<dyn dist::Client>>> {
-        let mut guard = self.state.lock().await;
-        let state = &mut *guard;
-        Self::maybe_recreate_state(state).await;
-        let result = match state {
-            DistClientState::Some(_, dc) | DistClientState::Broker(dc) => Ok(Some(dc.clone())),
-            DistClientState::Disabled | DistClientState::RetryCreateAt(_, _) => Ok(None),
-            DistClientState::FailWithMessage(_, msg) => {
-                let msg = msg.clone();
-                let DistClientState::FailWithMessage(config, _) =
-                    mem::replace(state, DistClientState::Disabled)
-                else {
-                    return Err(anyhow!("distributed client state changed unexpectedly"));
-                };
-                // The client is most likely mis-configured, make sure we
-                // re-create on our next attempt.
-                *state = DistClientState::RetryCreateAt(config, Instant::now());
-                Err(anyhow!(msg))
-            }
-        };
-        drop(guard);
-        result
-    }
-
-    async fn maybe_recreate_state(state: &mut DistClientState) {
-        let DistClientState::RetryCreateAt(_, instant) = state else {
-            return;
-        };
-        if *instant > Instant::now() {
-            return;
-        }
-        let DistClientState::RetryCreateAt(config, _) =
-            mem::replace(state, DistClientState::Disabled)
-        else {
-            return;
-        };
-        info!("Attempting to recreate the dist client");
-        *state = Self::create_state(*config).await;
-    }
-
-    // Attempt to recreate the dist client
-    async fn create_state(config: DistClientConfig) -> DistClientState {
-        macro_rules! try_or_retry_later {
-            ($v:expr) => {{
-                match $v {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // `{:?}` prints the full cause chain and backtrace.
-                        error!("{:?}", e);
-                        return DistClientState::RetryCreateAt(
-                            Box::new(config),
-                            Instant::now() + DIST_CLIENT_RECREATE_TIMEOUT,
-                        );
-                    }
-                }
-            }};
-        }
-
-        macro_rules! try_or_fail_with_message {
-            ($v:expr) => {{
-                match $v {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // `{:?}` prints the full cause chain and backtrace.
-                        let errmsg = format!("{:?}", e);
-                        error!("{}", errmsg);
-                        return DistClientState::FailWithMessage(
-                            Box::new(config),
-                            errmsg.to_string(),
-                        );
-                    }
-                }
-            }};
-        }
-        if let Some(ref addr) = config.scheduler_url {
-            let url = addr.to_url();
-            info!("Enabling distributed sccache to {url}");
-            let cluster = try_or_fail_with_message!(
-                config
-                    .cluster
-                    .clone()
-                    .context("distributed cluster trust configuration required")
-            );
-            let address = try_or_retry_later!(sccache_cluster_identity::endpoint(&url));
-            let auth = config.auth.clone();
-            let peer = try_or_retry_later!(
-                sccache_cluster_identity::PeerCredentials::open(
-                    cluster,
-                    address,
-                    sccache_cluster_identity::Role::Client,
-                    move || Self::enrollment_token(&auth),
-                )
-                .await
-            );
-            let dist_client = dist::http::Client::new(
-                &config.pool,
-                Arc::new(peer),
-                &config.cache_dir.join("client"),
-                config.toolchain_cache_size,
-                &config.toolchains,
-                config.rewrite_includes_only,
-            );
-            let dist_client =
-                try_or_retry_later!(dist_client.context("failure during dist client creation"));
-            if let Ok(res) = dist_client.do_get_status().await {
-                info!(
-                    "Successfully created dist client with {:?} cores across {:?} servers",
-                    res.num_cpus, res.num_servers
-                );
-                DistClientState::Some(Box::new(config), Arc::new(dist_client))
-            } else {
-                warn!("Scheduler address configured, but could not communicate with scheduler");
-                DistClientState::RetryCreateAt(
-                    Box::new(config),
-                    Instant::now() + DIST_CLIENT_RECREATE_TIMEOUT,
-                )
-            }
-        } else {
-            info!("No scheduler address configured, disabling distributed sccache");
-            DistClientState::Disabled
-        }
-    }
-
+    #[cfg(feature = "dist-client")]
     pub(crate) fn enrollment_token(auth: &config::DistAuth) -> Result<String> {
         match auth {
             config::DistAuth::Token { token } => Ok(token.clone()),
@@ -541,6 +285,7 @@ impl DistClientContainer {
         }
     }
 
+    #[cfg(feature = "dist-client")]
     fn get_cached_config_auth_token(auth_url: &str) -> Result<String> {
         let cached_config = config::CachedConfig::reload()?;
         cached_config
@@ -1094,8 +839,6 @@ where
 
     /// Distributed sccache client
     dist_client: Arc<DistClientContainer>,
-    #[cfg(feature = "dist-client")]
-    namespace_reservations: Arc<namespace::ToolchainReservations>,
 
     /// Cache policy of this invocation, inherited by decomposed subcommands.
     cache_control: CacheControl,
@@ -1259,8 +1002,7 @@ where
             }
             Request::StorageHandshake => {
                 debug!("handle_client: storage_handshake");
-                let dist_rewrite_includes_only =
-                    transfers.initialize_distribution(&self.dist_client).await;
+                transfers.initialize_distribution(&self.dist_client);
                 let info = StorageHandshakeInfo {
                     location: self.storage.location(),
                     cache_type_name: self.storage.cache_type_name().to_owned(),
@@ -1270,7 +1012,6 @@ where
                     max_size: self.storage.max_size().await.unwrap_or(None),
                     namespace_protocol: crate::protocol::NAMESPACE_PROTOCOL_VERSION,
                     transfer_chunk_bytes: transfers.chunk_bytes(),
-                    dist_rewrite_includes_only,
                     native: transfers.native_policy(),
                 };
                 Ok(Message::WithoutBody(Response::StorageHandshake(info)))
@@ -1323,8 +1064,6 @@ where
             compiler_aliases: Arc::new(compiler_aliases),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
-            #[cfg(feature = "dist-client")]
-            namespace_reservations: Arc::default(),
             rt,
             creator: C::new(client),
             tx,
@@ -1347,8 +1086,6 @@ where
             compiler_aliases: Arc::default(),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
-            #[cfg(feature = "dist-client")]
-            namespace_reservations: Arc::default(),
             rt,
             creator: C::new(&client),
             tx,
@@ -1449,11 +1186,7 @@ where
                 }
                 first => first,
             };
-            let mut transfers = TransferSession::new(
-                chunk_bytes,
-                #[cfg(feature = "dist-client")]
-                Arc::clone(&me.namespace_reservations),
-            );
+            let mut transfers = TransferSession::new(chunk_bytes);
             while let Some(mut req) = next {
                 let Message::WithoutBody(request) = &mut req else {
                     bail!("unexpected body in request");
@@ -2158,9 +1891,9 @@ where
                         }
                         Err(err) => match err.downcast::<HttpClientError>() {
                             Ok(HttpClientError(msg)) => {
+                                stats.dist_errors += 1;
                                 // Make sure the write guard has been dropped ASAP.
                                 drop(stats);
-                                me.dist_client.reset_state().await;
                                 let errmsg = format!("[{out_pretty:?}] http error status: {msg}");
                                 error!("{errmsg}");
                                 res.retcode = Some(1);
@@ -3447,36 +3180,13 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    #[cfg(feature = "dist-client")]
-    fn test_dist_status_retries_expired_client_state() -> Result<()> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let config = DistClientConfig {
-            pool: runtime.handle().clone(),
-            scheduler_url: None,
-            cluster: None,
-            auth: config::DistAuth::Token {
-                token: String::new(),
-            },
-            cache_dir: PathBuf::new(),
-            toolchain_cache_size: 0,
-            toolchains: vec![],
-            rewrite_includes_only: false,
-        };
-        let retry_at = Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .ok_or_else(|| anyhow::anyhow!("failed to construct expired retry instant"))?;
-        let container = DistClientContainer::new_with_state(DistClientState::RetryCreateAt(
-            Box::new(config),
-            retry_at,
+    #[tokio::test]
+    async fn missing_native_configuration_is_disabled() {
+        let container = DistClientContainer::new_disabled();
+        assert!(matches!(
+            container.get_status().await,
+            DistInfo::Disabled(_)
         ));
-
-        let status = runtime.block_on(container.get_status());
-
-        assert!(matches!(status, DistInfo::Disabled(_)));
-        Ok(())
     }
 
     #[test]
