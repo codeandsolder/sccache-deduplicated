@@ -59,8 +59,6 @@ pub static BUILD_CAPABILITIES: &[&str] = &[
     #[cfg(feature = "direct-metrics")]
     telemetry::CAPABILITY,
 ];
-#[doc(hidden)]
-pub use compiler::PreprocessorCacheEntry;
 
 use std::env;
 

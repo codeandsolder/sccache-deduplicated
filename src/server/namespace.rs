@@ -135,7 +135,7 @@ impl TransferSession {
         match request {
             TransferRequest::NativeStart => {
                 ensure!(
-                    matches!(self.state, Transfer::Idle) && self.native_exchange.is_none(),
+                    self.native_exchange.is_none(),
                     "native action already active"
                 );
                 let client = self
