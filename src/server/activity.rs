@@ -185,6 +185,32 @@ struct Interval {
     end: u64,
 }
 
+/// Independent digests of the exact bytes fed to each key field. Retained
+/// in executor observations because namespace children do not export OTLP.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct KeyEvidence {
+    kind: String,
+    digest: String,
+    fields: Vec<(String, String)>,
+    offset: u64,
+}
+
+impl KeyEvidence {
+    fn valid(&self, elapsed: u64) -> bool {
+        let digest =
+            |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit());
+        self.kind.len() <= 64
+            && self.kind.is_ascii()
+            && digest(&self.digest)
+            && self.offset <= elapsed
+            && self.fields.len() <= 512
+            && self
+                .fields
+                .iter()
+                .all(|(name, value)| name.len() <= 256 && name.is_ascii() && digest(value))
+    }
+}
+
 /// Complete, bounded history from the process that owns the compilation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TraceHistory {
@@ -196,6 +222,7 @@ pub struct TraceHistory {
     omitted_intervals: u64,
     outcome: Option<TraceOutcome>,
     action: Option<crate::build_runtime::ActionKey>,
+    key_evidence: Vec<KeyEvidence>,
 }
 
 impl TraceHistory {
@@ -213,6 +240,7 @@ impl TraceHistory {
             omitted_intervals: 0,
             outcome: None,
             action: None,
+            key_evidence: Vec::new(),
         }
     }
 
@@ -239,6 +267,11 @@ impl TraceHistory {
     fn valid(&self) -> bool {
         self.transitions.len() <= MAX_TRACE_INTERVALS
             && self.intervals.len() <= MAX_TRACE_INTERVALS
+            && self.key_evidence.len() <= 8
+            && self
+                .key_evidence
+                .iter()
+                .all(|evidence| evidence.valid(self.elapsed))
             && self
                 .transitions
                 .first()
@@ -306,6 +339,24 @@ impl TraceHistory {
                 LatencySpan::child(parent, "sccache-client", interval.kind.name(), from, until);
             span.attributes
                 .push(("sccache.span_kind", "interval".into()));
+            spans.push(span);
+        }
+        for evidence in &self.key_evidence {
+            let at = self.start.saturating_add(evidence.offset).clamp(start, end);
+            let mut span = LatencySpan::child(
+                parent,
+                "sccache-client",
+                "cache_key_components",
+                at.saturating_sub(1).max(start),
+                at,
+            );
+            span.attributes
+                .push(("sccache.key.kind", evidence.kind.clone()));
+            span.attributes
+                .push(("sccache.key.digest", evidence.digest.clone()));
+            if let Ok(fields) = serde_json::to_string(&evidence.fields) {
+                span.attributes.push(("sccache.key.components", fields));
+            }
             spans.push(span);
         }
     }
@@ -489,7 +540,11 @@ impl Activity {
                 sample.trace.start == previous.start
                     && sample.trace.elapsed >= previous.elapsed
                     && sample.trace.transitions.starts_with(&previous.transitions)
-                    && sample.trace.intervals.starts_with(&previous.intervals),
+                    && sample.trace.intervals.starts_with(&previous.intervals)
+                    && sample
+                        .trace
+                        .key_evidence
+                        .starts_with(&previous.key_evidence),
                 "inconsistent remote trace history"
             );
         }
@@ -929,6 +984,31 @@ pub fn wait_for_producer(producer: Option<TraceContext>) {
     });
 }
 
+/// Record independently comparable input digests, not the original values.
+/// The bounded observation travels back to the daemon with the request trace.
+pub(crate) fn key_evidence(kind: &str, digest: &str, fields: Vec<(&str, String)>) {
+    let _ = CURRENT.try_with(|current| {
+        if let Some(activity) = current {
+            let mut state = lock(&activity.state);
+            let offset = nanos(activity.started.elapsed());
+            if state.history.key_evidence.len() < 8 {
+                let evidence = KeyEvidence {
+                    kind: kind.into(),
+                    digest: digest.into(),
+                    fields: fields
+                        .into_iter()
+                        .map(|(name, value)| (name.into(), value))
+                        .collect(),
+                    offset,
+                };
+                if evidence.valid(offset) {
+                    state.history.key_evidence.push(evidence);
+                }
+            }
+        }
+    });
+}
+
 pub fn phase(phase: Phase) {
     let _ = CURRENT.try_with(|current| {
         if let Some(activity) = current {
@@ -1059,6 +1139,57 @@ mod tests {
         assert_eq!(waiting[0].end - waiting[0].start, 5_000_000_000);
         assert_eq!(waiting[1].links, vec![second]);
         assert_eq!(waiting[1].end - waiting[1].start, 7_000_000_000);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn key_audit_preserves_digest_and_reaches_daemon() -> Result<()> {
+        let identity = CompileIdentity {
+            client_pid: 42,
+            exe: "/usr/bin/cc".into(),
+            cwd: "/build".into(),
+        };
+        let parent = Activity::new("key-audit".into(), &identity, CompileOwner::Daemon);
+        let child = Arc::new(Activity::new(
+            parent.snapshot().id,
+            &identity,
+            CompileOwner::Daemon,
+        ));
+        let hash = |bytes: &[u8]| {
+            let mut digest = crate::util::Digest::new();
+            digest.update(bytes);
+            digest.finish()
+        };
+        let key = scope(&child, async {
+            let mut digest = crate::util::Digest::audited("test-key");
+            digest.audit_field("first");
+            digest.update(b"one");
+            digest.audit_field("second");
+            digest.update(b"two");
+            digest.finish()
+        })
+        .await;
+        assert_eq!(key, hash(b"onetwo"));
+        parent.observe_executor(child.snapshot())?;
+        let history = parent.snapshot().trace;
+        let evidence = &history.key_evidence[0];
+        assert_eq!(evidence.digest, key);
+        assert_eq!(
+            evidence.fields,
+            vec![
+                ("first".into(), hash(b"one")),
+                ("second".into(), hash(b"two"))
+            ]
+        );
+        let mut spans = Vec::new();
+        history.append_spans(
+            TraceContext::request("key-audit"),
+            history.start,
+            history.start + history.elapsed,
+            &mut spans,
+        );
+        assert!(spans.iter().any(|span| span.name == "cache_key_components"));
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

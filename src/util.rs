@@ -125,8 +125,29 @@ struct DirectoryHashEntry {
 }
 
 #[derive(Clone)]
+struct DigestAudit {
+    kind: &'static str,
+    fields: Vec<(&'static str, String)>,
+    field: Option<(&'static str, blake3_Hasher)>,
+}
+
+impl DigestAudit {
+    fn finish_field(&mut self) {
+        if let Some((name, digest)) = self.field.take() {
+            self.fields.push((name, hex(digest.finalize().as_bytes())));
+        }
+    }
+
+    fn emit(mut self, key: &str) {
+        self.finish_field();
+        crate::server::activity::key_evidence(self.kind, key, self.fields);
+    }
+}
+
+#[derive(Clone)]
 pub struct Digest {
     inner: blake3_Hasher,
+    audit: Option<Box<DigestAudit>>,
 }
 
 impl Digest {
@@ -134,6 +155,31 @@ impl Digest {
     pub fn new() -> Self {
         Self {
             inner: blake3_Hasher::new(),
+            audit: None,
+        }
+    }
+
+    /// Fingerprint the actual serialized bytes of each named cache-key field
+    /// independently for diagnosis. This does not change the key or export
+    /// raw arguments, paths, source text or environment values.
+    pub fn audited(kind: &'static str) -> Self {
+        let mut digest = Self::new();
+        if crate::server::activity::trace_context().is_some() {
+            digest.audit = Some(Box::new(DigestAudit {
+                kind,
+                fields: Vec::new(),
+                field: None,
+            }));
+        }
+        digest
+    }
+
+    /// Start another independently comparable field; bytes already passed
+    /// to the key hasher are unchanged.
+    pub fn audit_field(&mut self, name: &'static str) {
+        if let Some(audit) = self.audit.as_mut() {
+            audit.finish_field();
+            audit.field = Some((name, blake3_Hasher::new()));
         }
     }
 
@@ -306,6 +352,11 @@ impl Digest {
 
     pub fn update(&mut self, bytes: &[u8]) {
         self.inner.update(bytes);
+        if let Some(audit) = self.audit.as_mut()
+            && let Some((_, field)) = audit.field.as_mut()
+        {
+            field.update(bytes);
+        }
     }
 
     pub fn delimiter(&mut self, name: &[u8]) {
@@ -316,7 +367,11 @@ impl Digest {
 
     #[must_use = "the returned digest is the calculated content identifier"]
     pub fn finish(self) -> String {
-        hex(self.inner.finalize().as_bytes())
+        let key = hex(self.inner.finalize().as_bytes());
+        if let Some(audit) = self.audit {
+            audit.emit(&key);
+        }
+        key
     }
 }
 

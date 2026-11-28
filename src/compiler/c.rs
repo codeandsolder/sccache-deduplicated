@@ -48,7 +48,7 @@ use crate::errors::{Context, ProcessError, Result, bail};
 use anyhow::ensure;
 
 use super::CacheControl;
-use super::canonical_native::NativeCargoPaths;
+use super::canonical_native::{NativeCargoPaths, relocatable_object};
 use super::preprocessor_cache::PreprocessorCacheEntry;
 
 /// A generic implementation of the `Compiler` trait for C/C++ compilers.
@@ -408,6 +408,8 @@ struct CCompilation<I: CCompilerImpl> {
     is_locally_preprocessed: bool,
     allow_dist: bool,
     native_resolution: Option<NativeCodegenResolution>,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    relocate_native_object: bool,
     #[cfg(feature = "dist-client")]
     preprocessed_input: Vec<u8>,
     executable: PathBuf,
@@ -864,6 +866,8 @@ where
                             is_locally_preprocessed: false,
                             allow_dist: true,
                             native_resolution: native_resolution.clone(),
+                            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                            relocate_native_object: false,
                             #[cfg(feature = "dist-client")]
                             preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON.to_vec(),
                             executable: self.executable.clone(),
@@ -1027,9 +1031,26 @@ where
 
         // Hash the same remapped filename identity that the compiler uses for
         // debug information. Do not strip arbitrary source literals or flags.
+        let relocate_native_object = canonical_native.is_some()
+            && native_identity
+            && matches!(
+                self.compiler.kind(),
+                CCompilerKind::Gcc | CCompilerKind::Clang
+            )
+            && relocatable_object(&parsed_args);
         let key_input = if let Some(paths) = &canonical_native {
             let normalized = paths.preprocessed_key_bytes(&preprocessor_output);
-            extra_hashes.push(paths.context_digest(&self.parsed_args, &cwd, &normalized));
+            extra_hashes.push(paths.context_digest(
+                &self.parsed_args,
+                &cwd,
+                &normalized,
+                native_identity
+                    && matches!(
+                        self.compiler.kind(),
+                        CCompilerKind::Gcc | CCompilerKind::Clang
+                    )
+                    && relocatable_object(&parsed_args),
+            ));
             normalized
         } else {
             Cow::Borrowed(preprocessor_output.as_slice())
@@ -1108,6 +1129,8 @@ where
                 is_locally_preprocessed: true,
                 allow_dist,
                 native_resolution,
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                relocate_native_object,
                 #[cfg(feature = "dist-client")]
                 preprocessed_input: preprocessor_output,
                 executable: self.executable.clone(),
@@ -2163,6 +2186,11 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         }
     }
 
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    fn native_relocatable_output(&self) -> bool {
+        self.relocate_native_object
+    }
+
     fn generate_compile_commands(
         &self,
         path_transformer: &mut dist::PathTransformer,
@@ -3005,14 +3033,20 @@ impl<'a> HashKeyParams<'a> {
     /// # Note
     /// If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
     pub fn compute(&self) -> String {
-        let mut m = Digest::new();
+        let mut m = Digest::audited("c-frontend");
+        m.audit_field("sccache.key.compiler");
         m.update(self.compiler_digest.as_bytes());
         // clang and clang++ have different behavior despite being byte-for-byte identical binaries, so
         // we have to incorporate that into the hash as well.
+        m.audit_field("sccache.key.driver_mode");
         m.update(&[u8::from(self.plusplus)]);
+        m.audit_field("sccache.key.schema");
         m.update(CACHE_VERSION);
+        m.audit_field("sccache.key.language");
         m.update(self.language.as_str().as_bytes());
+        m.audit_field("sccache.key.arguments");
         hash_arguments(&mut m, self.arguments, self.basedirs);
+        m.audit_field("sccache.key.auxiliary");
         hash_auxiliary_inputs(&mut m, self.extra_hashes, self.assembler_digest);
         // The compiler writes the source's file name into the object (the
         // STT_FILE symbol on ELF), and -P leaves it out of the preprocessed
@@ -3020,16 +3054,19 @@ impl<'a> HashKeyParams<'a> {
         // object naming only one of them. The directory is left out: the
         // symbol does not record it, and keeping it would cost cache hits
         // across checkouts.
+        m.audit_field("sccache.key.input_basename");
         hash_input_file_name_marker(&mut m, self.input_file_name.is_some());
         if let Some(input_file_name) = self.input_file_name {
             hash_length_prefixed(&mut m, input_file_name.as_encoded_bytes());
         }
 
+        m.audit_field("sccache.key.environment");
         hash_cached_env_vars(&mut m, self.env_vars, &CACHED_ENV_VARS);
 
         // Version only the debug-dependent keys: objects without debug data
         // retain their existing cache identity, while old unsafe debug hits
         // cannot alias the additional domain and directory payload.
+        m.audit_field("sccache.key.debug_compdir");
         if let Some(dir) = self.debug_compilation_dir {
             m.delimiter(b"c-effective-debug-compdir-v1");
             hash_length_prefixed(&mut m, dir);
@@ -3038,6 +3075,7 @@ impl<'a> HashKeyParams<'a> {
         // Strip basedirs from preprocessor output if configured
         let preprocessor_output_to_hash = strip_basedirs(self.preprocessor_output, self.basedirs);
 
+        m.audit_field("sccache.key.preprocessed");
         m.update(&preprocessor_output_to_hash);
         m.finish()
     }

@@ -3340,7 +3340,8 @@ where
         );
 
         // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
-        let mut m = Digest::new();
+        let mut m = Digest::audited("rust-frontend");
+        m.audit_field("sccache.key.schema");
         // Hash inputs:
         // 1. A version
         m.update(CACHE_VERSION);
@@ -3374,9 +3375,11 @@ where
             m.update(b"rust-metadata-output-v1");
         }
         // 2. compiler_shlibs_digests
+        m.audit_field("sccache.key.compiler_libraries");
         for d in &self.compiler_shlibs_digests {
             m.update(d.as_bytes());
         }
+        m.audit_field("sccache.key.layout");
         if canonical_paths.is_some() {
             m.update(b"canonical-rust-layout-v2");
         }
@@ -3406,6 +3409,7 @@ where
         // identity and the weak-to-strong archive mapping. Changing the
         // assembler, DLL generator, or any loaded library cannot reuse an
         // old compiled import library or an old toolchain package.
+        m.audit_field("sccache.key.dlltool");
         let weak_toolchain_key = if let Some(plan) = &dlltool_plan {
             m.delimiter(b"rust-dlltool-closure-v1");
             m.delimiter(plan.identity.as_bytes());
@@ -3439,6 +3443,7 @@ where
             // out, sort them, and append them to the rest of the arguments.
             .partition(|&(arg, _)| arg == "--cfg");
         sortables.sort();
+        m.audit_field("sccache.key.arguments");
         hash_rust_argument_pairs(
             &mut m,
             rest.len() + sortables.len(),
@@ -3457,6 +3462,7 @@ where
                 })
                 .collect::<Vec<_>>()
         });
+        m.audit_field("sccache.key.native_cpu");
         if native_requested {
             // Keep the resolved host profile in the cache identity even when
             // `native` was rewritten to a proven-equivalent explicit CPU for
@@ -3472,14 +3478,20 @@ where
         // 5. The digest of all files listed on the commandline (self.externs).
         // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
         // 7. The digest of the content of the target json file specified via `--target` (if any).
+        m.audit_field("sccache.key.sources");
         hash_rust_input_group(&mut m, b"rust-sources-v1", &source_hashes);
+        m.audit_field("sccache.key.externs");
         hash_rust_input_group(&mut m, b"rust-externs-v1", &extern_hashes);
+        m.audit_field("sccache.key.extern_bindings");
         hash_rust_extern_bindings(&mut m, &extern_bindings);
+        m.audit_field("sccache.key.static_libraries");
         hash_rust_input_group(&mut m, b"rust-staticlibs-v1", &staticlib_hashes);
+        m.audit_field("sccache.key.target_json");
         hash_rust_input_group(&mut m, b"rust-target-json-v1", &target_json_hash);
         // 8. Environment variables: Hash all environment variables listed in the rustc dep-info
         //    output. Additionally also has all environment variables starting with `CARGO_`,
         //    since those are not listed in dep-info but affect cacheability.
+        m.audit_field("sccache.key.observed_environment");
         env_deps.sort();
         if canonical_paths.is_none() && !env_deps.is_empty() {
             // Earlier physical-layout distributed builds could rewrite explicit
@@ -3517,6 +3529,7 @@ where
         // invoking Cargo wrapper. Their physical roots are already represented by
         // CanonicalRustPaths, and direct env!/option_env! observations remain in
         // env_deps above and are therefore still hashed exactly as observed.
+        m.audit_field("sccache.key.cargo_environment");
         if !precise_dependencies || opaque {
             for (var, val) in rust_cargo_env_for_hash(&env_vars, canonical_paths.as_ref()) {
                 var.hash(&mut HashToDigest { digest: &mut m });
@@ -3524,6 +3537,7 @@ where
                 val.hash(&mut HashToDigest { digest: &mut m });
             }
         }
+        m.audit_field("sccache.key.clippy_environment");
         if is_clippy_driver(&self.executable) {
             if canonical_paths.is_some() {
                 m.delimiter(b"canonical-clippy-env-v1");
@@ -3547,8 +3561,10 @@ where
         let hash_cwd = canonical_paths
             .as_ref()
             .map_or_else(|| cwd.clone(), |canonical| canonical.canonical_cwd(&cwd));
+        m.audit_field("sccache.key.cwd");
         hash_cwd.hash(&mut HashToDigest { digest: &mut m });
         // 10. The version of the compiler.
+        m.audit_field("sccache.key.compiler_version");
         self.version.hash(&mut HashToDigest { digest: &mut m });
 
         if let Some(metadata) = &self.parsed_args.split_link_metadata

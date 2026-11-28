@@ -1365,6 +1365,13 @@ where
         super::ResultIdentityPolicy::Exact
     }
 
+    /// The native compiler produces an independent object at a fixed
+    /// sandbox path; the caller's filename is only a delivery destination.
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    fn native_relocatable_output(&self) -> bool {
+        false
+    }
+
     /// The original Rust native link stage's local namespace, if this
     /// compilation uses an independently cacheable codegen action.
     #[cfg(all(feature = "dist-client", target_os = "linux"))]

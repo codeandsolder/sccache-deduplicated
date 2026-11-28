@@ -360,6 +360,20 @@ impl NativeCompilerClient {
     ) -> Result<(NativeBuildResult, crate::build_runtime::ActionKey)> {
         let fingerprint = plan.spec.action_request()?.action_fingerprint()?;
         let key = fingerprint.key()?;
+        crate::server::activity::key_evidence(
+            &fingerprint.schema,
+            &blake3::Hash::from_bytes(key.0).to_hex().to_string(),
+            fingerprint
+                .components
+                .iter()
+                .map(|(name, digest)| {
+                    (
+                        name.as_str(),
+                        blake3::Hash::from_bytes(digest.0).to_hex().to_string(),
+                    )
+                })
+                .collect(),
+        );
         debug!(
             "native action {key:?}: components={:?}; input trees={:?}",
             fingerprint.components,
@@ -410,6 +424,7 @@ struct NativeOutput {
     name: String,
     source: PathBuf,
     destination: PathBuf,
+    remote: Option<BuildPath>,
     required: bool,
     kind: OutputKind,
 }
@@ -421,6 +436,7 @@ impl NativeOutput {
             name: output.key,
             source: path.clone(),
             destination: path,
+            remote: None,
             required: !output.optional,
             kind: OutputKind::File,
         }
@@ -430,6 +446,7 @@ impl NativeOutput {
             name,
             source,
             destination,
+            remote: None,
             required: true,
             kind: OutputKind::GeneratedTree,
         }
@@ -450,6 +467,9 @@ impl NativeOutput {
                 ),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error).context("inspect native output destination"),
+            }
+            if let Some(remote) = &self.remote {
+                return Ok(remote.clone());
             }
             let parent = self
                 .source
@@ -956,6 +976,35 @@ fn prepare_dispatch(
         *scratch = Some(directory);
         *split = Some(link);
         outputs
+    } else if compilation.native_relocatable_output() {
+        let [output] = <[_; 1]>::try_from(expected)
+            .map_err(|_| anyhow::anyhow!("relocatable object requires exactly one output"))?;
+        ensure!(
+            output.key == "obj" && !output.optional,
+            "invalid relocatable object"
+        );
+        let mut output = NativeOutput::file(cwd, output);
+        let mut positions = remote
+            .arguments
+            .iter()
+            .enumerate()
+            .filter(|(_, argument)| *argument == "-o");
+        let (position, _) = positions
+            .next()
+            .context("missing native object destination")?;
+        ensure!(
+            positions.next().is_none(),
+            "multiple native object destinations"
+        );
+        let destination = remote
+            .arguments
+            .get_mut(position + 1)
+            .context("missing -o operand")?;
+        // The toolchain already declares /out. The actual command and
+        // output contract share this path, independent of delivery.
+        *destination = "/out/object.o".into();
+        output.remote = Some(BuildPath::new(b"/out/object.o".to_vec())?);
+        vec![output]
     } else {
         expected
             .into_iter()
@@ -1137,6 +1186,7 @@ mod tests {
         args: &[OsString],
         environment: &[(OsString, OsString)],
         config: &Config,
+        native_identity: bool,
     ) -> Result<super::super::HashResult<ProcessCommandCreator>> {
         let pool = rt.handle();
         let storage = storage_from_config(config, pool)?;
@@ -1159,7 +1209,16 @@ mod tests {
             anyhow::bail!("real compiler arguments are not cacheable");
         };
         let hashed = rt.block_on(hasher.generate_hash_key(GenerateHashKeyContext {
-            native: None,
+            native: native_identity.then(|| {
+                Arc::new(NativeCompilerClient::new(
+                    config.dist.native.clone().unwrap(),
+                    config.dist.scheduler_url.clone(),
+                    None,
+                    config.dist.auth.clone(),
+                    Vec::new(),
+                    &[],
+                ))
+            }),
             creator,
             cwd: cwd.to_owned(),
             env_vars: environment.to_vec(),
@@ -1199,6 +1258,7 @@ mod tests {
             &args,
             &environment,
             &config,
+            false,
         )?;
         let compilation = hashed.compilation;
         let result_policy = compilation.native_result_policy();
@@ -1427,7 +1487,8 @@ mod tests {
             "-c".into(),
             source.into_os_string(),
             "-o".into(),
-            cwd.join("input.o").into_os_string(),
+            cwd.join(if alternate { "renamed.o" } else { "input.o" })
+                .into_os_string(),
         ];
         let mut config = config()?;
         config.fallback_cache.dir = root.join("unexpected-archive-cache");
@@ -1441,6 +1502,7 @@ mod tests {
             &args,
             &environment,
             &config,
+            true,
         )?;
         let compilation = hash.compilation;
         let policy = compilation.native_result_policy();
@@ -1448,22 +1510,32 @@ mod tests {
         let (_, remote, cacheable) =
             compilation.generate_compile_commands(&mut transformer, CompileTransport::Native)?;
         assert_eq!(cacheable, Cacheable::Yes);
-        let remote = remote.context("missing real C++ native command")?;
-        let outputs = compilation
-            .outputs()
-            .filter(|output| output.key != "d")
-            .map(|output| NativeOutput::file(&cwd, output))
-            .collect();
-        let mut layout = dist::PathTransformer::new();
-        for (local, remote) in transformer.path_mappings() {
-            layout.add_root_mapping(local, &remote);
-        }
+        let mut remote = remote.context("missing real C++ native command")?;
+        let (outputs, layout, packagers) = prepare_dispatch(
+            compilation,
+            &mut remote,
+            transformer,
+            &cwd,
+            environment,
+            &mut None,
+            &mut None,
+        )?;
+        assert!(
+            remote
+                .arguments
+                .windows(2)
+                .any(|args| args == ["-o", "/out/object.o"])
+        );
+        assert_eq!(
+            outputs[0].destination,
+            cwd.join(if alternate { "renamed.o" } else { "input.o" })
+        );
         CompilerPlan::prepare(
             remote,
             &cwd,
             outputs,
             layout,
-            compilation.into_dist_packagers(transformer)?,
+            packagers,
             (ContentId::of(b"test"), policy, &hash.key),
             (digests, None),
         )
