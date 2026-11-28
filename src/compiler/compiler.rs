@@ -1150,7 +1150,10 @@ where
                 }
             }
         }
-        let environment_dependencies = compilation.dist_environment_dependencies();
+        let environment_dependencies =
+            compilation.dist_environment_dependencies(CompileTransport::Archive {
+                rewrite_includes_only,
+            });
         let dist_command_uses_cargo = compilation.dist_command_uses_cargo();
         let automatic_dist_toolchain_is_ready = compilation.automatic_dist_toolchain_is_ready();
         let (inputs_packager, toolchain_packager) =
@@ -1381,7 +1384,10 @@ where
 
     /// Exact environment observations that the final distributed command must preserve.
     #[cfg(feature = "dist-client")]
-    fn dist_environment_dependencies(&self) -> Vec<(OsString, Option<OsString>)> {
+    fn dist_environment_dependencies(
+        &self,
+        _transport: CompileTransport,
+    ) -> Vec<(OsString, Option<OsString>)> {
         Vec::new()
     }
 

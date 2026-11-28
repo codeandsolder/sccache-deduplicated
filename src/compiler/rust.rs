@@ -353,7 +353,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"16";
+const CACHE_VERSION: &[u8] = b"17";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -1261,6 +1261,48 @@ fn compiler_execution_environment(
     effective_environment(result)
 }
 
+/// The native contract normalizes managed build paths, while preserving all
+/// other explicitly observed values. Archive transport preserves observations
+/// verbatim. Use the same policy for keying, execution, and dispatch validation.
+fn canonical_compiler_environment(
+    paths: &CanonicalRustPaths,
+    env: &[(OsString, OsString)],
+    observed: &HashSet<OsString>,
+    native: bool,
+) -> Vec<(OsString, OsString)> {
+    let preserve = observed
+        .iter()
+        .filter(|name| !native || !super::canonical_paths::compiler_build_path_variable(name))
+        .cloned()
+        .collect();
+    paths.env_to_canonical_preserving(env, &preserve)
+}
+
+/// Restrict cwd identity to explicit path-remap scopes that deliberately
+/// preserve the physical working directory in some compiler outputs.
+fn native_normalizes_cwd(arguments: &[Argument<ArgData>]) -> bool {
+    arguments
+        .iter()
+        .rev()
+        .find_map(|arg| match arg {
+            Argument::WithValue("--remap-path-scope", ArgData::PassThrough(value), _) => {
+                Some(value == "all")
+            }
+            _ => None,
+        })
+        .unwrap_or(true)
+}
+
+fn native_cwd_remap(cwd: &Path) -> Argument<ArgData> {
+    let mut mapping = cwd.as_os_str().to_owned();
+    mapping.push("=/sccache/cwd");
+    Argument::WithValue(
+        "--remap-path-prefix",
+        ArgData::PassThrough(mapping),
+        ArgDisposition::Separated,
+    )
+}
+
 fn is_clippy_driver(executable: &Path) -> bool {
     executable
         .file_stem()
@@ -1507,7 +1549,7 @@ static CPU_CFG_FEATURE_CACHE: LazyLock<CpuCfgFeatureCache> =
 
 fn native_target_requested(arguments: &[Argument<ArgData>]) -> bool {
     arguments.iter().rev().find_map(|arg| match arg.get_data() {
-        Some(CodeGen(ArgCodegen { opt, value })) if opt == "target-cpu" => {
+        Some(CodeGen(ArgCodegen { opt, value })) if option_is(opt, "target-cpu") => {
             Some(value.as_deref() == Some("native"))
         }
         _ => None,
@@ -1516,7 +1558,7 @@ fn native_target_requested(arguments: &[Argument<ArgData>]) -> bool {
 
 fn native_tune_requested(arguments: &[Argument<ArgData>]) -> bool {
     arguments.iter().rev().find_map(|arg| match arg.get_data() {
-        Some(Unstable(ArgUnstable { opt, value })) if opt == "tune-cpu" => {
+        Some(Unstable(ArgUnstable { opt, value })) if option_is(opt, "tune-cpu") => {
             Some(value.as_deref() == Some("native"))
         }
         _ => None,
@@ -1595,13 +1637,13 @@ fn rewrite_native_target_cpu(
     let first_user_target_feature = arguments.iter().position(|arg| {
         matches!(
             arg.get_data(),
-            Some(CodeGen(ArgCodegen { opt, .. })) if opt == "target-feature"
+            Some(CodeGen(ArgCodegen { opt, .. })) if option_is(opt, "target-feature")
         )
     });
     let mut last_rewritten_cpu = None;
     for (index, arg) in arguments.iter_mut().enumerate() {
         if let Argument::WithValue(_, CodeGen(ArgCodegen { opt, value }), _) = arg
-            && opt == "target-cpu"
+            && option_is(opt, "target-cpu")
             && value.as_deref() == Some("native")
         {
             *value = Some(baseline_cpu.to_owned());
@@ -1633,24 +1675,26 @@ fn rewrite_native_target_cpu(
 fn rewrite_native_tune_cpu(arguments: &mut [Argument<ArgData>], cpu: &str) {
     for arg in arguments {
         if let Argument::WithValue(_, Unstable(ArgUnstable { opt, value }), _) = arg
-            && opt == "tune-cpu"
+            && option_is(opt, "tune-cpu")
             && value.as_deref() == Some("native")
         {
             *value = Some(cpu.to_owned());
         }
     }
 }
-fn remove_dep_info_emit(arguments: &mut [Argument<ArgData>]) {
-    for arg in arguments {
-        if let Argument::WithValue(_, Emit(value), _) = arg {
-            let filtered = value
+fn remove_dep_info_emit(arguments: &mut Vec<Argument<ArgData>>) {
+    arguments.retain_mut(|argument| {
+        if let Argument::WithValue(_, Emit(value), _) = argument {
+            *value = value
                 .split(',')
                 .filter(|item| *item != "dep-info")
                 .collect::<Vec<_>>()
                 .join(",");
-            *value = filtered;
+            !value.is_empty()
+        } else {
+            true
         }
-    }
+    });
 }
 
 fn parse_native_profile(llvm_ir: &str) -> Result<String> {
@@ -2422,7 +2466,9 @@ impl IntoArg for ArgCodegen {
     fn into_arg_string(self, transformer: PathTransformerFn<'_>) -> ArgToStringResult {
         let Self { opt, value } = self;
         Ok(match value {
-            Some(value) if opt == "profile-use" => {
+            Some(value)
+                if option_is(&opt, "profile-use") || option_is(&opt, "profile-sample-use") =>
+            {
                 format!(
                     "{opt}={}",
                     PathBuf::from(value).into_arg_string(transformer)?
@@ -2564,6 +2610,7 @@ use self::ArgData::{
 };
 
 use super::CacheControl;
+use super::rust_key_arguments::option_is;
 
 // These are taken from https://github.com/rust-lang/rust/blob/b671c32ddc8c36d50866428d83b7716233356721/src/librustc/session/config.rs#L1186
 counted_array!(static ARGS: [ArgInfo<ArgData>; _] = [
@@ -2703,11 +2750,8 @@ fn parse_arguments(
                 }
             }
             Some(Emit(value)) => {
-                if emit.is_some() {
-                    // We don't support passing --emit more than once.
-                    cannot_cache!("more than one --emit");
-                }
-                emit = Some(value.split(',').map(str::to_owned).collect());
+                emit.get_or_insert_with(HashSet::new)
+                    .extend(value.split(',').map(str::to_owned));
             }
             Some(CrateType(ArgCrateTypes {
                 rlib,
@@ -2724,7 +2768,7 @@ fn parse_arguments(
             Some(OutDir(value)) => output_dir = Some(value.clone()),
             Some(Extern(ArgExtern { path, .. })) => externs.push(path.clone()),
             Some(CodeGen(ArgCodegen { opt, value })) => {
-                match (opt.as_ref(), value) {
+                match (opt.replace('_', "-").as_str(), value) {
                     ("extra-filename", Some(value)) => extra_filename = Some(value.to_owned()),
                     ("extra-filename", None) => cannot_cache!("extra-filename"),
                     ("linker" | "link-arg" | "link-args", _) => {
@@ -2743,7 +2787,7 @@ fn parse_arguments(
                 }
             }
             Some(Unstable(ArgUnstable { opt, value })) => match value.as_deref() {
-                _ if matches!(opt.as_ref(), "no-link" | "link-only") => {
+                _ if option_is(opt, "no-link") || option_is(opt, "link-only") => {
                     // An explicit stage invocation has a different output
                     // contract from an ordinary --emit=link compilation.
                     cannot_cache!("explicit Rust link stage", opt.clone());
@@ -2996,7 +3040,7 @@ fn relocate_rust_operands(
                     value: Some(value),
                 }),
                 _,
-            ) if opt == "profile-use" => {
+            ) if option_is(opt, "profile-use") || option_is(opt, "profile-sample-use") => {
                 let mut path = PathBuf::from(&*value);
                 relocate_path(&mut path)?;
                 *value = path.into_os_string().into_string().ok()?;
@@ -3090,7 +3134,7 @@ pub(super) fn native_link_stage_input(
             }
             _ => match argument.get_data() {
                 Some(Unstable(option))
-                    if matches!(option.opt.as_str(), "no-link" | "link-only") =>
+                    if option_is(&option.opt, "no-link") || option_is(&option.opt, "link-only") =>
                 {
                     bail!("Rust invocation already specifies a link stage");
                 }
@@ -3104,15 +3148,10 @@ pub(super) fn native_link_stage_input(
                         let (_, path) = kind.split_once('=')?;
                         (path != "-").then(|| PathBuf::from(path))
                     }));
-                    ensure!(
-                        emit.replace(
-                            value
-                                .split(',')
-                                .any(|kind| kind == "link" || kind.starts_with("link="))
-                        )
-                        .is_none(),
-                        "multiple Rust emit options"
-                    );
+                    let emits_link = value
+                        .split(',')
+                        .any(|kind| kind == "link" || kind.starts_with("link="));
+                    emit = Some(emit.unwrap_or(false) || emits_link);
                 }
                 _ => {}
             },
@@ -3905,40 +3944,17 @@ where
         } else {
             weak_toolchain_key
         };
-        // 3. The full commandline (self.arguments)
-        // TODO: there will be full paths here, it would be nice to
-        // normalize them so we can get cross-machine cache hits.
-        // A few argument types are not passed in a deterministic order
-        // by cargo: --extern, -L, --cfg. We'll filter those out, sort them,
-        // and append them to the rest of the arguments.
-        let (mut sortables, rest): (Vec<_>, Vec<_>) = hash_os_string_arguments
-            .iter()
-            // We exclude a few arguments from the hash:
-            //   -L, --extern, --out-dir
-            // These contain paths which aren't relevant to the output, and the compiler inputs
-            // in those paths (rlibs and static libs used in the compilation) are used as hash
-            // inputs below.
-            .filter(|&(arg, _)| !(arg == "--extern" || arg == "-L" || arg == "--out-dir"))
-            // We also exclude `--target` if it specifies a path to a .json file. The file content
-            // is used as hash input below.
-            // If `--target` specifies a string, it continues to be hashed as part of the arguments.
-            .filter(|&(arg, _)| self.parsed_args.target_json.is_none() || arg != "--target")
-            // A few argument types were not passed in a deterministic order
-            // by older versions of cargo: --extern, -L, --cfg. We'll filter the rest of those
-            // out, sort them, and append them to the rest of the arguments.
-            .partition(|&(arg, _)| arg == "--cfg");
-        sortables.sort();
-        // rustc stores cfg predicates in a set. Exact duplicate predicates have no effect.
-        sortables.dedup();
-        m.audit_field("sccache.key.arguments");
-        hash_rust_argument_pairs(
-            &mut m,
-            rest.len() + sortables.len(),
-            rest.iter().chain(sortables.iter()).copied(),
+        // rustc parses independent codegen fields and output/cfg sets. Key
+        // their effective representation rather than their raw spelling.
+        let key_arguments = super::rust_key_arguments::normalize(
+            &hash_os_string_arguments,
+            self.parsed_args.target_json.is_some(),
         );
+        m.audit_field("sccache.key.arguments");
+        hash_rust_argument_pairs(&mut m, key_arguments.len(), key_arguments.iter());
         let hashed_argument_pairs = shadow_log_path.is_some().then(|| {
-            rest.iter()
-                .chain(sortables.iter())
+            key_arguments
+                .iter()
                 .map(|(name, value)| {
                     (
                         name.to_string_lossy().into_owned(),
@@ -3992,14 +4008,7 @@ where
                 .as_ref()
                 .zip(native_execution.as_ref())
                 .map(|(paths, execution)| {
-                    // Preserve explicit observations other than managed build paths,
-                    // exactly as the eventual native worker invocation does.
-                    let preserve = env_dep_names
-                        .iter()
-                        .filter(|name| !super::canonical_paths::compiler_build_path_variable(name))
-                        .cloned()
-                        .collect();
-                    paths.env_to_canonical_preserving(execution, &preserve)
+                    canonical_compiler_environment(paths, execution, &env_dep_names, true)
                 });
         // Empty sets add no identity. rustc reports unset and empty distinctly;
         // neither the caller environment nor an old-layout salt is necessary.
@@ -4090,7 +4099,7 @@ where
             .as_ref()
             .map_or_else(|| cwd.clone(), |canonical| canonical.canonical_cwd(&cwd));
         m.audit_field("sccache.key.cwd");
-        if !native_discovery {
+        if !native_discovery || !native_normalizes_cwd(&effective_arguments) {
             hash_cwd.hash(&mut HashToDigest { digest: &mut m });
         }
         // The driver and shared-library contents already identify the
@@ -4455,14 +4464,22 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         } else {
             env_vars
         };
-        let canonical_preserve = env_dep_names
-            .iter()
-            .filter(|name| {
-                transport != CompileTransport::Native
-                    || !super::canonical_paths::compiler_build_path_variable(name)
-            })
-            .cloned()
-            .collect::<HashSet<_>>();
+        let execution_arguments;
+        let arguments = if transport == CompileTransport::Native && native_normalizes_cwd(arguments)
+        {
+            // rustc tracks its working directory even without debug information.
+            // Give the compiler a stable source-map directory, before user
+            // remaps so their explicit precedence is retained.
+            let logical_cwd = canonical_paths
+                .as_ref()
+                .map_or_else(|| cwd.clone(), |paths| paths.canonical_cwd(cwd));
+            execution_arguments = std::iter::once(native_cwd_remap(&logical_cwd))
+                .chain(arguments.iter().cloned())
+                .collect::<Vec<_>>();
+            &execution_arguments
+        } else {
+            arguments
+        };
         let command: Box<dyn CompileCommand<T>> = canonical_paths.as_ref().map_or_else(
             || {
                 Ok::<_, anyhow::Error>(CCompileCommand::boxed(SingleCompileCommand {
@@ -4490,8 +4507,12 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                             arguments,
                             cwd,
                         ),
-                        env_vars: canonical
-                            .env_to_canonical_preserving(local_env, &canonical_preserve),
+                        env_vars: canonical_compiler_environment(
+                            canonical,
+                            local_env,
+                            env_dep_names,
+                            transport == CompileTransport::Native,
+                        ),
                         cwd: canonical.canonical_cwd(cwd),
                     }))
                 }
@@ -4571,9 +4592,12 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             let env_vars = local_env;
             let mut changed_out_dir: Option<PathBuf> = None;
             let mut env_vars = if let Some(canonical) = canonical_paths {
-                dist::osstring_tuples_to_strings(
-                    &canonical.env_to_canonical_preserving(env_vars, &canonical_preserve),
-                )?
+                dist::osstring_tuples_to_strings(&canonical_compiler_environment(
+                    canonical,
+                    env_vars,
+                    env_dep_names,
+                    transport == CompileTransport::Native,
+                ))?
             } else {
                 let mut env_vars = dist::osstring_tuples_to_strings(env_vars)?;
                 for (k, v) in &mut env_vars {
@@ -4676,17 +4700,36 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
     }
 
     #[cfg(feature = "dist-client")]
-    fn dist_environment_dependencies(&self) -> Vec<(OsString, Option<OsString>)> {
+    fn dist_environment_dependencies(
+        &self,
+        transport: CompileTransport,
+    ) -> Vec<(OsString, Option<OsString>)> {
+        let canonical_execution = self
+            .canonical_paths
+            .as_ref()
+            .filter(|_| transport == CompileTransport::Native)
+            .map(|paths| {
+                let execution = compiler_execution_environment(
+                    &self.env_vars,
+                    &self.env_dep_names,
+                    &self.crate_name,
+                    is_clippy_driver(&self.executable),
+                );
+                canonical_compiler_environment(paths, &execution, &self.env_dep_names, true)
+            });
         self.env_dep_names
             .iter()
             .map(|name| {
-                let value = self
+                let observed = self
                     .env_vars
                     .iter()
                     .rev()
                     .find(|(key, _)| key == name)
-                    .map(|(_, value)| value.clone());
-                (name.clone(), value)
+                    .map(|(_, value)| value.as_os_str());
+                (
+                    name.clone(),
+                    observed_environment_key(name, observed, canonical_execution.as_deref()),
+                )
             })
             .collect()
     }
@@ -6476,7 +6519,9 @@ mod test {
             let features = args
                 .iter()
                 .filter_map(|arg| match arg.get_data() {
-                    Some(CodeGen(ArgCodegen { opt, value })) if opt == "target-feature" => {
+                    Some(CodeGen(ArgCodegen { opt, value }))
+                        if option_is(opt, "target-feature") =>
+                    {
                         value.clone()
                     }
                     _ => None,
@@ -7044,6 +7089,74 @@ LLVM version: 15.0.2
             "incremental=/foo"
         );
         assert_eq!(r, CompilerArguments::CannotCache("incremental", None));
+    }
+
+    #[test]
+    fn native_cpu_detection_and_lowering_support_underscore_spelling() {
+        let parsed = parses!(
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "--out-dir",
+            "out",
+            "--emit=link",
+            "foo.rs",
+            "-Ctarget_cpu=native",
+            "-Ctarget_feature=-avx2",
+            "-Ztune_cpu=native"
+        );
+        let mut args = parsed.arguments;
+        assert!(native_target_requested(&args));
+        assert!(native_tune_requested(&args));
+        rewrite_native_target_cpu(&mut args, "x86-64", "+avx2");
+        rewrite_native_tune_cpu(&mut args, "znver2");
+        assert!(!native_target_requested(&args));
+        assert!(!native_tune_requested(&args));
+        let features = args
+            .iter()
+            .filter_map(|arg| match arg.get_data() {
+                Some(CodeGen(ArgCodegen { opt, value })) if option_is(opt, "target-feature") => {
+                    value.as_deref()
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(features, ["+avx2", "-avx2"]);
+    }
+
+    #[test]
+    fn repeated_emit_requests_have_one_output_contract() {
+        let mut parsed = parses!(
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "foo.rs",
+            "--emit=dep-info",
+            "--emit=metadata,link",
+            "--emit=link",
+            "--out-dir",
+            "out",
+            "-Cextra_filename=-abc"
+        );
+        assert_eq!(parsed.dep_info, Some("foo-abc.d".into()));
+        assert_eq!(
+            parsed.emit,
+            HashSet::from(["dep-info".into(), "metadata".into(), "link".into()])
+        );
+        remove_dep_info_emit(&mut parsed.arguments);
+        assert_eq!(
+            parsed
+                .arguments
+                .iter()
+                .filter_map(|arg| match arg.get_data() {
+                    Some(Emit(value)) => Some(value.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["metadata,link", "link"]
+        );
     }
 
     #[test]
@@ -9014,12 +9127,36 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                     ("SCCACHE_LOG".into(), "debug".into()),
                 ]);
                 native.env_dep_names.insert("RUSTC_ICE".into());
+                let out = native.cwd.join("target/generated");
+                fs::create_dir_all(&out)?;
+                native
+                    .env_vars
+                    .push(("OUT_DIR".into(), out.into_os_string()));
+                native.env_dep_names.insert("OUT_DIR".into());
+                native.env_dep_names.insert("ABSENT".into());
+                native
+                    .canonical_paths
+                    .as_mut()
+                    .context("missing canonical paths")?
+                    .normalize_generated_root(&native.env_vars);
+
                 let mut transformer = dist::PathTransformer::new();
                 let (_, remote, _) =
                     <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
                         &native, &mut transformer, CompileTransport::Native,
                     )?;
                 let remote = remote.context("native Clippy command missing")?;
+                let dependencies = <RustCompilation as Compilation<ProcessCommandCreator>>::dist_environment_dependencies(&native, CompileTransport::Native);
+                assert!(dependencies.contains(&("OUT_DIR".into(), Some("/generated".into()))));
+                assert!(dependencies.contains(&("ABSENT".into(), None)));
+                super::super::core::validate_dist_environment_dependencies(&remote, &dependencies)?;
+                assert!(
+                    remote
+                        .arguments
+                        .windows(2)
+                        .any(|pair| pair == ["--remap-path-prefix", "/build=/sccache/cwd"])
+                );
+
                 assert!(!remote.env_vars.iter().any(|(name, _)| matches!(
                     name.as_str(),
                     "RUSTC_WRAPPER" | "RUSTC_WORKSPACE_WRAPPER" | "SCCACHE_LOG"

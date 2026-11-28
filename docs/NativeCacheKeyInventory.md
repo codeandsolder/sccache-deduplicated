@@ -36,7 +36,8 @@ runtime profiling destinations remain meaningful inputs.
 ## Rust
 
 Hash the actual compiler driver and loader-selected compiler libraries, target and
-semantic arguments (including deduplicated cfg predicates), selected source and binary dependencies (including selected
+semantic arguments (effective codegen fields, emission sets and deduplicated
+cfg predicates), selected source and binary dependencies (including selected
 standard libraries), extern name-to-content bindings, auxiliary inputs,
 static libraries, custom target contents and explicitly observed environment.
 Native nightly dep-info reports binary dependencies; stable compilers and
@@ -52,7 +53,11 @@ transport key or read target installation ledgers. Explicit externs are keyed on
 and content, independently of filename ordering or repeated discovery.
 An originating CPU profile is only hashed if the effective invocation still
 requests native CPU or tuning; successfully lowered explicit target arguments
-already identify the worker compilation.
+already identify the worker compilation. Normalize rustc codegen option aliases,
+static defaults, overwritten scalar assignments and independent field order.
+Preserve append order for metadata salts and linker/LLVM arguments, the
+frame-pointer ratchet, and distinct raw versus effective optimization/debug
+settings when a short flag overrides a long option.
 Native nightly metadata-only and rlib-only results key the binary operands
 selected by rustc, not all explicit extern candidate files. A separate rlib
 supplied alongside selected rmeta contributes no digest; an entirely unused
@@ -67,8 +72,11 @@ order, including missing slots; archive locations do not identify results.
 
 Standard Cargo build paths used by compiler environment observations are
 normalized for both key and execution. The build-script output root is
-`/generated`. Do not hash the native working directory or all Cargo environment
-variables. Retain the actual package identity where ordinary proc macros use it,
+`/generated`. The dispatch validator uses the identical realized environment.
+Rustc embeds the physical working directory even without debug information;
+native commands normalize it with a default prefix map to `/sccache/cwd`.
+Only an explicit restricted remap scope retains cwd identity. Do not hash
+all Cargo environment variables. Retain the actual package identity where ordinary proc macros use it,
 compiler switches supplied through the environment, and Clippy policy and flags.
 Resolve duplicate environment assignments before discovery, hashing or execution;
 explicit observations are not repeated in the native compiler or Clippy environment

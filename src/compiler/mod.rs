@@ -46,6 +46,7 @@ mod ptxas;
 mod response_files;
 mod rust;
 mod rust_dlltool;
+mod rust_key_arguments;
 #[cfg(target_os = "linux")]
 pub mod rust_link;
 mod rust_response;

@@ -875,7 +875,7 @@ fn prepare_dispatch(
 ) -> Result<(Vec<NativeOutput>, dist::PathTransformer, DistPackagers)> {
     super::core::validate_dist_environment_dependencies(
         remote,
-        &compilation.dist_environment_dependencies(),
+        &compilation.dist_environment_dependencies(CompileTransport::Native),
     )?;
     let expected = compilation
         .outputs()
@@ -1191,7 +1191,7 @@ mod tests {
         let mut remote = remote.context("no distributed command for real compiler")?;
         super::super::core::validate_dist_environment_dependencies(
             &remote,
-            &compilation.dist_environment_dependencies(),
+            &compilation.dist_environment_dependencies(CompileTransport::Native),
         )?;
         let expected = compilation
             .outputs()

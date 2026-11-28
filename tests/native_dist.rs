@@ -2531,7 +2531,7 @@ fn compiler_script() -> &'static str {
 set -eu
 mkdir -p build
 "$2" -c probe.c -o build/probe.o -MMD -MF build/probe-c.d
-"$3" --crate-name probe --crate-type rlib --edition=2024 --emit=link,dep-info --out-dir build probe.rs
+"$3" --crate-name probe --crate-type rlib --edition=2024 --emit=link,dep-info --out-dir build --remap-path-prefix="$PWD=/sccache/cwd" probe.rs
 cp build/probe.o gcc-reference.o
 cp build/libprobe.rlib rust-reference.rlib
 for i in 1 2 ${4:+3 4}; do
@@ -2539,8 +2539,8 @@ for i in 1 2 ${4:+3 4}; do
     rm -f build/probe.o build/libprobe.rlib build/probe.d build/probe-c.d
     "$1" "$2" -c probe.c -o build/probe.o -MMD -MF build/probe-c.d
     "$1" "$3" --crate-name probe --crate-type rlib --edition=2024 --emit=link,dep-info --out-dir build probe.rs
-    cmp gcc-reference.o build/probe.o
-    cmp rust-reference.rlib build/libprobe.rlib
+    cmp gcc-reference.o build/probe.o >&2
+    cmp rust-reference.rlib build/libprobe.rlib >&2
     test -s build/probe-c.d
     test -s build/probe.d
 done
@@ -2779,6 +2779,72 @@ fn run_environment_audit(
     let ((same, source), bytes) = compile("second", None)?;
     assert_eq!((same, source), (absent, "hit".into()));
     assert_eq!(missing, bytes);
+    Ok(())
+}
+
+fn run_rust_argument_audit(
+    service: &LocalService,
+    directory: &Path,
+    rustc: &Path,
+    config: &Path,
+) -> Result<()> {
+    fs::write(
+        directory.join("arg_audit.rs"),
+        b"pub fn answer(x: u32) -> u32 { x + 1 }\n",
+    )?;
+    let compile = |flags: &[&str]| -> Result<((String, String), Vec<u8>)> {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .arg(rustc)
+            .args([
+                "--crate-name",
+                "arg_audit",
+                "--crate-type",
+                "rlib",
+                "--edition=2024",
+                "--out-dir",
+                "build",
+                "arg_audit.rs",
+            ])
+            .args(flags)
+            .current_dir(directory)
+            .env("SCCACHE_CONF", config)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
+            .output()?;
+        Ok((
+            action_report(&output)?,
+            fs::read(directory.join("build/libarg_audit.rlib"))?,
+        ))
+    };
+    let ((key, source), first) = compile(&[
+        "--emit=link,metadata",
+        "-Copt-level=2",
+        "-Cdebuginfo=1",
+        "-Cembed-bitcode=no",
+    ])?;
+    assert_eq!(source, "worker");
+    let ((same, source), second) = compile(&[
+        "--emit=metadata",
+        "--emit=link",
+        "-O",
+        "-Cembed_bitcode=false",
+        "--codegen",
+        "debuginfo=limited",
+        "-Copt-level=1",
+        "-Copt-level=2",
+    ])?;
+    assert_eq!((same, source), (key.clone(), "hit".into()));
+    assert_eq!(first, second);
+    let ((changed, source), third) = compile(&[
+        "--emit=link,metadata",
+        "-Copt-level=2",
+        "-O",
+        "-Cdebuginfo=1",
+        "-Cembed-bitcode=no",
+    ])?;
+    assert_eq!(source, "worker");
+    assert_ne!(key, changed);
+    assert_ne!(first, third);
     Ok(())
 }
 
@@ -3106,7 +3172,10 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     );
     let stats = service.stats()?;
     let namespace_compiles = stats.dist_compiles.values().sum::<usize>();
-    assert!((11..=12).contains(&namespace_compiles));
+    // The ordinary C and Rust results must cross the namespace boundary.
+    // Two explicit refreshes remain; the split-link output trees may also
+    // need a new codegen result if their output topology differs.
+    assert!((8..=10).contains(&namespace_compiles));
     assert_eq!(stats.cache_hits.all() + stats.cache_misses.all(), 24);
     assert_eq!(stats.forced_recaches, 4);
     assert_eq!(stats.dist_errors, 0);
@@ -3150,6 +3219,7 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         namespace_compiles
     );
     run_environment_audit(&service, &direct, &rustc, &direct_config)?;
+    run_rust_argument_audit(&service, &direct, &rustc, &direct_config)?;
     assert_eq!(service.stats()?.dist_errors, 0);
     service.stop()?;
     let (scheduler, worker) = fleet.finish()?;
