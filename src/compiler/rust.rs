@@ -415,7 +415,7 @@ where
         let mut cmd = creator
             .clone()
             .new_command_sync(Path::new("/usr/bin/strace"));
-        cmd.args([
+        cmd.args(&[
             "-f",
             "-qq",
             "-y",

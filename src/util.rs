@@ -234,6 +234,7 @@ impl Digest {
         let mut digest = if is_directory {
             Self {
                 inner: blake3_Hasher::new_derive_key("sccache tracked directory digest v2"),
+                audit: None,
             }
         } else {
             Self::new()
