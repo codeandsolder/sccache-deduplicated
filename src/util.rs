@@ -17,8 +17,6 @@ use blake3::Hasher as blake3_Hasher;
 use byteorder::{BigEndian, ByteOrder};
 use fs::File;
 use fs_err as fs;
-use object::read::archive::ArchiveFile;
-use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
@@ -162,6 +160,7 @@ impl Digest {
     /// Fingerprint the actual serialized bytes of each named cache-key field
     /// independently for diagnosis. This does not change the key or export
     /// raw arguments, paths, source text or environment values.
+    #[must_use = "the returned hasher records the cache key and audit fields"]
     pub fn audited(kind: &'static str) -> Self {
         let mut digest = Self::new();
         if crate::server::activity::trace_context().is_some() {
@@ -234,6 +233,7 @@ impl Digest {
         let mut digest = if is_directory {
             Self {
                 inner: blake3_Hasher::new_derive_key("sccache tracked directory digest v2"),
+                audit: None,
             }
         } else {
             Self::new()
@@ -502,13 +502,15 @@ pub fn hex(bytes: &[u8]) -> String {
 /// Concurrent compile requests already provide file-level I/O concurrency.
 /// Keeping one task per independent dependency list also bounds archive
 /// buffers and the number of open descriptors in private executors.
-pub(crate) async fn hash_path_batch<F>(
-    files: &[PathBuf],
+pub(crate) async fn hash_input_batch<I, F, T>(
+    inputs: &[I],
     pool: &tokio::runtime::Handle,
     mut hash: F,
-) -> Result<Vec<String>>
+) -> Result<Vec<T>>
 where
-    F: FnMut(&Path) -> Result<String> + Send + 'static,
+    I: Clone + Send + Sync + 'static,
+    F: FnMut(&I) -> Result<T> + Send + 'static,
+    T: Send + 'static,
 {
     use std::sync::{
         Arc,
@@ -521,24 +523,24 @@ where
         }
     }
 
-    if files.is_empty() {
+    if inputs.is_empty() {
         return Ok(Vec::new());
     }
-    let files = files.to_vec();
+    let inputs = inputs.to_vec();
     let cancelled = Arc::new(AtomicBool::new(false));
     // Dropping an async caller cannot interrupt an in-progress blocking
     // file read, but must not continue through the rest of the batch.
     let guard = CancelBatch(Arc::clone(&cancelled));
     let hashes = pool
         .spawn_blocking(move || {
-            files
+            inputs
                 .iter()
-                .map(|path| {
+                .map(|input| {
                     anyhow::ensure!(
                         !cancelled.load(Ordering::Relaxed),
                         "input hash batch cancelled"
                     );
-                    hash(path)
+                    hash(input)
                 })
                 .collect()
         })
@@ -552,7 +554,7 @@ where
 pub async fn hash_all(files: &[PathBuf], pool: &tokio::runtime::Handle) -> Result<Vec<String>> {
     let start = time::Instant::now();
     let count = files.len();
-    let hashes = hash_path_batch(files, pool, Digest::path_sync).await?;
+    let hashes = hash_input_batch(files, pool, |path| Digest::path_sync(path)).await?;
     trace!(
         "Hashed {count} files in {}",
         fmt_duration_as_secs(&start.elapsed())
@@ -570,62 +572,6 @@ pub fn new_client_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-}
-
-/// Calculate the digest of each static library archive in `files` on background threads in
-/// `pool`.
-///
-/// The hash is calculated by adding the filename of each archive entry followed
-/// by its contents, ignoring headers and other file metadata. This primarily
-/// exists because Apple's `ar` tool inserts timestamps for each file with
-/// no way to disable this behavior.
-pub async fn hash_all_archives(
-    files: &[PathBuf],
-    pool: &tokio::runtime::Handle,
-) -> Result<Vec<String>> {
-    let start = time::Instant::now();
-    let count = files.len();
-    let hashes = hash_path_batch(files, pool, |path| {
-        let mut m = Digest::new();
-        // Read into owned memory rather than mmap the archive. File-backed mappings
-        // cannot prove that another process will not truncate or rewrite the file
-        // while Rust holds a slice into it; an owned buffer removes that unsafe
-        // lifetime/aliasing boundary entirely.
-        let archive = fs::read(path)
-            .with_context(|| format!("Failed to read file for hashing: {}", debug_display(path)))?;
-
-        if let Ok(fat) = MachOFatFile32::parse(&*archive) {
-            for arch in fat.arches() {
-                hash_regular_archive(&mut m, arch.data(&*archive)?)?;
-            }
-        } else if let Ok(fat) = MachOFatFile64::parse(&*archive) {
-            for arch in fat.arches() {
-                hash_regular_archive(&mut m, arch.data(&*archive)?)?;
-            }
-        } else {
-            // Not a FatHeader at all, regular archive.
-            hash_regular_archive(&mut m, &archive)?;
-        }
-
-        Ok(m.finish())
-    })
-    .await?;
-
-    trace!(
-        "Hashed {count} files in {}",
-        fmt_duration_as_secs(&start.elapsed())
-    );
-    Ok(hashes)
-}
-
-fn hash_regular_archive(m: &mut Digest, data: &[u8]) -> Result<()> {
-    let archive = ArchiveFile::parse(data)?;
-    for entry in archive.members() {
-        let entry = entry?;
-        m.update(entry.name());
-        m.update(entry.data(data)?);
-    }
-    Ok(())
 }
 
 /// Return the average of a total duration over `samples` without truncating

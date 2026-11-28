@@ -241,6 +241,76 @@ fn search_contract(
     Ok((Some(path), selected))
 }
 
+/// Resolve the actual loader-selected files in requested-library-name order.
+/// Result identity can use this without constructing a delivery package.
+pub(super) fn selected_loader_files(
+    executable: &Path,
+    environment: &[(OsString, OsString)],
+    cwd: &Path,
+) -> Result<Vec<PathBuf>> {
+    let path = environment
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "LD_LIBRARY_PATH")
+        .map(|(_, value)| value.as_os_str());
+    Ok(LoaderProbe::open(executable.to_owned())?
+        .resolve(environment, cwd, path, true)?
+        .into_values()
+        .collect())
+}
+
+/// The native platform supplies the core language and OS runtime. All other
+/// selected libraries are compiler dependencies, even when a distribution
+/// installs them in the system library directory. Private overrides remain
+/// compiler inputs regardless of their library names.
+fn is_compiler_code_library(path: &Path, private_root: Option<&Path>) -> bool {
+    if private_root.is_some_and(|root| path.starts_with(root)) {
+        return true;
+    }
+    if path.starts_with("/usr/local")
+        || !["/usr/lib", "/lib", "/lib64", "/usr/lib64"]
+            .iter()
+            .any(|root| path.starts_with(root))
+    {
+        return true;
+    }
+    !path.file_name().is_some_and(|name| {
+        [
+            b"ld-linux-".as_slice(),
+            b"ld-musl-",
+            b"libc.so.",
+            b"libm.so.",
+            b"libpthread.so.",
+            b"librt.so.",
+            b"libdl.so.",
+            b"libgcc_s.so.",
+            b"libstdc++.so.",
+            b"libresolv.so.",
+        ]
+        .iter()
+        .any(|prefix| name.as_bytes().starts_with(prefix))
+    })
+}
+
+/// Resolve only actually loaded compiler code. Ignore unrelated installed
+/// libraries, path aliases, and the fixed platform's ordinary system runtime.
+pub(super) fn selected_compiler_libraries(
+    executable: &Path,
+    environment: &[(OsString, OsString)],
+    cwd: &Path,
+    private_root: Option<&Path>,
+) -> Result<Vec<PathBuf>> {
+    let mut seen = BTreeSet::new();
+    let mut selected = Vec::new();
+    for path in selected_loader_files(executable, environment, cwd)? {
+        let path = path.canonicalize()?;
+        if is_compiler_code_library(&path, private_root) && seen.insert(path.clone()) {
+            selected.push(path);
+        }
+    }
+    Ok(selected)
+}
+
 pub(super) fn prepare_loader_search(
     builder: &mut ToolchainPackageBuilder,
     executables: &[PathBuf],
@@ -299,6 +369,34 @@ pub(super) fn prepare_search(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn selected_compiler_code_includes_distribution_and_private_libraries() {
+        for path in [
+            "/usr/lib/libclang-cpp.so.23.1",
+            "/usr/lib/libLLVM.so.23.1",
+            "/usr/lib/libisl.so.23",
+            "/usr/lib/libmpc.so.3",
+            "/usr/lib/libcustom.so",
+            "/usr/lib/libzstd.so.1",
+            "/usr/local/lib/libcustom.so",
+            "/opt/compiler/lib/libcustom.so",
+        ] {
+            assert!(is_compiler_code_library(Path::new(path), None), "{path}");
+        }
+        assert!(!is_compiler_code_library(
+            Path::new("/usr/lib/libc.so.6"),
+            None
+        ));
+        assert!(!is_compiler_code_library(
+            Path::new("/usr/lib/libstdc++.so.6"),
+            None
+        ));
+        assert!(is_compiler_code_library(
+            Path::new("/usr/lib/custom/libcode.so"),
+            Some(Path::new("/usr/lib/custom"))
+        ));
+    }
 
     #[test]
     fn loader_selection_parser_preserves_requested_names() -> Result<()> {

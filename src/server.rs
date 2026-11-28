@@ -854,6 +854,7 @@ type SccacheResponse = Message<Response, Pin<Box<dyn Future<Output = Result<Resp
 /// Whenever a request is receive a `Request` message is sent which will reset
 /// the idle shutdown timer, and otherwise a `Shutdown` message indicates that
 /// a server shutdown was requested via an RPC.
+#[derive(Debug)]
 pub enum ServerMessage {
     /// A message sent whenever a request is received.
     Request,

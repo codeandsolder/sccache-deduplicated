@@ -1,177 +1,160 @@
-# Native compiler cache identity inventory
+# Native compiler cache identity
 
-Baseline: production client a83d0a2294054b26480d99a9c7fb843013af68b0,
-scheduler 50454954; managed runtime wrapper 50d90ef2. Audited 2026-11-28.
-Distinguish a result key, a transport tree ID, a preprocessor index key,
-and an installation-digest memo: these are not interchangeable.
+## Result identity (v2, protocol 8)
 
-## Final action key
+The compiler frontend owns the meaning of its result. The native action
+fingerprint for independent compiler files contains exactly two components: `compiler/semantic` (the frontend
+digest) and `native/output-contract` (required/optional artifact roles and
+types). The schema separates incompatible key interpretations.
 
-The BLAKE3 typed hash of the schema and ordered map of component names to
-content digests, in build-runtime's ActionFingerprint::key. The selected
-result fingerprint replaces the exact execution fingerprint when available.
-The wire layer adds native/output-contract in either case.
+Platform admission, the composed root, mounts, toolchain package, input tree,
+command environment, umask and output delivery paths are execution and transport
+data, not additional independent-file cache-key components. Generated codegen trees retain their logical output root because rlink artifacts embed logical object paths. Link planning and final linking are independent scheduler-owned actions keyed by their actual generated and selected linker inputs. Generic non-compiler execution retains its exact execution identity. There is no proc-macro or
+dynamic-library exception that switches compiler results to exact identity.
 
-| Component | Purpose |
-| --- | --- |
-| schema | Version the interpretation of the components |
-| compiler/semantic | Compiler frontend identity |
-| compiler/toolchain | Actual packaged compiler, helpers and runtime |
-| compiler/environment | Residual compiler environment |
-| compiler/input-closure (Rust) | Transitive filesystem input identity |
-| platform | Configured execution platform contract digest, not a worker ID |
-| command/umask | Output file creation permissions |
-| output/path/NAME (generated trees) | Logical output root, potentially embedded in generated artifacts |
-| native/output-contract | Sorted required/optional named artifact roles and kinds |
+## C / C++
 
-Schema native-compiler-result-v1 is used for eligible ordinary compiler
-results. Exact execution (native-linux-bwrap-v4) instead hashes:
-command/executable, command/arguments (ordered vector), command/cwd,
-command/umask, each supplied environment name/value, platform, every
-mount path and tree ID, every named output path, composed root/tree and
-native/output-contract. This is used for opaque extensions, proc macros,
-and compilation without a result-identity policy. The composed filesystem
-rather than the transport recipe is the root identity. Scheduler job IDs,
-worker IDs, admission times, quotas, transfer statistics and leases are not
-independent key fields.
+Hash the compiler, language/driver mode, semantic options, preprocessed program
+(including expanded macros), selected auxiliary inputs and assembler. For GCC,
+hash the actual selected frontend and specs file, not its installation tree.
+Native GCC/Clang results use driver bytes, actual loaded compiler-code shared
+libraries, and the assembler selected by this invocation, rather than a version
+banner or the default assembler discovered for an unrelated invocation. The
+managed system runtime is not an additional compiler identity. Distribution
+compiler-code libraries (including split Clang/LLVM and GCC numeric libraries)
+and private installation dependencies remain actual compiler inputs.
+Native CPU identity uses the actual lowered target flags in the worker argument
+list, without a separate expansion fingerprint or original native request. Source basenames remain where they identify object contents.
+Hash declared environment dependencies as effective name/value assignments;
+ordering and overridden assignments are not semantic inputs. Darwin SDK and
+deployment variables are removed before discovery and execution on non-Darwin
+targets, including Linux-targeted Clang cross compilers. GCC does not consume
+Clang driver overrides. Query the actual target only when those settings are
+present. Arbitrary custom
+cache-buster environment values are not inputs; forced recache is a cache
+operation, not a distinct result identity.
 
-## C / C++ frontend
+Do not hash native debug compilation directories, directory spellings in line
+markers, debug/file/macro prefix-map operands, or independent output destinations.
+Actual expanded string literals remain inputs, including date/time macro
+expansions from `SOURCE_DATE_EPOCH`. That setting is not a separate result
+fingerprint for ordinary preprocessed C and is not passed to its worker. Ordinary single-object outputs
+use the same execution destination. Multi-artifact output relationships and
+runtime profiling destinations remain meaningful inputs.
 
-src/compiler/c.rs, HashKeyParams::compute, CACHE_VERSION 15:
-compiler executable digest (combined with compiler version string if known);
-C++ driver flag; version; language; ordered common and architecture
-arguments; auxiliary content digests (extra hash files, resolved native CPU
-probe, Cargo path context), external assembler digest; source basename
-presence marker and basename if applicable; selected environment; effective
-debug compilation directory when debug output observes it; entire
-preprocessed stream. Compiler source bytes, expanded headers, macros and
-source line markers determine the compiled program and debug information.
-The source basename can occur in ELF STT_FILE. Auxiliary files include
-assembler .incbin/.include dependencies and plugin inputs. Native CPU
-resolution currently hashes the complete compiler -### cc1 response, not
-just the target features. This can unnecessarily retain incidental paths.
+## Rust
 
-Selected environment: SCCACHE_C_CUSTOM_CACHE_BUSTER (explicit partition),
-MACOSX_DEPLOYMENT_TARGET, IPHONEOS_DEPLOYMENT_TARGET, TVOS_DEPLOYMENT_TARGET,
-WATCHOS_DEPLOYMENT_TARGET, SDKROOT (target SDK), CCC_OVERRIDE_OPTIONS
-(compiler override arguments).
+Hash the actual compiler driver and loader-selected compiler libraries, target and
+semantic arguments (effective codegen fields, emission sets and deduplicated
+cfg predicates and effective check-cfg expectation sets), selected source and binary dependencies (including selected
+standard libraries), extern name-to-content bindings, auxiliary inputs,
+static libraries, custom target contents and explicitly observed environment.
+Dependency files are generated in the receiving checkout from the discovery
+records. The compiler action does not emit them. `--emit=dep-info`, the
+`-Zdep-info-omit-d-target` delivery policy and the `artifacts` JSON notification
+flag do not contribute to native result identity. Generate artifact notifications
+for the actual receiving paths on hits and misses; preserve other diagnostic
+controls. Parse rustc's unambiguous per-file prerequisite rules and validate
+the combined target rule rather than splitting on ambiguous escaped spaces.
+Native nightly dep-info reports binary dependencies; stable compilers and
+proc-macro compilations discover successful file reads in the dependency probe,
+rather than treating a package tree as a dependency. The trace tool is part of
+the managed runtime. Fixed system runtime files and probe scratch are not
+project dependencies. The compiler version banner is discovery data, not an
+additional digest input. Resolve the actual ELF dependency closure, including
+versioned LLVM shared libraries, not every file with a shared-library suffix
+in the installation. Managed system runtime libraries do not contribute to
+private toolchain identity. Native execution does not compute an archive
+transport key or read target installation ledgers. Explicit externs are keyed once by name, modifiers
+and content, independently of filename ordering or repeated discovery.
+An originating CPU profile is only hashed if the effective invocation still
+requests native CPU or tuning; successfully lowered explicit target arguments
+already identify the worker compilation. Normalize rustc codegen option aliases,
+static defaults, overwritten scalar assignments and independent field order.
+Preserve append order for metadata salts and linker/LLVM arguments, the
+frame-pointer ratchet, and distinct raw versus effective optimization/debug
+settings when a short flag overrides a long option. Rustc merges repeated
+check-cfg declarations by name and value; any-value dominates finite sets,
+and any-name disables exhaustive names without disabling value checking.
+Use the parsed sets, not their CLI order, grouping, or literal spelling.
+Retain distinct enabled/disabled checking, empty value sets and bare cfg
+predicates. The original options still go to rustc for validation/diagnostics. An
+omitted target and explicit host target identify the same compiler result.
+Explicit JSON targets use the canonical file stem and selected file contents,
+not the path spelling. Named targets use the compiler-reported built-in list,
+then the first matching `RUST_TARGET_PATH` file or installed target spec;
+only the selected specification participates. Preserve observed search-path
+environment values, otherwise retain only the selected directory for execution.
+Physical input layout preserves JSON aliases whose resolved names lack the
+`.json` suffix. Target specifications discovered again by tracing are not
+hashed a second time.
+Native nightly metadata-only and rlib-only results key the binary operands
+selected by rustc, not all explicit extern candidate files. A separate rlib
+supplied alongside selected rmeta contributes no digest; an entirely unused
+extern contributes its name and modifiers, not file contents. Reuse the
+already-computed selected dependency digests. Native-linking results retain
+linkable inputs, and the execution packager can still deliver siblings.
+Native library declarations are discovered in the managed nightly compiler's
+expanded dependency pass, including source attributes produced by macros and
+conditional compilation. Apply command-line kind and rename overrides in rustc
+order. Resolve selected archives using the compiler-reported target filename
+convention and ordered native search directories; metadata-only compilations,
+shadowed archives and unrelated files do not contribute identity. Preserve
+request order and missing slots. Ordinary bundling keys framed ordered member
+names and actual contents; the compiler's selected Mach-O slice is sufficient.
+Packed or directly linked archives are normalized before worker execution,
+not just in the key: GNU archives are reserialized deterministically with
+ordered members, symbol-to-member associations and recomputed index offsets.
+Packed thin archives become self-contained regular archives. Other recognized
+archive layouts normalize creation metadata without rewriting their index or
+layout; unsupported layouts retain exact bytes. When source/proc macros observe
+the raw archive, retain the original bytes instead of substituting normalized
+ones. Normalized bytes are the input to both the digest and worker packaging.
+Unmaterialized thin archives key and package the actual external members.
+Source-aware archive discovery requires the managed nightly; narrow structured
+compiler-native dependency output would eliminate expanded-source serialization
+cost (tracked in #538).
 
-Cargo canonical path-context: domain; mapped cwd; mapped input filename;
-named non-dependency output paths; physical and canonical prefix-map pairs
-when relevant to source literals, flags or assembler directives. The
-assembly heuristic treats any .file or numeric escape as possibly observing
-all maps. It has not been demonstrated that each such dependency is necessary.
-Dependency file destinations are not compiler result fields. Split DWARF,
-coverage and other linked artifacts can observe destination paths.
+Standard Cargo build paths used by compiler environment observations are
+normalized for both key and execution. The build-script output root is
+`/generated`. The dispatch validator uses the identical realized environment.
+Rustc embeds the physical working directory even without debug information;
+native commands normalize it with a default prefix map to `/sccache/cwd`.
+Only an explicit restricted remap scope retains cwd identity. Do not hash
+all Cargo environment variables. Retain the actual package identity where ordinary proc macros use it,
+compiler switches supplied through the environment, and Clippy policy and flags.
+Resolve duplicate environment assignments before discovery, hashing or execution;
+explicit observations are not repeated in the native compiler or Clippy environment
+group. Dep-info preserves unset versus empty values as a typed observation;
+key only the observed value, not a second copy of the caller environment.
+Managed build-path observations use the realized canonical environment,
+including synthesized Cargo build-directory defaults.
+Normalize unobserved Rust bootstrap permissions to the effective scope of the
+current crate; unrelated crate names do not affect either execution or identity.
+Global bootstrap and crate-specific permission remain distinct. The obsolete
+`RUSTC_FORCE_UNSTABLE` setting is not an implicit compiler input. Preserve
+`SOURCE_DATE_EPOCH` when explicitly observed, consumed by opaque macros, or
+needed by an unsplit native linker; ordinary Rust codegen does not key it.
+Keep Rust metadata/output-name salts: changing `-C extra-filename` was verified
+to change both rlib and rmeta contents even with identical metadata salt.
 
-## Rust frontend
+## Execution
 
-src/compiler/rust.rs generate_hash_key, CACHE_VERSION 10:
-version; conditional native-library-input, Clippy execution, external
-Clippy config, selected-binary-dependency, Cargo-manifest, proc-macro package
-tree, metadata-only-output markers; sorted immediate sysroot lib shared
-library content digests (plus configured archive if any); canonical-layout
-marker; optional dlltool closure; ordered argument pairs (sorted cfg
-entries, excluding extern, library search and output directory; target JSON
-pathname replaced with its contents; local linker-only args excluded for
-split link); resolved native CPU profile; source and selected binary
-dependency content digests; extern name/content bindings; static-library
-digests; target JSON digest; observed environment names, values and
-presence; broad Cargo environment for opaque or nonprecise discovery;
-Clippy environment; mapped cwd; full compiler verbose version string.
+Forward ordinary caller build variables to compiler discovery rather than
+stripping them before they can be observed. Process-local instrumentation and
+jobserver state remain transport concerns.
 
-The arguments and input hashes determine code, metadata and diagnostics.
-Extern bindings distinguish otherwise identical dependency sets used under
-different names. DLL tool and target CPU inputs affect code generation and
-import libraries. Observed environment includes env!/option_env! and
-explicitly tracked macro inputs. Broad Cargo and proc-macro-tree rules
-are conservative fallbacks, not proven dependencies. Sources can include
-generated files, manifests, Clippy configs, and the full package tree for
-opaque macros (excluding known output and VCS directories). Whole-package
-enumeration must eventually be replaced with actual dependency discovery.
+Use the resident shared compiler runtime. Allowlist compiler execution variables,
+preserve explicit observations, normalize locale and scratch, and set native
+umask to 022. Packaging may still select different files for different languages
+and compiler features; it does not select a different key algorithm. Filesystem
+manifests and output destinations still verify and deliver actual bytes. Installed
+file memo validity and transport tree IDs are not result fingerprints.
 
-## Native environment
+The scope is ordinary compiler workloads, not arbitrary plugins engineered to
+observe orchestration state or system runtime files. Build-specific semantic
+inputs must be discovered or supplied through the frontend, never approximated
+by adding the entire execution envelope to the result key.
 
-src/compiler/native.rs compiler_environment hashes each selected name and
-value, length framed. Common: LANG, LANGUAGE, TZ, TERM, SOURCE_DATE_EPOCH,
-PATH, LC_*, LD_*. C: GCC_*, CLANG_*, CCC_*, COMPILER_PATH, LIBRARY_PATH,
-CPATH, C_INCLUDE_PATH, CPLUS_INCLUDE_PATH, OBJC_INCLUDE_PATH,
-DEPENDENCIES_OUTPUT, SUNPRO_DEPENDENCIES. Rust: RUSTC_*, RUST_MIN_STACK,
-RUST_BACKTRACE, RUST_LIB_BACKTRACE, RUSTFLAGS. Exact mode hashes the full
-supplied environment instead. Ordinary native C normalizes locale, removes
-consumed include paths and selects a private compiler search path; ordinary
-Rust normalizes locale, selects a package-owned PATH and normalizes loader
-selection where applicable. These are execution changes, not merely
-exclusions from the digest. Preserve explicit observations; do not hash
-the pre-resolution search path again if its only effect is resolved content.
-
-Rust control-variable filtering excludes orchestration prefixes SCCACHE_,
-CODEANDSOLDER_, RUST_SKILLS2_, CARGO_TERM_, CARGO_PROFILE_, CARGO_BUILD_
-(except CARGO_BUILD_BUILD_DIR), CARGO_REGISTRIES_, CARGO_HTTP_, CARGO_NET_,
-GITHUB_, RUNNER_, ACTIONS_, RUSTUP_; specific driver, jobserver, shell and
-systemd control variables. Explicitly observed variables take precedence.
-See compiler_control_environment and compiler_execution_environment for
-the authoritative predicate. CLIPPY_* is retained for Clippy.
-
-## Trees and storage identity
-
-Tree ID is the typed BLAKE3 hash of root metadata and ordered relative
-paths and entries. Directory: mode and mtime (seconds, nanoseconds).
-Regular file: content hash, logical length, mode, mtime. Symlink: raw
-target bytes and mtime. Hardlink: target tree path. Ownership, ACLs and
-extended attributes are excluded. The tree describes actual sandbox
-contents, not only compiler semantics. Installed toolchain timestamps and
-modes are normalized; Rust inputs normalize timestamps, ordinary Rust
-closure additionally zeros timestamps. Exact C still includes input
-metadata. These mtime fields must not be mistaken for content hashes.
-
-Result ID is separate: artifact roles, types, content/tree digests and
-metadata, stdout and stderr. Identical artifacts alone (especially Clippy
-metadata) do not prove identical complete results. The result is not hashed
-into its own lookup key.
-
-## Other lookup keys
-
-C direct preprocessor index (not used by ordinary native compilation):
-compiler digest, C++ driver bit, format 3, ignore-time-macro policy,
-language, preprocessor/common/architecture arguments, auxiliary hashes,
-assembler digest, input-basename-presence, SCCACHE_C_CUSTOM_CACHE_BUSTER,
-CPATH, C_INCLUDE_PATH, CPLUS_INCLUDE_PATH, OBJC_INCLUDE_PATH,
-OBJCPLUS_INCLUDE_PATH, encoded input pathname and source content digest.
-The selected include files are subsequently validated. This is an index
-to a result key, not the result key.
-
-Weak toolchain archive lookup: C executable pathname + executable digest;
-Rust package schema, shared-library hashes, target triple, physical sysroot
-when noncanonical, target std installation-manifest presence/digest and
-optional dlltool closure. Native uses the actual tree ID instead.
-Installed-file digest memo additionally checks file identity, size and
-mtime/ctime, with namespace/credential scope; these are local memo validity
-checks, not separately supplied native action fields. Mutable source content
-is hashed. Timestamp-based local memo validity is still a separate concern.
-
-## Reproduced defect and candidate
-
-On the deployed client the BoringSSL md5-586-apple.S source compiled to
-identical SHA256 d3810d7d99d615d619ae3a56e4d023dde070df6a27f672bae6de83f5c0fdfa7a
-for every tested destination and lease, but changing only output filename
-missed with and without debug flags. Changing the Cargo lease alone hit.
-Evidence: Asus /home/jan/build/sccache-key-audit-20261128/assembly-probe.log.
-The source is conditionally empty on Linux. These data prove the delivery
-filename defect, not the attribution of all same-name production duplicates.
-
-Candidate: native canonical ordinary single-object compilation uses one
-stable sandbox output path and a relocatable artifact policy. Required
-multi-output relationships, profiling, recorded compiler invocations and
-opaque extensions retain their path identity. The physical delivery path
-is preserved for publication. The policy changes affected keys, so do not
-deploy repeatedly without validation.
-
-New diagnostic instrumentation captures component hashes of the actual
-serialized bytes entering C frontend, C path context, Rust frontend and
-final native action keys, using existing request traces without raw values.
-The instrumentation itself is key-neutral; it allows comparing the otherwise
-opaque frontend digest of actual duplicate results. Regressions cover
-destination renaming, independent sandbox execution and evidence transfer
-from executor to daemon. No claim of production recovery until measured
-against real workload.
+Protocol 8 / rollout epoch 9 changes the compiler-result wire structure and
+requires a coordinated client/scheduler/worker upgrade.

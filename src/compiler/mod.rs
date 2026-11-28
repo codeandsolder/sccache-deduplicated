@@ -15,6 +15,7 @@
 #[macro_use]
 mod args;
 mod c;
+mod c_driver_environment;
 #[cfg(all(
     feature = "dist-client",
     target_os = "linux",
@@ -38,16 +39,21 @@ mod msvc;
 #[cfg(all(feature = "dist-client", target_os = "linux"))]
 mod native;
 #[cfg(all(feature = "dist-client", target_os = "linux"))]
-pub use native::{NativeCompilerClient, ResultIdentityPolicy};
+pub use native::{CompilerPackagingPolicy, NativeCompilerClient};
+mod native_archive;
 mod nvcc;
 mod nvhpc;
 mod ptxas;
 mod response_files;
 mod rust;
 mod rust_dlltool;
+mod rust_key_arguments;
+mod rust_key_cfg;
 #[cfg(target_os = "linux")]
 pub mod rust_link;
+mod rust_native_library;
 mod rust_response;
+mod rust_target;
 mod tasking_vx;
 #[macro_use]
 mod counted_array;

@@ -2478,7 +2478,7 @@ fn compiler_script() -> &'static str {
 set -eu
 mkdir -p build
 "$2" -c probe.c -o build/probe.o -MMD -MF build/probe-c.d
-"$3" --crate-name probe --crate-type rlib --edition=2024 --emit=link,dep-info --out-dir build probe.rs
+"$3" --crate-name probe --crate-type rlib --edition=2024 --emit=link,dep-info --out-dir build --remap-path-prefix="$PWD=/sccache/cwd" probe.rs
 cp build/probe.o gcc-reference.o
 cp build/libprobe.rlib rust-reference.rlib
 for i in 1 2 ${4:+3 4}; do
@@ -2486,8 +2486,8 @@ for i in 1 2 ${4:+3 4}; do
     rm -f build/probe.o build/libprobe.rlib build/probe.d build/probe-c.d
     "$1" "$2" -c probe.c -o build/probe.o -MMD -MF build/probe-c.d
     "$1" "$3" --crate-name probe --crate-type rlib --edition=2024 --emit=link,dep-info --out-dir build probe.rs
-    cmp gcc-reference.o build/probe.o
-    cmp rust-reference.rlib build/libprobe.rlib
+    cmp gcc-reference.o build/probe.o >&2
+    cmp rust-reference.rlib build/libprobe.rlib >&2
     test -s build/probe-c.d
     test -s build/probe.d
 done
@@ -2676,11 +2676,11 @@ fn run_environment_audit(
 ) -> Result<()> {
     fs::write(
         directory.join("audit.rs"),
-        b"pub const OBSERVED: &str = env!(\"NATIVE_AUDIT_OBSERVED\");\n",
+        b"pub const OBSERVED: Option<&str> = option_env!(\"SOURCE_DATE_EPOCH\");\n",
     )?;
-    let compile = |unused: &str, observed: &str| -> Result<((String, String), Vec<u8>)> {
-        let output = service
-            .command(env!("CARGO_BIN_EXE_sccache"))
+    let compile = |unused: &str, observed: Option<&str>| -> Result<((String, String), Vec<u8>)> {
+        let mut command = service.command(env!("CARGO_BIN_EXE_sccache"));
+        command
             .arg(rustc)
             .args([
                 "--crate-name",
@@ -2695,23 +2695,300 @@ fn run_environment_audit(
             ])
             .current_dir(directory)
             .env("SCCACHE_CONF", config)
-            .env("NATIVE_AUDIT_UNUSED", unused)
-            .env("SCCACHE_LOG", "sccache::native_action=info")
-            .env("NATIVE_AUDIT_OBSERVED", observed)
-            .output()?;
+            .env("HOSTNAME", unused)
+            .env("RUSTC_BOOTSTRAP", unused)
+            .env("SCCACHE_LOG", "sccache::native_action=info");
+        if let Some(value) = observed {
+            command.env("SOURCE_DATE_EPOCH", value);
+        } else {
+            command.env_remove("SOURCE_DATE_EPOCH");
+        }
+        let output = command.output()?;
         let report = action_report(&output)?;
         Ok((report, fs::read(directory.join("build/libaudit.rlib"))?))
     };
-    let ((key, source), first) = compile("first", "first")?;
+    let ((key, source), first) = compile("first", Some("0"))?;
     assert_eq!(source, "worker");
-    let ((same, source), second) = compile("second", "first")?;
+    let ((same, source), second) = compile("second", Some("0"))?;
     assert_eq!(source, "hit");
     assert_eq!(key, same);
     assert_eq!(first, second);
-    let ((changed, source), third) = compile("first", "second")?;
+    let ((changed, source), third) = compile("first", Some("86400"))?;
     assert_eq!(source, "worker");
     assert_ne!(key, changed);
     assert_ne!(first, third);
+    let ((absent, source), missing) = compile("first", None)?;
+    assert_eq!(source, "worker");
+    let ((empty, source), present) = compile("first", Some(""))?;
+    assert_eq!(source, "worker");
+    assert_ne!(absent, empty);
+    assert_ne!(missing, present);
+    let ((same, source), bytes) = compile("second", None)?;
+    assert_eq!((same, source), (absent, "hit".into()));
+    assert_eq!(missing, bytes);
+    Ok(())
+}
+
+fn run_rust_argument_audit(
+    service: &LocalService,
+    directory: &Path,
+    rustc: &Path,
+    config: &Path,
+) -> Result<()> {
+    fs::write(
+        directory.join("arg_audit.rs"),
+        b"#[cfg(feature=\"a\")] pub fn answer(x: u32) -> u32 { x + 1 }\n",
+    )?;
+    let compile = |flags: &[&str]| -> Result<((String, String), Vec<u8>)> {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .arg(rustc)
+            .args([
+                "--crate-name",
+                "arg_audit",
+                "--crate-type",
+                "rlib",
+                "--edition=2024",
+                "--out-dir",
+                "build",
+                "arg_audit.rs",
+            ])
+            .args(flags)
+            .current_dir(directory)
+            .env("SCCACHE_CONF", config)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
+            .output()?;
+        Ok((
+            action_report(&output)?,
+            fs::read(directory.join("build/libarg_audit.rlib"))?,
+        ))
+    };
+    let ((key, source), first) = compile(&[
+        "--emit=link,metadata",
+        "-Copt-level=2",
+        "-Cdebuginfo=1",
+        "-Cembed-bitcode=no",
+        "--cfg=feature=\"a\"",
+        "--check-cfg=cfg(feature,values(\"a\",\"b\"))",
+    ])?;
+    assert_eq!(source, "worker");
+    let ((same, source), second) = compile(&[
+        "--emit=metadata",
+        "--emit=link",
+        "-O",
+        "-Cembed_bitcode=false",
+        "--codegen",
+        "debuginfo=limited",
+        "-Copt-level=1",
+        "-Copt-level=2",
+        "--cfg=r#feature=r#\"a\"#",
+        "--check-cfg=cfg(feature,values(\"b\"))",
+        "--check-cfg=cfg(feature,values(\"a\"))",
+    ])?;
+    assert_eq!((same, source), (key.clone(), "hit".into()));
+    assert_eq!(first, second);
+    let ((changed, source), third) = compile(&[
+        "--emit=link,metadata",
+        "-Copt-level=2",
+        "-O",
+        "-Cdebuginfo=1",
+        "-Cembed-bitcode=no",
+        "--cfg=feature=\"a\"",
+        "--check-cfg=cfg(feature,values(\"a\",\"b\"))",
+    ])?;
+    assert_eq!(source, "worker");
+    assert_ne!(key, changed);
+    assert_ne!(first, third);
+    // Expectation sets affect diagnostics even when active cfgs and machine code
+    // do not change; a different lint policy must remain a distinct result.
+    let ((changed_policy, source), _) = compile(&[
+        "--emit=link,metadata",
+        "-Copt-level=2",
+        "-Cdebuginfo=1",
+        "-Cembed-bitcode=no",
+        "--cfg=feature=\"a\"",
+        "--check-cfg=cfg(feature,values(\"a\"))",
+    ])?;
+    assert_eq!(source, "worker");
+    assert_ne!(key, changed_policy);
+    Ok(())
+}
+
+/// Rustc keys explicit JSON targets by resolved stem and contents, and
+/// searches named custom targets in order without reporting them in dep-info.
+fn run_rust_target_audit(
+    service: &LocalService,
+    root: &Path,
+    rustc: &Path,
+    config: &Path,
+) -> Result<()> {
+    let directory = root.join("target-audit");
+    fs::create_dir_all(directory.join("one"))?;
+    fs::create_dir_all(directory.join("two"))?;
+    fs::create_dir_all(directory.join("build"))?;
+    fs::write(
+        directory.join("probe.rs"),
+        b"#![feature(no_core)]\n#![no_core]\n",
+    )?;
+    let specification = Command::new(rustc)
+        .args(["-Zunstable-options", "--print", "target-spec-json"])
+        .output()?;
+    ensure!(
+        specification.status.success(),
+        "cannot obtain host target spec"
+    );
+    for path in [
+        "one/alpha.json",
+        "two/alpha.json",
+        "two/beta.json",
+        "one/alpha.spec",
+    ] {
+        fs::write(directory.join(path), &specification.stdout)?;
+    }
+    std::os::unix::fs::symlink("alpha.spec", directory.join("one/alias.json"))?;
+    let compile = |target: &str, search: &str| -> Result<((String, String), Vec<u8>)> {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .arg(rustc)
+            .args([
+                "--crate-name",
+                "target_audit",
+                "--crate-type",
+                "rlib",
+                "--edition=2024",
+                "--emit=metadata",
+                "--out-dir",
+                "build",
+                "-Zunstable-options",
+                "--target",
+                target,
+                "probe.rs",
+            ])
+            .current_dir(&directory)
+            .env("SCCACHE_CONF", config)
+            .env("RUST_TARGET_PATH", search)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
+            .output()?;
+        Ok((
+            action_report(&output)?,
+            fs::read(directory.join("build/libtarget_audit.rmeta"))?,
+        ))
+    };
+    let ((explicit, source), first) = compile("one/alias.json", "one:two")?;
+    assert_eq!(source, "worker");
+    let ((same, source), second) = compile("two/alpha.json", "two:one")?;
+    assert_eq!((same, source), (explicit.clone(), "hit".into()));
+    assert_eq!(first, second);
+    let ((alias, source), alias_bytes) = compile("one/alpha.json", "two:one")?;
+    assert_eq!((alias, source), (explicit.clone(), "hit".into()));
+    assert_eq!(first, alias_bytes);
+    let ((beta, source), _) = compile("two/beta.json", "one:two")?;
+    assert_eq!(source, "worker");
+    assert_ne!(explicit, beta);
+    let ((named, source), first_named) = compile("alpha", "one:two")?;
+    assert_eq!(source, "worker");
+    assert_ne!(explicit, named);
+    let ((same, source), second_named) = compile("alpha", "two:one")?;
+    assert_eq!((same, source), (named.clone(), "hit".into()));
+    assert_eq!(first_named, second_named);
+    let mut changed: serde_json::Value = serde_json::from_slice(&specification.stdout)?;
+    changed["max-atomic-width"] = serde_json::json!(32);
+    fs::write(
+        directory.join("two/alpha.json"),
+        serde_json::to_vec(&changed)?,
+    )?;
+    let ((same, source), _) = compile("alpha", "one:two")?;
+    assert_eq!((same, source), (named.clone(), "hit".into()));
+    let ((different, source), _) = compile("alpha", "two:one")?;
+    assert_eq!(source, "worker");
+    assert_ne!(different, named);
+    Ok(())
+}
+
+/// The epoch affects C only through the expansion that the compiler consumes.
+/// Equal expanded dates must share a result even when the epochs differ.
+fn run_c_epoch_audit(service: &LocalService, root: &Path, config: &Path) -> Result<()> {
+    let directory = root.join("epoch");
+    fs::create_dir(&directory)?;
+    fs::write(directory.join("date.c"), b"const char *date = __DATE__;\n")?;
+    let compile = |epoch: &str| -> Result<((String, String), Vec<u8>)> {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .args(["/usr/bin/gcc", "-c", "date.c", "-o", "date.o"])
+            .current_dir(&directory)
+            .env("SCCACHE_CONF", config)
+            .env("SOURCE_DATE_EPOCH", epoch)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
+            .output()?;
+        Ok((action_report(&output)?, fs::read(directory.join("date.o"))?))
+    };
+    let ((key, source), first) = compile("0")?;
+    assert_eq!(source, "worker");
+    assert!(first.windows(11).any(|bytes| bytes == b"Jan  1 1970"));
+    let ((same, source), second) = compile("1")?;
+    assert_eq!((same, source), (key.clone(), "hit".into()));
+    assert_eq!(first, second);
+    let ((different, source), third) = compile("86400")?;
+    assert_eq!(source, "worker");
+    assert_ne!(key, different);
+    assert!(third.windows(11).any(|bytes| bytes == b"Jan  2 1970"));
+    Ok(())
+}
+
+fn run_c_driver_environment_audit(
+    service: &LocalService,
+    root: &Path,
+    config: &Path,
+) -> Result<()> {
+    let directory = root.join("driver-environment");
+    fs::create_dir(&directory)?;
+    fs::write(
+        directory.join("driver.c"),
+        b"int driver_probe(int x) { return x * 3 + 1; }\n",
+    )?;
+    let compile = |driver: &str,
+                   target: Option<&str>,
+                   deployment: &str,
+                   sdk: &str,
+                   override_options: &str|
+     -> Result<((String, String), Vec<u8>)> {
+        let mut command = service.command(env!("CARGO_BIN_EXE_sccache"));
+        command
+            .args([driver, "-c", "driver.c", "-o", "driver.o"])
+            .current_dir(&directory)
+            .env("SCCACHE_CONF", config)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
+            .env("MACOSX_DEPLOYMENT_TARGET", deployment)
+            .env("SDKROOT", sdk)
+            .env("CCC_OVERRIDE_OPTIONS", override_options);
+        if let Some(target) = target {
+            command.arg(target);
+        }
+        let output = command.output()?;
+        Ok((
+            action_report(&output)?,
+            fs::read(directory.join("driver.o"))?,
+        ))
+    };
+    let ((gcc_key, source), first) = compile("/usr/bin/gcc", None, "10.14", "/unused-a", "^-O0")?;
+    assert_eq!(source, "worker");
+    let ((same, source), second) = compile("/usr/bin/gcc", None, "12.0", "/unused-b", "^-O2")?;
+    assert_eq!((same, source), (gcc_key, "hit".into()));
+    assert_eq!(first, second);
+    let clang = "/usr/bin/clang";
+    let ((clang_key, source), first) = compile(clang, None, "10.14", "/unused-a", "")?;
+    assert_eq!(source, "worker");
+    let ((same, source), second) = compile(clang, None, "12.0", "/unused-b", "")?;
+    assert_eq!((same, source), (clang_key, "hit".into()));
+    assert_eq!(first, second);
+    // These same environment variables are real inputs for a Darwin target.
+    let target = Some("--target=x86_64-apple-darwin");
+    let ((old, source), first) = compile(clang, target, "10.14", "/unused-a", "")?;
+    assert_eq!(source, "worker");
+    let ((new, source), second) = compile(clang, target, "12.0", "/unused-a", "")?;
+    assert_eq!(source, "worker");
+    assert_ne!(old, new);
+    assert_ne!(first, second);
     Ok(())
 }
 
@@ -2766,6 +3043,362 @@ fn native_compiler_semantic_reuse_across_ephemeral_inputs() -> Result<()> {
         assert_ne!(key, changed);
         assert_ne!(artifact, bytes);
     }
+    run_c_epoch_audit(&service, &root, &config)?;
+    run_c_driver_environment_audit(&service, &root, &config)?;
+    service.stop()?;
+    fleet.finish()?;
+    Ok(())
+}
+
+fn embedded_native_probe_member(bytes: &[u8]) -> Result<Vec<u8>> {
+    use object::{Object, ObjectSection};
+    use std::io::Read;
+    let mut rlib = ar::Archive::new(bytes);
+    while let Some(entry) = rlib.next_entry() {
+        let mut entry = entry?;
+        if entry.header().identifier() != b"libprobe.a" {
+            continue;
+        }
+        let mut wrapper = Vec::new();
+        entry.read_to_end(&mut wrapper)?;
+        let object = object::File::parse(wrapper.as_slice())?;
+        let section = object
+            .section_by_name(".bundled_lib")
+            .context("missing packed archive section")?;
+        let bytes = section.data()?;
+        let archive = object::read::archive::ArchiveFile::parse(bytes)?;
+        assert!(!archive.is_thin());
+        let index = archive.symbols()?.context("missing symbol index")?;
+        for symbol in index {
+            let symbol = symbol?;
+            if symbol.name() == b"native_value" {
+                return Ok(archive.member(symbol.offset())?.data(bytes)?.to_vec());
+            }
+        }
+    }
+    anyhow::bail!("missing packed native object")
+}
+
+fn run_packed_archive_audit(
+    service: &LocalService,
+    source: &Path,
+    rustc: &Path,
+    config: &Path,
+) -> Result<()> {
+    fs::write(
+        source.join("packed.rs"),
+        br#"
+        macro_rules! native { () => {
+            #[link(name="probe", kind="static", modifiers="+whole-archive")]
+            unsafe extern "C" { fn native_value() -> i32; }
+        } }
+        native!();
+        pub fn rust_value() -> i32 { unsafe { native_value() } }
+    "#,
+    )?;
+    let archive_path = source.join("one/libprobe.a");
+    let member = source.join("one/probe.o");
+    fs::copy(source.join("probe.o"), &member)?;
+    let make_archive = |mode: &str| -> Result<()> {
+        if archive_path.exists() {
+            fs::remove_file(&archive_path)?;
+        }
+        ensure!(
+            Command::new("/usr/bin/ar")
+                .args([mode, "libprobe.a", "probe.o"])
+                .current_dir(source.join("one"))
+                .status()?
+                .success(),
+            "archive creation failed"
+        );
+        Ok(())
+    };
+    let compile = || -> Result<((String, String), Vec<u8>)> {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .arg(rustc)
+            .args([
+                "--crate-name",
+                "packed",
+                "--crate-type",
+                "rlib",
+                "--edition=2024",
+                "--emit=link",
+                "--out-dir",
+                "build",
+                "-Lnative=one",
+                "packed.rs",
+            ])
+            .current_dir(source)
+            .env("SCCACHE_CONF", config)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
+            .output()?;
+        Ok((
+            action_report(&output)?,
+            fs::read(source.join("build/libpacked.rlib"))?,
+        ))
+    };
+    make_archive("crs")?;
+    let ((key, kind), first) = compile()?;
+    assert_eq!(kind, "worker");
+    assert_eq!(embedded_native_probe_member(&first)?, fs::read(&member)?);
+    let mut archive_bytes = fs::read(&archive_path)?;
+    archive_bytes[24..36].copy_from_slice(b"123456      ");
+    fs::write(&archive_path, archive_bytes)?;
+    let ((same, kind), second) = compile()?;
+    assert_eq!((same, kind), (key.clone(), "hit".into()));
+    assert_eq!(first, second);
+    make_archive("crsT")?;
+    let thin = fs::read(&archive_path)?;
+    let ((same, kind), third) = compile()?;
+    assert_eq!((same, kind), (key.clone(), "hit".into()));
+    assert_eq!(first, third);
+    fs::copy(source.join("one/member.o"), &member)?;
+    assert_eq!(fs::read(&archive_path)?, thin);
+    let ((changed, kind), fourth) = compile()?;
+    assert_eq!(kind, "worker");
+    assert_ne!(changed, key);
+    assert_eq!(embedded_native_probe_member(&fourth)?, fs::read(member)?);
+    assert_ne!(first, fourth);
+    Ok(())
+}
+
+fn run_rust_delivery_audit(
+    service: &LocalService,
+    source: &Path,
+    rustc: &Path,
+    config: &Path,
+) -> Result<()> {
+    fs::write(
+        source.join("delivery.rs"),
+        br#"pub const DATA: &[u8] = include_bytes!("ending\\");"#,
+    )?;
+    fs::write(source.join("ending\\"), b"initial")?;
+    let compile = |out: &str, extra: &[&str]| -> Result<(std::process::Output, Vec<u8>)> {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .arg(rustc)
+            .args([
+                "--crate-name",
+                "delivery_audit",
+                "--crate-type",
+                "rlib",
+                "--edition=2024",
+                "--error-format=json",
+                "--out-dir",
+                out,
+                "delivery.rs",
+            ])
+            .args(extra)
+            .current_dir(source)
+            .env("SCCACHE_CONF", config)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
+            .output()?;
+        action_report(&output)?;
+        Ok((
+            output,
+            fs::read(source.join(out).join("libdelivery_audit.rlib"))?,
+        ))
+    };
+    let artifacts = |output: &std::process::Output| -> Vec<serde_json::Value> {
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|message| message["$message_type"] == "artifact")
+            .collect()
+    };
+    let (first, original) = compile("delivery-first", &["--emit=metadata,link"])?;
+    let (key, kind) = action_report(&first)?;
+    assert_eq!(kind, "worker");
+    assert!(artifacts(&first).is_empty());
+    let (second, restored) = compile(
+        "delivery-second",
+        &[
+            "--emit=metadata,link,dep-info",
+            "--json=artifacts",
+            "-Zdep-info-omit-d-target",
+        ],
+    )?;
+    assert_eq!(action_report(&second)?, (key.clone(), "hit".into()));
+    assert_eq!(original, restored);
+    assert_eq!(
+        fs::read(source.join("delivery-first/libdelivery_audit.rmeta"))?,
+        fs::read(source.join("delivery-second/libdelivery_audit.rmeta"))?
+    );
+    assert_eq!(
+        artifacts(&second),
+        [
+            serde_json::json!({"$message_type":"artifact","artifact":"delivery-second/delivery_audit.d","emit":"dep-info"}),
+            serde_json::json!({"$message_type":"artifact","artifact":"delivery-second/libdelivery_audit.rmeta","emit":"metadata"}),
+            serde_json::json!({"$message_type":"artifact","artifact":"delivery-second/libdelivery_audit.rlib","emit":"link"}),
+        ]
+    );
+    let dep_info = fs::read_to_string(source.join("delivery-second/delivery_audit.d"))?;
+    assert!(!dep_info.contains("delivery-second/delivery_audit.d: "));
+    assert!(dep_info.contains("ending\\:\n"));
+    let (third, restored) = compile("delivery-third", &["--emit=metadata,link,dep-info"])?;
+    assert_eq!(action_report(&third)?, (key.clone(), "hit".into()));
+    assert_eq!(original, restored);
+    assert!(artifacts(&third).is_empty());
+    assert!(
+        fs::read_to_string(source.join("delivery-third/delivery_audit.d"))?
+            .starts_with("delivery-third/delivery_audit.d: ")
+    );
+    fs::write(source.join("ending\\"), b"changed")?;
+    let (changed, bytes) = compile("delivery-fourth", &["--emit=metadata,link"])?;
+    let (changed_key, kind) = action_report(&changed)?;
+    assert_ne!(changed_key, key);
+    assert_eq!(kind, "worker");
+    assert_ne!(bytes, original);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Linux Bubblewrap, GCC, Rust toolchain and ldd"]
+fn native_rust_bundled_archive_identity_follows_search_precedence() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("native-rust-archives-")
+        .tempdir_in("/tmp")?;
+    let root = temp.path().canonicalize()?;
+    let fleet = Fleet::start(&root, BTreeMap::new())?;
+    let mut service = LocalService::start(&root, &fleet, None)?;
+    let config = root.join("direct.toml");
+    fs::write(&config, "client_side_mode = false\n")?;
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()?;
+    ensure!(sysroot.status.success(), "could not discover test sysroot");
+    let rustc = PathBuf::from(String::from_utf8(sysroot.stdout)?.trim()).join("bin/rustc");
+    let source = root.join("compile");
+    for directory in ["one", "two", "build"] {
+        fs::create_dir_all(source.join(directory))?;
+    }
+    fs::write(
+        source.join("probe.c"),
+        b"int native_value(void) { return 42; }",
+    )?;
+    fs::write(
+        source.join("probe.rs"),
+        b"pub fn rust_value() -> u32 { 42 }",
+    )?;
+    let object = service
+        .command(env!("CARGO_BIN_EXE_sccache"))
+        .args(["/usr/bin/gcc", "-c", "probe.c", "-o", "probe.o"])
+        .current_dir(&source)
+        .env("SCCACHE_CONF", &config)
+        .output()?;
+    ensure!(
+        object.status.success(),
+        "C fixture compilation failed: {}",
+        String::from_utf8_lossy(&object.stderr)
+    );
+    let bytes = fs::read(source.join("probe.o"))?;
+    let archive = |dir: &str, name: &str| -> Result<()> {
+        let mut builder = ar::Builder::new(File::create(source.join(dir).join("libprobe.a"))?);
+        builder.append(
+            &ar::Header::new(name.as_bytes().to_vec(), u64::try_from(bytes.len())?),
+            bytes.as_slice(),
+        )?;
+        Ok(())
+    };
+    archive("one", "first.o")?;
+    archive("two", "second.o")?;
+    let compile = |order: [&str; 2], emit: &str| -> Result<((String, String), Vec<u8>)> {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .arg(&rustc)
+            .args([
+                "--crate-name",
+                "probe",
+                "--crate-type",
+                "rlib",
+                "--emit",
+                emit,
+                "--out-dir",
+                "build",
+                "-lstatic=probe",
+                "probe.rs",
+            ])
+            .args(order.map(|dir| format!("-Lnative={dir}")))
+            .current_dir(&source)
+            .env("SCCACHE_CONF", &config)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
+            .output()?;
+        let report = action_report(&output)?;
+        let name = if emit == "metadata" {
+            "libprobe.rmeta"
+        } else {
+            "libprobe.rlib"
+        };
+        Ok((report, fs::read(source.join("build").join(name))?))
+    };
+    let has_member = |bytes: &[u8], name: &[u8]| -> Result<bool> {
+        let mut archive = ar::Archive::new(bytes);
+        while let Some(entry) = archive.next_entry() {
+            if entry?.header().identifier() == name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    let ((first_key, source_kind), first) = compile(["one", "two"], "link")?;
+    assert_eq!(source_kind, "worker");
+    assert!(has_member(&first, b"first.o")?);
+    archive("two", "shadowed.o")?;
+    let ((same, source_kind), bytes) = compile(["one", "two"], "link")?;
+    assert_eq!((same, source_kind), (first_key.clone(), "hit".into()));
+    assert_eq!(first, bytes);
+    let ((second_key, source_kind), second) = compile(["two", "one"], "link")?;
+    assert_eq!(source_kind, "worker");
+    assert_ne!(first_key, second_key);
+    assert!(has_member(&second, b"shadowed.o")?);
+    assert!(!has_member(&second, b"first.o")?);
+    let ((metadata_key, _), metadata) = compile(["one", "two"], "metadata")?;
+    archive("one", "modified.o")?;
+    archive("two", "also_modified.o")?;
+    let ((same, source_kind), bytes) = compile(["two", "one"], "metadata")?;
+    assert_eq!((same, source_kind), (metadata_key, "hit".into()));
+    assert_eq!(metadata, bytes);
+    // A GNU thin archive has no embedded object bytes. Recompiling the
+    // external object must invalidate the bundled rlib even when the archive
+    // itself (including all its headers and symbol index) is unchanged.
+    let thin = source.join("one/libprobe.a");
+    fs::remove_file(&thin)?;
+    fs::copy(source.join("probe.o"), source.join("one/member.o"))?;
+    let status = Command::new("/usr/bin/ar")
+        .args(["crsT", "libprobe.a", "member.o"])
+        .current_dir(source.join("one"))
+        .status()?;
+    ensure!(status.success(), "thin archive creation failed");
+    let archive_bytes = fs::read(&thin)?;
+    let ((thin_key, source_kind), first) = compile(["one", "two"], "link")?;
+    assert_eq!(source_kind, "worker");
+    assert!(has_member(&first, b"member.o")?);
+    fs::write(
+        source.join("probe.c"),
+        b"int native_value(void) { return 17; }",
+    )?;
+    let object = service
+        .command(env!("CARGO_BIN_EXE_sccache"))
+        .args(["/usr/bin/gcc", "-c", "probe.c", "-o", "one/member.o"])
+        .current_dir(&source)
+        .env("SCCACHE_CONF", &config)
+        .output()?;
+    ensure!(
+        object.status.success(),
+        "thin member compilation failed: {}",
+        String::from_utf8_lossy(&object.stderr)
+    );
+    assert_eq!(fs::read(&thin)?, archive_bytes);
+    let ((changed, source_kind), second) = compile(["one", "two"], "link")?;
+    assert_eq!(source_kind, "worker");
+    assert_ne!(changed, thin_key);
+    assert_ne!(first, second);
+    let ((same, source_kind), third) = compile(["one", "two"], "link")?;
+    assert_eq!((same, source_kind), (changed, "hit".into()));
+    assert_eq!(second, third);
+    run_packed_archive_audit(&service, &source, &rustc, &config)?;
+    run_rust_delivery_audit(&service, &source, &rustc, &config)?;
     service.stop()?;
     fleet.finish()?;
     Ok(())
@@ -2940,6 +3573,8 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         namespace_compiles
     );
     run_environment_audit(&service, &direct, &rustc, &direct_config)?;
+    run_rust_argument_audit(&service, &direct, &rustc, &direct_config)?;
+    run_rust_target_audit(&service, &direct, &rustc, &direct_config)?;
     assert_eq!(service.stats()?.dist_errors, 0);
     service.stop()?;
     let (scheduler, worker) = fleet.finish()?;

@@ -73,6 +73,7 @@ opentelemetry-proto = { version = "=0.33.1", default-features = false, features 
 prost = { version = "0.14", optional = true }
 object = { version = "0.41", default-features = false, features = ["read", "std"] }
 wreq = { workspace = true, optional = true }
+proc-macro2 = "1"
 rand = "0.10.0"
 rayon-core = { version = "1.13", optional = true }
 regex = "1.10.3"
@@ -88,6 +89,7 @@ serde_json = ">=1.0, <1.0.155" # zmij (used in 1.0.147+) requires Rust 1.84+
 sha2 = { version = "0.11.0", optional = true }
 shlex = "2.0.1"
 strip-ansi-escapes = "0.2"
+syn = { version = "3", default-features = false, features = ["parsing"] }
 tar = "0.4.40"
 tempfile = "3"
 tokio = { version = "1", features = [

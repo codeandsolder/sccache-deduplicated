@@ -141,8 +141,12 @@ verify_index_location() {
       return 1
     }
   fi
-  [[ -d "$index" && -d "$store" ]] || return 0
-  [[ $(stat -c %d "$store") != $(stat -c %d "$index") ]] || {
+  # Resolve the filesystem of the nearest existing parent for new stores.
+  # Creating a directory cannot move it to another capacity domain.
+  local store_parent="$store" index_parent="$index"
+  while [[ ! -d "$store_parent" ]]; do store_parent=$(dirname -- "$store_parent"); done
+  while [[ ! -d "$index_parent" ]]; do index_parent=$(dirname -- "$index_parent"); done
+  [[ $(stat -c %d "$store_parent") != $(stat -c %d "$index_parent") ]] || {
     printf 'CAS and index must occupy different capacity domains: %s %s\n' "$store" "$index" >&2
     return 1
   }

@@ -203,6 +203,48 @@ impl NativeCargoPaths {
         result.map_or(Cow::Borrowed(bytes), Cow::Owned)
     }
 
+    /// Compiler line-marker directory spelling is diagnostic/debug metadata;
+    /// actual string literals (including expanded __FILE__) are untouched.
+    pub(super) fn native_line_marker_identity(bytes: &[u8]) -> Cow<'_, [u8]> {
+        let mut lexer = LineContext::Code;
+        let mut continued = false;
+        let mut result = None::<Vec<u8>>;
+        let mut offset = 0;
+        for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+            let marker = if lexer == LineContext::Code && !continued {
+                linemarker_filename(line)
+            } else {
+                None
+            };
+            let replacement = marker.and_then(|(start, end)| {
+                let name = &line[start..end];
+                name.iter()
+                    .rposition(|&b| b == b'/')
+                    .map(|slash| (start, end, &name[slash + 1..]))
+            });
+            if let Some((start, end, name)) = replacement {
+                let output = result.get_or_insert_with(|| {
+                    let mut output = Vec::with_capacity(bytes.len());
+                    output.extend_from_slice(&bytes[..offset]);
+                    output
+                });
+                output.extend_from_slice(&line[..start]);
+                output.extend_from_slice(name);
+                output.extend_from_slice(&line[end..]);
+            } else {
+                if marker.is_none() {
+                    lexer.scan(line);
+                }
+                if let Some(output) = result.as_mut() {
+                    output.extend_from_slice(line);
+                }
+            }
+            continued = line.strip_suffix(b"\n").unwrap_or(line).ends_with(b"\\");
+            offset += line.len();
+        }
+        result.map_or(Cow::Borrowed(bytes), Cow::Owned)
+    }
+
     pub(super) fn context_digest(
         &self,
         args: &ParsedArguments,
@@ -213,33 +255,27 @@ impl NativeCargoPaths {
         let mut digest = Digest::audited("c-path-context");
         digest.audit_field("sccache.key.schema");
         digest.update(b"sccache-cargo-native-paths-v1\0");
+        digest.audit_field("sccache.key.output_paths");
+        if relocatable_output {
+            digest.update(b"relocatable-single-artifact-v2\0");
+            return digest.finish();
+        }
         let input = cwd.join(&args.input);
         digest.audit_field("sccache.key.cwd");
         self.hash_path(&mut digest, cwd);
         digest.audit_field("sccache.key.input_path");
         self.hash_path(&mut digest, &input);
-        // The ordinary object destination is a delivery location, not an
-        // input to compilation. Keep the existing identity of outputs which
-        // can reference each other (split DWARF, coverage, etc.). Dependency
-        // files are delivered by local preprocessing and do not participate.
         digest.audit_field("sccache.key.output_paths");
         let mut outputs: Vec<_> = args
             .outputs
             .iter()
             .filter(|(name, _)| **name != "d")
             .collect();
-        if !relocatable_output {
-            outputs.sort_unstable_by_key(|(name, _)| *name);
-            for (name, output) in outputs {
-                digest.update(name.as_bytes());
-                digest.update(b"\0");
-                self.hash_path(&mut digest, &cwd.join(&output.path));
-            }
-        } else {
-            // Domain separate the relocatable artifact policy from the
-            // earlier path-dependent policy without invalidating unrelated
-            // compiler keys.
-            digest.update(b"relocatable-single-artifact-v1\0");
+        outputs.sort_unstable_by_key(|(name, _)| *name);
+        for (name, output) in outputs {
+            digest.update(name.as_bytes());
+            digest.update(b"\0");
+            self.hash_path(&mut digest, &cwd.join(&output.path));
         }
 
         // Arbitrary strings, assembler .file directives, and explicit
@@ -536,6 +572,21 @@ const char *other = u8R"(
 # 9 "/stable/source.cc" 2
 "##;
         assert_eq!(paths.preprocessed_key_bytes(input).as_ref(), expected);
+    }
+
+    #[test]
+    fn native_line_marker_identity_ignores_only_directory_spelling() {
+        let first = b"# 1 \"/first/tree/src.c\"\nconst char *name = \"/actual/program/data\";\n";
+        let second = b"# 1 \"/other/tree/src.c\"\nconst char *name = \"/actual/program/data\";\n";
+        let changed = b"# 1 \"/other/tree/src.c\"\nconst char *name = \"/changed/program/data\";\n";
+        assert_eq!(
+            NativeCargoPaths::native_line_marker_identity(first),
+            NativeCargoPaths::native_line_marker_identity(second)
+        );
+        assert_ne!(
+            NativeCargoPaths::native_line_marker_identity(first),
+            NativeCargoPaths::native_line_marker_identity(changed)
+        );
     }
 
     #[test]

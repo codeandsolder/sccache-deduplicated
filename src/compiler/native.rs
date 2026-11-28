@@ -174,7 +174,7 @@ impl NativeCompilerClient {
         pool: &tokio::runtime::Handle,
     ) -> Result<Vec<String>> {
         let client = Arc::clone(self);
-        crate::util::hash_path_batch(files, pool, move |path| {
+        crate::util::hash_input_batch(files, pool, move |path| {
             if path.is_dir() {
                 return crate::util::Digest::path_sync(path);
             }
@@ -187,6 +187,36 @@ impl NativeCompilerClient {
                 let blob = crate::build_runtime::hash_descriptor(&file)?;
                 Ok(crate::util::hex(&blob.id.0))
             }
+        })
+        .await
+    }
+
+    /// Reuse installed toolchain content digests for files selected by
+    /// compiler dependency discovery. Mutable project inputs still use
+    /// descriptor content hashes or retained CAS references.
+    pub(crate) async fn hash_compiler_inputs(
+        self: &Arc<Self>,
+        files: &[PathBuf],
+        sysroot: &Path,
+        pool: &tokio::runtime::Handle,
+    ) -> Result<Vec<String>> {
+        let client = Arc::clone(self);
+        let sysroot = sysroot.canonicalize()?;
+        crate::util::hash_input_batch(files, pool, move |path| {
+            if path.is_dir() {
+                return crate::util::Digest::path_sync(path);
+            }
+            if path.starts_with(&sysroot) {
+                return Ok(crate::util::hex(
+                    &client.toolchain_digests.file_digest(path)?.id.0,
+                ));
+            }
+            let file = std::fs::File::open(path)?;
+            let blob = match client.reference(&file)? {
+                Some((blob, _)) => blob,
+                None => crate::build_runtime::hash_descriptor(&file)?,
+            };
+            Ok(crate::util::hex(&blob.id.0))
         })
         .await
     }
@@ -370,7 +400,7 @@ impl NativeCompilerClient {
         let key = fingerprint.key()?;
         crate::server::activity::key_evidence(
             &fingerprint.schema,
-            &blake3::Hash::from_bytes(key.0).to_hex().to_string(),
+            blake3::Hash::from_bytes(key.0).to_hex().as_ref(),
             fingerprint
                 .components
                 .iter()
@@ -499,64 +529,16 @@ impl NativeOutput {
     }
 }
 
-/// The compiler frontend declares which semantic identity it can establish.
-///
-/// Opaque extensions keep exact execution identity: their code can observe
-/// arbitrary environment values and input metadata outside compiler dep-info.
+/// Compiler-specific package construction policy. It never selects a
+/// different cache-key algorithm.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ResultIdentityPolicy {
-    Exact,
+pub enum CompilerPackagingPolicy {
+    Default,
     PreprocessedC,
     Rust,
 }
 
-impl ResultIdentityPolicy {
-    fn identity(
-        self,
-        key: &str,
-        command: &CommandSpec,
-        toolchain: TreeId,
-        inputs: &TreeManifest,
-    ) -> Result<Option<CompilerResultIdentity>> {
-        if self == Self::Exact || opaque_compiler_extension(command, inputs) {
-            return Ok(None);
-        }
-        let environment = compiler_environment(command, self);
-        let input_closure = if self == Self::Rust {
-            // Rust's dep-info includes sources and direct externs, but the
-            // packaged search closure also includes transitive dependencies.
-            // Rustc reads these by content; do not make delivery mtimes inputs.
-            let mut manifest = inputs.clone();
-            let stamp = TreeTimestamp {
-                seconds: 0,
-                nanoseconds: 0,
-            };
-            manifest.root.modified = stamp;
-            for entry in manifest.entries.values_mut() {
-                match entry {
-                    TreeEntry::Directory(metadata) | TreeEntry::File { metadata, .. } => {
-                        metadata.modified = stamp;
-                    }
-                    TreeEntry::Symlink { modified, .. } => *modified = stamp,
-                    TreeEntry::Hardlink(_) => {}
-                }
-            }
-            Some(manifest.id()?)
-        } else {
-            None
-        };
-        Ok(Some(CompilerResultIdentity {
-            semantic: ContentId::of(key.as_bytes()),
-            toolchain,
-            input_closure,
-            environment,
-        }))
-    }
-}
-
-/// Retain exact identity for extensions executing arbitrary native code.
-///
-/// Their dependencies lie outside ordinary compiler frontend discovery.
+/// Select packaging requirements for extensions executing native code.
 fn opaque_compiler_extension(command: &CommandSpec, inputs: &TreeManifest) -> bool {
     command.arguments.iter().any(|arg| {
         [
@@ -579,77 +561,17 @@ fn opaque_compiler_extension(command: &CommandSpec, inputs: &TreeManifest) -> bo
         .any(|path| path.as_bytes().ends_with(b".so"))
 }
 
-/// Hash compiler driver/runtime environment dependencies.
-///
-/// Rust source-observed values and Cargo semantic environment are already
-/// included in the frontend digest. Omit job, shell and scheduler bookkeeping.
-fn compiler_environment(command: &CommandSpec, policy: ResultIdentityPolicy) -> ContentId {
-    let mut digest = blake3::Hasher::new();
-    digest.update(b"sccache-native-compiler-environment-v1\0");
-    for (name, value) in &command.environment {
-        let name = name.as_slice();
-        let relevant = [
-            b"LANG".as_slice(),
-            b"LANGUAGE",
-            b"TZ",
-            b"TERM",
-            b"SOURCE_DATE_EPOCH",
-            b"PATH",
-        ]
-        .contains(&name)
-            || [b"LC_".as_slice(), b"LD_"]
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-            || match policy {
-                ResultIdentityPolicy::PreprocessedC => {
-                    [b"GCC_".as_slice(), b"CLANG_", b"CCC_"]
-                        .iter()
-                        .any(|prefix| name.starts_with(prefix))
-                        || [
-                            b"COMPILER_PATH".as_slice(),
-                            b"LIBRARY_PATH",
-                            b"CPATH",
-                            b"C_INCLUDE_PATH",
-                            b"CPLUS_INCLUDE_PATH",
-                            b"OBJC_INCLUDE_PATH",
-                            b"DEPENDENCIES_OUTPUT",
-                            b"SUNPRO_DEPENDENCIES",
-                        ]
-                        .contains(&name)
-                }
-                ResultIdentityPolicy::Rust => {
-                    name.starts_with(b"RUSTC_")
-                        || [
-                            b"RUST_MIN_STACK".as_slice(),
-                            b"RUST_BACKTRACE",
-                            b"RUST_LIB_BACKTRACE",
-                            b"RUSTFLAGS",
-                        ]
-                        .contains(&name)
-                }
-                ResultIdentityPolicy::Exact => false,
-            };
-        if relevant {
-            for field in [name, value.as_slice()] {
-                digest.update(&(field.len() as u128).to_le_bytes());
-                digest.update(field);
-            }
-        }
-    }
-    ContentId(*digest.finalize().as_bytes())
-}
-
 fn prepare_toolchain(
     packager: Box<dyn pkg::ToolchainPackager>,
     digests: &SourceDigestCache,
-    policy: ResultIdentityPolicy,
+    policy: CompilerPackagingPolicy,
     command: &mut CommandSpec,
     inputs: &TreeManifest,
 ) -> Result<PreparedTree> {
     let scope = match (policy, opaque_compiler_extension(command, inputs)) {
-        (ResultIdentityPolicy::Rust, false) => pkg::ToolchainScope::RustCompiler,
-        (ResultIdentityPolicy::Rust, true) => pkg::ToolchainScope::RustOpaque,
-        (ResultIdentityPolicy::PreprocessedC, false) => pkg::ToolchainScope::PreprocessedC,
+        (CompilerPackagingPolicy::Rust, false) => pkg::ToolchainScope::RustCompiler,
+        (CompilerPackagingPolicy::Rust, true) => pkg::ToolchainScope::RustOpaque,
+        (CompilerPackagingPolicy::PreprocessedC, false) => pkg::ToolchainScope::PreprocessedC,
         _ => pkg::ToolchainScope::Default,
     };
     let before = digests.catalog_hits();
@@ -670,20 +592,31 @@ fn prepare_toolchain(
                 .insert(b"LD_LIBRARY_PATH".to_vec(), libraries);
         }
     }
-    if scope == pkg::ToolchainScope::PreprocessedC {
-        // Diagnostics are produced under one reproducible locale/terminal
-        // contract. The local preprocessor has already consumed source-level
-        // environment and include search.
+    if policy != CompilerPackagingPolicy::Rust {
+        // The preprocessor already consumed source-level environment.
+        // Construct the remaining driver environment explicitly. Search
+        // paths are established by the actual toolchain package above.
         command.environment.retain(|name, _| {
-            !name.starts_with(b"LC_")
-                && ![
-                    b"LANG".as_slice(),
-                    b"LANGUAGE",
-                    b"TZ",
-                    b"TERM",
-                    b"COLORTERM",
-                ]
-                .contains(&name.as_slice())
+            let name = name.as_slice();
+            [
+                b"PATH".as_slice(),
+                b"LD_LIBRARY_PATH",
+                b"CCC_OVERRIDE_OPTIONS",
+            ]
+            .contains(&name)
+                || super::c_driver_environment::darwin_variable(std::ffi::OsStr::from_bytes(name))
+                || (scope != pkg::ToolchainScope::PreprocessedC
+                    && [
+                        b"SOURCE_DATE_EPOCH".as_slice(),
+                        b"GCC_EXEC_PREFIX",
+                        b"COMPILER_PATH",
+                        b"LIBRARY_PATH",
+                        b"CUDA_PATH",
+                        b"CUDA_HOME",
+                        b"NVCC_PREPEND_FLAGS",
+                        b"NVCC_APPEND_FLAGS",
+                    ]
+                    .contains(&name))
         });
         for (name, value) in [
             (b"LANG".as_slice(), b"C".as_slice()),
@@ -691,16 +624,6 @@ fn prepare_toolchain(
             (b"TZ", b"UTC"),
         ] {
             command.environment.insert(name.to_vec(), value.to_vec());
-        }
-        // The native worker receives fully preprocessed input. Include
-        // search already ran locally; these variables are not runtime inputs.
-        for name in [
-            b"CPATH".as_slice(),
-            b"C_INCLUDE_PATH",
-            b"CPLUS_INCLUDE_PATH",
-            b"OBJC_INCLUDE_PATH",
-        ] {
-            command.environment.remove(name);
         }
     }
     let prepared = package.mapping.prepare_with_cache(digests)?;
@@ -779,20 +702,6 @@ impl CompilerPlan {
             })
             .cloned()
             .collect())
-    }
-
-    fn declare_link_inputs(
-        &mut self,
-        inputs: &link_inputs::LinkInputs,
-        client: Option<&NativeCompilerClient>,
-    ) -> Result<()> {
-        let additional = inputs.prepare_declared(client)?;
-        // If a file has both roles, retain it during source projection.
-        for tree in &additional {
-            self.codegen_only
-                .retain(|path| !tree.manifest().entries.contains_key(path));
-        }
-        self.extend_inputs(additional)
     }
 
     fn complete_link_inputs(
@@ -938,7 +847,7 @@ impl CompilerPlan {
         outputs: Vec<NativeOutput>,
         transformer: dist::PathTransformer,
         packagers: DistPackagers,
-        identity: (ContentId, ResultIdentityPolicy, &str),
+        identity: (ContentId, CompilerPackagingPolicy, &str),
         preparation: (&SourceDigestCache, Option<&NativeCompilerClient>),
     ) -> Result<Self> {
         let (toolchain_digests, native) = preparation;
@@ -966,9 +875,7 @@ impl CompilerPlan {
         }
         let (inputs, toolchain) = packagers;
         let mut command = CommandSpec {
-            umask: command
-                .umask
-                .context("native execution requires a known process umask")?,
+            umask: 0o022,
             executable: BuildPath::new(command.executable.into_bytes())?,
             arguments: command
                 .arguments
@@ -1009,8 +916,9 @@ impl CompilerPlan {
                 .map(|tree| (tree.id(), tree.manifest()))
                 .collect(),
         )?;
-        let compiler_result =
-            result_policy.identity(key, &command, inputs[0].id(), inputs[1].manifest())?;
+        let compiler_result = Some(CompilerResultIdentity {
+            semantic: ContentId::of(key.as_bytes()),
+        });
         let spec = ExecutionSpec {
             compiler_result,
             working_inputs: Default::default(),
@@ -1213,7 +1121,7 @@ fn prepare_dispatch(
 ) -> Result<(Vec<NativeOutput>, dist::PathTransformer, DistPackagers)> {
     super::core::validate_dist_environment_dependencies(
         remote,
-        &compilation.dist_environment_dependencies(),
+        &compilation.dist_environment_dependencies(CompileTransport::Native),
     )?;
     let expected = compilation
         .outputs()
@@ -1301,7 +1209,6 @@ async fn prepare_link_action(
     let mut base = plan.clone();
     let prepared = pool
         .spawn_blocking(move || {
-            base.declare_link_inputs(&discovery, Some(&preparation_client))?;
             let capture = discovery
                 .relay()?
                 .map(|(basename, expected)| {
@@ -1360,6 +1267,20 @@ async fn prepare_link_action(
     Ok(None)
 }
 
+fn deliver_compiler_messages(
+    mut output: process::Output,
+    (mut discovery, success): (Vec<u8>, Vec<u8>),
+) -> process::Output {
+    if !discovery.is_empty() {
+        discovery.append(&mut output.stderr);
+        output.stderr = discovery;
+    }
+    if output.status.success() {
+        output.stderr.extend(success);
+    }
+    output
+}
+
 pub(super) async fn compile<T: CommandCreatorSync>(
     client: Arc<NativeCompilerClient>,
     _creator: T,
@@ -1369,7 +1290,8 @@ pub(super) async fn compile<T: CommandCreatorSync>(
     pool: &tokio::runtime::Handle,
 ) -> Result<(CompileResult, process::Output)> {
     let start = Instant::now();
-    let result_policy = compilation.native_result_policy();
+    let result_policy = compilation.native_packaging_policy();
+    let delivery = compilation.native_delivery_messages();
     let (control, key) = identity;
     let key = key.to_owned();
     crate::server::activity::phase(crate::server::activity::Phase::PlanCompile);
@@ -1469,7 +1391,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                 failure.output.stderr = generated.output.stderr;
                 return Ok((
                     CompileResult::Native(reports, start.elapsed()),
-                    failure.output,
+                    deliver_compiler_messages(failure.output, delivery),
                 ));
             } else {
                 client
@@ -1512,7 +1434,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
     drop(scratch);
     Ok((
         CompileResult::Native(reports, start.elapsed()),
-        result.output,
+        deliver_compiler_messages(result.output, delivery),
     ))
 }
 
@@ -1582,7 +1504,6 @@ mod tests {
                     config.dist.scheduler_url.clone(),
                     None,
                     config.dist.auth.clone(),
-                    Vec::new(),
                     &[],
                 ))
             }),
@@ -1648,10 +1569,10 @@ mod tests {
             &args,
             &environment,
             &config,
-            false,
+            true,
         )?;
         let compilation = hashed.compilation;
-        let result_policy = compilation.native_result_policy();
+        let result_policy = compilation.native_packaging_policy();
         let mut transformer = dist::PathTransformer::new();
         let (_, remote, cacheable) =
             compilation.generate_compile_commands(&mut transformer, CompileTransport::Native)?;
@@ -1659,7 +1580,7 @@ mod tests {
         let mut remote = remote.context("no distributed command for real compiler")?;
         super::super::core::validate_dist_environment_dependencies(
             &remote,
-            &compilation.dist_environment_dependencies(),
+            &compilation.dist_environment_dependencies(CompileTransport::Native),
         )?;
         let expected = compilation
             .outputs()
@@ -1757,7 +1678,6 @@ mod tests {
             });
             let cache = SourceDigestCache::default();
             let (mut link_plan, artifact) = link.plan(&plan, manifest, &provider)?;
-            link_plan.declare_link_inputs(&link.inputs, None)?;
             if args.iter().any(|arg| arg == "static=fixture") {
                 let root = link_plan.spec.root.recipe.compose(
                     &link_plan
@@ -2025,7 +1945,7 @@ mod tests {
             true,
         )?;
         let compilation = hash.compilation;
-        let policy = compilation.native_result_policy();
+        let policy = compilation.native_packaging_policy();
         let mut transformer = dist::PathTransformer::new();
         let (_, remote, cacheable) =
             compilation.generate_compile_commands(&mut transformer, CompileTransport::Native)?;
@@ -2036,7 +1956,6 @@ mod tests {
             &mut remote,
             transformer,
             &cwd,
-            environment,
             &mut None,
             &mut None,
         )?;

@@ -321,7 +321,7 @@ async fn report_compile(
         tokio::select! {
             biased;
             result = &mut work => {
-                output.write_all(&frame(&ExecutorEvent::Progress(activity.snapshot()))?)?;
+                output.write_all(&frame(&ExecutorEvent::Progress(Box::new(activity.snapshot())))?)?;
                 output.write_all(&frame(&ExecutorEvent::Finished(
                     result.map_err(|error| format!("{error:#}")),
                 ))?)?;
@@ -329,7 +329,7 @@ async fn report_compile(
                 return Ok(());
             }
             _ = ticker.tick() => {
-                output.write_all(&frame(&ExecutorEvent::Progress(activity.snapshot()))?)?;
+                output.write_all(&frame(&ExecutorEvent::Progress(Box::new(activity.snapshot())))?)?;
                 output.flush()?;
             }
         }

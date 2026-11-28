@@ -643,8 +643,8 @@ where
 
     /// Compiler-specific result identity policy for the native CAS.
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
-    fn native_result_policy(&self) -> super::ResultIdentityPolicy {
-        super::ResultIdentityPolicy::Exact
+    fn native_packaging_policy(&self) -> super::CompilerPackagingPolicy {
+        super::CompilerPackagingPolicy::Default
     }
 
     /// The native compiler produces an independent object at a fixed
@@ -652,6 +652,14 @@ where
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
     fn native_relocatable_output(&self) -> bool {
         false
+    }
+
+    /// Per-request delivery diagnostics. These are never stored in the shared
+    /// result. The first buffer follows successful discovery; the second is
+    /// emitted only once the requested artifacts have been delivered.
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    fn native_delivery_messages(&self) -> (Vec<u8>, Vec<u8>) {
+        (Vec::new(), Vec::new())
     }
 
     /// The original Rust native link stage's local namespace, if this
@@ -663,7 +671,10 @@ where
 
     /// Exact environment observations that the final distributed command must preserve.
     #[cfg(feature = "dist-client")]
-    fn dist_environment_dependencies(&self) -> Vec<(OsString, Option<OsString>)> {
+    fn dist_environment_dependencies(
+        &self,
+        _transport: CompileTransport,
+    ) -> Vec<(OsString, Option<OsString>)> {
         Vec::new()
     }
 
@@ -1943,6 +1954,7 @@ LLVM version: 6.0",
         fs::create_dir(f.tempdir.path().join("lib"))?;
         fs::create_dir(f.tempdir.path().join("bin"))?;
         let rustc = f.mk_bin("rustc-workspace-wrapper")?;
+        let wrapped_rustc = f.mk_bin("rustc.exe")?;
         let creator = new_creator();
         let runtime = single_threaded_runtime();
         let pool = runtime.handle();
@@ -1952,7 +1964,7 @@ LLVM version: 6.0",
             &rustc,
             f.tempdir.path(),
             // Specifying an extension tests the ignoring
-            &[OsString::from("rustc.exe")],
+            &[wrapped_rustc.into_os_string()],
             &[(OsString::from("CARGO"), OsString::from("CARGO"))],
             pool,
             CompilerDiscovery::default(),

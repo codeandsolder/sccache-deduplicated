@@ -19,7 +19,7 @@ pub struct SpacePolicy {
 impl SpacePolicy {
     /// An absent logical bound leaves physical filesystem availability as
     /// the only retention constraint.
-    #[must_use]
+    #[must_use = "the returned limit determines resident storage admission"]
     pub const fn resident_limit(self) -> u64 {
         match self.max_resident_bytes {
             Some(limit) => limit,

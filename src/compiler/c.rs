@@ -30,7 +30,7 @@ use crate::util::{
 use async_trait::async_trait;
 use fs_err as fs;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -366,13 +366,13 @@ where
         })
         .context("compiler did not expose a native CPU frontend expansion")?;
     let flags = native_driver_replacement(driver_line, kind, &native_args)?;
-    // Preserve the requesting compiler's full observed frontend state in the
-    // native-only cache supplement. The working directory can affect emitted
-    // debug metadata without changing preprocessed bytes (notably Clang -g),
-    // so hashing only the CPU switches could alias materially different objects.
+    // The resolved effective CPU switches are the input. Driver transcript
+    // paths, including -fdebug-compilation-dir, are not CPU information.
     let mut digest = Digest::new();
-    digest.update(b"sccache-native-target-resolution-v4\0");
-    digest.update(driver_line.as_bytes());
+    digest.update(b"sccache-native-target-resolution-v5\0");
+    for flag in &flags {
+        digest.delimiter(flag.as_encoded_bytes());
+    }
     #[cfg(not(feature = "dist-client"))]
     let _ = flags;
     Ok(Some(NativeCodegenResolution {
@@ -667,7 +667,12 @@ where
         context: GenerateHashKeyContext<'_, T>,
     ) -> Result<HashResult<T>> {
         #[cfg(all(feature = "dist-client", target_os = "linux"))]
-        let native_identity = context.native.is_some();
+        let native_digests = context
+            .native
+            .as_ref()
+            .map(|client| client.toolchain_digests());
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        let native_identity = native_digests.is_some();
         #[cfg(not(all(feature = "dist-client", target_os = "linux")))]
         let native_identity = false;
         let GenerateHashKeyContext {
@@ -681,6 +686,19 @@ where
             cache_control,
             ..
         } = context;
+        let env_vars = if native_identity {
+            super::c_driver_environment::normalize(
+                creator,
+                &self.executable,
+                self.compiler.kind(),
+                &self.parsed_args,
+                &cwd,
+                env_vars,
+            )
+            .await?
+        } else {
+            env_vars
+        };
         let mut parsed_args = self.parsed_args.clone();
         if native_identity {
             parsed_args.suppress_rewrite_includes_only = true;
@@ -700,6 +718,60 @@ where
         }
 
         let mut extra_hashes = hash_all(&parsed_args.extra_hash_files, &pool.clone()).await?;
+        #[cfg(all(
+            feature = "dist-client",
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let native_toolchain = if let Some(digests) = native_digests
+            && matches!(
+                self.compiler.kind(),
+                CCompilerKind::Gcc | CCompilerKind::Clang
+            ) {
+            let packager = CToolchainPackager {
+                executable: self.executable.clone(),
+                kind: self.compiler.kind(),
+                cwd: cwd.clone(),
+                env_vars: env_vars.clone(),
+                driver_args: parsed_args
+                    .common_args
+                    .iter()
+                    .chain(&parsed_args.arch_args)
+                    .cloned()
+                    .collect(),
+            };
+            let language = parsed_args.language;
+            let external_assembler = parsed_args.uses_external_assembler;
+            Some(
+                pool.spawn_blocking(move || {
+                    packager.compiler_identity(language, external_assembler, &digests)
+                })
+                .await??,
+            )
+        } else {
+            None
+        };
+        #[cfg(not(all(
+            feature = "dist-client",
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        let native_toolchain: Option<CCompilerIdentity> = None;
+        let (compiler_digest, assembler_digest) = native_toolchain.map_or_else(
+            || {
+                (
+                    Cow::Borrowed(self.executable_digest.as_str()),
+                    parsed_args
+                        .uses_external_assembler
+                        .then(|| self.compiler.assembler_digest())
+                        .flatten(),
+                )
+            },
+            |identity| {
+                extra_hashes.extend(identity.implementation);
+                (Cow::Owned(identity.driver), identity.assembler)
+            },
+        );
         let native_resolution = native_codegen_resolution(
             creator,
             &self.executable,
@@ -711,7 +783,9 @@ where
         .await;
         let mut cache_control = cache_control;
         if let Ok(Some(resolution)) = &native_resolution {
-            extra_hashes.push(resolution.fingerprint.clone());
+            if !native_identity {
+                extra_hashes.push(resolution.fingerprint.clone());
+            }
         } else if let Err(error) = &native_resolution {
             warn!(
                 "Failed to resolve native C/C++ codegen identity; native action cannot be prepared: {error:#}"
@@ -719,13 +793,6 @@ where
             cache_control = CacheControl::ForceNoCache;
         }
         let native_resolution = native_resolution.ok().flatten();
-        // The assembler that turns the compiler's output into the object file is
-        // as much a part of the result as the compiler itself.
-        let assembler_digest = if parsed_args.uses_external_assembler {
-            self.compiler.assembler_digest()
-        } else {
-            None
-        };
         let absolute_input_path: Cow<'_, _> = if parsed_args.input.is_absolute() {
             Cow::Borrowed(&parsed_args.input)
         } else {
@@ -853,33 +920,82 @@ where
         // Create an argument vector containing both common and arch args, to
         // use in creating a hash key
         let mut common_and_arch_args = self.parsed_args.common_args.clone();
+        // Native workers execute the lowered target arguments. Key that
+        // exact representation instead of both the request and a separate
+        // fingerprint of its expansion.
+        #[cfg(feature = "dist-client")]
+        if native_identity && let Some(resolution) = &native_resolution {
+            common_and_arch_args = resolution.rewrite_arguments(common_and_arch_args);
+        }
         common_and_arch_args.extend(self.parsed_args.arch_args.clone());
+        if native_identity {
+            // Debug path flags and prefix-map operands are delivery metadata.
+            // Any actual preprocessor macro effect is already in its output.
+            common_and_arch_args.retain(|arg| {
+                let bytes = arg.as_encoded_bytes();
+                ![
+                    b"-fdebug-prefix-map=".as_slice(),
+                    b"-ffile-prefix-map=",
+                    b"-fmacro-prefix-map=",
+                    b"-fdebug-compilation-dir=",
+                    b"-Wa,--debug-prefix-map=",
+                    b"--debug-prefix-map=",
+                ]
+                .iter()
+                .any(|prefix| bytes.starts_with(prefix))
+            });
+        }
 
         // Hash the same remapped filename identity that the compiler uses for
         // debug information. Do not strip arbitrary source literals or flags.
-        let relocate_native_object = canonical_native.is_some()
-            && native_identity
+        let relocate_native_object = native_identity
             && matches!(
                 self.compiler.kind(),
                 CCompilerKind::Gcc | CCompilerKind::Clang
             )
             && relocatable_object(&parsed_args);
-        let key_input = if let Some(paths) = &canonical_native {
-            let normalized = paths.preprocessed_key_bytes(&preprocessor_output);
-            extra_hashes.push(paths.context_digest(
-                &self.parsed_args,
-                &cwd,
-                &normalized,
-                native_identity
-                    && matches!(
-                        self.compiler.kind(),
-                        CCompilerKind::Gcc | CCompilerKind::Clang
-                    )
-                    && relocatable_object(&parsed_args),
-            ));
-            normalized
+        let mapped_input = canonical_native
+            .as_ref()
+            .map_or(Cow::Borrowed(preprocessor_output.as_slice()), |paths| {
+                paths.preprocessed_key_bytes(&preprocessor_output)
+            });
+        let key_input = if native_identity {
+            if relocate_native_object {
+                extra_hashes.push("native-relocatable-object-v2".into());
+            } else {
+                // Some outputs reference a companion by name, or encode the
+                // runtime profiling destination. Preserve only that actual
+                // relationship, never arbitrary source/debug directories.
+                let mut digest = Digest::new();
+                digest.delimiter(b"native-output-relationships-v1");
+                let mut outputs = parsed_args
+                    .outputs
+                    .iter()
+                    .filter(|(name, _)| **name != "d")
+                    .collect::<Vec<_>>();
+                outputs.sort_unstable_by_key(|(name, _)| *name);
+                for (name, output) in outputs {
+                    digest.delimiter(name.as_bytes());
+                    let path = if parsed_args.profile_generate {
+                        cwd.join(&output.path)
+                    } else {
+                        PathBuf::from(output.path.file_name().unwrap_or_default())
+                    };
+                    digest.delimiter(path.as_os_str().as_encoded_bytes());
+                }
+                extra_hashes.push(digest.finish());
+            }
+            NativeCargoPaths::native_line_marker_identity(&mapped_input)
         } else {
-            Cow::Borrowed(preprocessor_output.as_slice())
+            if let Some(paths) = &canonical_native {
+                extra_hashes.push(paths.context_digest(
+                    &self.parsed_args,
+                    &cwd,
+                    &mapped_input,
+                    false,
+                ));
+            }
+            Cow::Borrowed(mapped_input.as_ref())
         };
         let basedirs = if canonical_native.is_some() || native_identity {
             &[][..]
@@ -903,7 +1019,7 @@ where
             )
         });
         let key = HashKeyParams::new(
-            &self.executable_digest,
+            &compiler_digest,
             parsed_args.language,
             &common_and_arch_args,
             &key_input,
@@ -917,7 +1033,11 @@ where
             self.parsed_args.language,
             &self.parsed_args.input,
         ))
-        .with_debug_compilation_dir(debug_compilation_dir.as_deref())
+        .with_debug_compilation_dir(if native_identity {
+            None
+        } else {
+            debug_compilation_dir.as_deref()
+        })
         .compute();
 
         // A compiler binary may be a symlink to another and so has the same digest, but that means
@@ -1453,17 +1573,17 @@ const INCLUDE_DIRECTIVE: &[u8] = b".include";
 
 impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I> {
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
-    fn native_result_policy(&self) -> super::native::ResultIdentityPolicy {
-        use super::native::ResultIdentityPolicy;
+    fn native_packaging_policy(&self) -> super::native::CompilerPackagingPolicy {
+        use super::native::CompilerPackagingPolicy;
         if matches!(
             self.compiler.kind(),
             CCompilerKind::Gcc | CCompilerKind::Clang
         ) && !self.parsed_args.profile_generate
             && !self.parsed_args.language.is_c_like_header()
         {
-            ResultIdentityPolicy::PreprocessedC
+            CompilerPackagingPolicy::PreprocessedC
         } else {
-            ResultIdentityPolicy::Exact
+            CompilerPackagingPolicy::Default
         }
     }
 
@@ -1584,7 +1704,7 @@ struct CInputsPackager {
 impl pkg::InputsPackager for CInputsPackager {
     #[cfg(target_os = "linux")]
     fn native_mapping(self: Box<Self>) -> Result<pkg::NativeInputPlan> {
-        (*self).discover()?.into_native_input_plan(|_| false)
+        (*self).discover()?.into_native_input_plan(|_| true)
     }
 }
 
@@ -1612,6 +1732,14 @@ impl CInputsPackager {
         }
         Ok(inputs)
     }
+}
+
+/// Content of the actual driver, selected compilation implementation and
+/// external assembler. The version banner is not another compiler input.
+struct CCompilerIdentity {
+    driver: String,
+    implementation: Vec<String>,
+    assembler: Option<String>,
 }
 
 #[cfg(feature = "dist-client")]
@@ -1675,6 +1803,90 @@ fn real_cross_gcc_package_preserves_executable_helper_search_path() -> Result<()
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 impl CToolchainPackager {
+    fn compiler_identity(
+        &self,
+        language: Language,
+        external_assembler: bool,
+        digests: &crate::build_runtime::SourceDigestCache,
+    ) -> Result<CCompilerIdentity> {
+        let hash_file = |path: &Path| -> Result<String> {
+            Ok(crate::util::hex(&digests.file_digest(path)?.id.0))
+        };
+        let driver = hash_file(&self.executable)?;
+        let mut files = super::c_toolchain::selected_compiler_libraries(
+            &self.executable,
+            &self.env_vars,
+            &self.cwd,
+            None,
+        )?;
+        if self.kind == CCompilerKind::Gcc {
+            let frontend = match language {
+                Language::Assembler | Language::AssemblerToPreprocess => None,
+                Language::Cxx
+                | Language::CxxHeader
+                | Language::CxxPreprocessed
+                | Language::CxxModule => Some("cc1plus"),
+                Language::ObjectiveC
+                | Language::ObjectiveCHeader
+                | Language::ObjectiveCPreprocessed => Some("cc1obj"),
+                Language::ObjectiveCxx
+                | Language::ObjectiveCxxHeader
+                | Language::ObjectiveCxxPreprocessed => Some("cc1objplus"),
+                _ => Some("cc1"),
+            };
+            if let Some(name) = frontend {
+                let path = self
+                    .named_tool("prog", name, pkg::ToolchainScope::PreprocessedC)?
+                    .context("GCC selected frontend unavailable")?;
+                files.extend(super::c_toolchain::selected_compiler_libraries(
+                    &path,
+                    &self.env_vars,
+                    &self.cwd,
+                    None,
+                )?);
+                files.push(path);
+            }
+            if let Some(path) =
+                self.named_tool("file", "specs", pkg::ToolchainScope::PreprocessedC)?
+            {
+                files.push(path);
+            }
+        }
+        let mut seen = HashSet::new();
+        // Preserve selection order, not installation pathname order. A path
+        // alias for the same selected implementation is not another input.
+        let mut implementation = Vec::new();
+        for path in files {
+            if seen.insert(path.canonicalize()?) {
+                implementation.push(hash_file(&path)?);
+            }
+        }
+        let assembler = if external_assembler {
+            let path = self
+                .named_tool("prog", "as", pkg::ToolchainScope::PreprocessedC)?
+                .context("selected assembler unavailable")?;
+            let mut identity = Digest::new();
+            identity.delimiter(b"c-selected-assembler-v1");
+            identity.update(hash_file(&path)?.as_bytes());
+            for library in super::c_toolchain::selected_compiler_libraries(
+                &path,
+                &self.env_vars,
+                &self.cwd,
+                None,
+            )? {
+                identity.update(hash_file(&library)?.as_bytes());
+            }
+            Some(identity.finish())
+        } else {
+            None
+        };
+        Ok(CCompilerIdentity {
+            driver,
+            implementation,
+            assembler,
+        })
+    }
+
     fn named_tool(
         &self,
         kind: &str,
@@ -1934,26 +2146,16 @@ pub(super) fn hashed_input_file_name(language: Language, input: &Path) -> Option
 }
 
 /// The cache is versioned by the inputs to `HashKeyParams::compute`.
-pub const CACHE_VERSION: &[u8] = b"15";
+pub const CACHE_VERSION: &[u8] = b"19";
 
 /// Environment variables that are factored into the cache key.
 static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
-    [
-        // SCCACHE_C_CUSTOM_CACHE_BUSTER has no particular meaning behind it,
-        // serving as a way for the user to factor custom data into the hash.
-        // One can set it to different values for different invocations
-        // to prevent cache reuse between them.
-        "SCCACHE_C_CUSTOM_CACHE_BUSTER",
-        "MACOSX_DEPLOYMENT_TARGET",
-        "IPHONEOS_DEPLOYMENT_TARGET",
-        "TVOS_DEPLOYMENT_TARGET",
-        "WATCHOS_DEPLOYMENT_TARGET",
-        "SDKROOT",
-        "CCC_OVERRIDE_OPTIONS",
-    ]
-    .iter()
-    .map(OsStr::new)
-    .collect()
+    super::c_driver_environment::DARWIN_ENVIRONMENT
+        .iter()
+        .copied()
+        .chain(std::iter::once("CCC_OVERRIDE_OPTIONS"))
+        .map(OsStr::new)
+        .collect()
 });
 
 /// Feed normalized compiler arguments into the digest with unambiguous boundaries.
@@ -2003,24 +2205,23 @@ pub(super) fn hash_input_file_name_marker(m: &mut Digest, present: bool) {
     m.update(&[u8::from(present)]);
 }
 
-/// Hash only the declared compiler environment dependencies, preserving
-/// ordering, duplicates, field boundaries and arbitrary OS string bytes.
+/// Hash the effective compiler environment dependencies, not the order
+/// of the caller's environment vector or superseded assignments.
 pub(super) fn hash_cached_env_vars(
     m: &mut Digest,
     env_vars: &[(OsString, OsString)],
     dependencies: &HashSet<&'static OsStr>,
 ) {
-    m.delimiter(b"c-cached-env-v1");
-    let count = env_vars
+    m.delimiter(b"c-cached-env-v2");
+    let effective = env_vars
         .iter()
         .filter(|(name, _)| dependencies.contains(name.as_os_str()))
-        .count();
-    m.update(&(count as u128).to_le_bytes());
-    for (name, value) in env_vars {
-        if dependencies.contains(name.as_os_str()) {
-            hash_length_prefixed(m, name.as_encoded_bytes());
-            hash_length_prefixed(m, value.as_encoded_bytes());
-        }
+        .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
+        .collect::<BTreeMap<_, _>>();
+    m.update(&(effective.len() as u128).to_le_bytes());
+    for (name, value) in effective {
+        hash_length_prefixed(m, name.as_encoded_bytes());
+        hash_length_prefixed(m, value.as_encoded_bytes());
     }
 }
 
@@ -2621,6 +2822,20 @@ mod test {
             ["-march=znver2", "-mno-avx2", "-mno-xsaves", "-mtune=znver2"]
         );
         assert!(!remote_args.iter().any(|arg| arg.ends_with("=native")));
+        let lowered = resolution.rewrite_arguments(parsed_args.common_args);
+        let explicit = ovec![
+            "-mno-avx2",
+            "-march=znver2",
+            "-mno-avx2",
+            "-mno-xsaves",
+            "-mtune=znver2"
+        ];
+        let key =
+            |args: &[OsString]| HashKeyParams::new("gcc", Language::C, args, b"input").compute();
+        assert_eq!(key(&lowered), key(&explicit));
+        let mut different = explicit;
+        different.push("-mavx2".into());
+        assert_ne!(key(&lowered), key(&different));
         Ok(())
     }
 
@@ -2739,12 +2954,11 @@ mod test {
 
         assert_eq!(znver2, znver2_again);
         assert_ne!(znver2, skylake);
-        // Debug compilation directories can affect emitted DW_AT_comp_dir even
-        // when preprocessing output and CPU ISA are otherwise identical.
-        assert_ne!(
+        // A debug directory or compiler installation alias is not a CPU.
+        assert_eq!(
             znver2,
             fingerprint(
-                "/usr/lib/gcc/cc1 -march=znver2 -mtune=znver2 -fdebug-compilation-dir=/other/worktree"
+                "/other/gcc/cc1 -march=znver2 -mtune=znver2 -fdebug-compilation-dir=/other/worktree"
             )
         );
         // Conversely, an effective ISA change must never alias the cache.
@@ -3148,7 +3362,7 @@ mod test {
     fn test_hash_key_environment_field_boundaries() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let name = OsString::from("SCCACHE_C_CUSTOM_CACHE_BUSTER");
+        let name = OsString::from("SDKROOT");
         let other = OsString::from("MACOSX_DEPLOYMENT_TARGET");
         let collapsed = [(
             name.clone(),
@@ -3162,6 +3376,42 @@ mod test {
                 .compute()
         };
         assert_ne!(key(&collapsed), key(&split));
+    }
+
+    #[test]
+    fn test_hash_key_environment_uses_effective_assignments() {
+        let base: [(OsString, OsString); 2] = [
+            ("SDKROOT".into(), "one".into()),
+            ("MACOSX_DEPLOYMENT_TARGET".into(), "two".into()),
+        ];
+        let reversed = [base[1].clone(), base[0].clone()];
+        let overwritten = [
+            ("SDKROOT".into(), "discarded".into()),
+            base[1].clone(),
+            base[0].clone(),
+        ];
+        let key = |env: &[(OsString, OsString)]| {
+            HashKeyParams::new("compiler", Language::C, &[], b"input")
+                .with_env_vars(env)
+                .compute()
+        };
+        assert_eq!(key(&base), key(&reversed));
+        assert_eq!(key(&base), key(&overwritten));
+        assert_ne!(key(&base), key(&overwritten[..2]));
+    }
+
+    #[test]
+    fn test_arbitrary_cache_buster_is_not_a_compiler_input() {
+        let env = [(
+            OsString::from("SCCACHE_C_CUSTOM_CACHE_BUSTER"),
+            OsString::from("arbitrary"),
+        )];
+        let key = |env: &[(OsString, OsString)]| {
+            HashKeyParams::new("compiler", Language::C, &[], b"input")
+                .with_env_vars(env)
+                .compute()
+        };
+        assert_eq!(key(&[]), key(&env));
     }
 
     #[test]
