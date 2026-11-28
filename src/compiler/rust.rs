@@ -353,7 +353,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"18";
+const CACHE_VERSION: &[u8] = b"19";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -2025,19 +2025,11 @@ fn native_rust_compiler_files(
     let root = sysroot.canonicalize()?;
     let compiler = executable.canonicalize()?;
     let mut selected = vec![compiler.clone()];
-    let mut seen = HashSet::from([compiler]);
-    for library in super::c_toolchain::selected_loader_files(executable, environment, cwd)? {
-        let path = library.canonicalize()?;
-        // A private toolchain supplies compiler code, not the fixed managed
-        // system runtime. A system-installed compiler has no separate private
-        // root, so its actual selected closure under the sysroot remains input.
-        let system_runtime = ["/usr", "/lib", "/lib64", "/etc"]
-            .iter()
-            .any(|directory| path.starts_with(directory));
-        if (path.starts_with(&root) || !system_runtime) && seen.insert(path.clone()) {
-            selected.push(path);
-        }
-    }
+    selected.extend(
+        super::c_toolchain::selected_compiler_libraries(executable, environment, cwd, Some(&root))?
+            .into_iter()
+            .filter(|path| path != &compiler),
+    );
     Ok(selected)
 }
 

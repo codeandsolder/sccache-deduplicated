@@ -710,6 +710,19 @@ where
             cache_control,
             ..
         } = context;
+        let env_vars = if native_identity {
+            super::c_driver_environment::normalize(
+                creator,
+                &self.executable,
+                self.compiler.kind(),
+                &self.parsed_args,
+                &cwd,
+                env_vars,
+            )
+            .await?
+        } else {
+            env_vars
+        };
         let start_of_compilation = std::time::SystemTime::now();
         let mut parsed_args = self.parsed_args.clone();
         if native_identity {
@@ -735,9 +748,11 @@ where
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
-        if let Some(digests) = native_digests
-            && self.compiler.kind() == CCompilerKind::Gcc
-        {
+        let native_toolchain = if let Some(digests) = native_digests
+            && matches!(
+                self.compiler.kind(),
+                CCompilerKind::Gcc | CCompilerKind::Clang
+            ) {
             let packager = CToolchainPackager {
                 executable: self.executable.clone(),
                 kind: self.compiler.kind(),
@@ -751,39 +766,37 @@ where
                     .collect(),
             };
             let language = parsed_args.language;
-            let selected = pool
-                .spawn_blocking(move || -> Result<Vec<String>> {
-                    let frontend = match language {
-                        Language::Assembler | Language::AssemblerToPreprocess => None,
-                        Language::Cxx
-                        | Language::CxxHeader
-                        | Language::CxxPreprocessed
-                        | Language::CxxModule => Some("cc1plus"),
-                        Language::ObjectiveC
-                        | Language::ObjectiveCHeader
-                        | Language::ObjectiveCPreprocessed => Some("cc1obj"),
-                        Language::ObjectiveCxx
-                        | Language::ObjectiveCxxHeader
-                        | Language::ObjectiveCxxPreprocessed => Some("cc1objplus"),
-                        _ => Some("cc1"),
-                    };
-                    let mut selected = Vec::new();
-                    if let Some(name) = frontend {
-                        let path = packager
-                            .named_tool("prog", name, pkg::ToolchainScope::PreprocessedC)?
-                            .context("GCC selected frontend unavailable")?;
-                        selected.push(crate::util::hex(&digests.file_digest(&path)?.id.0));
-                    }
-                    if let Some(path) =
-                        packager.named_tool("file", "specs", pkg::ToolchainScope::PreprocessedC)?
-                    {
-                        selected.push(crate::util::hex(&digests.file_digest(&path)?.id.0));
-                    }
-                    Ok(selected)
+            let external_assembler = parsed_args.uses_external_assembler;
+            Some(
+                pool.spawn_blocking(move || {
+                    packager.compiler_identity(language, external_assembler, &digests)
                 })
-                .await??;
-            extra_hashes.extend(selected);
-        }
+                .await??,
+            )
+        } else {
+            None
+        };
+        #[cfg(not(all(
+            feature = "dist-client",
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        let native_toolchain: Option<CCompilerIdentity> = None;
+        let (compiler_digest, assembler_digest) = native_toolchain.map_or_else(
+            || {
+                (
+                    Cow::Borrowed(self.executable_digest.as_str()),
+                    parsed_args
+                        .uses_external_assembler
+                        .then(|| self.compiler.assembler_digest())
+                        .flatten(),
+                )
+            },
+            |identity| {
+                extra_hashes.extend(identity.implementation);
+                (Cow::Owned(identity.driver), identity.assembler)
+            },
+        );
         let native_resolution = native_codegen_resolution(
             creator,
             &self.executable,
@@ -805,13 +818,6 @@ where
             cache_control = CacheControl::ForceNoCache;
         }
         let native_resolution = native_resolution.ok().flatten();
-        // The assembler that turns the compiler's output into the object file is
-        // as much a part of the result as the compiler itself.
-        let assembler_digest = if parsed_args.uses_external_assembler {
-            self.compiler.assembler_digest()
-        } else {
-            None
-        };
         // Create an argument vector containing both preprocessor and arch args, to
         // use in creating a hash key
         let mut preprocessor_and_arch_args = parsed_args.preprocessor_args.clone();
@@ -1187,7 +1193,7 @@ where
             )
         });
         let key = HashKeyParams::new(
-            &self.executable_digest,
+            &compiler_digest,
             parsed_args.language,
             &common_and_arch_args,
             &key_input,
@@ -2455,6 +2461,14 @@ impl CInputsPackager {
     }
 }
 
+/// Content of the actual driver, selected compilation implementation and
+/// external assembler. The version banner is not another compiler input.
+struct CCompilerIdentity {
+    driver: String,
+    implementation: Vec<String>,
+    assembler: Option<String>,
+}
+
 #[cfg(feature = "dist-client")]
 struct CToolchainPackager {
     executable: PathBuf,
@@ -2653,6 +2667,90 @@ fn real_cross_gcc_package_preserves_executable_helper_search_path() -> Result<()
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 impl CToolchainPackager {
+    fn compiler_identity(
+        &self,
+        language: Language,
+        external_assembler: bool,
+        digests: &crate::build_runtime::SourceDigestCache,
+    ) -> Result<CCompilerIdentity> {
+        let hash_file = |path: &Path| -> Result<String> {
+            Ok(crate::util::hex(&digests.file_digest(path)?.id.0))
+        };
+        let driver = hash_file(&self.executable)?;
+        let mut files = super::c_toolchain::selected_compiler_libraries(
+            &self.executable,
+            &self.env_vars,
+            &self.cwd,
+            None,
+        )?;
+        if self.kind == CCompilerKind::Gcc {
+            let frontend = match language {
+                Language::Assembler | Language::AssemblerToPreprocess => None,
+                Language::Cxx
+                | Language::CxxHeader
+                | Language::CxxPreprocessed
+                | Language::CxxModule => Some("cc1plus"),
+                Language::ObjectiveC
+                | Language::ObjectiveCHeader
+                | Language::ObjectiveCPreprocessed => Some("cc1obj"),
+                Language::ObjectiveCxx
+                | Language::ObjectiveCxxHeader
+                | Language::ObjectiveCxxPreprocessed => Some("cc1objplus"),
+                _ => Some("cc1"),
+            };
+            if let Some(name) = frontend {
+                let path = self
+                    .named_tool("prog", name, pkg::ToolchainScope::PreprocessedC)?
+                    .context("GCC selected frontend unavailable")?;
+                files.extend(super::c_toolchain::selected_compiler_libraries(
+                    &path,
+                    &self.env_vars,
+                    &self.cwd,
+                    None,
+                )?);
+                files.push(path);
+            }
+            if let Some(path) =
+                self.named_tool("file", "specs", pkg::ToolchainScope::PreprocessedC)?
+            {
+                files.push(path);
+            }
+        }
+        let mut seen = HashSet::new();
+        // Preserve selection order, not installation pathname order. A path
+        // alias for the same selected implementation is not another input.
+        let mut implementation = Vec::new();
+        for path in files {
+            if seen.insert(path.canonicalize()?) {
+                implementation.push(hash_file(&path)?);
+            }
+        }
+        let assembler = if external_assembler {
+            let path = self
+                .named_tool("prog", "as", pkg::ToolchainScope::PreprocessedC)?
+                .context("selected assembler unavailable")?;
+            let mut identity = Digest::new();
+            identity.delimiter(b"c-selected-assembler-v1");
+            identity.update(hash_file(&path)?.as_bytes());
+            for library in super::c_toolchain::selected_compiler_libraries(
+                &path,
+                &self.env_vars,
+                &self.cwd,
+                None,
+            )? {
+                identity.update(hash_file(&library)?.as_bytes());
+            }
+            Some(identity.finish())
+        } else {
+            None
+        };
+        Ok(CCompilerIdentity {
+            driver,
+            implementation,
+            assembler,
+        })
+    }
+
     fn named_tool(
         &self,
         kind: &str,
@@ -2942,21 +3040,16 @@ pub(super) fn hashed_input_file_name(language: Language, input: &Path) -> Option
 }
 
 /// The cache is versioned by the inputs to `HashKeyParams::compute`.
-pub const CACHE_VERSION: &[u8] = b"18";
+pub const CACHE_VERSION: &[u8] = b"19";
 
 /// Environment variables that are factored into the cache key.
 static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
-    [
-        "MACOSX_DEPLOYMENT_TARGET",
-        "IPHONEOS_DEPLOYMENT_TARGET",
-        "TVOS_DEPLOYMENT_TARGET",
-        "WATCHOS_DEPLOYMENT_TARGET",
-        "SDKROOT",
-        "CCC_OVERRIDE_OPTIONS",
-    ]
-    .iter()
-    .map(OsStr::new)
-    .collect()
+    super::c_driver_environment::DARWIN_ENVIRONMENT
+        .iter()
+        .copied()
+        .chain(std::iter::once("CCC_OVERRIDE_OPTIONS"))
+        .map(OsStr::new)
+        .collect()
 });
 
 /// Feed normalized compiler arguments into the digest with unambiguous boundaries.

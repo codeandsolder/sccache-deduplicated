@@ -18,10 +18,20 @@ dynamic-library exception that switches compiler results to exact identity.
 Hash the compiler, language/driver mode, semantic options, preprocessed program
 (including expanded macros), selected auxiliary inputs and assembler. For GCC,
 hash the actual selected frontend and specs file, not its installation tree.
+Native GCC/Clang results use driver bytes, actual loaded compiler-code shared
+libraries, and the assembler selected by this invocation, rather than a version
+banner or the default assembler discovered for an unrelated invocation. The
+managed system runtime is not an additional compiler identity. Distribution
+compiler-code libraries (including split Clang/LLVM and GCC numeric libraries)
+and private installation dependencies remain actual compiler inputs.
 Native CPU identity uses the actual lowered target flags in the worker argument
 list, without a separate expansion fingerprint or original native request. Source basenames remain where they identify object contents.
 Hash declared environment dependencies as effective name/value assignments;
-ordering and overridden assignments are not semantic inputs. Arbitrary custom
+ordering and overridden assignments are not semantic inputs. Darwin SDK and
+deployment variables are removed before discovery and execution on non-Darwin
+targets, including Linux-targeted Clang cross compilers. GCC does not consume
+Clang driver overrides. Query the actual target only when those settings are
+present. Arbitrary custom
 cache-buster environment values are not inputs; forced recache is a cache
 operation, not a distinct result identity.
 

@@ -2878,6 +2878,63 @@ fn run_c_epoch_audit(service: &LocalService, root: &Path, config: &Path) -> Resu
     Ok(())
 }
 
+fn run_c_driver_environment_audit(
+    service: &LocalService,
+    root: &Path,
+    config: &Path,
+) -> Result<()> {
+    let directory = root.join("driver-environment");
+    fs::create_dir(&directory)?;
+    fs::write(
+        directory.join("driver.c"),
+        b"int driver_probe(int x) { return x * 3 + 1; }\n",
+    )?;
+    let compile = |driver: &str,
+                   target: Option<&str>,
+                   deployment: &str,
+                   sdk: &str,
+                   override_options: &str|
+     -> Result<((String, String), Vec<u8>)> {
+        let mut command = service.command(env!("CARGO_BIN_EXE_sccache"));
+        command
+            .args([driver, "-c", "driver.c", "-o", "driver.o"])
+            .current_dir(&directory)
+            .env("SCCACHE_CONF", config)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
+            .env("MACOSX_DEPLOYMENT_TARGET", deployment)
+            .env("SDKROOT", sdk)
+            .env("CCC_OVERRIDE_OPTIONS", override_options);
+        if let Some(target) = target {
+            command.arg(target);
+        }
+        let output = command.output()?;
+        Ok((
+            action_report(&output)?,
+            fs::read(directory.join("driver.o"))?,
+        ))
+    };
+    let ((gcc_key, source), first) = compile("/usr/bin/gcc", None, "10.14", "/unused-a", "^-O0")?;
+    assert_eq!(source, "worker");
+    let ((same, source), second) = compile("/usr/bin/gcc", None, "12.0", "/unused-b", "^-O2")?;
+    assert_eq!((same, source), (gcc_key, "hit".into()));
+    assert_eq!(first, second);
+    let clang = "/usr/bin/clang";
+    let ((clang_key, source), first) = compile(clang, None, "10.14", "/unused-a", "")?;
+    assert_eq!(source, "worker");
+    let ((same, source), second) = compile(clang, None, "12.0", "/unused-b", "")?;
+    assert_eq!((same, source), (clang_key, "hit".into()));
+    assert_eq!(first, second);
+    // These same environment variables are real inputs for a Darwin target.
+    let target = Some("--target=x86_64-apple-darwin");
+    let ((old, source), first) = compile(clang, target, "10.14", "/unused-a", "")?;
+    assert_eq!(source, "worker");
+    let ((new, source), second) = compile(clang, target, "12.0", "/unused-a", "")?;
+    assert_eq!(source, "worker");
+    assert_ne!(old, new);
+    assert_ne!(first, second);
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires Linux Bubblewrap, GCC and ldd"]
 fn native_compiler_semantic_reuse_across_ephemeral_inputs() -> Result<()> {
@@ -2930,6 +2987,7 @@ fn native_compiler_semantic_reuse_across_ephemeral_inputs() -> Result<()> {
         assert_ne!(artifact, bytes);
     }
     run_c_epoch_audit(&service, &root, &config)?;
+    run_c_driver_environment_audit(&service, &root, &config)?;
     service.stop()?;
     fleet.finish()?;
     Ok(())

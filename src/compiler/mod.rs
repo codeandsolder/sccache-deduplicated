@@ -15,6 +15,7 @@
 #[macro_use]
 mod args;
 mod c;
+mod c_driver_environment;
 #[cfg(all(
     feature = "dist-client",
     target_os = "linux",

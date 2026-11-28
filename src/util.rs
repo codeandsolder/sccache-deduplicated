@@ -615,12 +615,12 @@ fn hash_archive(
     let archive = fs::read(path)
         .with_context(|| format!("Failed to read archive: {}", debug_display(path)))?;
     if let Ok(fat) = MachOFatFile32::parse(&*archive) {
-        hash_fat_archive(path, &archive, fat.arches(), macho_target)
-    } else if let Ok(fat) = MachOFatFile64::parse(&*archive) {
-        hash_fat_archive(path, &archive, fat.arches(), macho_target)
-    } else {
-        hash_regular_archive(path, &archive)
+        return hash_fat_archive(path, &archive, fat.arches(), macho_target);
     }
+    if let Ok(fat) = MachOFatFile64::parse(&*archive) {
+        return hash_fat_archive(path, &archive, fat.arches(), macho_target);
+    }
+    hash_regular_archive(path, &archive)
 }
 
 fn hash_fat_archive<A: FatArch>(

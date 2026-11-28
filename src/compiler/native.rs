@@ -584,13 +584,9 @@ fn prepare_toolchain(
                 b"PATH".as_slice(),
                 b"LD_LIBRARY_PATH",
                 b"CCC_OVERRIDE_OPTIONS",
-                b"SDKROOT",
-                b"MACOSX_DEPLOYMENT_TARGET",
-                b"IPHONEOS_DEPLOYMENT_TARGET",
-                b"TVOS_DEPLOYMENT_TARGET",
-                b"WATCHOS_DEPLOYMENT_TARGET",
             ]
             .contains(&name)
+                || super::c_driver_environment::darwin_variable(std::ffi::OsStr::from_bytes(name))
                 || (scope != pkg::ToolchainScope::PreprocessedC
                     && [
                         b"SOURCE_DATE_EPOCH".as_slice(),
