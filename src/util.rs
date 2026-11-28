@@ -180,7 +180,7 @@ impl Digest {
         pool.spawn_blocking(move || Self::path_sync(&path)).await?
     }
 
-    fn path_sync(path: &Path) -> Result<String> {
+    pub(crate) fn path_sync(path: &Path) -> Result<String> {
         let is_directory = path.is_dir();
         // A different BLAKE3 domain keeps a file whose literal bytes
         // equal a directory serialization from sharing its digest.

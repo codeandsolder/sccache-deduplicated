@@ -175,6 +175,9 @@ impl NativeCompilerClient {
     ) -> Result<Vec<String>> {
         let client = Arc::clone(self);
         crate::util::hash_path_batch(files, pool, move |path| {
+            if path.is_dir() {
+                return crate::util::Digest::path_sync(path);
+            }
             let file = std::fs::File::open(path)?;
             if let Some((blob, _)) = client.reference(&file)? {
                 Ok(crate::util::hex(&blob.id.0))
