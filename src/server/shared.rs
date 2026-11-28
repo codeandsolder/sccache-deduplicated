@@ -60,7 +60,7 @@ struct Job {
 
 #[derive(Serialize, Deserialize)]
 enum ExecutorEvent {
-    Progress(activity::CompileActivity),
+    Progress(Box<activity::CompileActivity>),
     Finished(std::result::Result<CompileFinished, String>),
 }
 
@@ -206,7 +206,7 @@ async fn read_result(
         let mut bytes = vec![0; len];
         reader.read_exact(&mut bytes).await?;
         match decode_frame(&bytes)? {
-            ExecutorEvent::Progress(sample) => activity.observe_executor(sample)?,
+            ExecutorEvent::Progress(sample) => activity.observe_executor(*sample)?,
             ExecutorEvent::Finished(result) => return result.map_err(anyhow::Error::msg),
         }
     }

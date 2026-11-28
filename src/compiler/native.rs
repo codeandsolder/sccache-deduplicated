@@ -388,7 +388,7 @@ impl NativeCompilerClient {
         let key = fingerprint.key()?;
         crate::server::activity::key_evidence(
             &fingerprint.schema,
-            &blake3::Hash::from_bytes(key.0).to_hex().to_string(),
+            blake3::Hash::from_bytes(key.0).to_hex().as_ref(),
             fingerprint
                 .components
                 .iter()

@@ -1113,10 +1113,11 @@ where
                 CCompilerKind::Gcc | CCompilerKind::Clang
             )
             && relocatable_object(&parsed_args);
-        let mapped_input = canonical_native.as_ref().map_or_else(
-            || Cow::Borrowed(preprocessor_output.as_slice()),
-            |paths| paths.preprocessed_key_bytes(&preprocessor_output),
-        );
+        let mapped_input = canonical_native
+            .as_ref()
+            .map_or(Cow::Borrowed(preprocessor_output.as_slice()), |paths| {
+                paths.preprocessed_key_bytes(&preprocessor_output)
+            });
         let key_input = if native_identity {
             if relocate_native_object {
                 extra_hashes.push("native-relocatable-object-v2".into());

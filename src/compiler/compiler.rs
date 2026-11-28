@@ -2761,6 +2761,7 @@ LLVM version: 6.0",
         fs::create_dir(f.tempdir.path().join("lib"))?;
         fs::create_dir(f.tempdir.path().join("bin"))?;
         let rustc = f.mk_bin("rustc-workspace-wrapper")?;
+        let wrapped_rustc = f.mk_bin("rustc.exe")?;
         let creator = new_creator();
         let runtime = single_threaded_runtime();
         let pool = runtime.handle();
@@ -2770,7 +2771,7 @@ LLVM version: 6.0",
             &rustc,
             f.tempdir.path(),
             // Specifying an extension tests the ignoring
-            &[OsString::from("rustc.exe")],
+            &[wrapped_rustc.into_os_string()],
             &[(OsString::from("CARGO"), OsString::from("CARGO"))],
             pool,
             CompilerDiscovery::default(),

@@ -162,6 +162,7 @@ impl Digest {
     /// Fingerprint the actual serialized bytes of each named cache-key field
     /// independently for diagnosis. This does not change the key or export
     /// raw arguments, paths, source text or environment values.
+    #[must_use = "the returned hasher records the cache key and audit fields"]
     pub fn audited(kind: &'static str) -> Self {
         let mut digest = Self::new();
         if crate::server::activity::trace_context().is_some() {

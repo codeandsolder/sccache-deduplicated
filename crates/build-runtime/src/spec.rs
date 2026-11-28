@@ -412,7 +412,7 @@ mod tests {
             .outputs
             .get_mut("object")
             .context("test output")?
-            .path = BuildPath::new(b"/different/output")?;
+            .path = BuildPath::new(b"/different/output".to_vec())?;
         let changed_request = changed.action_request()?;
         assert_ne!(request, changed_request);
         assert_eq!(key, changed_request.action_fingerprint()?.key()?);

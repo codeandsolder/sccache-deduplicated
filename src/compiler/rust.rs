@@ -3879,7 +3879,9 @@ where
                     .rev()
                     .find(|(name, _)| name == var)
                     .map(|(_, value)| paths.env_value_to_canonical(var, value));
-                observed.hash(&mut HashToDigest { digest: &mut m });
+                observed
+                    .as_deref()
+                    .hash(&mut HashToDigest { digest: &mut m });
                 continue;
             }
             var.hash(&mut HashToDigest { digest: &mut m });
@@ -4650,8 +4652,8 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         let runtime = Some(RustRuntimeSearch {
-            executable: executable.clone(),
-            cwd: cwd.clone(),
+            executable,
+            cwd,
             environment: env_vars.clone(),
             preserve_libraries: env_dep_names.contains(OsStr::new("LD_LIBRARY_PATH")),
         });
@@ -5873,7 +5875,10 @@ impl pkg::DiscoverToolchain for RustToolchainPackager {
 
         let bins_path = sysroot.join(BINS_DIR);
         let sysroot_executable = bins_path.join("rustc").with_extension(EXE_EXTENSION);
-        if scope != pkg::ToolchainScope::Default {
+        if scope == pkg::ToolchainScope::Default {
+            package_builder.add_executable_and_deps(sysroot_executable)?;
+            package_builder.add_dir_contents(&bins_path)?;
+        } else {
             if let Some(runtime) = runtime {
                 runtime.prepare(
                     &mut package_builder,
@@ -5897,9 +5902,6 @@ impl pkg::DiscoverToolchain for RustToolchainPackager {
                     }
                 }
             }
-        } else {
-            package_builder.add_executable_and_deps(sysroot_executable)?;
-            package_builder.add_dir_contents(&bins_path)?;
         }
         if BINS_DIR != LIBS_DIR {
             let libs_path = sysroot.join(LIBS_DIR);

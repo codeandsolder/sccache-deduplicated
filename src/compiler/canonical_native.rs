@@ -271,18 +271,11 @@ impl NativeCargoPaths {
             .iter()
             .filter(|(name, _)| **name != "d")
             .collect();
-        if !relocatable_output {
-            outputs.sort_unstable_by_key(|(name, _)| *name);
-            for (name, output) in outputs {
-                digest.update(name.as_bytes());
-                digest.update(b"\0");
-                self.hash_path(&mut digest, &cwd.join(&output.path));
-            }
-        } else {
-            // Domain separate the relocatable artifact policy from the
-            // earlier path-dependent policy without invalidating unrelated
-            // compiler keys.
-            digest.update(b"relocatable-single-artifact-v1\0");
+        outputs.sort_unstable_by_key(|(name, _)| *name);
+        for (name, output) in outputs {
+            digest.update(name.as_bytes());
+            digest.update(b"\0");
+            self.hash_path(&mut digest, &cwd.join(&output.path));
         }
 
         // Arbitrary strings, assembler .file directives, and explicit
