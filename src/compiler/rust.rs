@@ -5166,6 +5166,16 @@ impl RustRuntimeSearch {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
         let rustc = sysroot.join(BINS_DIR).join("rustc");
+        if canonical
+            && let Some(alias) = self.executable.parent().and_then(Path::parent)
+            && alias.canonicalize()? == sysroot.canonicalize()?
+        {
+            // rustup can return an executable through a campaign-local
+            // toolchain symlink while --print=sysroot returns the real root.
+            // The canonical invocation uses /rust/bin, so the outer alias is
+            // not an execution dependency. Keep internal symlink topology.
+            builder.add_root_mapping(alias.to_owned(), "/rust".into());
+        }
         if opaque || self.preserve_libraries {
             builder.add_executable_and_deps(rustc)?;
             builder.add_executable_and_deps(self.executable)?;

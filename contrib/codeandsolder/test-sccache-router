@@ -58,6 +58,13 @@ output="$(CARGO_BUILD_BUILD_DIR="$root/scratch/{workspace-path-hash}" route comp
 rg -Fxq "uds=$root/listener.sock port= canonical=1 start=0 no_auto=1" <<<"$output"
 output="$(CARGO_MANIFEST_DIR="$root/workspace" route compiler 1000 rustc --version)"
 rg -Fxq "uds=$root/listener.sock port= canonical=1 start=0 no_auto=1" <<<"$output"
+mkdir -p "$root/toolchain/bin" "$root/campaign/rustup"
+ln -s "$root/toolchain" "$root/campaign/rustup/nightly"
+touch "$root/toolchain/bin/rustc" "$root/toolchain/bin/clippy-driver"
+for compiler in rustc clippy-driver; do
+    output="$(CARGO_TARGET_DIR="$root/target" route compiler 1000 "$root/campaign/rustup/nightly/bin/$compiler" --version)"
+    rg -Fxq "arg=<$root/toolchain/bin/$compiler>" <<<"$output"
+done
 output="$(route public 1000 rustc --version)"
 rg -Fxq 'arg=<rustc>' <<<"$output"
 output="$(SCCACHE_SERVER_PORT=12345 route compiler 1000 gcc -c 'foo bar.c')"

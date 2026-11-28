@@ -131,6 +131,20 @@ sccache_wrapper_main() {
         if (( ${#args[@]} )) && [[ "${args[0]}" == rustc ]]; then
             args[0]="$("$rustup" which rustc)"
         fi
+        # Cargo's selected Rustup toolchain may be reached through a
+        # campaign-local directory symlink. Resolve that directory, not the
+        # executable's basename (Rustup proxies are multi-call binaries).
+        # The managed canonical Rust invocation already uses /rust/bin.
+        if [[ ${SCCACHE_EXPERIMENTAL_CANONICAL_RUST:-} == 1 && ${args[0]:-} == /* ]]; then
+            case "${args[0]##*/}" in
+                rustc|clippy-driver)
+                    local compiler_dir
+                    if compiler_dir=$(realpath -e -- "${args[0]%/*}" 2>/dev/null); then
+                        args[0]="$compiler_dir/${args[0]##*/}"
+                    fi
+                    ;;
+            esac
+        fi
     fi
     exec "$binary" "${args[@]}"
 }
