@@ -39,7 +39,7 @@ fn search_path_spec(
         .iter()
         .rev()
         .find(|(name, _)| name == TARGET_PATH)
-        .map_or(OsStr::new(""), |(_, value)| value.as_os_str());
+        .map_or_else(|| OsStr::new(""), |(_, value)| value.as_os_str());
     let name = format!("{target}.json");
     std::env::split_paths(search).find_map(|dir| {
         let path = cwd.join(&dir).join(&name);

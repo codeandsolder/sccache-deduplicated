@@ -3103,6 +3103,118 @@ fn native_compiler_semantic_reuse_across_ephemeral_inputs() -> Result<()> {
     Ok(())
 }
 
+fn run_packed_archive_audit(
+    service: &LocalService,
+    source: &Path,
+    rustc: &Path,
+    config: &Path,
+) -> Result<()> {
+    use object::{Object, ObjectSection};
+    use std::io::Read;
+    fs::write(
+        source.join("packed.rs"),
+        br#"
+        macro_rules! native { () => {
+            #[link(name="probe", kind="static", modifiers="+whole-archive")]
+            unsafe extern "C" { fn native_value() -> i32; }
+        } }
+        native!();
+        pub fn rust_value() -> i32 { unsafe { native_value() } }
+    "#,
+    )?;
+    let archive_path = source.join("one/libprobe.a");
+    let member = source.join("one/probe.o");
+    fs::copy(source.join("probe.o"), &member)?;
+    let make_archive = |mode: &str| -> Result<()> {
+        if archive_path.exists() {
+            fs::remove_file(&archive_path)?;
+        }
+        ensure!(
+            Command::new("/usr/bin/ar")
+                .args([mode, "libprobe.a", "probe.o"])
+                .current_dir(source.join("one"))
+                .status()?
+                .success(),
+            "archive creation failed"
+        );
+        Ok(())
+    };
+    let compile = || -> Result<((String, String), Vec<u8>)> {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .arg(rustc)
+            .args([
+                "--crate-name",
+                "packed",
+                "--crate-type",
+                "rlib",
+                "--edition=2024",
+                "--emit=link",
+                "--out-dir",
+                "build",
+                "-Lnative=one",
+                "packed.rs",
+            ])
+            .current_dir(source)
+            .env("SCCACHE_CONF", config)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
+            .output()?;
+        Ok((
+            action_report(&output)?,
+            fs::read(source.join("build/libpacked.rlib"))?,
+        ))
+    };
+    let embedded_member = |bytes: &[u8]| -> Result<Vec<u8>> {
+        let mut rlib = ar::Archive::new(bytes);
+        while let Some(entry) = rlib.next_entry() {
+            let mut entry = entry?;
+            if entry.header().identifier() != b"libprobe.a" {
+                continue;
+            }
+            let mut wrapper = Vec::new();
+            entry.read_to_end(&mut wrapper)?;
+            let object = object::File::parse(wrapper.as_slice())?;
+            let section = object
+                .section_by_name(".bundled_lib")
+                .context("missing packed archive section")?;
+            let bytes = section.data()?;
+            let archive = object::read::archive::ArchiveFile::parse(bytes)?;
+            assert!(!archive.is_thin());
+            let index = archive.symbols()?.context("missing symbol index")?;
+            for symbol in index {
+                let symbol = symbol?;
+                if symbol.name() == b"native_value" {
+                    return Ok(archive.member(symbol.offset())?.data(bytes)?.to_vec());
+                }
+            }
+        }
+        bail!("missing packed native object")
+    };
+    make_archive("crs")?;
+    let ((key, kind), first) = compile()?;
+    assert_eq!(kind, "worker");
+    assert_eq!(embedded_member(&first)?, fs::read(&member)?);
+    let mut archive_bytes = fs::read(&archive_path)?;
+    archive_bytes[24..36].copy_from_slice(b"123456      ");
+    fs::write(&archive_path, archive_bytes)?;
+    let ((same, kind), second) = compile()?;
+    assert_eq!((same, kind), (key.clone(), "hit".into()));
+    assert_eq!(first, second);
+    make_archive("crsT")?;
+    let thin = fs::read(&archive_path)?;
+    let ((same, kind), third) = compile()?;
+    assert_eq!((same, kind), (key.clone(), "hit".into()));
+    assert_eq!(first, third);
+    fs::copy(source.join("one/member.o"), &member)?;
+    assert_eq!(fs::read(&archive_path)?, thin);
+    let ((changed, kind), fourth) = compile()?;
+    assert_eq!(kind, "worker");
+    assert_ne!(changed, key);
+    assert_eq!(embedded_member(&fourth)?, fs::read(member)?);
+    assert_ne!(first, fourth);
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires Linux Bubblewrap, GCC, Rust toolchain and ldd"]
 fn native_rust_bundled_archive_identity_follows_search_precedence() -> Result<()> {
@@ -3247,6 +3359,7 @@ fn native_rust_bundled_archive_identity_follows_search_precedence() -> Result<()
     let ((same, source_kind), third) = compile(["one", "two"], "link")?;
     assert_eq!((same, source_kind), (changed, "hit".into()));
     assert_eq!(second, third);
+    run_packed_archive_audit(&service, &source, &rustc, &config)?;
     service.stop()?;
     fleet.finish()?;
     Ok(())

@@ -186,7 +186,7 @@ impl NativeCompilerClient {
         pool: &tokio::runtime::Handle,
     ) -> Result<Vec<String>> {
         let client = Arc::clone(self);
-        crate::util::hash_path_batch(files, pool, move |path| {
+        crate::util::hash_input_batch(files, pool, move |path| {
             let file = std::fs::File::open(path)?;
             if let Some((blob, _)) = client.reference(&file)? {
                 Ok(crate::util::hex(&blob.id.0))
@@ -211,7 +211,7 @@ impl NativeCompilerClient {
     ) -> Result<Vec<String>> {
         let client = Arc::clone(self);
         let sysroot = sysroot.canonicalize()?;
-        crate::util::hash_path_batch(files, pool, move |path| {
+        crate::util::hash_input_batch(files, pool, move |path| {
             if path.starts_with(&sysroot) {
                 return Ok(crate::util::hex(
                     &client.toolchain_digests.file_digest(path)?.id.0,

@@ -17,8 +17,6 @@ use blake3::Hasher as blake3_Hasher;
 use byteorder::{BigEndian, ByteOrder};
 use fs::File;
 use fs_err as fs;
-use object::read::archive::ArchiveFile;
-use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
@@ -504,13 +502,14 @@ pub fn hex(bytes: &[u8]) -> String {
 /// Concurrent compile requests already provide file-level I/O concurrency.
 /// Keeping one task per independent dependency list also bounds archive
 /// buffers and the number of open descriptors in private executors.
-pub(crate) async fn hash_path_batch<F, T>(
-    files: &[PathBuf],
+pub(crate) async fn hash_input_batch<I, F, T>(
+    inputs: &[I],
     pool: &tokio::runtime::Handle,
     mut hash: F,
 ) -> Result<Vec<T>>
 where
-    F: FnMut(&Path) -> Result<T> + Send + 'static,
+    I: Clone + Send + 'static,
+    F: FnMut(&I) -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
     use std::sync::{
@@ -524,24 +523,24 @@ where
         }
     }
 
-    if files.is_empty() {
+    if inputs.is_empty() {
         return Ok(Vec::new());
     }
-    let files = files.to_vec();
+    let inputs = inputs.to_vec();
     let cancelled = Arc::new(AtomicBool::new(false));
     // Dropping an async caller cannot interrupt an in-progress blocking
     // file read, but must not continue through the rest of the batch.
     let guard = CancelBatch(Arc::clone(&cancelled));
     let hashes = pool
         .spawn_blocking(move || {
-            files
+            inputs
                 .iter()
-                .map(|path| {
+                .map(|input| {
                     anyhow::ensure!(
                         !cancelled.load(Ordering::Relaxed),
                         "input hash batch cancelled"
                     );
-                    hash(path)
+                    hash(input)
                 })
                 .collect()
         })
@@ -555,7 +554,7 @@ where
 pub async fn hash_all(files: &[PathBuf], pool: &tokio::runtime::Handle) -> Result<Vec<String>> {
     let start = time::Instant::now();
     let count = files.len();
-    let hashes = hash_path_batch(files, pool, Digest::path_sync).await?;
+    let hashes = hash_input_batch(files, pool, |path| Digest::path_sync(path)).await?;
     trace!(
         "Hashed {count} files in {}",
         fmt_duration_as_secs(&start.elapsed())
@@ -573,124 +572,6 @@ pub fn new_client_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-}
-
-/// A selected thin member is both a semantic input and a worker input. The
-/// literal archive name matters because rustc preserves it when bundling.
-#[derive(Debug)]
-pub(crate) struct ThinArchiveMember {
-    pub name: PathBuf,
-    pub path: PathBuf,
-}
-
-#[derive(Debug)]
-pub(crate) struct ArchiveIdentity {
-    pub digest: String,
-    pub external_members: Vec<ThinArchiveMember>,
-}
-
-/// Hash ordered archive member names and bytes, not timestamps, ownership,
-/// header padding, or symbol-table offsets. Thin archives refer to external
-/// files: read those exact files and return their paths for packaging.
-pub(crate) async fn hash_all_archives(
-    files: &[PathBuf],
-    pool: &tokio::runtime::Handle,
-    macho_target: Option<object::Architecture>,
-) -> Result<Vec<ArchiveIdentity>> {
-    let start = time::Instant::now();
-    let count = files.len();
-    let hashes = hash_path_batch(files, pool, move |path| hash_archive(path, macho_target)).await?;
-    trace!(
-        "Hashed {count} archives in {}",
-        fmt_duration_as_secs(&start.elapsed())
-    );
-    Ok(hashes)
-}
-
-fn hash_archive(
-    path: &Path,
-    macho_target: Option<object::Architecture>,
-) -> Result<ArchiveIdentity> {
-    // Use owned memory: another process may truncate or rewrite the archive.
-    let archive = fs::read(path)
-        .with_context(|| format!("Failed to read archive: {}", debug_display(path)))?;
-    if let Ok(fat) = MachOFatFile32::parse(&*archive) {
-        return hash_fat_archive(path, &archive, fat.arches(), macho_target);
-    }
-    if let Ok(fat) = MachOFatFile64::parse(&*archive) {
-        return hash_fat_archive(path, &archive, fat.arches(), macho_target);
-    }
-    hash_regular_archive(path, &archive)
-}
-
-fn hash_fat_archive<A: FatArch>(
-    path: &Path,
-    data: &[u8],
-    arches: &[A],
-    target: Option<object::Architecture>,
-) -> Result<ArchiveIdentity> {
-    // rustc's macOS archive builder chooses the first matching architecture
-    // (not the CPU subtype), then treats its slice as an ordinary archive.
-    if let Some(selected) =
-        target.and_then(|target| arches.iter().find(|arch| arch.architecture() == target))
-    {
-        return hash_regular_archive(path, selected.data(data)?);
-    }
-    // Unknown/non-macOS consumers cannot be equated to an arbitrary slice.
-    // Keep architecture association and slice boundaries explicit.
-    let mut digest = Digest::new();
-    digest.delimiter(b"fat-archive-v2");
-    let mut external_members = Vec::new();
-    for arch in arches {
-        digest.update(&arch.cputype().0.to_le_bytes());
-        digest.update(&arch.cpusubtype().0.to_le_bytes());
-        let slice = hash_regular_archive(path, arch.data(data)?)?;
-        digest.update(slice.digest.as_bytes());
-        external_members.extend(slice.external_members);
-    }
-    Ok(ArchiveIdentity {
-        digest: digest.finish(),
-        external_members,
-    })
-}
-
-fn hash_regular_archive(path: &Path, data: &[u8]) -> Result<ArchiveIdentity> {
-    let archive = ArchiveFile::parse(data)?;
-    let mut digest = Digest::new();
-    digest.delimiter(b"archive-members-v2");
-    let mut external_members = Vec::new();
-    for entry in archive.members() {
-        let entry = entry?;
-        let name = entry.name();
-        digest.update(&(name.len() as u128).to_le_bytes());
-        digest.update(name);
-        let content = if entry.is_thin() {
-            // rustc uses the member's UTF-8 name verbatim and resolves it
-            // relative to the selected archive's parent, including ../.
-            let name = PathBuf::from(str::from_utf8(name)?);
-            let member_path = path.parent().context("archive has no parent")?.join(&name);
-            let file = File::open(&member_path).with_context(|| {
-                format!(
-                    "Failed to open thin archive member {}",
-                    debug_display(&member_path)
-                )
-            })?;
-            let mut member_hash = blake3::Hasher::new();
-            member_hash.update_reader(file)?;
-            external_members.push(ThinArchiveMember {
-                name,
-                path: member_path,
-            });
-            member_hash.finalize()
-        } else {
-            blake3::hash(entry.data(data)?)
-        };
-        digest.update(content.as_bytes());
-    }
-    Ok(ArchiveIdentity {
-        digest: digest.finish(),
-        external_members,
-    })
 }
 
 /// Return the average of a total duration over `samples` without truncating
@@ -1874,96 +1755,6 @@ mod tests {
         assert!(super::hash_all(&[], &pool).await?.is_empty());
         files.push(root.join("absent"));
         assert!(super::hash_all(&files, &pool).await.is_err());
-        Ok(())
-    }
-
-    fn archive_bytes(name: &[u8], data: &[u8], mtime: u64) -> anyhow::Result<Vec<u8>> {
-        let mut builder = ar::Builder::new(Vec::new());
-        let mut header = ar::Header::new(name.to_vec(), u64::try_from(data.len())?);
-        header.set_mtime(mtime);
-        builder.append(&header, data)?;
-        Ok(builder.into_inner()?)
-    }
-
-    #[test]
-    fn archive_identity_frames_members_and_ignores_timestamps() -> anyhow::Result<()> {
-        let path = Path::new("/lib.a");
-        let digest = |name: &[u8], data: &[u8], time| -> anyhow::Result<String> {
-            Ok(super::hash_regular_archive(path, &archive_bytes(name, data, time)?)?.digest)
-        };
-        assert_eq!(digest(b"a", b"bc", 1)?, digest(b"a", b"bc", 2)?);
-        assert_ne!(digest(b"a", b"bc", 1)?, digest(b"ab", b"c", 1)?);
-        Ok(())
-    }
-
-    #[test]
-    fn fat_archive_identity_selects_the_compiler_architecture() -> anyhow::Result<()> {
-        use object::macho::{CPU_TYPE_ARM64, CPU_TYPE_X86_64, FAT_MAGIC};
-        let fat = |arm: &[u8]| -> anyhow::Result<Vec<u8>> {
-            let x86 = archive_bytes(b"x86.o", b"x86 bytes", 0)?;
-            let arm = archive_bytes(b"arm.o", arm, 0)?;
-            let mut output = Vec::new();
-            output.extend(FAT_MAGIC.to_be_bytes());
-            output.extend(2u32.to_be_bytes());
-            let mut offset = 48u32;
-            for (cpu, bytes) in [(CPU_TYPE_X86_64.0, &x86), (CPU_TYPE_ARM64.0, &arm)] {
-                let size = u32::try_from(bytes.len())?;
-                for field in [cpu, 0, offset, size, 0] {
-                    output.extend(field.to_be_bytes());
-                }
-                offset += size;
-            }
-            output.extend(x86);
-            output.extend(arm);
-            Ok(output)
-        };
-        let temp = tempfile::tempdir()?;
-        let path = temp.path().join("fat.a");
-        std::fs::write(&path, fat(b"old arm")?)?;
-        let x86 = super::hash_archive(&path, Some(object::Architecture::X86_64))?.digest;
-        let arm = super::hash_archive(&path, Some(object::Architecture::Aarch64))?.digest;
-        let all = super::hash_archive(&path, None)?.digest;
-        std::fs::write(&path, fat(b"new arm")?)?;
-        assert_eq!(
-            x86,
-            super::hash_archive(&path, Some(object::Architecture::X86_64))?.digest
-        );
-        assert_ne!(
-            arm,
-            super::hash_archive(&path, Some(object::Architecture::Aarch64))?.digest
-        );
-        assert_ne!(all, super::hash_archive(&path, None)?.digest);
-        Ok(())
-    }
-
-    #[test]
-    fn thin_archive_identity_reads_external_member_bytes() -> anyhow::Result<()> {
-        let temp = tempfile::tempdir()?;
-        let archive_path = temp.path().join("thin.a");
-        let member = temp.path().join("member.o");
-        // A GNU thin archive stores a member header but no inline member body.
-        let mut thin = b"!<thin>\n".to_vec();
-        let header = format!(
-            "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
-            "member.o/", 0, 0, 0, "644", 3
-        );
-        thin.extend(header.as_bytes());
-        std::fs::write(&archive_path, &thin)?;
-        std::fs::write(&member, b"old")?;
-        let first = super::hash_archive(&archive_path, None)?;
-        assert_eq!(first.external_members.len(), 1);
-        assert_eq!(first.external_members[0].path, member);
-        assert_eq!(
-            first.digest,
-            super::hash_regular_archive(&archive_path, &archive_bytes(b"member.o", b"old", 0)?)?
-                .digest
-        );
-        std::fs::write(&member, b"new")?;
-        let second = super::hash_archive(&archive_path, None)?;
-        assert_ne!(first.digest, second.digest);
-        assert_eq!(std::fs::read(&archive_path)?, thin);
-        std::fs::remove_file(member)?;
-        assert!(super::hash_archive(&archive_path, None).is_err());
         Ok(())
     }
 

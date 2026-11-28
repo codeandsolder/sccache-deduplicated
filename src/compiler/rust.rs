@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::native_archive::{ArchiveIdentity, ArchiveUse, hash_all_archives};
+use super::rust_native_library::{ArchiveRequest, Library, NativeLibraries};
 use crate::cache::FileObjectSource;
 #[cfg(target_os = "linux")]
 use crate::compiler::CompileCommandImpl;
@@ -33,7 +35,7 @@ use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
 use crate::lru_disk_cache::{Meter, WeightedLru};
 use crate::mock_command::{CommandCreatorSync, RunCommand};
-use crate::util::{Digest, fmt_duration_as_secs, hash_all, hash_all_archives, run_input_output};
+use crate::util::{Digest, fmt_duration_as_secs, hash_all, run_input_output};
 use crate::util::{HashToDigest, OsStrExt};
 use crate::{counted_array, dist};
 use async_trait::async_trait;
@@ -217,8 +219,8 @@ pub struct ParsedArguments {
     externs: Vec<PathBuf>,
     /// The directories searched for rlibs
     crate_link_paths: Vec<PathBuf>,
-    /// Static libraries whose bytes can be bundled into the output.
-    staticlibs: Vec<StaticLibraryRequest>,
+    /// Native libraries and their command-line overrides.
+    native_libraries: NativeLibraries,
     /// Native search paths, in compiler search order.
     static_link_paths: Vec<PathBuf>,
     /// The crate name passed to --crate-name.
@@ -270,6 +272,8 @@ pub struct RustCompilation {
     arguments: Vec<Argument<ArgData>>,
     /// The compiler inputs.
     inputs: Vec<PathBuf>,
+    #[cfg(feature = "dist-client")]
+    generated_archives: BTreeMap<PathBuf, Vec<u8>>,
     /// The compiler outputs.
     outputs: HashMap<String, ArtifactDescriptor>,
     /// The directories searched for rlibs
@@ -356,7 +360,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"21";
+const CACHE_VERSION: &[u8] = b"22";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -368,6 +372,7 @@ struct RustDepInfoRequest<'a, T> {
     pool: &'a tokio::runtime::Handle,
     binary_dependencies: bool,
     trace_reads: bool,
+    discover_native_libraries: bool,
 }
 
 /// Run `rustc --emit=dep-info` to discover source files and env-deps.
@@ -376,7 +381,7 @@ struct RustDepInfoRequest<'a, T> {
 /// dep-info locally instead of restoring one from a cache entry or build server.
 async fn get_source_files_and_env_deps<T>(
     request: RustDepInfoRequest<'_, T>,
-) -> Result<ParsedDepFile>
+) -> Result<(ParsedDepFile, Vec<Library>)>
 where
     T: CommandCreatorSync,
 {
@@ -390,6 +395,7 @@ where
         pool,
         binary_dependencies,
         trace_reads,
+        discover_native_libraries,
     } = request;
     let start = time::Instant::now();
     let temp_dir = tempfile::Builder::new()
@@ -398,12 +404,21 @@ where
         .context("Failed to create temp dir")?;
     let dep_file = temp_dir.path().join("deps.d");
     let mut spawn_arguments = arguments.to_vec();
-    spawn_arguments.extend([
-        OsString::from("--emit"),
-        OsString::from("dep-info"),
-        OsString::from("-o"),
-        dep_file.as_os_str().to_owned(),
-    ]);
+    if discover_native_libraries {
+        // Unlike -o, an explicit dep-info destination also writes the
+        // dependency file when rustc prints its expanded source.
+        spawn_arguments.extend([
+            OsString::from(format!("--emit=dep-info={}", dep_file.display())),
+            OsString::from("-Zunpretty=expanded"),
+        ]);
+    } else {
+        spawn_arguments.extend([
+            OsString::from("--emit"),
+            OsString::from("dep-info"),
+            OsString::from("-o"),
+            dep_file.as_os_str().to_owned(),
+        ]);
+    }
     if binary_dependencies {
         spawn_arguments.extend([OsString::from("-Z"), OsString::from("binary-dep-depinfo")]);
     }
@@ -442,7 +457,7 @@ where
         .envs(env_vars.to_vec())
         .current_dir(cwd);
     trace!("[{crate_name}]: get dep-info: {cmd:?}");
-    let _dep_info = run_input_output(cmd, None).await?;
+    let discovery = run_input_output(cmd, None).await?;
 
     let cwd = cwd.to_owned();
     let name = crate_name.to_owned();
@@ -463,10 +478,15 @@ where
                 files.sort();
                 files.dedup();
             }
-            Ok::<_, anyhow::Error>((files, env_deps, text, temp_dir))
+            let libraries = if discover_native_libraries {
+                super::rust_native_library::expanded_libraries(&discovery.stdout)?
+            } else {
+                Vec::new()
+            };
+            Ok::<_, anyhow::Error>((files, env_deps, text, libraries, temp_dir))
         })
         .await?;
-    parsed.map(move |(files, env_deps, dep_info, temp_dir)| {
+    parsed.map(move |(files, env_deps, dep_info, libraries, temp_dir)| {
         trace!(
             "[{crate_name}]: got {} source files and {} env-deps from dep-info in {}",
             files.len(),
@@ -474,7 +494,7 @@ where
             fmt_duration_as_secs(&start.elapsed())
         );
         drop(temp_dir);
-        (files, env_deps, dep_info)
+        ((files, env_deps, dep_info), libraries)
     })
 }
 
@@ -801,12 +821,7 @@ impl StaticArchiveNaming {
         })
     }
 
-    fn select(
-        &self,
-        request: &StaticLibraryRequest,
-        paths: &[PathBuf],
-        cwd: &Path,
-    ) -> Option<PathBuf> {
+    fn select(&self, request: &ArchiveRequest, paths: &[PathBuf], cwd: &Path) -> Option<PathBuf> {
         let names = if request.verbatim {
             vec![request.name.clone()]
         } else {
@@ -836,15 +851,34 @@ impl StaticArchiveNaming {
     }
 }
 
+#[derive(Debug)]
+struct SelectedArchive {
+    path: PathBuf,
+    lookup: Option<PathBuf>,
+}
+
 impl ParsedArguments {
+    fn archive_requests(&self, source: Vec<Library>) -> Vec<ArchiveRequest> {
+        if self.metadata_only_output.is_some() || self.split_link {
+            return Vec::new();
+        }
+        self.native_libraries.archive_requests(
+            source,
+            self.crate_types.rlib,
+            self.crate_types.staticlib,
+            self.crate_types.cdylib,
+        )
+    }
+
     async fn selected_staticlibs<T: CommandCreatorSync>(
         &self,
         creator: &T,
         executable: &Path,
         cwd: &Path,
         env: &[(OsString, OsString)],
-    ) -> Result<Vec<Option<PathBuf>>> {
-        if self.staticlibs.is_empty() {
+        requests: &[ArchiveRequest],
+    ) -> Result<Vec<Option<SelectedArchive>>> {
+        if requests.is_empty() {
             return Ok(Vec::new());
         }
         let mut arguments = vec![
@@ -876,10 +910,30 @@ impl ParsedArguments {
             .current_dir(cwd);
         let output = run_input_output(command, Some(Vec::new())).await?;
         let naming = StaticArchiveNaming::parse(&output.stdout)?;
-        Ok(self
-            .staticlibs
+        Ok(requests
             .iter()
-            .map(|request| naming.select(request, &self.static_link_paths, cwd))
+            .map(|request| {
+                let selected = naming.select(request, &self.static_link_paths, cwd)?;
+                if request.usage == ArchiveUse::Packed
+                    && let Some(name) = selected.file_name().and_then(OsStr::to_str)
+                {
+                    let path = naming.select(
+                        &ArchiveRequest {
+                            name: name.to_owned(),
+                            verbatim: true,
+                            usage: request.usage,
+                        },
+                        &self.static_link_paths,
+                        cwd,
+                    )?;
+                    let lookup = (path != selected).then_some(selected);
+                    return Some(SelectedArchive { path, lookup });
+                }
+                Some(SelectedArchive {
+                    path: selected,
+                    lookup: None,
+                })
+            })
             .collect())
     }
 }
@@ -1606,7 +1660,7 @@ fn macho_archive_target(
 /// every member to its independently mapped input.
 fn thin_archive_members_visible(
     archive: &Path,
-    identity: &crate::util::ArchiveIdentity,
+    identity: &ArchiveIdentity,
     canonical: &CanonicalRustPaths,
 ) -> bool {
     use super::canonical_paths::physical_operand;
@@ -2434,12 +2488,6 @@ impl IntoArg for ArgCrateTypes {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct StaticLibraryRequest {
-    name: String,
-    verbatim: bool,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 struct ArgLinkLibrary {
     kind: Option<String>,
@@ -2605,7 +2653,7 @@ enum ArgTarget {
 impl FromArg for ArgTarget {
     fn process(arg: OsString) -> ArgParseResult<Self> {
         // Is it obviously a json file path?
-        if arg.to_str().is_some_and(|value| value.ends_with(".json")) {
+        if arg.as_encoded_bytes().ends_with(b".json") {
             return Ok(Self::Path(arg.into()));
         }
         // rustc interprets only a .json suffix as an explicit path. Other
@@ -2733,7 +2781,7 @@ fn parse_arguments(
     let mut extra_filename = None;
     let mut externs = vec![];
     let mut crate_link_paths = vec![];
-    let mut static_lib_names = vec![];
+    let mut native_libraries = NativeLibraries::default();
     let mut static_link_paths: Vec<PathBuf> = vec![];
     let mut color_mode = ColorMode::Auto;
     let mut has_json = false;
@@ -2773,18 +2821,7 @@ fn parse_arguments(
                 return CompilerArguments::NotCompilation;
             }
             Some(LinkLibrary(ArgLinkLibrary { kind, name })) => {
-                // The kind may be inherited from a source #[link] attribute.
-                let (kind, modifiers) = kind.as_deref().map_or(("static", ""), |kind| {
-                    kind.split_once(':').unwrap_or((kind, ""))
-                });
-                if kind == "static" {
-                    let name = name
-                        .split_once(':')
-                        .map_or(name.as_str(), |(_, rename)| rename);
-                    let bundle = !modifiers.split(',').any(|m| m == "-bundle");
-                    let verbatim = modifiers.split(',').any(|m| m == "+verbatim");
-                    static_lib_names.push((name.to_owned(), bundle, verbatim));
-                }
+                native_libraries.push(kind.as_deref(), name);
             }
             Some(LinkPath(ArgLinkPath { kind, path })) => {
                 // "crate" is not typically necessary as cargo will normally
@@ -2834,6 +2871,13 @@ fn parse_arguments(
                 }
             }
             Some(Unstable(ArgUnstable { opt, value })) => match value.as_deref() {
+                value if option_is(opt, "packed-bundled-libs") => {
+                    native_libraries.packed = !matches!(value, Some("n" | "no" | "off" | "false"));
+                }
+                value if option_is(opt, "link-directives") => {
+                    native_libraries.source_directives =
+                        !matches!(value, Some("n" | "no" | "off" | "false"));
+                }
                 _ if option_is(opt, "no-link") || option_is(opt, "link-only") => {
                     // An explicit stage invocation has a different output
                     // contract from an ordinary --emit=link compilation.
@@ -3013,14 +3057,6 @@ fn parse_arguments(
         None
     };
 
-    // Metadata does not bundle machine code; split native linking owns its
-    // own archive inputs. Defer archive lookup until the selected compiler
-    // can report the target's actual filename convention.
-    let staticlibs = static_lib_names
-        .into_iter()
-        .filter(|(_, bundle, _)| !metadata_only && !split_link && (*bundle || crate_types.cdylib))
-        .map(|(name, _, verbatim)| StaticLibraryRequest { name, verbatim })
-        .collect();
     // We'll figure out the source files and outputs later in
     // `generate_hash_key` where we can run rustc.
     // Cargo doesn't deterministically order --externs, and we need the hash inputs in a
@@ -3032,7 +3068,7 @@ fn parse_arguments(
         crate_types,
         externs,
         crate_link_paths,
-        staticlibs,
+        native_libraries,
         static_link_paths,
         crate_name,
         dep_info: dep_info.map(std::convert::Into::into),
@@ -3306,7 +3342,7 @@ where
         // case: rustc must first recognize the argument as a JSON path.
         let explicit_alias = explicit_target
             .as_ref()
-            .is_some_and(|path| !path.to_str().is_some_and(|value| value.ends_with(".json")));
+            .is_some_and(|path| !path.as_os_str().as_encoded_bytes().ends_with(b".json"));
         if let Some(path) = &explicit_target {
             for argument in &mut effective_arguments {
                 if let Argument::WithValue(_, Target(ArgTarget::Path(operand)), _) = argument {
@@ -3629,6 +3665,20 @@ where
                 && !self.parsed_args.crate_types.cdylib
                 && !self.parsed_args.split_link);
         let selected_externs_only = binary_dependencies && metadata_inputs_only;
+        let needs_native_libraries = self.parsed_args.metadata_only_output.is_none()
+            && !self.parsed_args.split_link
+            && self.parsed_args.native_libraries.source_directives
+            && !self.parsed_args.static_link_paths.is_empty();
+        let discover_native_libraries = needs_native_libraries && self.version.contains("-nightly");
+        if needs_native_libraries && !discover_native_libraries {
+            // Older stable compilers cannot report expanded native link directives.
+            // Do not admit a result under an incomplete archive identity.
+            anyhow::ensure!(
+                !native_discovery,
+                "native Rust archive discovery requires the managed nightly compiler"
+            );
+            effective_cache_control = CacheControl::ForceNoCache;
+        }
         let source_hashes_pool = pool.clone();
         let source_files_and_hashes_and_env_deps = async {
             let discover = async |environment: &[(OsString, OsString)], trace_reads| {
@@ -3642,10 +3692,11 @@ where
                     pool,
                     binary_dependencies,
                     trace_reads,
+                    discover_native_libraries,
                 })
                 .await
             };
-            let (mut source_files, mut env_deps, mut dep_info_text) =
+            let ((mut source_files, mut env_deps, mut dep_info_text), mut libraries) =
                 discover(&env_vars, false).await?;
             let mut observed = env_deps
                 .iter()
@@ -3674,7 +3725,9 @@ where
                     if previous.as_ref() == Some(&execution) {
                         break;
                     }
-                    let (files, deps, text) = discover(&execution, true).await?;
+                    let ((files, deps, text), discovered_libraries) =
+                        discover(&execution, true).await?;
+                    libraries = discovered_libraries;
                     observed.extend(deps.iter().map(|(name, _)| name.clone()));
                     source_files = files;
                     env_deps = deps;
@@ -3736,6 +3789,7 @@ where
                 dep_info_text,
                 observed,
                 opaque,
+                libraries,
             ))
         };
 
@@ -3763,28 +3817,6 @@ where
         };
         #[cfg(not(all(feature = "dist-client", target_os = "linux")))]
         let extern_hashes = hash_all(&abs_externs, pool);
-        // Hash the contents of the staticlibs listed on the commandline.
-        trace!(
-            "[{}]: hashing {} staticlibs",
-            self.parsed_args.crate_name,
-            self.parsed_args.staticlibs.len()
-        );
-        let selected_staticlibs = self
-            .parsed_args
-            .selected_staticlibs(creator, &self.executable, &cwd, &env_vars)
-            .await?;
-        let abs_staticlibs = selected_staticlibs
-            .iter()
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>();
-        let archive_target = if !abs_staticlibs.is_empty() && !self.parsed_args.crate_types.cdylib {
-            macho_archive_target(&target, target_spec.map(PathBuf::as_path), &cwd)
-        } else {
-            None
-        };
-        let staticlib_hashes = hash_all_archives(&abs_staticlibs, pool, archive_target);
-
         // The selected target specification is a real compiler input;
         // rustc binary dep-info does not report it.
         let target_json_files = if explicit_alias {
@@ -3815,19 +3847,98 @@ where
 
         // Perform all hashing operations on the files.
         let (
-            (source_files, source_hashes, mut env_deps, dep_info_text, env_dep_names, opaque),
+            (
+                source_files,
+                source_hashes,
+                mut env_deps,
+                dep_info_text,
+                env_dep_names,
+                opaque,
+                libraries,
+            ),
             extern_hashes,
-            staticlib_hashes,
             target_json_hash,
             mut outputs,
         ) = futures::try_join!(
             source_files_and_hashes_and_env_deps,
             extern_hashes,
-            staticlib_hashes,
             target_json_hash,
             outputs
         )?;
 
+        let archive_requests = self.parsed_args.archive_requests(libraries);
+        let selected_staticlibs = self
+            .parsed_args
+            .selected_staticlibs(
+                creator,
+                &self.executable,
+                &cwd,
+                &env_vars,
+                &archive_requests,
+            )
+            .await?;
+        let archive_inputs = selected_staticlibs
+            .iter()
+            .zip(&archive_requests)
+            .filter_map(|(selected, request)| {
+                selected
+                    .as_ref()
+                    .map(|selected| (selected.path.clone(), request.usage))
+            })
+            .collect::<Vec<_>>();
+        let archive_lookup_paths = selected_staticlibs
+            .iter()
+            .flatten()
+            .filter_map(|selected| selected.lookup.clone())
+            .collect::<Vec<_>>();
+        let abs_staticlibs = archive_inputs
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let archive_target = if !abs_staticlibs.is_empty() && !self.parsed_args.crate_types.cdylib {
+            macho_archive_target(&target, target_spec.map(PathBuf::as_path), &cwd)
+        } else {
+            None
+        };
+        let staticlib_hashes = hash_all_archives(
+            &archive_inputs,
+            pool,
+            archive_target,
+            native_discovery,
+            &source_files,
+        )
+        .await?;
+        #[cfg(not(feature = "dist-client"))]
+        debug_assert!(
+            staticlib_hashes
+                .iter()
+                .all(|archive| archive.generated.is_none())
+        );
+        #[cfg(feature = "dist-client")]
+        let mut staticlib_hashes = staticlib_hashes;
+        #[cfg(feature = "dist-client")]
+        let generated_archives = abs_staticlibs
+            .iter()
+            .zip(&mut staticlib_hashes)
+            .filter_map(|(path, archive)| {
+                archive
+                    .generated
+                    .take()
+                    .map(|bytes| path.canonicalize().map(|path| (path, bytes)))
+            })
+            .collect::<std::io::Result<BTreeMap<_, _>>>()?;
+        #[cfg(feature = "dist-client")]
+        if !generated_archives.is_empty() {
+            for (path, archive) in abs_staticlibs.iter().zip(&mut staticlib_hashes) {
+                if !archive.external_members.is_empty()
+                    && generated_archives
+                        .get(&path.canonicalize()?)
+                        .is_some_and(|bytes| bytes.starts_with(&object::archive::MAGIC))
+                {
+                    archive.external_members.clear();
+                }
+            }
+        }
         let archive_members = staticlib_hashes
             .iter()
             .flat_map(|archive| {
@@ -3862,6 +3973,7 @@ where
                 .iter()
                 .chain(abs_externs.iter())
                 .chain(abs_staticlibs.iter())
+                .chain(archive_lookup_paths.iter())
                 .chain(archive_members.iter())
                 .chain(target_json_files.iter())
                 // An rmeta can implicitly load a host proc macro through -L
@@ -4009,13 +4121,6 @@ where
         // Hash inputs:
         // 1. A version
         m.update(CACHE_VERSION);
-        if effective_arguments.iter().any(|arg| {
-            matches!(arg.get_data(), Some(LinkLibrary(ArgLinkLibrary { kind, name }))
-                if kind.as_deref().is_none_or(|kind| kind.starts_with("static:"))
-                    || name.contains(':'))
-        }) {
-            m.delimiter(b"native-library-inputs-v1");
-        }
         if is_clippy_driver(&self.executable) {
             // Separate correctly executed Clippy from old rustc-substituted results.
             m.update(b"clippy-driver-correct-execution-v1");
@@ -4125,7 +4230,7 @@ where
         }
         // 4. The digest of all source files (this includes src file from cmdline).
         // 5. The digest of all files listed on the commandline (self.externs).
-        // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
+        // 6. The digests of the native archives actually consumed by rustc.
         // 7. The digest of the content of the target json file specified via `--target` (if any).
         m.audit_field("sccache.key.sources");
         hash_rust_input_group(&mut m, b"rust-sources-v1", &source_hashes);
@@ -4353,6 +4458,7 @@ where
             .filter(|path| !precise_dependencies || !path.starts_with(&physical_sysroot))
             .chain(abs_externs.iter())
             .chain(abs_staticlibs.iter())
+            .chain(archive_lookup_paths.iter())
             .chain(archive_members.iter())
             .chain(target_json_files.iter())
             .cloned()
@@ -4499,6 +4605,8 @@ where
                 sysroot: self.sysroot.clone(),
                 arguments,
                 inputs,
+                #[cfg(feature = "dist-client")]
+                generated_archives,
                 outputs,
                 crate_link_paths: self.parsed_args.crate_link_paths.clone(),
                 #[cfg(feature = "dist-client")]
@@ -4906,6 +5014,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
     ) -> Result<DistPackagers> {
         let Self {
             inputs,
+            generated_archives,
             crate_link_paths,
             precise_dependencies,
             sysroot,
@@ -4982,6 +5091,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             crate_link_paths,
             can_trim_rlibs,
             inputs,
+            generated_archives,
             path_transformer,
             rlib_dep_reader,
         });
@@ -5029,6 +5139,7 @@ struct RustInputsPackager {
     crate_link_paths: Vec<PathBuf>,
     can_trim_rlibs: bool,
     inputs: Vec<PathBuf>,
+    generated_archives: BTreeMap<PathBuf, Vec<u8>>,
     path_transformer: dist::PathTransformer,
     rlib_dep_reader: Option<Arc<RlibDepReader>>,
 }
@@ -5245,6 +5356,8 @@ version = "6.1.0"
     assert!(inputs.contains(&protocol));
 
     let packager = RustInputsPackager {
+        #[cfg(feature = "dist-client")]
+        generated_archives: BTreeMap::new(),
         precise_dependencies: false,
         env_vars: vec![(
             OsString::from("CARGO_PKG_NAME"),
@@ -5303,6 +5416,8 @@ fn test_dist_archive_includes_clippy_config_files_and_empty_directory() -> Resul
         let mut transformer = dist::PathTransformer::new();
         transformer.add_root_mapping(policy.clone(), "/clippy-config");
         let packager = RustInputsPackager {
+            #[cfg(feature = "dist-client")]
+            generated_archives: BTreeMap::new(),
             precise_dependencies: false,
             env_vars: vec![],
             input_dirs: vec![policy.clone()],
@@ -5597,6 +5712,8 @@ fn test_dist_dependency_inspection_failure_keeps_all_candidates() -> Result<()> 
     let mut transformer = dist::PathTransformer::new();
     transformer.add_root_mapping(tmp.path().to_owned(), "/target");
     let packager = RustInputsPackager {
+        #[cfg(feature = "dist-client")]
+        generated_archives: BTreeMap::new(),
         precise_dependencies: false,
         env_vars,
         input_dirs: vec![],
@@ -5654,6 +5771,8 @@ fn native_rust_inputs_retain_complete_dependency_artifacts() -> Result<()> {
     let mut transformer = dist::PathTransformer::new();
     transformer.add_root_mapping(source, "/work");
     let packager = RustInputsPackager {
+        #[cfg(feature = "dist-client")]
+        generated_archives: BTreeMap::new(),
         precise_dependencies: false,
         env_vars: Vec::new(),
         input_dirs: Vec::new(),
@@ -5715,6 +5834,8 @@ fn canonical_native_generated_inputs_have_stable_metadata_across_leases() -> Res
         transformer.add_root_mapping(source.clone(), "/build");
         transformer.add_root_mapping(generated, "/intermediate");
         let packager = RustInputsPackager {
+            #[cfg(feature = "dist-client")]
+            generated_archives: BTreeMap::new(),
             precise_dependencies: false,
             env_vars: Vec::new(),
             input_dirs: Vec::new(),
@@ -5838,6 +5959,7 @@ impl RustInputsPackager {
             precise_dependencies,
             can_trim_rlibs: _,
             inputs,
+            generated_archives,
             path_transformer,
             rlib_dep_reader,
             env_vars,
@@ -5870,7 +5992,12 @@ impl RustInputsPackager {
             {
                 bail!("Cannot distribute dylib input {}", input_path.display());
             }
-            plan.file(&input_path, None)?;
+            let generated = if generated_archives.is_empty() {
+                None
+            } else {
+                generated_archives.get(&input_path.canonicalize()?).cloned()
+            };
+            plan.file(&input_path, generated)?;
         }
         for directory in input_dirs {
             plan.directory(&directory)?;
@@ -7419,20 +7546,24 @@ LLVM version: 15.0.2
             "out"
         );
         let expected = if hashed {
-            vec![StaticLibraryRequest {
+            vec![ArchiveRequest {
                 name: "bar".into(),
                 verbatim: false,
+                usage: if kind.contains("+whole-archive") {
+                    ArchiveUse::Packed
+                } else {
+                    ArchiveUse::Members
+                },
             }]
         } else {
             vec![]
         };
-        assert_eq!(h.staticlibs, expected);
+        assert_eq!(h.archive_requests(Vec::new()), expected);
     }
 
     #[test_case("static=original:renamed", "librenamed.a"; "renamed")]
     #[test_case("static:+verbatim=archive.custom", "archive.custom"; "verbatim")]
     #[test_case("static:+verbatim=original:renamed.custom", "renamed.custom"; "renamed verbatim")]
-    #[test_case("renamed", "librenamed.a"; "implicit kind")]
     fn test_parse_arguments_static_library_names(spec: &str, file: &str) {
         let f = TestFixture::new();
         let lib = f.touch(file).unwrap();
@@ -7456,9 +7587,13 @@ LLVM version: 15.0.2
             suffix: ".a".into(),
             target_libdir: PathBuf::new(),
         };
-        assert_eq!(h.staticlibs.len(), 1);
+        assert_eq!(h.archive_requests(Vec::new()).len(), 1);
         assert_eq!(
-            naming.select(&h.staticlibs[0], &h.static_link_paths, f.tempdir.path()),
+            naming.select(
+                &h.archive_requests(Vec::new())[0],
+                &h.static_link_paths,
+                f.tempdir.path()
+            ),
             Some(lib)
         );
     }
@@ -7487,9 +7622,10 @@ LLVM version: 15.0.2
             )
             .as_bytes(),
         )?;
-        let request = StaticLibraryRequest {
+        let request = ArchiveRequest {
             name: "probe".into(),
             verbatim: false,
+            usage: ArchiveUse::Members,
         };
         let paths = [PathBuf::from("one"), PathBuf::from("two")];
         assert_eq!(
@@ -7506,17 +7642,19 @@ LLVM version: 15.0.2
             naming.select(&request, &paths, root),
             Some(root.join("two/probe.lib"))
         );
-        let request = StaticLibraryRequest {
+        let request = ArchiveRequest {
             name: "archive.custom".into(),
             verbatim: true,
+            usage: ArchiveUse::Members,
         };
         assert_eq!(
             naming.select(&request, &paths, root),
             Some(root.join("two/archive.custom"))
         );
-        let request = StaticLibraryRequest {
+        let request = ArchiveRequest {
             name: "builtin".into(),
             verbatim: false,
+            usage: ArchiveUse::Members,
         };
         assert_eq!(
             naming.select(&request, &[PathBuf::from("@RUSTC_BUILTINthird")], root),
@@ -7599,10 +7737,11 @@ LLVM version: 15.0.2
             "out"
         );
         assert_eq!(
-            h.staticlibs,
-            [StaticLibraryRequest {
+            h.archive_requests(Vec::new()),
+            [ArchiveRequest {
                 name: "bar".into(),
-                verbatim: false
+                verbatim: false,
+                usage: ArchiveUse::Link,
             }]
         );
     }
@@ -8421,7 +8560,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 output_dir: "out".into(),
                 externs: vec![],
                 crate_link_paths: vec![],
-                staticlibs: vec![],
+                native_libraries: NativeLibraries::default(),
                 static_link_paths: vec![],
                 crate_name: "foo".into(),
                 crate_types: CrateTypes {
@@ -8494,8 +8633,10 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         })
         .unwrap();
         let mut m = Digest::new();
+        m.delimiter(b"archive-members-v2");
+        m.update(&5u128.to_le_bytes());
         m.update(b"baz.o");
-        m.update(&vec![0; BAZ_O_SIZE as usize]);
+        m.update(blake3::hash(&vec![0; BAZ_O_SIZE as usize]).as_bytes());
         let libbaz_a_digest = m.finish();
 
         let mut emit = HashSet::new();
@@ -8537,10 +8678,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 output_dir: "foo/".into(),
                 externs: vec!["bar.rlib".into()],
                 crate_link_paths: vec![],
-                staticlibs: vec![StaticLibraryRequest {
-                    name: "baz".into(),
-                    verbatim: false,
-                }],
+                native_libraries: {
+                    let mut libraries = NativeLibraries::default();
+                    libraries.push(Some("static"), "baz");
+                    libraries
+                },
                 static_link_paths: vec![f.tempdir.path().to_owned()],
                 crate_name: "foo".into(),
                 crate_types: CrateTypes {
@@ -8560,12 +8702,12 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             },
         });
         let creator = new_creator();
+        mock_dep_info(&creator, &["foo.rs", "bar.rs"]);
+        mock_file_names(&creator, &["foo.rlib", "foo.a"]);
         mock_file_names(
             &creator,
             &["libsccache_native_archive_probe.a", "/toolchain/lib"],
         );
-        mock_dep_info(&creator, &["foo.rs", "bar.rs"]);
-        mock_file_names(&creator, &["foo.rlib", "foo.a"]);
         let runtime = single_threaded_runtime();
         let pool = runtime.handle().clone();
         let res = hasher
@@ -8843,15 +8985,15 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let runtime = single_threaded_runtime();
         let pool = runtime.handle().clone();
 
-        if !hasher.parsed_args.staticlibs.is_empty() {
+        mock_dep_info(&creator, &["foo.rs"]);
+        if hasher.parsed_args.metadata_only_output.is_none() {
+            mock_file_names(&creator, &["foo.rlib"]);
+        }
+        if !hasher.parsed_args.archive_requests(Vec::new()).is_empty() {
             mock_file_names(
                 &creator,
                 &["libsccache_native_archive_probe.a", "/toolchain/lib"],
             );
-        }
-        mock_dep_info(&creator, &["foo.rs"]);
-        if hasher.parsed_args.metadata_only_output.is_none() {
-            mock_file_names(&creator, &["foo.rlib"]);
         }
         let result = hasher
             .generate_hash_key(GenerateHashKeyContext {
@@ -9088,6 +9230,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 other => bail!("unexpected parse result: {other:?}"),
             };
             let compilation = RustCompilation {
+                #[cfg(feature = "dist-client")]
+                generated_archives: BTreeMap::new(),
                 executable: clippy.clone(),
                 host: "x86_64-unknown-linux-gnu".into(),
                 #[cfg(feature = "dist-client")]
@@ -9208,6 +9352,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let canonical = CanonicalRustPaths::from_env(&env, &build, &sysroot)
             .context("canonical Rust paths are unavailable")?;
         let compilation = RustCompilation {
+            #[cfg(feature = "dist-client")]
+            generated_archives: BTreeMap::new(),
             executable: clippy,
             host: "x86_64-unknown-linux-gnu".into(),
             #[cfg(feature = "dist-client")]
@@ -9526,6 +9672,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         };
 
         let compilation = RustCompilation {
+            #[cfg(feature = "dist-client")]
+            generated_archives: BTreeMap::new(),
             executable: sysroot.join(BINS_DIR).join("rustc"),
             host: "x86_64-unknown-linux-gnu".to_owned(),
             #[cfg(feature = "dist-client")]
@@ -9606,6 +9754,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         };
 
         let compilation = RustCompilation {
+            #[cfg(feature = "dist-client")]
+            generated_archives: BTreeMap::new(),
             executable: sysroot.join(BINS_DIR).join("rustc"),
             host: "x86_64-unknown-linux-gnu".to_owned(),
             #[cfg(feature = "dist-client")]

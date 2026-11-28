@@ -40,6 +40,7 @@ mod msvc;
 mod native;
 #[cfg(all(feature = "dist-client", target_os = "linux"))]
 pub use native::{CompilerPackagingPolicy, NativeCompilerClient};
+mod native_archive;
 mod nvcc;
 mod nvhpc;
 mod preprocessor_cache;
@@ -51,6 +52,7 @@ mod rust_key_arguments;
 mod rust_key_cfg;
 #[cfg(target_os = "linux")]
 pub mod rust_link;
+mod rust_native_library;
 mod rust_response;
 mod rust_target;
 mod tasking_vx;

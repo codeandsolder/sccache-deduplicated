@@ -4243,6 +4243,7 @@ dependencies = [
  "opentelemetry-proto",
  "percent-encoding",
  "predicates",
+ "proc-macro2",
  "prost",
  "rand 0.10.4",
  "rayon-core",
