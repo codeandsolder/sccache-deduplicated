@@ -1289,6 +1289,7 @@ mod server {
             let native_endpoint = if let Some(config) = native_cache {
                 let store = crate::build_runtime::NativeStore::open_managed(
                     &config.directory,
+                    &config.index_directory,
                     config.space,
                 )?;
                 if local_worker.is_some() {

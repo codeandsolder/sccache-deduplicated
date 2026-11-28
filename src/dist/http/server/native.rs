@@ -495,7 +495,13 @@ where
                         warn!("native cache space pressure: {report:?}");
                     }
                     Ok(_) => {}
-                    Err(error) => error!("native cache space maintenance failed: {error:#}"),
+                    Err(error) => {
+                        if maintenance.store().index_requires_restart() {
+                            error!("native cache index requires reopening; terminating for supervised recovery: {error:#}");
+                            std::process::exit(1);
+                        }
+                        error!("native cache space maintenance failed: {error:#}");
+                    }
                 }
             }
         })?;

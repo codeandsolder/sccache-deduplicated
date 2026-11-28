@@ -150,9 +150,13 @@ impl NativeStore {
     ///
     /// # Errors
     /// Returns an error for invalid policy or storage initialization failure.
-    pub fn open_managed(root: &std::path::Path, policy: SpacePolicy) -> Result<Self> {
+    pub fn open_managed(
+        root: &std::path::Path,
+        index_directory: &std::path::Path,
+        policy: SpacePolicy,
+    ) -> Result<Self> {
         policy.validate()?;
-        Self::open_inner(root, Some(policy))
+        Self::open_inner(root, index_directory, Some(policy))
     }
 
     fn available_bytes(&self) -> Result<u64> {
@@ -160,6 +164,22 @@ impl NativeStore {
         stat.f_bavail
             .checked_mul(stat.f_frsize)
             .context("available filesystem size overflow")
+    }
+
+    /// Preserve the managed filesystem's emergency headroom during compiler
+    /// preparation and execution. Private writable views and compiler output
+    /// are allocated outside staging admission but share the CAS quota.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn check_execution_space(&self) -> Result<()> {
+        if let Some(policy) = self.inner.space_policy {
+            let available = self.available_bytes()?;
+            ensure!(
+                available >= policy.min_available_bytes,
+                "native execution filesystem pressure: {available} bytes available, {} required",
+                policy.min_available_bytes
+            );
+        }
+        Ok(())
     }
 
     /// Observe free filesystem space and pending staging reservations without

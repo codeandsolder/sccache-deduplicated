@@ -109,7 +109,7 @@ fn unreclaimable_space_rejects_admission_and_work_is_bounded() -> Result<()> {
 #[test]
 fn managed_staging_reservations_are_released_and_oversize_rejected() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let store = NativeStore::open_managed(temp.path(), policy())?;
+    let store = NativeStore::open_managed(temp.path(), temp.path(), policy())?;
     let mut budget = super::StageBudget::new(&store);
     budget.grow_to(4096)?;
     assert_eq!(
@@ -166,7 +166,7 @@ fn reuse_favors_a_hot_root_over_a_newer_cold_root() -> Result<()> {
 fn empty_gc_and_healthy_space_maintenance_do_not_wait_for_publication() -> Result<()> {
     use std::{sync::mpsc, thread};
     let temp = tempfile::tempdir()?;
-    let store = NativeStore::open_managed(temp.path(), policy())?;
+    let store = NativeStore::open_managed(temp.path(), temp.path(), policy())?;
     let key = publish(&store, "data")?;
     let mutation = store.inner.lock_mutations()?;
     let report = thread::scope(|scope| -> Result<_> {
@@ -357,7 +357,7 @@ fn staged_files_keep_exact_reservations_until_commit_or_drop() -> Result<()> {
     let mut limit = policy();
     limit.max_resident_bytes = Some(10);
     limit.target_resident_bytes = Some(8);
-    let store = NativeStore::open_managed(temp.path(), limit)?;
+    let store = NativeStore::open_managed(temp.path(), temp.path(), limit)?;
     let first = store.stage(&b"12345"[..])?;
     assert_eq!(
         store
@@ -401,7 +401,7 @@ fn exact_budget_allows_exact_verified_blob_but_rejects_oversize() -> Result<()> 
     let mut limit = policy();
     limit.max_resident_bytes = Some(3);
     limit.target_resident_bytes = Some(3);
-    let store = NativeStore::open_managed(temp.path(), limit)?;
+    let store = NativeStore::open_managed(temp.path(), temp.path(), limit)?;
     let expected = BlobRef {
         id: ContentId::of(b"abc"),
         size: 3,
@@ -429,7 +429,7 @@ fn exact_budget_allows_exact_verified_blob_but_rejects_oversize() -> Result<()> 
 #[test]
 fn staged_release_never_waits_for_space_admission_lock() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let store = NativeStore::open_managed(temp.path(), policy())?;
+    let store = NativeStore::open_managed(temp.path(), temp.path(), policy())?;
     let staged = store.stage(&b"reservation"[..])?;
     let held = store
         .inner
@@ -542,7 +542,7 @@ fn committed_action_releases_staging_reservations_into_resident_accounting() -> 
     let mut limit = policy();
     limit.max_resident_bytes = Some(6);
     limit.target_resident_bytes = Some(5);
-    let store = NativeStore::open_managed(temp.path(), limit)?;
+    let store = NativeStore::open_managed(temp.path(), temp.path(), limit)?;
     let key = publish(&store, "12345")?;
     let report = store.maintain_space()?.context("missing policy")?;
     assert_eq!(report.reserved_bytes, 0);
@@ -558,7 +558,7 @@ fn committed_tree_releases_staging_reservations_into_resident_accounting() -> Re
     let mut limit = policy();
     limit.max_resident_bytes = Some(6);
     limit.target_resident_bytes = Some(5);
-    let store = NativeStore::open_managed(temp.path(), limit)?;
+    let store = NativeStore::open_managed(temp.path(), temp.path(), limit)?;
     let staged = store.stage(&b"12345"[..])?;
     let metadata = TreeMetadata {
         mode: 0o755,
@@ -792,7 +792,7 @@ fn output_headroom_survives_other_staging_and_converts_without_double_charge() -
     let mut limit = policy();
     limit.max_resident_bytes = Some(10);
     limit.target_resident_bytes = Some(10);
-    let store = NativeStore::open_managed(temp.path(), limit)?;
+    let store = NativeStore::open_managed(temp.path(), temp.path(), limit)?;
     let mut output = store.reserve_staging(7)?;
     let input = store.stage_expected(
         BlobRef {
@@ -864,7 +864,7 @@ fn rejected_reserved_upload_releases_its_charge() -> Result<()> {
     let mut limit = policy();
     limit.max_resident_bytes = Some(10);
     limit.target_resident_bytes = Some(10);
-    let store = NativeStore::open_managed(temp.path(), limit)?;
+    let store = NativeStore::open_managed(temp.path(), temp.path(), limit)?;
     let mut budget = store.reserve_staging(10)?;
     assert!(
         budget
@@ -923,7 +923,7 @@ fn residency_snapshot_tracks_live_outputs_across_eviction_and_restart() -> Resul
 #[test]
 fn observation_does_not_reclaim_or_wait_for_admission() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let store = NativeStore::open_managed(temp.path(), policy())?;
+    let store = NativeStore::open_managed(temp.path(), temp.path(), policy())?;
     let mut budget = StageBudget::new(&store);
     budget.grow_to(4096)?;
     let before = store.stats()?;
@@ -967,7 +967,7 @@ fn reservations_that_cannot_fit_do_not_evict_resident_content() -> Result<()> {
     let mut limit = policy();
     limit.max_resident_bytes = Some(20);
     limit.target_resident_bytes = Some(10);
-    let store = NativeStore::open_managed(dir.path(), limit)?;
+    let store = NativeStore::open_managed(dir.path(), dir.path(), limit)?;
     let hot = publish(&store, "hot")?;
     let _reservation = store.reserve_staging(16)?;
     let refused = store.reserve_staging(5);
@@ -985,7 +985,7 @@ fn full_admission_does_not_evict_until_maintenance_replenishes_headroom() -> Res
     let mut limit = policy();
     limit.max_resident_bytes = Some(12);
     limit.target_resident_bytes = Some(8);
-    let store = NativeStore::open_managed(dir.path(), limit)?;
+    let store = NativeStore::open_managed(dir.path(), dir.path(), limit)?;
     for name in ["aaaa", "bbbb", "cccc"] {
         publish(&store, name)?;
     }
@@ -1001,7 +1001,7 @@ fn full_admission_does_not_evict_until_maintenance_replenishes_headroom() -> Res
 #[test]
 fn maintenance_exclusion_does_not_block_headroom_admission() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let store = NativeStore::open_managed(dir.path(), policy())?;
+    let store = NativeStore::open_managed(dir.path(), dir.path(), policy())?;
     let _maintenance = store
         .inner
         .space_maintenance
@@ -1038,11 +1038,26 @@ fn quota_only_policy_rejects_impossible_uncompressed_staging() -> Result<()> {
     let mut limit = policy();
     limit.max_resident_bytes = None;
     limit.target_resident_bytes = None;
-    let store = NativeStore::open_managed(dir.path(), limit)?;
+    let store = NativeStore::open_managed(dir.path(), dir.path(), limit)?;
     let capacity = store.staging_limit(limit)?;
     assert!(matches!(
         store.reserve_staging(capacity.saturating_add(1)),
         Err(error) if error.is::<StageSpaceTooLarge>()
     ));
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn execution_respects_physical_watermark_even_without_staging_budget() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut limit = policy();
+    limit.min_available_bytes = u64::MAX;
+    limit.target_available_bytes = u64::MAX;
+    let store = NativeStore::open_managed(dir.path(), dir.path(), limit)?;
+    assert!(store.check_execution_space().is_err());
+    drop(store);
+    let store = NativeStore::open_managed(dir.path(), dir.path(), policy())?;
+    store.check_execution_space()?;
     Ok(())
 }

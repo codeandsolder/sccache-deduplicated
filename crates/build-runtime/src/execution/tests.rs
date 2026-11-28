@@ -626,6 +626,7 @@ async fn captured_output_publication_reuses_original_inode() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = NativeStore::open_managed(
         dir.path(),
+        dir.path(),
         SpacePolicy {
             min_available_bytes: 100,
             target_available_bytes: 200,
@@ -765,6 +766,7 @@ fn capture_without_resident_headroom_still_has_verified_delivery_bytes() -> Resu
     use std::io::Write as _;
     let dir = tempfile::tempdir()?;
     let store = NativeStore::open_managed(
+        &dir.path().join("store"),
         &dir.path().join("store"),
         crate::SpacePolicy {
             min_available_bytes: 1,

@@ -25,6 +25,7 @@ use sccache::{
 
 pub struct NativeWorker {
     store: NativeStore,
+    _scratch_lock: std::fs::File,
     client: NativeCacheClient,
     pub(super) policy: ExecutionPolicy,
     renewal_interval: Duration,
@@ -55,10 +56,17 @@ impl NativeWorker {
         );
 
         let shared = shared_store.is_some();
-        let store = match (shared_store, config.directory, config.space) {
-            (Some(store), None, None) => store,
-            (None, Some(directory), Some(space)) if directory.is_absolute() => {
-                NativeStore::open_managed(&directory, space)?
+        let store = match (
+            shared_store,
+            config.directory,
+            config.index_directory,
+            config.space,
+        ) {
+            (Some(store), None, None, None) => store,
+            (None, Some(directory), Some(index), Some(space))
+                if directory.is_absolute() && index.is_absolute() =>
+            {
+                NativeStore::open_managed(&directory, &index, space)?
             }
             _ => anyhow::bail!("invalid standalone or shared native store configuration"),
         };
@@ -93,7 +101,7 @@ impl NativeWorker {
                 "workers do not retain compressed original archives"
             );
         }
-        std::fs::create_dir_all(&config.scratch)?;
+        let scratch_lock = store.claim_execution_scratch(&config.scratch)?;
         let scope = ContentId::of(
             format!(
                 "{}\n{}",
@@ -112,7 +120,6 @@ impl NativeWorker {
             placement.analytics = Some(store.analytics_sampler()?);
         }
         let package_transfer = PackageTransportTracker::new(timing)?;
-        let _ = store.can_clone_into(&config.scratch)?;
         let client = NativeCacheClient::new(
             &config.cache_url.to_url(),
             peer,
@@ -121,6 +128,7 @@ impl NativeWorker {
         )?;
         Ok(Self {
             store,
+            _scratch_lock: scratch_lock,
             client,
             policy: ExecutionPolicy {
                 platform: ContentId::of(config.platform_contract.as_bytes()),
@@ -147,10 +155,20 @@ impl NativeWorker {
     pub(super) fn maintain_local_store(&self) -> Result<()> {
         if let Some(grace) = &self.artifact_grace {
             grace.reap();
-            if let Some(report) = self.store.maintain_space()?
-                && !report.minimum_satisfied
-            {
-                debug!("native worker cache space pressure: {report:?}");
+            match self.store.maintain_space() {
+                Ok(Some(report)) if !report.minimum_satisfied => {
+                    debug!("native worker cache space pressure: {report:?}");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    if self.store.index_requires_restart() {
+                        error!(
+                            "native worker index requires reopening; terminating for supervised recovery: {error:#}"
+                        );
+                        std::process::exit(1);
+                    }
+                    return Err(error);
+                }
             }
         }
         Ok(())

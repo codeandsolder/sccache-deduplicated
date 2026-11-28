@@ -820,6 +820,10 @@ pub fn execute(
         "invalid execution limits"
     );
     let started = Instant::now();
+    let mut progress = || {
+        progress()?;
+        store.check_execution_space()
+    };
     progress()?;
     let build = PreparedBuild::prepare(spec, store, &policy.scratch, inputs)?;
     let invocation = SandboxInvocation::from_spec(&spec.command)?;

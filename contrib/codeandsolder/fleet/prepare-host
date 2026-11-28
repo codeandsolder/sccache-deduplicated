@@ -220,6 +220,7 @@ scheduler_id = "$scheduler_id"
 [native_worker]
 cache_url = "$cache_url"
 directory = "/var/cache/sccache-native/worker"
+index_directory = "/var/lib/sccache-native-index/worker"
 scratch = "/var/cache/sccache-native/scratch"
 bubblewrap = "/usr/bin/bwrap"
 platform_contract = "$platform"
@@ -280,6 +281,7 @@ percent = 200.0
 [native_cache]
 public_addr = "100.73.74.69:10602"
 directory = "/var/cache/sccache-native/scheduler"
+index_directory = "/var/lib/sccache-native-index/scheduler"
 idle_timeout_secs = 120
 max_sessions = 256
 max_result_bytes = 1073741824

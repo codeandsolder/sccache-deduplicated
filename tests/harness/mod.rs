@@ -272,6 +272,7 @@ fn sccache_scheduler_cfg(
             public_addr: cache_addr,
             bind_address: Some(cache_addr),
             directory: Path::new(CONFIGS_CONTAINER_PATH).join("scheduler-store"),
+            index_directory: Path::new(CONFIGS_CONTAINER_PATH).join("scheduler-store"),
             space: test_space(),
             idle_timeout_secs: 300,
             max_sessions: 128,
@@ -330,6 +331,7 @@ fn sccache_server_cfg(
                 url::Url::parse(&format!("https://{cache_addr}")).unwrap(),
             ),
             directory: Some(Path::new(CONFIGS_CONTAINER_PATH).join(&relpath)),
+            index_directory: Some(Path::new(CONFIGS_CONTAINER_PATH).join(&relpath)),
             space: Some(test_space()),
             scratch: Path::new(CONFIGS_CONTAINER_PATH)
                 .join(format!("scratch-{}", server_addr.port())),

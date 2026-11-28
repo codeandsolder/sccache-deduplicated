@@ -1043,6 +1043,8 @@ pub mod scheduler {
         pub public_addr: SocketAddr,
         pub bind_address: Option<SocketAddr>,
         pub directory: PathBuf,
+        /// Independently provisioned durable index storage; not charged to the CAS quota.
+        pub index_directory: PathBuf,
         pub space: crate::build_runtime::SpacePolicy,
         pub idle_timeout_secs: u64,
         pub max_sessions: usize,
@@ -1065,8 +1067,8 @@ pub mod scheduler {
         /// # Errors
         /// Returns an error for a relative path or unusable resource bounds.
         pub fn session_limits(&self) -> Result<crate::build_runtime::SessionLimits> {
-            if !self.directory.is_absolute() {
-                bail!("native cache directory must be absolute");
+            if !self.directory.is_absolute() || !self.index_directory.is_absolute() {
+                bail!("native cache and index directories must be absolute");
             }
             if self.http_threads <= self.max_total_uploads || self.max_metadata_bytes == 0 {
                 bail!(
@@ -1268,6 +1270,7 @@ pub mod server {
     pub struct NativeWorkerConfig {
         pub cache_url: HTTPUrl,
         pub directory: Option<PathBuf>,
+        pub index_directory: Option<PathBuf>,
         pub space: Option<crate::build_runtime::SpacePolicy>,
         pub scratch: PathBuf,
         pub bubblewrap: PathBuf,
@@ -1302,13 +1305,20 @@ pub mod server {
     impl Config {
         pub(super) fn validate_native_store(&self, shared: bool) -> Result<()> {
             if let Some(native) = &self.native_worker {
-                match (&native.directory, native.space, shared) {
-                    (None, None, true) => (),
-                    (Some(directory), Some(space), false) if directory.is_absolute() => {
+                match (
+                    &native.directory,
+                    &native.index_directory,
+                    native.space,
+                    shared,
+                ) {
+                    (None, None, None, true) => (),
+                    (Some(directory), Some(index), Some(space), false)
+                        if directory.is_absolute() && index.is_absolute() =>
+                    {
                         space.validate()?;
                     }
                     _ => bail!(
-                        "standalone native workers require directory and space; local workers inherit both from the scheduler"
+                        "standalone native workers require directory, index_directory and space; colocated workers inherit the store from the scheduler"
                     ),
                 }
             } else {
@@ -1729,6 +1739,7 @@ token = "test-token"
 [native_worker]
 cache_url = "https://192.168.1.1:10502"
 directory = "/tmp/worker-store"
+index_directory = "/tmp/worker-store"
 scratch = "/tmp/worker-scratch"
 bubblewrap = "/usr/bin/bwrap"
 platform_contract = "test-linux"

@@ -129,6 +129,24 @@ install_atomic() {
   install -o "$owner" -g "$group" -m "$mode" "$from" "$tmp"
   mv -Tf -- "$tmp" "$to"
 }
+verify_index_location() {
+  local store="$1" index="$2"
+  if [[ -e "$store/index.redb" || -L "$store/index.redb" ]]; then
+    printf 'Relocate the stopped store index before activation: %s -> %s\n' "$store" "$index" >&2
+    return 1
+  fi
+  if [[ -d "$store" && -n $(find "$store" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+    [[ -f "$index/index.redb" && ! -L "$index/index.redb" ]] || {
+      printf 'Existing CAS requires its relocated index: %s\n' "$index" >&2
+      return 1
+    }
+  fi
+  [[ -d "$index" && -d "$store" ]] || return 0
+  [[ $(stat -c %d "$store") != $(stat -c %d "$index") ]] || {
+    printf 'CAS and index must occupy different capacity domains: %s %s\n' "$store" "$index" >&2
+    return 1
+  }
+}
 assert_stopped() {
   local u state
   for u in "${clients[@]}" "${workers[@]}" "${scheduler[@]}"; do
@@ -233,6 +251,12 @@ case "$phase" in
     [[ $(cat "$rollback/release-sha") == "$sha" && -e "$drain" ]]
     assert_prepared
     assert_stopped
+    if [[ -f server.conf ]]; then
+      verify_index_location /var/cache/sccache-native/worker /var/lib/sccache-native-index/worker
+    fi
+    if [[ -f scheduler.conf ]]; then
+      verify_index_location /var/cache/sccache-native/scheduler /var/lib/sccache-native-index/scheduler
+    fi
     assert_updaters_paused
     install_atomic "$bundle/sccache" "$live" 0755
     install_atomic "$bundle/sccache-dist" "$dist" 0755
@@ -264,13 +288,14 @@ case "$phase" in
       install_atomic server.conf /etc/sccache-dist/server.conf 0600
       install -d -m 0755 /var/cache/sccache-native
       install -d -m 0700 /var/cache/sccache-native/worker /var/cache/sccache-native/scratch
+      install -d -m 0700 /var/lib/sccache-native-index/worker
       [[ $(stat -c %d /var/cache/sccache-native/worker) == $(stat -c %d /var/cache/sccache-native/scratch) ]]
     fi
     if [[ -f scheduler.conf ]]; then
       install_atomic scheduler.conf /etc/sccache-dist/scheduler.conf 0640 root sccache-scheduler
       /usr/local/libexec/host-native-metadata dashboard-select "$bundle" "$dashboard_link"
       runuser -u sccache-scheduler -- test -r "$dashboard_link/sccache-dashboard_bg.wasm"
-      install -d -o sccache-scheduler -g sccache-scheduler -m 0700 /var/cache/sccache-native/scheduler
+      install -d -o sccache-scheduler -g sccache-scheduler -m 0700 /var/cache/sccache-native/scheduler /var/lib/sccache-native-index/scheduler
     fi
     systemctl daemon-reload
     [[ $(systemctl show sccache-local.service -p User --value) == root ]]

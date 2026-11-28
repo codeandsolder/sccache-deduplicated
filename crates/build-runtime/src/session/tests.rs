@@ -259,6 +259,7 @@ fn competing_results_reserve_complete_missing_closures_and_retry() -> Result<()>
     let dir = tempfile::tempdir()?;
     let store = NativeStore::open_managed(
         dir.path(),
+        dir.path(),
         crate::SpacePolicy {
             min_available_bytes: 1,
             target_available_bytes: 1,
@@ -338,6 +339,7 @@ fn transfer_larger_than_resident_budget_is_not_retryable() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service_with_store(NativeStore::open_managed(
         dir.path(),
+        dir.path(),
         crate::SpacePolicy {
             min_available_bytes: 1,
             target_available_bytes: 1,
@@ -372,6 +374,7 @@ fn transfer_larger_than_resident_budget_is_not_retryable() -> Result<()> {
 fn cancelled_transfer_retains_budget_until_active_upload_is_dropped() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service_with_store(NativeStore::open_managed(
+        dir.path(),
         dir.path(),
         crate::SpacePolicy {
             min_available_bytes: 1,

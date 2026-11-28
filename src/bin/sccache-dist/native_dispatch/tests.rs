@@ -17,6 +17,7 @@ fn worker(
         NativeWorkerConfig {
             cache_url: HTTPUrl::from_url(url),
             directory: Some(root.join("store")),
+            index_directory: Some(root.join("store")),
             space: Some(SpacePolicy {
                 min_available_bytes: 1 << 20,
                 target_available_bytes: 2 << 20,
