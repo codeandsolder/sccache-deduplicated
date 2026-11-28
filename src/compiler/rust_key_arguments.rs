@@ -263,6 +263,7 @@ pub(super) fn normalize(arguments: &[ArgumentPair], custom_target: bool) -> Vec<
     let mut short_debug = false;
     let mut ordered = Vec::new();
     let mut cfg = BTreeSet::new();
+    let mut check_cfg = Vec::new();
     let mut emit = BTreeSet::new();
     let mut fields = CodegenFields::default();
     for (flag, value) in arguments {
@@ -278,8 +279,14 @@ pub(super) fn normalize(arguments: &[ArgumentPair], custom_target: bool) -> Vec<
                 continue;
             }
             Some("--cfg") => {
-                cfg.insert(value.clone());
+                cfg.insert(value.as_deref().map(super::rust_key_cfg::predicate));
                 continue;
+            }
+            Some("--check-cfg") => {
+                if let Some(value) = value {
+                    check_cfg.push(value.clone());
+                    continue;
+                }
             }
             Some("--emit") => {
                 if let Some(value) = value.as_ref().and_then(|value| value.to_str()) {
@@ -333,6 +340,15 @@ pub(super) fn normalize(arguments: &[ArgumentPair], custom_target: bool) -> Vec<
     }
     ordered.extend(fields.into_pairs());
     ordered.extend(cfg.into_iter().map(|value| ("--cfg".into(), value)));
+    let check_cfg = super::rust_key_cfg::expectations(&check_cfg).unwrap_or_else(|| {
+        log::debug!("Unrecognized rustc check-cfg grammar; retaining original specifications");
+        check_cfg
+    });
+    ordered.extend(
+        check_cfg
+            .into_iter()
+            .map(|value| ("--check-cfg".into(), Some(value))),
+    );
     ordered
 }
 

@@ -4261,6 +4261,7 @@ dependencies = [
  "shlex",
  "socket2",
  "strip-ansi-escapes",
+ "syn 3.0.10",
  "syslog",
  "tar",
  "temp-env",

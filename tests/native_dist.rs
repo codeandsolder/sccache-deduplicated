@@ -2790,7 +2790,7 @@ fn run_rust_argument_audit(
 ) -> Result<()> {
     fs::write(
         directory.join("arg_audit.rs"),
-        b"pub fn answer(x: u32) -> u32 { x + 1 }\n",
+        b"#[cfg(feature=\"a\")] pub fn answer(x: u32) -> u32 { x + 1 }\n",
     )?;
     let compile = |flags: &[&str]| -> Result<((String, String), Vec<u8>)> {
         let output = service
@@ -2821,6 +2821,8 @@ fn run_rust_argument_audit(
         "-Copt-level=2",
         "-Cdebuginfo=1",
         "-Cembed-bitcode=no",
+        "--cfg=feature=\"a\"",
+        "--check-cfg=cfg(feature,values(\"a\",\"b\"))",
     ])?;
     assert_eq!(source, "worker");
     let ((same, source), second) = compile(&[
@@ -2832,6 +2834,9 @@ fn run_rust_argument_audit(
         "debuginfo=limited",
         "-Copt-level=1",
         "-Copt-level=2",
+        "--cfg=r#feature=r#\"a\"#",
+        "--check-cfg=cfg(feature,values(\"b\"))",
+        "--check-cfg=cfg(feature,values(\"a\"))",
     ])?;
     assert_eq!((same, source), (key.clone(), "hit".into()));
     assert_eq!(first, second);
@@ -2841,10 +2846,24 @@ fn run_rust_argument_audit(
         "-O",
         "-Cdebuginfo=1",
         "-Cembed-bitcode=no",
+        "--cfg=feature=\"a\"",
+        "--check-cfg=cfg(feature,values(\"a\",\"b\"))",
     ])?;
     assert_eq!(source, "worker");
     assert_ne!(key, changed);
     assert_ne!(first, third);
+    // Expectation sets affect diagnostics even when active cfgs and machine code
+    // do not change; a different lint policy must remain a distinct result.
+    let ((changed_policy, source), _) = compile(&[
+        "--emit=link,metadata",
+        "-Copt-level=2",
+        "-Cdebuginfo=1",
+        "-Cembed-bitcode=no",
+        "--cfg=feature=\"a\"",
+        "--check-cfg=cfg(feature,values(\"a\"))",
+    ])?;
+    assert_eq!(source, "worker");
+    assert_ne!(key, changed_policy);
     Ok(())
 }
 

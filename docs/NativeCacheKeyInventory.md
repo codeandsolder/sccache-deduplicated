@@ -47,7 +47,7 @@ runtime profiling destinations remain meaningful inputs.
 
 Hash the actual compiler driver and loader-selected compiler libraries, target and
 semantic arguments (effective codegen fields, emission sets and deduplicated
-cfg predicates), selected source and binary dependencies (including selected
+cfg predicates and effective check-cfg expectation sets), selected source and binary dependencies (including selected
 standard libraries), extern name-to-content bindings, auxiliary inputs,
 static libraries, custom target contents and explicitly observed environment.
 Native nightly dep-info reports binary dependencies; stable compilers and
@@ -67,7 +67,12 @@ already identify the worker compilation. Normalize rustc codegen option aliases,
 static defaults, overwritten scalar assignments and independent field order.
 Preserve append order for metadata salts and linker/LLVM arguments, the
 frame-pointer ratchet, and distinct raw versus effective optimization/debug
-settings when a short flag overrides a long option.
+settings when a short flag overrides a long option. Rustc merges repeated
+check-cfg declarations by name and value; any-value dominates finite sets,
+and any-name disables exhaustive names without disabling value checking.
+Use the parsed sets, not their CLI order, grouping, or literal spelling.
+Retain distinct enabled/disabled checking, empty value sets and bare cfg
+predicates. The original options still go to rustc for validation/diagnostics.
 Native nightly metadata-only and rlib-only results key the binary operands
 selected by rustc, not all explicit extern candidate files. A separate rlib
 supplied alongside selected rmeta contributes no digest; an entirely unused

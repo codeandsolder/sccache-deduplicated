@@ -353,7 +353,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"19";
+const CACHE_VERSION: &[u8] = b"20";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,

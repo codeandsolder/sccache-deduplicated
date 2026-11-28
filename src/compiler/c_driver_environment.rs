@@ -44,7 +44,7 @@ fn darwin_target(triple: &str) -> bool {
             component.strip_prefix(os).is_some_and(|suffix| {
                 suffix.is_empty()
                     || suffix.as_bytes().first().is_some_and(u8::is_ascii_digit)
-                    || (*os == "macos" && suffix.starts_with("x"))
+                    || (*os == "macos" && suffix.starts_with('x'))
             })
         })
     })
