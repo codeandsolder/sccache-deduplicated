@@ -1,0 +1,14 @@
+[Unit]
+Description=Managed immutable runtime package profile broker
+
+[Socket]
+ListenStream=/run/sccache-runtime-profile.sock
+SocketUser=root
+SocketGroup=docker
+SocketMode=0660
+Accept=yes
+MaxConnections=64
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

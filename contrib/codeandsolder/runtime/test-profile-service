@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# End-to-end socket protocol, central resolution, remote import and dedup,
+# using a real Unix socket and independent fake Docker stores per host.
+set -euo pipefail
+here=$(dirname -- "$(realpath -- "$0")")
+root=$(mktemp -d)
+pid=
+cleanup() {
+    [[ -z $pid ]] || { kill "$pid" 2>/dev/null || :; wait "$pid" 2>/dev/null || :; }
+    rm -rf -- "$root"
+}
+trap cleanup EXIT
+mkdir -p "$root/bin" "$root/authority/images" "$root/client/images"
+base=sha256:$(printf '%064d' 1)
+export TEST_BASE=$base TEST_ROOT=$root TEST_HERE=$here
+export PATH="$root/bin:$PATH"
+for site in authority client; do
+    printf '%s\n' "$base" > "$root/$site/runtime-image"
+    printf 'base\n' > "$root/$site/images/${base#sha256:}"
+done
+printf 'local\n' > "$root/authority/runtime-profile-authority"
+printf 'ssh\n' > "$root/client/runtime-profile-authority"
+touch "$root/client/runtime-profile-ssh.conf"
+printf 'ripgrep\n' > "$root/request"
+printf 'libfontconfig-dev\n' > "$root/other"
+cat > "$root/bin/docker" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+state=$TEST_ROOT/$TEST_SITE
+if [[ $1 == build ]]; then
+    shift
+    iid= key= 
+    while (($#)); do
+        case "$1" in
+            --iidfile) iid=$2; shift ;;
+            --build-arg) [[ $2 != REQUEST_DIGEST=* ]] || key=${2#*=}; shift ;;
+        esac
+        shift
+    done
+    [[ -n $iid && -n $key ]]
+    printf '%s\n' "$key" >> "$state/builds"
+    sleep 0.2
+    printf '%s\n' "$key" > "$state/images/$key"
+    printf 'sha256:%s\n' "$key" > "$iid"
+    exit
+fi
+[[ $1 == image ]]
+shift
+case "$1" in
+    inspect)
+        if [[ $2 == --format ]]; then fmt=$3; image=$4; else fmt=; image=$2; fi
+        if [[ $image == local/sccache-runtime-base:sha256-* ]]; then image=sha256:${image##*sha256-}; fi
+        [[ -f $state/images/${image#sha256:} ]]
+        case "$fmt" in
+            '') ;;
+            '{{.Id}}') printf '%s\n' "$image" ;;
+            *profile-request*) cat "$state/images/${image#sha256:}" ;;
+            *profile-base*) printf '%s\n' "$TEST_BASE" ;;
+            *version*) printf '1\n' ;;
+            *RootFS.Layers*) printf 'base-layer\n'; [[ $image == "$TEST_BASE" ]] || printf 'profile-layer\n' ;;
+            *) exit 1 ;;
+        esac ;;
+    tag) ;;
+    save) [[ -f $state/images/${2#sha256:} ]]; printf '%s\n' "$2"; printf '%s\n' "$2" >> "$state/exports" ;;
+    load) read -r image; printf '%s\n' "${image#sha256:}" > "$state/images/${image#sha256:}"; printf '%s\n' "$image" >> "$state/imports" ;;
+    *) exit 1 ;;
+esac
+MOCK
+cat > "$root/bin/ssh" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# == 6 && $1 == -F && $3 == -T && $4 == sccache-runtime-authority ]]
+[[ ! -e $TEST_ROOT/offline ]] || exit 17
+export TEST_SITE=authority SSH_ORIGINAL_COMMAND="$5 $6"
+exec "$TEST_HERE/sccache-runtime-profile-service" ssh "$TEST_ROOT/authority" "$TEST_HERE/sccache-runtime-profile" "$TEST_ROOT/authority/catalog"
+MOCK
+chmod +x "$root/bin/"*
+export TEST_SITE=client
+service=$here/sccache-runtime-profile-service
+profile=$here/sccache-runtime-profile
+socket=$root/socket
+socat -t 3600 "UNIX-LISTEN:$socket,fork" "EXEC:$service socket $root/client $profile $root/client/catalog" &
+pid=$!
+for _ in {1..100}; do [[ ! -S $socket ]] || break; sleep 0.02; done
+[[ -S $socket ]]
+ensure() { "$profile" ensure "$base" "$1" "$root/client/catalog" "$socket"; }
+key=$("$profile" key "$root/request")
+for i in {1..8}; do ensure "$root/request" > "$root/reply-$i" & done
+# Wait for individual client processes without waiting on the listener.
+for _ in {1..500}; do
+    ready=0
+    for i in {1..8}; do [[ ! -s $root/reply-$i ]] || ready=$((ready+1)); done
+    [[ $ready != 8 ]] || break
+    sleep 0.02
+done
+for i in {1..8}; do [[ $(cat "$root/reply-$i") == "sha256:$key" ]]; done
+[[ $(wc -l < "$root/authority/builds") == 1 ]]
+[[ $(wc -l < "$root/authority/exports") == 1 ]]
+[[ $(wc -l < "$root/client/imports") == 1 ]]
+touch "$root/offline"
+[[ $(ensure "$root/request") == "sha256:$key" ]]
+if ensure "$root/other" > "$root/failure" 2>&1; then exit 1; fi
+rg -q 'provisioning failed' "$root/failure"
+other=$("$profile" key "$root/other")
+[[ ! -e $root/client/catalog/${base#sha256:}/$other ]]
+rm "$root/offline"
+# Recovery restores the exact mapping rather than resolving packages again.
+rm "$root/client/images/$key"
+[[ $(ensure "$root/request") == "sha256:$key" ]]
+[[ $(wc -l < "$root/authority/builds") == 1 ]]
+[[ $(wc -l < "$root/client/imports") == 2 ]]
+# A registered image with wrong ancestry/labels is not silently replaced.
+printf 'wrong\n' > "$root/client/images/$key"
+if ensure "$root/request" > "$root/failure" 2>&1; then exit 1; fi
+rg -q 'does not match package request' "$root/failure"
+# Validate authority-side dedup separately from the local import lock.
+rm "$root/client/images/$key"
+export TEST_SITE=authority
+pids=()
+for i in {1..8}; do
+    "$profile" provision "$base" "$root/authority/catalog" "$root/other" > "$root/authority-$i" &
+    pids+=("$!")
+done
+for child in "${pids[@]}"; do wait "$child"; done
+[[ $(rg -c "^$other$" "$root/authority/builds") == 1 ]]
+for i in {1..8}; do [[ $(cat "$root/authority-$i") == "$other"$'\t'"sha256:$other" ]]; done
+echo 'Automatic runtime profile broker: concurrent misses, one authoritative resolution, one local import, offline hits, exact recovery and explicit failures passed'

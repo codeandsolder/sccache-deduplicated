@@ -179,6 +179,11 @@ if [[ -x /usr/bin/rustup && -f /usr/local/bin/cargo ]]; then
   install -m 0700 "$repo/cargo-wrapper" "$stage/cargo-wrapper"
   install -m 0700 "$repo/runtime/run" "$stage/runtime-run"
   install -m 0700 "$repo/runtime/sccache-runtime-profile" "$stage/runtime-profile"
+  install -m 0700 "$repo/runtime/sccache-runtime-profile-service" "$stage/runtime-profile-service"
+  install -m 0600 "$repo/runtime/Dockerfile.profile" "$stage/runtime-profile-dockerfile"
+  install -m 0600 "$repo/runtime/sccache-runtime-profile.socket" "$stage/runtime-profile.socket"
+  install -m 0600 "$repo/runtime/sccache-runtime-profile@.service" "$stage/runtime-profile@.service"
+  [[ -r /etc/sccache/runtime-profile-authority ]] || { echo "Configure the fleet runtime profile authority before activation" >&2; exit 69; }
 fi
 for helper in sccache-cmake-launcher sccache-dist-client-preflight; do
   if [[ -f "/usr/local/libexec/$helper" ]]; then

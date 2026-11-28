@@ -1,0 +1,10 @@
+[Unit]
+Description=Resolve managed immutable runtime package profile
+
+[Service]
+Type=exec
+ExecStart=/usr/local/libexec/sccache-runtime-profile-service socket
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+RuntimeMaxSec=1h

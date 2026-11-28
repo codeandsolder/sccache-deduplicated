@@ -102,15 +102,15 @@ done
 if [[ $separator != true ]] || (($# == 0)); then usage; fi
 
 # Worktrees and subdirectories of one repository share the same package
-# declaration. Select only a previously registered immutable image; never
-# resolve packages or modify the base during an ordinary build.
+# declaration. A missing immutable profile is resolved by the fleet broker
+# before execution; the running container never modifies its packages.
 profile_tool=$(dirname -- "$(realpath -- "$0")")/sccache-runtime-profile
 manifest=$("$profile_tool" manifest "$project_dir")
 bind_dir "$(dirname -- "$manifest")"
 if [[ $explicit_image == true ]]; then
     "$profile_tool" verify "$image" "$manifest"
 else
-    image=$("$profile_tool" select "$image" "$manifest" /etc/sccache/runtime-profiles)
+    image=$("$profile_tool" ensure "$image" "$manifest" /etc/sccache/runtime-profiles /run/sccache-runtime-profile.sock)
 fi
 
 # Managed Cargo retains the exact installed host Rustup selection,

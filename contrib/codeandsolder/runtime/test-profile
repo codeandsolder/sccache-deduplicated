@@ -76,7 +76,7 @@ reject 65 "$profile" register "$base" "$manifest" "$other" "$catalog"
 reject 69 "$profile" select "$other" "$manifest" "$catalog"
 reject 65 "$profile" verify "$image" "$root/other"
 "$profile" verify "$image" "$root/equivalent"
-[[ $(find "$catalog" -type f | wc -l) == 1 ]]
+[[ $(find "$catalog" -type f ! -path "*/.locks/*" | wc -l) == 1 ]]
 printf 'debian:latest\n' > "$catalog/${base#sha256:}/$key"
 reject 65 "$profile" select "$base" "$manifest" "$catalog"
 echo 'Immutable runtime profile normalization, explicit selection, ancestry and atomic registration passed'

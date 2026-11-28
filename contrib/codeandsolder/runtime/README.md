@@ -144,9 +144,10 @@ The managed Cargo launcher selects the repository containing an explicit
 non-Cargo command can select its declaration with `--project-dir DIR`.
 Nested Cargo processes may use the enclosing runtime; if they declare a
 nonempty, different request they fail rather than silently use wrong native
-libraries. Missing/empty declarations use the shared base. A nonempty
-request **must** have a registered image; there is no host-native fallback,
-implicit package download, or mutable runtime during execution.
+libraries. Missing/empty declarations use the shared base. Nonempty requests
+select a verified resident image or synchronously request it through the
+socket-activated profile broker. The broker resolves the exact package
+closure before the container starts. No running build mutates its runtime.
 
 Each canonical request is identified by SHA-256, independently of repository
 name and checkout path. The catalog layout is
@@ -159,52 +160,46 @@ An explicit `--image` is a test override, but still must match a nonempty
 project declaration. The native compiler action identity remains based on
 actual compiler, toolchain, library and input bytes, not the profile ID.
 
-On one trusted builder, resolve any number of manifests together (the tool
-must run from the reviewed source directory):
+The authoritative host resolves a package set once, using the base's signed
+repositories and digest-pinned external archives where declared. A per-key
+lock deduplicates concurrent resolution without serializing unrelated sets.
+Existing mappings are verified rather than resolved again. On a client miss
+the broker requests the authoritative image ID over authenticated SSH, then
+imports the exact image if not already resident, verifies ancestry and labels,
+and atomically registers it. Client-side per-key locks deduplicate imports.
+Already resident profiles work offline, even if the authority is down.
+There is no independent client-side package resolution or host fallback.
 
-```sh
-base=$(cat /etc/sccache/runtime-image)
-contrib/codeandsolder/runtime/sccache-runtime-profile provision "$base" \
-    /path/to/staging-catalog \
-    /path/to/ocr/.sccache-runtime-packages \
-    /path/to/gui/.sccache-runtime-packages
-```
+Administrators install the broker socket/service, profile helper, reviewed
+Dockerfile and runtime launcher together. The root-owned
+`/etc/sccache/runtime-profile-authority` contains `local` on exactly one
+authoritative host and `ssh` on other clients. Client
+`/etc/sccache/runtime-profile-ssh.conf` configures the fixed host alias
+`sccache-runtime-authority`, using a dedicated key and pinned known-hosts
+file. The corresponding authorized key is restricted to the forced command
+`/usr/local/libexec/sccache-runtime-profile-service ssh` with forwarding,
+PTY, agent forwarding and user RC disabled. Do not configure unrestricted
+root SSH for the broker. The authority accepts only `resolve` and `export`
+operations on the configured base digest and a bounded manifest via stdin.
 
-`provision` validates all requests, groups them by content, builds only
-unregistered sets, and prints tab-separated request digest and image ID.
-Existing mappings are verified, not resolved again. Each image starts from
-the exact local base; APT resolves the complete dependency closure in a
-single transaction using the base's signed repositories. No package removal
-or downgrade is permitted. Some development packages require newer versions
-of existing libraries; the derived layer records every changed version,
-without altering the common base or other profiles. Inspect the complete
-installed inventory in `/usr/share/sccache-runtime/packages.txt`, additions
-and new versions in `profile-packages.txt`, and replaced base versions in
-`profile-replaced-packages.txt`. The immutable image itself is the resolved
-lock: don't independently rebuild it on other hosts from floating APT
-metadata. Re-resolving a set under new repository state requires explicit
-coordinated catalog rotation (or a new base), not an implicit tag update.
+The immutable image itself is the resolved lock. No package removal or
+downgrade is permitted; dependency-required upgrades are recorded in
+`/usr/share/sccache-runtime/profile-replaced-packages.txt`, and the complete
+installed inventory in `packages.txt`. A new base or explicit coordinated
+catalog rotation is required to re-resolve an existing set. The current
+transport streams a zstd-compressed Docker image archive, not a local
+rebuild; Docker deduplicates shared layers on disk.
 
-Distribute the exact resulting image(s) using an authenticated registry or
-`docker image save` / `docker image load`. Docker shares layers and can
-export multiple profile images together. Check the full local image ID on
-each submitting host before registration. On each host, the administrator
-installs the runner and profile tool together and registers each request:
-
-```sh
-install -m 0755 contrib/codeandsolder/runtime/run /usr/local/bin/sccache-runtime
-install -m 0755 contrib/codeandsolder/runtime/sccache-runtime-profile \
-    /usr/local/bin/sccache-runtime-profile
-sccache-runtime-profile register "$base" /path/to/project/.sccache-runtime-packages \
-    sha256:FULL_PROFILE_IMAGE_ID /etc/sccache/runtime-profiles
-```
+For prewarming, administrators may run `sccache-runtime-profile provision`
+on the authority, never on a client. Normal Cargo invocations require no
+per-project provisioning commands.
 
 Registration verifies actual image ancestry and both labels, atomically
 creates a new catalog record, and refuses to replace an existing record with
 a different image. Repeated registration of the same image is idempotent.
 Catalog directories are administrator-managed and readable by build users.
 `fleet/prepare-host` and `fleet/activate-host` stage, install and roll back
-the runner and profile helper as a pair. This needs neither a daemon restart
+the runner, profile helper, broker and Dockerfile together. This needs neither a daemon restart
 nor another compiler cache. Site-specific tools unavailable in the distribution may be supplied as a
 reviewed Debian package with its exact digest and HTTPS download URL:
 
@@ -223,7 +218,7 @@ packages themselves. Hosted native CI may install the same digest-pinned
 archive in its disposable runner. This does not import host `/usr` or require
 repository-specific installation scripts in managed builds.
 
-Use `test-profile` for Docker-free catalog/selection regression. For real
+Use `test-profile` and `test-profile-service` for Docker-free catalog, concurrency, socket and import regression. For real
 acceptance, run the declared tools in the immutable profile with
 `--offline`, then run normal managed Cargo tests on each host using the
 registered profile.
