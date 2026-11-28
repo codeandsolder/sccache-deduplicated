@@ -721,15 +721,25 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         let allocation = client.schedule(ticket, spec.clone())?;
         assert!(matches!(allocation, ScheduleReply::Assigned(_)));
         assert_eq!(client.schedule(ticket, spec.clone())?, allocation);
-        worker_client.renew(ticket)?;
+        assert_eq!(
+            worker_client.renew(ticket)?.valid_for,
+            limits().idle_timeout
+        );
         worker_client.verify_execution(ticket, spec.clone())?;
         let mut wrong = spec.clone();
         wrong.command.arguments.push(b"changed".to_vec());
         assert!(worker_client.verify_execution(ticket, wrong).is_err());
         assert!(wrong_job.verify_execution(ticket, spec.clone()).is_err());
         client.close(offer.ticket)?;
-        assert!(client.renew(ticket).is_err());
-        assert!(wrong_job.renew(ticket).is_err());
+        for rejected in [client.renew(ticket), wrong_job.renew(ticket)] {
+            let error = rejected.unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<wreq::Error>()
+                    .and_then(wreq::Error::status),
+                Some(http::StatusCode::FORBIDDEN)
+            );
+        }
 
         let bytes = vec![0x5a; 2 * 1024 * 1024];
         let blob = BlobRef {
