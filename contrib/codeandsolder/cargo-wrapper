@@ -2,10 +2,36 @@
 set -euo pipefail
 
 # The binary owns Cargo scratch leases and invokes the selected upstream
-# toolchain. Do not parse or rewrite Cargo's command line here.
+# toolchain. Only the leading Rustup +toolchain selector is interpreted
+# for workspace profiles; all Cargo command arguments remain opaque.
+runtime_profile() {
+    local cwd="$1" file="$2" root
+    [[ -r $file ]] || return 1
+    while IFS= read -r root || [[ -n $root ]]; do
+        [[ $root == /* && $root != / && $root != */ ]] || continue
+        if [[ $cwd == "$root" || $cwd == "$root/"* ]]; then
+            return 0
+        fi
+    done < "$file"
+    return 1
+}
 cargo_wrapper_main() {
     local binary="$1"
     shift
+    if [[ ! -e /run/sccache-runtime-session && -x /usr/local/bin/sccache-runtime ]] &&
+        runtime_profile "$(pwd -P)" /etc/sccache/runtime-workspaces; then
+        local selection
+        if [[ ${1:-} == +* ]]; then
+            selection="${1:1}"
+            shift
+        else
+            selection=$(rustup show active-toolchain)
+            selection="${selection%% *}"
+        fi
+        # Resolve the selected compiler without installing or updating it.
+        rustup which --toolchain "$selection" rustc >/dev/null
+        exec /usr/local/bin/sccache-runtime --host-toolchain --leased-intermediates -- cargo "+$selection" "$@"
+    fi
     exec "$binary" --cargo-final -- "$@"
 }
 

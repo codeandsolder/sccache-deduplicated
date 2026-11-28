@@ -54,3 +54,8 @@ source contrib/codeandsolder/cargo-wrapper
 grep -Fxq 'args=--cargo-final -- +1.99.0 test --locked -- --exact with\ spaces ' "$CARGO_REAL_LOG"
 
 echo 'codeandsolder wrapper routing tests passed'
+printf '%s\n' "$root/workspace" > "$root/profiles"
+runtime_profile "$root/workspace" "$root/profiles"
+runtime_profile "$root/workspace/nested" "$root/profiles"
+! runtime_profile "$root/workspace-other" "$root/profiles"
+! runtime_profile "$root/workspace" "$root/absent-profiles"

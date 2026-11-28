@@ -108,3 +108,24 @@ Clippy. The second host must report matching keys and hits for the three
 plain compiler actions, and matching artifact hashes. Build outputs are
 removed after the test; sources, reports and logs are retained. The CLI
 regression `test-run` does not require Docker or managed services.
+
+## Site workspace profiles
+
+A verified workspace can use the installed common runtime automatically
+through the managed Cargo launcher. Add the absolute workspace directory
+(or a deliberately selected parent containing its worktrees) as one line
+in the administrator-maintained `/etc/sccache/runtime-workspaces`. Match
+is on directory boundaries, not arbitrary string prefixes. Install the
+matching `cargo-wrapper` and runtime runner. Nested Cargo runs inside the
+runtime do not start a second container.
+
+This mode mounts the caller's existing Rustup home read-only and retains
+the caller-selected installed toolchain, including an explicit
+`+toolchain` or workspace override. It inherits the ordinary build
+environment except for host runtime paths and managed transport settings.
+The image controls the system runtime and native toolchain. Verify all
+required native packages, path dependencies and externally configured
+output locations before enabling a workspace profile. Workspaces not
+listed continue to run host-native. An opted-in workspace fails normally
+if its configured runtime is unavailable; it does not silently change
+execution identity by falling back to the host.

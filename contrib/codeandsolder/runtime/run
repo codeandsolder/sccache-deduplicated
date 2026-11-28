@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-    echo 'Usage: sccache-runtime [--image SHA256_IMAGE_ID] [--bind DIR]... [--offline] [--leased-intermediates] [--report-actions] -- COMMAND [ARG...]' >&2
+    echo 'Usage: sccache-runtime [--image SHA256_IMAGE_ID] [--bind DIR]... [--offline] [--leased-intermediates] [--report-actions] [--host-toolchain] -- COMMAND [ARG...]' >&2
     exit 64
 }
 
@@ -55,12 +55,16 @@ network=()
 leased=()
 report=()
 separator=false
+host_toolchain=false
 while (($#)); do
     case "$1" in
         --bind)
             (($# >= 2)) || usage
             bind_dir "$2"
             shift 2 ;;
+        --host-toolchain)
+            host_toolchain=true
+            shift ;;
         --offline)
             network=(--network none)
             shift ;;
@@ -82,6 +86,30 @@ while (($#)); do
     esac
 done
 if [[ $separator != true ]] || (($# == 0)); then usage; fi
+
+# An opted-in workspace retains the exact installed host Rustup selection,
+# but compiler processes see the common immutable system runtime. The host
+# installation is read-only and its actual bytes still enter native identity.
+# Only this separately selected mode inherits ordinary build environment.
+build_env=()
+if [[ $host_toolchain == true ]]; then
+    rust_home=$(realpath -e -- "${RUSTUP_HOME:-$home/.rustup}")
+    [[ -d $rust_home/toolchains && $rust_home != *,* ]] || exit 64
+    for protected in /usr /bin /sbin /lib /lib64 /etc /opt/sccache-rustup /run /dev /proc /sys /var/lib /var/cache /tmp; do
+        [[ $rust_home != "$protected" && $rust_home != "$protected/"* && $protected != "$rust_home/"* ]] || exit 64
+    done
+    mounts+=(--mount "type=bind,src=$rust_home,dst=$rust_home,readonly")
+    # Pass names, not values, to avoid exposing the inherited environment in
+    # docker's process command line. Transport and namespace settings belong
+    # to the managed launcher. All other project inputs remain available.
+    while IFS= read -r name; do
+        case "$name" in
+            HOME|CARGO_HOME|RUSTUP_HOME|PATH|PWD|OLDPWD|TMPDIR|TMP|TEMP|LD_*|SCCACHE_*|RUSTC_WRAPPER|SHLVL|_|BASH_FUNC_*) continue ;;
+        esac
+        build_env+=(--env "$name")
+    done < <(compgen -e)
+    build_env+=(--env "RUSTUP_HOME=$rust_home")
+fi
 
 # Refuse mutable tags, remote pulls and incompatible images. A rootless
 # engine cannot preserve the host user namespace required by the daemon.
@@ -142,6 +170,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 mounts+=(--mount "type=bind,src=$session/tmp,dst=/tmp")
+printf '%s\n' "$image" > "$session/runtime-session"
+mounts+=(--mount "type=bind,src=$session/runtime-session,dst=/run/sccache-runtime-session,readonly")
 # FUSE resolves the authenticated UID through NSS. Do not mount the
 # host's account database or invent a different effective identity.
 uid=$(id -u)
@@ -180,7 +210,7 @@ docker run --rm --init --interactive "${terminal[@]}" --pull never --read-only \
     --user "$uid:$gid" --userns host \
     "${groups[@]}" "${network[@]}" "${leased[@]}" "${mounts[@]}" \
     --hostname sccache-build --workdir "$cwd" \
-    --env "HOME=$home" --env "CARGO_HOME=$cargo_home" \
+    "${build_env[@]}" --env "HOME=$home" --env "CARGO_HOME=$cargo_home" \
     --env LANG=C.UTF-8 --env TZ=UTC \
     --env SCCACHE_CONF=/dev/null --env SCCACHE_SERVER_UDS=/run/sccache-shared/sccache.sock \
     --env SCCACHE_START_SERVER=0 --env SCCACHE_NO_AUTO_START_SERVER=1 \
