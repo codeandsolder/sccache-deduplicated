@@ -2348,9 +2348,7 @@ LLVM version: 6.0",
     }
 
     #[test]
-    fn test_preprocessed_file_works_without_preprocessor_call(
-        preprocessor_cache_mode: bool,
-    ) -> Result<()> {
+    fn test_preprocessed_file_works_without_preprocessor_call() -> Result<()> {
         let f = TestFixture::new();
         let clang = f.mk_bin("clang")?;
         let creator = new_creator();

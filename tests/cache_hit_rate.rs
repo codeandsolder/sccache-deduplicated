@@ -1,3 +1,5 @@
+#![cfg(all(target_os = "linux", feature = "dist-client", feature = "dist-server"))]
+pub mod harness;
 pub mod helpers;
 
 use anyhow::Result;

@@ -347,8 +347,8 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
         with:
           rust-toolchain: ${{ steps.rust.outputs.name }}
-      - name: Verify long Rust compiler arguments with actual rustc
-        run: cargo +${{ steps.rust.outputs.name }} test --locked --no-default-features --test sccache_cargo test_rust_response_file_long_command -- --test-threads 1
+      - name: Verify long Rust response-file encoding
+        run: cargo +${{ steps.rust.outputs.name }} test --locked --no-default-features --lib compiler::rust_response::tests -- --test-threads 1
       - name: Finalize mandatory sccache
         if: always()
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main

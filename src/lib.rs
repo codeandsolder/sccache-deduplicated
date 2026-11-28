@@ -36,7 +36,6 @@ mod compiler;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub use compiler::rust_link;
-pub mod compression;
 pub mod config;
 pub mod dist;
 #[cfg(feature = "http-client")]
@@ -60,7 +59,6 @@ pub static BUILD_CAPABILITIES: &[&str] = &[
     #[cfg(feature = "direct-metrics")]
     telemetry::CAPABILITY,
 ];
-// For benches/preprocessor_cache_bench.rs.
 #[doc(hidden)]
 pub use compiler::PreprocessorCacheEntry;
 

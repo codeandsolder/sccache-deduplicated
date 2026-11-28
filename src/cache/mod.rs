@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[path = "cache.rs"]
-pub mod storage;
-pub use storage as cache;
+pub mod cache;
 pub mod cache_io;
 pub mod ipc_storage;
 
+pub use cache::*;
 pub use cache_io::*;
 pub use ipc_storage::IpcStorage;
-pub use storage::*;

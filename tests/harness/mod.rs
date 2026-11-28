@@ -228,11 +228,7 @@ pub fn sccache_dist_path() -> PathBuf {
 }
 
 #[must_use = "the returned configuration must be used to configure the test client"]
-pub fn sccache_client_cfg(
-    tmpdir: &Path,
-    preprocessor_cache_mode: bool,
-) -> sccache::config::FileConfig {
-    let _ = (tmpdir, preprocessor_cache_mode);
+pub fn sccache_client_cfg() -> sccache::config::FileConfig {
     sccache::config::FileConfig {
         dist: sccache::config::DistConfig {
             cluster: None,

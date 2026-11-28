@@ -107,7 +107,6 @@ uuid = { version = "1.9", features = ["v4"] }
 walkdir = "2"
 # by default which pulls in an outdated failure version
 which = { version = "8", default-features = false, features = ["real-sys"] }
-zstd = "0.14"
 zlib-rs-fast = { package = "zlib-rs", version = "=0.6.8", optional = true, default-features = false, features = ["std"] }
 
 # dist-server only
@@ -118,6 +117,7 @@ syslog = { version = "7", optional = true }
 sha2 = "0.11"
 
 [dev-dependencies]
+zstd = "0.14"
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["test-util"] }
 assert_cmd = "2.0.13"

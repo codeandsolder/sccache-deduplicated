@@ -6689,20 +6689,11 @@ c:/foo/bar.rs:
         args: &[&'static str],
         env_vars: &[(OsString, OsString)],
         pre_func: F,
-        preprocessor_cache_mode: bool,
     ) -> String
     where
         F: Fn(&Path) -> Result<()>,
     {
-        hash_keys_for_compiler(
-            f,
-            args,
-            env_vars,
-            pre_func,
-            preprocessor_cache_mode,
-            "rustc",
-        )
-        .0
+        hash_keys_for_compiler(f, args, env_vars, pre_func, "rustc").0
     }
 
     fn hash_keys_for_compiler<F>(
@@ -6710,7 +6701,6 @@ c:/foo/bar.rs:
         args: &[&'static str],
         env_vars: &[(OsString, OsString)],
         pre_func: F,
-        _preprocessor_cache_mode: bool,
         executable: &str,
     ) -> (String, String)
     where
@@ -6811,7 +6801,7 @@ c:/foo/bar.rs:
             OsString::from("-march=x86-64-v4"),
         )];
         let key = |args: &[&'static str], env: &[(OsString, OsString)]| {
-            hash_key(&f, args, env, |_| Ok(()), false)
+            hash_key(&f, args, env, |_| Ok(()))
         };
         let rust_v2 = key(&args_v2, no_env);
         let rust_v4 = key(&args_v4, no_env);
@@ -6851,9 +6841,9 @@ c:/foo/bar.rs:
             "--crate-type",
             "lib",
         ];
-        let first = hash_keys_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver").0;
+        let first = hash_keys_for_compiler(&f, &args, &env, |_| Ok(()), "clippy-driver").0;
         fs::write(&file, b"disallowed-names = [\"bad_two\"]\n")?;
-        let second = hash_keys_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver").0;
+        let second = hash_keys_for_compiler(&f, &args, &env, |_| Ok(()), "clippy-driver").0;
         assert_ne!(
             first, second,
             "changing the external Clippy policy must invalidate cache"
@@ -6909,7 +6899,7 @@ c:/foo/bar.rs:
         let env_a = policy_env(&a);
         let env_b = policy_env(&b);
         let key = |fixture: &TestFixture, env: &[(OsString, OsString)]| {
-            hash_keys_for_compiler(fixture, &args, env, |_| Ok(()), false, "clippy-driver").0
+            hash_keys_for_compiler(fixture, &args, env, |_| Ok(()), "clippy-driver").0
         };
         let first = key(&a, &env_a);
         assert_eq!(first, key(&b, &env_b));
@@ -6940,11 +6930,9 @@ c:/foo/bar.rs:
             "CLIPPY_ARGS".into(),
             "-Aclippy::unwrap_used__CLIPPY_HACKERY__".into(),
         )];
-        let deny_key =
-            hash_keys_for_compiler(&f, &args, &deny, |_| Ok(()), false, "clippy-driver").0;
-        let allow_key =
-            hash_keys_for_compiler(&f, &args, &allow, |_| Ok(()), false, "clippy-driver").0;
-        let rustc_key = hash_keys_for_compiler(&f, &args, &deny, |_| Ok(()), false, "rustc").0;
+        let deny_key = hash_keys_for_compiler(&f, &args, &deny, |_| Ok(()), "clippy-driver").0;
+        let allow_key = hash_keys_for_compiler(&f, &args, &allow, |_| Ok(()), "clippy-driver").0;
+        let rustc_key = hash_keys_for_compiler(&f, &args, &deny, |_| Ok(()), "rustc").0;
         assert_ne!(
             deny_key, allow_key,
             "different Clippy lint levels must not reuse diagnostics"
@@ -7863,8 +7851,8 @@ c:/foo/bar.rs:
         ];
 
         assert_eq!(
-            hash_key(&a, &args, &env_a, mk_manifest, false),
-            hash_key(&b, &args, &env_b, mk_manifest, false)
+            hash_key(&a, &args, &env_a, mk_manifest),
+            hash_key(&b, &args, &env_b, mk_manifest)
         );
     }
 
@@ -7913,38 +7901,26 @@ c:/foo/bar.rs:
             f.tempdir.path().as_os_str().to_owned(),
         )];
 
-        let first = hash_key(
-            &f,
-            &args,
-            &env,
-            |root| {
-                fs::write(
-                    root.join("Cargo.toml"),
-                    b"[package]
+        let first = hash_key(&f, &args, &env, |root| {
+            fs::write(
+                root.join("Cargo.toml"),
+                b"[package]
 name='foo'
 version='1.0.0'
 ",
-                )?;
-                Ok(())
-            },
-            false,
-        );
-        let second = hash_key(
-            &f,
-            &args,
-            &env,
-            |root| {
-                fs::write(
-                    root.join("Cargo.toml"),
-                    b"[package]
+            )?;
+            Ok(())
+        });
+        let second = hash_key(&f, &args, &env, |root| {
+            fs::write(
+                root.join("Cargo.toml"),
+                b"[package]
 name='foo'
 version='2.0.0'
 ",
-                )?;
-                Ok(())
-            },
-            false,
-        );
+            )?;
+            Ok(())
+        });
 
         assert_ne!(first, second);
         Ok(())
@@ -7989,8 +7965,8 @@ version='2.0.0'
             }
         };
 
-        let first = hash_key(&f, &args, &env, make_inputs(b"<protocol name='a'/>"), false);
-        let second = hash_key(&f, &args, &env, make_inputs(b"<protocol name='b'/>"), false);
+        let first = hash_key(&f, &args, &env, make_inputs(b"<protocol name='a'/>"));
+        let second = hash_key(&f, &args, &env, make_inputs(b"<protocol name='b'/>"));
 
         assert_ne!(first, second);
         Ok(())
@@ -8055,7 +8031,6 @@ version='2.0.0'
                 ],
                 &[],
                 mk_files,
-                false,
             ),
             hash_key(
                 &f,
@@ -8104,7 +8079,6 @@ version='2.0.0'
                 ],
                 &[],
                 nothing,
-                false,
             ),
             hash_key(
                 &f,
@@ -8155,7 +8129,6 @@ version='2.0.0'
                 ],
                 &[],
                 nothing,
-                false,
             ),
             hash_key(
                 &f,
@@ -8204,7 +8177,6 @@ version='2.0.0'
                 ],
                 &[],
                 nothing,
-                false,
             ),
             hash_key(
                 &f,
@@ -8253,7 +8225,6 @@ version='2.0.0'
                 ],
                 &[],
                 nothing,
-                false,
             ),
             hash_key(
                 &f,
@@ -8458,9 +8429,9 @@ version='2.0.0'
         )?;
         let env = vec![(OsString::from("CLIPPY_CONF_DIR"), policy.into_os_string())];
         let (rustc_key, rustc_toolchain) =
-            hash_keys_for_compiler(&f, &args, &[], |_| Ok(()), false, "rustc");
+            hash_keys_for_compiler(&f, &args, &[], |_| Ok(()), "rustc");
         let (clippy_key, clippy_toolchain) =
-            hash_keys_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver");
+            hash_keys_for_compiler(&f, &args, &env, |_| Ok(()), "clippy-driver");
         assert_ne!(rustc_key, clippy_key);
         assert_eq!(rustc_toolchain, clippy_toolchain);
         Ok(())

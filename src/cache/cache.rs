@@ -19,7 +19,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-/// An interface to cache storage.
+/// Native compilation session metadata. CAS operations are not part of this interface.
 #[async_trait]
 pub trait Storage: Send + Sync {
     /// Verify that a connection-owned compilation session remains usable.
@@ -34,7 +34,7 @@ pub trait Storage: Send + Sync {
     /// Get the storage location.
     fn location(&self) -> String;
 
-    /// Get the cache backend type name (e.g., "disk", "redis", "s3").
+    /// Describe the native session for diagnostics.
     /// Used for statistics and display purposes.
     fn cache_type_name(&self) -> &'static str {
         "unknown"

@@ -22,9 +22,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-/// `Storage` implementation that forwards all cache operations to the sccache
-/// daemon over the existing IPC connection.  Used by CLI processes in
-/// client-side mode.
+/// Native session metadata and broker connection for namespace discovery.
 ///
 /// `ServerConnection` is synchronous and non-`Clone`, so it lives behind a
 /// `Mutex` and every RPC dispatches via `tokio::task::spawn_blocking`.  The

@@ -36,7 +36,7 @@ fn test_log_timestamp_format_without_millis() {
     let mut cmd = Command::new(sccache_bin());
     cmd.arg("--show-stats")
         .env("SCCACHE_LOG", "debug")
-        .env("SCCACHE_DIR", tempdir.path())
+        .env("SCCACHE_CONF", tempdir.path().join("missing-config"))
         .env_remove("SCCACHE_LOG_MILLIS");
 
     let output = cmd.output().unwrap();
@@ -69,7 +69,7 @@ fn test_log_timestamp_format_with_millis() {
     cmd.arg("--show-stats")
         .env("SCCACHE_LOG", "debug")
         .env("SCCACHE_LOG_MILLIS", "1")
-        .env("SCCACHE_DIR", tempdir.path());
+        .env("SCCACHE_CONF", tempdir.path().join("missing-config"));
 
     let output = cmd.output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -99,7 +99,7 @@ fn test_log_millis_flag_with_various_values() {
         cmd.arg("--show-stats")
             .env("SCCACHE_LOG", "debug")
             .env("SCCACHE_LOG_MILLIS", value)
-            .env("SCCACHE_DIR", tempdir.path());
+            .env("SCCACHE_CONF", tempdir.path().join("missing-config"));
 
         let output = cmd.output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);

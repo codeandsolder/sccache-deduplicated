@@ -46,6 +46,12 @@ basedirs = ["/workspace"]
 dir = "/old/l0"
 size = 1073741824
 
+[cache.s3]
+bucket = "retired"
+
+[cache.multilevel]
+chain = ["disk", "s3"]
+
 [dist]
 cache_dir = "/old/client"
 toolchain_cache_size = 1073741824
@@ -64,7 +70,7 @@ TOML
 rg -Fxq 'native_installation_catalogs = ["/catalog"]' "$root/native-client"
 rg -Fxq 'directory = "/identity"' "$root/native-client"
 rg -Fxq 'endpoint = "https://127.0.0.1:10602"' "$root/native-client"
-if rg -q 'cache_dir|toolchain_cache_size|toolchains|rewrite_includes_only|/old/|\[cache.disk\]' "$root/native-client"; then exit 1; fi
+if rg -q 'cache_dir|toolchain_cache_size|toolchains|rewrite_includes_only|/old/|\[cache([.]|\])' "$root/native-client"; then exit 1; fi
 "$here/native-only-config" client "$root/native-client" > "$root/repeat"
 cmp "$root/native-client" "$root/repeat"
 cat >> "$root/client" <<'TOML'

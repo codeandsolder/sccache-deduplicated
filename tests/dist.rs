@@ -54,7 +54,7 @@ impl RustDistFixture {
     fn case(&self) -> Result<RustDistCase> {
         let root = tempfile::tempdir()?;
         let path = root.path();
-        let mut cfg = harness::sccache_client_cfg(path, false);
+        let mut cfg = harness::sccache_client_cfg();
         self.system.configure_client(&mut cfg);
         let config = path.join("sccache-cfg.json");
         let cached_config = path.join("sccache-cached-cfg");
@@ -150,11 +150,8 @@ fn rust_compile(tmpdir: &Path, sccache_cfg_path: &Path, sccache_cached_cfg_path:
         .unwrap()
 }
 
-pub fn dist_test_sccache_client_cfg(
-    tmpdir: &Path,
-    system: &harness::DistSystem,
-) -> sccache::config::FileConfig {
-    let mut sccache_cfg = harness::sccache_client_cfg(tmpdir, false);
+pub fn dist_test_sccache_client_cfg(system: &harness::DistSystem) -> sccache::config::FileConfig {
+    let mut sccache_cfg = harness::sccache_client_cfg();
     system.configure_client(&mut sccache_cfg);
     sccache_cfg
 }
@@ -173,7 +170,7 @@ fn test_dist_basic() {
     system.add_scheduler();
     system.add_server(&[]);
 
-    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, &system);
+    let sccache_cfg = dist_test_sccache_client_cfg(&system);
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
@@ -209,7 +206,7 @@ fn test_dist_c_debug_compilation_directory_is_cache_identity() -> Result<()> {
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
     system.add_scheduler();
     system.add_server(&[]);
-    let mut config = dist_test_sccache_client_cfg(root, &system);
+    let mut config = dist_test_sccache_client_cfg(&system);
     config
         .cache
         .disk
@@ -353,7 +350,7 @@ fn test_dist_c_native_target_codegen_and_cache() -> Result<()> {
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
     system.add_scheduler();
     system.add_server(&[]);
-    let mut config = dist_test_sccache_client_cfg(root, &system);
+    let mut config = dist_test_sccache_client_cfg(&system);
     // Unlike the minimal distribution smoke test, retain objects for the
     // repeat-request cache verification.
     config
@@ -477,7 +474,7 @@ fn test_dist_namespace_broker() -> Result<()> {
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), &root);
     system.add_scheduler();
     let _worker = system.add_server(&[]);
-    let mut cfg = harness::sccache_client_cfg(&root, false);
+    let mut cfg = harness::sccache_client_cfg();
     system.configure_client(&mut cfg);
     let config = root.join("sccache-cfg.json");
     write_json_cfg(&root, "sccache-cfg.json", &cfg);
@@ -592,7 +589,7 @@ fn test_dist_c_compiler_aliases() -> Result<()> {
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), &root);
     system.add_scheduler();
     let _worker = system.add_server(&[]);
-    let mut cfg = harness::sccache_client_cfg(&root, false);
+    let mut cfg = harness::sccache_client_cfg();
     system.configure_client(&mut cfg);
     cfg.compiler_aliases.0.insert(
         transparent.clone(),
@@ -668,7 +665,7 @@ fn test_dist_c_success_without_object() -> Result<()> {
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), &root);
     system.add_scheduler();
     let _worker = system.add_server(&[]);
-    let mut cfg = harness::sccache_client_cfg(&root, false);
+    let mut cfg = harness::sccache_client_cfg();
     system.configure_client(&mut cfg);
     let config = root.join("sccache-cfg.json");
     write_json_cfg(&root, "sccache-cfg.json", &cfg);
@@ -734,7 +731,7 @@ fn test_dist_restartedserver() {
     system.add_scheduler();
     let server_handle = system.add_server(&[]);
 
-    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, &system);
+    let sccache_cfg = dist_test_sccache_client_cfg(&system);
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
@@ -773,7 +770,7 @@ fn test_dist_nobuilder() {
     let mut system = harness::DistSystem::new(&sccache_dist, tmpdir);
     system.add_scheduler();
 
-    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, &system);
+    let sccache_cfg = dist_test_sccache_client_cfg(&system);
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
@@ -887,7 +884,7 @@ fn test_dist_failingserver() {
     system.add_scheduler();
     system.add_custom_server_process("failing_server_process");
 
-    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, &system);
+    let sccache_cfg = dist_test_sccache_client_cfg(&system);
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
@@ -919,7 +916,7 @@ fn test_dist_cargo_build() {
     system.add_scheduler();
     let _server_handle = system.add_server(&[]);
 
-    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, &system);
+    let sccache_cfg = dist_test_sccache_client_cfg(&system);
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
@@ -1353,7 +1350,7 @@ fn test_dist_cargo_makeflags() {
     system.add_scheduler();
     let _server_handle = system.add_server(&[]);
 
-    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, &system);
+    let sccache_cfg = dist_test_sccache_client_cfg(&system);
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");

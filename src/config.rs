@@ -592,6 +592,7 @@ fn config_from_environment(environment: &Environment) -> Result<EnvConfig> {
                     | "SCCACHE_SKIP_CACHE_CHECK"
                     | "SCCACHE_DIRECT"
                     | "SCCACHE_LOCAL_RW_MODE"
+                    | "SCCACHE_CACHE_ZSTD_LEVEL"
                     | "SCCACHE_REDIS"
                     | "SCCACHE_MEMCACHED"
             );

@@ -22,7 +22,7 @@ pub struct MockStorage {
 }
 
 impl MockStorage {
-    /// Create a new `MockStorage`. if `delay` is `Some`, wait for that amount of time before returning from operations.
+    /// Create a test session with no cache storage.
     pub(crate) fn new() -> Self {
         Self {
             fail_size_query: false,
