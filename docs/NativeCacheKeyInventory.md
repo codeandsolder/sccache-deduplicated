@@ -88,17 +88,26 @@ supplied alongside selected rmeta contributes no digest; an entirely unused
 extern contributes its name and modifiers, not file contents. Reuse the
 already-computed selected dependency digests. Native-linking results retain
 linkable inputs, and the execution packager can still deliver siblings.
-Bundled native archives are resolved per library request using the compiler-reported
-target filename convention and ordered native search directories. Shadowed
-archives, unrelated filename conventions, and archives not used by metadata-only
-compilation do not participate. Selected archive digests retain the request
-order, including missing slots; archive locations do not identify results.
-Ordered member names and content digests are framed independently, without
-archive timestamps, ownership, or index offsets. Thin archives contribute the
-actual external member bytes and their embedded names; those members are also
-packaged as compiler inputs. A Mach-O fat archive contributes only the first
-matching architecture slice when rustc selects that slice for bundling. Native
-linker consumption retains the complete architecture-to-content association.
+Native library declarations are discovered in the managed nightly compiler's
+expanded dependency pass, including source attributes produced by macros and
+conditional compilation. Apply command-line kind and rename overrides in rustc
+order. Resolve selected archives using the compiler-reported target filename
+convention and ordered native search directories; metadata-only compilations,
+shadowed archives and unrelated files do not contribute identity. Preserve
+request order and missing slots. Ordinary bundling keys framed ordered member
+names and actual contents; the compiler's selected Mach-O slice is sufficient.
+Packed or directly linked archives are normalized before worker execution,
+not just in the key: GNU archives are reserialized deterministically with
+ordered members, symbol-to-member associations and recomputed index offsets.
+Packed thin archives become self-contained regular archives. Other recognized
+archive layouts normalize creation metadata without rewriting their index or
+layout; unsupported layouts retain exact bytes. When source/proc macros observe
+the raw archive, retain the original bytes instead of substituting normalized
+ones. Normalized bytes are the input to both the digest and worker packaging.
+Unmaterialized thin archives key and package the actual external members.
+Source-aware archive discovery requires the managed nightly; narrow structured
+compiler-native dependency output would eliminate expanded-source serialization
+cost (tracked in #538).
 
 Standard Cargo build paths used by compiler environment observations are
 normalized for both key and execution. The build-script output root is
