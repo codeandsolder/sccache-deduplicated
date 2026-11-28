@@ -690,8 +690,8 @@ impl NativeCacheClient {
             Ok(NativeRunResult::JobNotFound) => {
                 Some(anyhow::anyhow!("native worker lost its assigned job"))
             }
-            Ok(NativeRunResult::Unavailable) => Some(anyhow::anyhow!(
-                "native worker could not execute its assigned job"
+            Ok(NativeRunResult::InfrastructureFailure { message }) => Some(anyhow::anyhow!(
+                "native worker could not execute its assigned job: {message}"
             )),
             Ok(NativeRunResult::Pending(_) | NativeRunResult::Acknowledged) => {
                 Some(anyhow::anyhow!("unexpected nonterminal worker result"))

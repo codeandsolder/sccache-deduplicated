@@ -715,7 +715,9 @@ pub enum NativeRunRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeRunResult {
     Pending(NativeJobPhase),
-    Unavailable,
+    InfrastructureFailure {
+        message: String,
+    },
     Acknowledged,
     Stored,
     Failed {

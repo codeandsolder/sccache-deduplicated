@@ -198,7 +198,7 @@ pub mod urls {
     /// # Errors
     /// Returns an error if the worker origin is not a valid base URL.
     pub fn server_run_native_job(base: &url::Url, job_id: JobId) -> Result<url::Url> {
-        Ok(base.join(&format!("/api/v5/distserver/run_native_job/{job_id}"))?)
+        Ok(base.join(&format!("/api/v6/distserver/run_native_job/{job_id}"))?)
     }
 }
 
@@ -1101,7 +1101,7 @@ mod server {
                 ),
             )
             .route(
-                "/api/v5/distserver/run_native_job/{job_id}",
+                "/api/v6/distserver/run_native_job/{job_id}",
                 path_route(
                     MethodFilter::POST,
                     |_| AdmissionClass::Metadata,

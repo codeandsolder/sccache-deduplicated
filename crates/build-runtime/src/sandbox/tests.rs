@@ -60,6 +60,7 @@ fn layout_is_independent_of_host_paths_and_mounts_are_explicit() -> Result<()> {
     let command = b.command(
         Path::new("/usr/bin/bwrap"),
         &invocation(vec![("X".into(), "1".into())])?,
+        tempfile::tempfile()?,
     )?;
     let arguments: Vec<_> = command.get_args().collect();
     assert!(arguments.contains(&OsStr::new("--clearenv")));
@@ -115,8 +116,13 @@ fn executes_isolated_process_with_readonly_inputs_and_private_outputs() -> Resul
         [("PRESENT".into(), "value".into()), ("EMPTY".into(), "".into())],
         0o077,
     )?;
+    let mut status = tempfile::tempfile()?;
     let result = plan
-        .command(Path::new("/usr/bin/bwrap"), &invocation)?
+        .command(
+            Path::new("/usr/bin/bwrap"),
+            &invocation,
+            status.try_clone()?,
+        )?
         .env("HOST_SENTINEL", "must-not-leak")
         .output()?;
     ensure!(
@@ -124,6 +130,9 @@ fn executes_isolated_process_with_readonly_inputs_and_private_outputs() -> Resul
         "sandbox command failed: {}",
         String::from_utf8_lossy(&result.stderr)
     );
+    use std::io::Seek;
+    status.rewind()?;
+    verify_status(status, result.status)?;
     assert_eq!(fs::read(output.path().join("result"))?, b"original");
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(
@@ -135,5 +144,24 @@ fn executes_isolated_process_with_readonly_inputs_and_private_outputs() -> Resul
     );
     assert_eq!(fs::read(root.path().join("workspace/input"))?, b"original");
     assert!(!root.path().join("tmp/scratch").exists());
+    Ok(())
+}
+
+#[test]
+fn compiler_failure_is_distinct_from_sandbox_failure() -> Result<()> {
+    use std::os::unix::process::ExitStatusExt;
+    let failure = ExitStatus::from_raw(1 << 8);
+    let valid = br#"{ "child-pid": 123, "mnt-namespace": 456 }
+{ "exit-code": 1 }
+"#;
+    verify_status(valid.as_slice(), failure)?;
+    for invalid in [
+        b"".as_slice(),
+        br#"{ "child-pid": 123 }"#,
+        br#"{ "child-pid": 123 } { "exit-code": 0 }"#,
+        br#"{ "exit-code": 1 }"#,
+    ] {
+        assert!(verify_status(invalid, failure).is_err());
+    }
     Ok(())
 }

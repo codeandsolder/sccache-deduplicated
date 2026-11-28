@@ -243,6 +243,10 @@ cache address, not necessarily the example loopback address). Select
 `cache_dir` and archive sources. This worker never constructs the legacy
 overlay builder or archive cache, and cannot be scheduled for archive jobs.
 Legacy archive builders and their configuration fields have been removed.
+Workers require Bubblewrap with `--json-status-fd` support. A launch or
+namespace failure is a distinct infrastructure failure, with its bounded
+diagnostic delivered to the caller; compiler exit failures remain ordinary
+failed compilation results.
 
 ```toml
 [builder]

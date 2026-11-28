@@ -391,11 +391,11 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
         assert!(verification_rx.try_recv().is_err());
 
         for id in [first, second] {
-            assert_eq!(terminal(&dispatcher, id)?, NativeRunResult::Unavailable);
-            assert_eq!(
-                dispatcher.poll(id, NativeRunRequest::Poll)?,
-                NativeRunResult::Unavailable
+            let failure = terminal(&dispatcher, id)?;
+            assert!(
+                matches!(&failure, NativeRunResult::InfrastructureFailure { message } if !message.is_empty())
             );
+            assert_eq!(dispatcher.poll(id, NativeRunRequest::Poll)?, failure);
         }
         assert!(active_jobs(&dispatcher).is_empty());
         assert!(
@@ -430,12 +430,13 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
             states.recv_timeout(Duration::from_secs(5))?,
             (third, JobState::Complete)
         );
-        assert_eq!(terminal(&dispatcher, third)?, NativeRunResult::Unavailable);
+        assert!(
+            matches!(terminal(&dispatcher, third)?, NativeRunResult::InfrastructureFailure { message } if !message.is_empty())
+        );
         assert!(states.try_recv().is_err());
         assert_eq!(queue.active(), 0);
-        assert_eq!(
-            dispatcher.poll(second, NativeRunRequest::Poll)?,
-            NativeRunResult::Unavailable
+        assert!(
+            matches!(dispatcher.poll(second, NativeRunRequest::Poll)?, NativeRunResult::InfrastructureFailure { message } if !message.is_empty())
         );
         dispatcher.poll(second, NativeRunRequest::Acknowledge)?;
         dispatcher.poll(third, NativeRunRequest::Acknowledge)?;

@@ -8,7 +8,10 @@ use std::{
     ffi::OsStr,
     fs::File,
     io::{Read, Seek, SeekFrom},
-    os::unix::{ffi::OsStrExt, fs::MetadataExt, process::ExitStatusExt},
+    os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, fs::MetadataExt, process::ExitStatusExt},
+    },
     path::{Path, PathBuf},
     process::{Child, ExitStatus, Stdio},
     sync::Arc,
@@ -141,13 +144,11 @@ impl CapturedExecution {
     /// # Errors
     /// Returns an error for undeclared content or descriptor failure.
     pub fn open_file(&self, id: ContentId) -> Result<File> {
-        let mut file = self
-            .files
-            .get(&id)
-            .context("uncaptured result blob")?
-            .try_clone()?;
-        file.rewind()?;
-        Ok(file)
+        let file = self.files.get(&id).context("uncaptured result blob")?;
+        // A dup shares the original open-file description and seek cursor.
+        // Reopening the pinned descriptor provides an independent cursor even
+        // after the captured file was unlinked from its temporary directory.
+        Ok(File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?)
     }
 
     /// Whether all captured content can be committed locally without copying.
@@ -823,7 +824,8 @@ pub fn execute(
     let build = PreparedBuild::prepare(spec, store, &policy.scratch, inputs)?;
     let invocation = SandboxInvocation::from_spec(&spec.command)?;
     let stdout = tempfile::tempfile_in(&policy.scratch)?;
-    let stderr = tempfile::tempfile_in(&policy.scratch)?;
+    let mut stderr = tempfile::tempfile_in(&policy.scratch)?;
+    let mut sandbox_status = tempfile::tempfile_in(&policy.scratch)?;
     progress()?;
     let preparation = started.elapsed();
     ensure!(
@@ -835,7 +837,7 @@ pub fn execute(
     let mut child = RunningChild(
         build
             .plan
-            .command(&policy.bubblewrap, &invocation)?
+            .command(&policy.bubblewrap, &invocation, sandbox_status.try_clone()?)?
             .stdin(Stdio::null())
             .stdout(stdout.try_clone()?)
             .stderr(stderr.try_clone()?)
@@ -845,6 +847,16 @@ pub fn execute(
         policy.timeout.saturating_sub(started.elapsed()),
         &mut progress,
     )?;
+    sandbox_status.rewind()?;
+    if let Err(error) = crate::sandbox::verify_status(sandbox_status, status) {
+        stderr.rewind()?;
+        let mut diagnostic = Vec::new();
+        (&mut stderr).take(16 * 1024).read_to_end(&mut diagnostic)?;
+        return Err(error.context(format!(
+            "Bubblewrap did not complete compiler execution ({status}): {}",
+            String::from_utf8_lossy(&diagnostic)
+        )));
+    }
     let process = running.elapsed();
     phase(ExecutionPhase::Capture);
     progress()?;

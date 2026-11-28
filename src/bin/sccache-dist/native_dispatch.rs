@@ -39,7 +39,7 @@ struct Assignment {
 enum Terminal {
     Stored,
     Failed(Box<CapturedExecution>),
-    Unavailable,
+    InfrastructureFailure(String),
 }
 
 impl Terminal {
@@ -47,7 +47,9 @@ impl Terminal {
         match self {
             Self::Stored => Ok(NativeRunResult::Stored),
             Self::Failed(captured) => captured.failure_result(),
-            Self::Unavailable => Ok(NativeRunResult::Unavailable),
+            Self::InfrastructureFailure(message) => Ok(NativeRunResult::InfrastructureFailure {
+                message: message.clone(),
+            }),
         }
     }
 
@@ -57,7 +59,9 @@ impl Terminal {
             Ok(captured) => Self::Failed(Box::new(captured)),
             Err(error) => {
                 warn!("Native worker action failed: {error:#}");
-                Self::Unavailable
+                let mut message = format!("{error:#}");
+                message.truncate(message.floor_char_boundary(16 * 1024));
+                Self::InfrastructureFailure(message)
             }
         }
     }

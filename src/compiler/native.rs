@@ -1556,10 +1556,9 @@ mod tests {
                 .collect::<Result<BTreeMap<_, _>>>()?;
             let encoding = result.physical_encoding();
             let provider = ReferenceBlobProvider::new(move |blob| {
-                let file = readers
-                    .get(&blob.id)
-                    .context("missing captured blob")?
-                    .try_clone()?;
+                use std::os::fd::AsRawFd;
+                let pinned = readers.get(&blob.id).context("missing captured blob")?;
+                let file = std::fs::File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))?;
                 Ok(Box::new(crate::build_runtime::BlobReader::open(
                     file, encoding,
                 )?))
