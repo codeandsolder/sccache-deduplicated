@@ -353,7 +353,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"17";
+const CACHE_VERSION: &[u8] = b"18";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -1285,9 +1285,11 @@ fn native_normalizes_cwd(arguments: &[Argument<ArgData>]) -> bool {
         .iter()
         .rev()
         .find_map(|arg| match arg {
-            Argument::WithValue("--remap-path-scope", ArgData::PassThrough(value), _) => {
-                Some(value == "all")
-            }
+            Argument::WithValue("--remap-path-scope", ArgData::PassThrough(value), _) => Some(
+                value
+                    .to_str()
+                    .is_some_and(|scope| scope.split(',').any(|scope| scope == "all")),
+            ),
             _ => None,
         })
         .unwrap_or(true)
@@ -1563,6 +1565,67 @@ fn native_tune_requested(arguments: &[Argument<ArgData>]) -> bool {
         }
         _ => None,
     }) == Some(true)
+}
+
+/// rustc extracts the first matching macOS fat-archive slice. Built-in
+/// Darwin targets have the corresponding `llvm-target` and architecture;
+/// custom targets describe those fields explicitly.
+fn macho_archive_target(
+    target: &str,
+    custom: Option<&Path>,
+    cwd: &Path,
+) -> Option<object::Architecture> {
+    let custom_spec;
+    let arch = if let Some(path) = custom {
+        custom_spec =
+            serde_json::from_slice::<serde_json::Value>(&fs::read(cwd.join(path)).ok()?).ok()?;
+        if !custom_spec
+            .get("llvm-target")?
+            .as_str()?
+            .contains("-apple-macosx")
+        {
+            return None;
+        }
+        custom_spec.get("arch")?.as_str()?
+    } else {
+        target.strip_suffix("-apple-darwin")?
+    };
+    match arch {
+        "aarch64" | "arm64e" => Some(object::Architecture::Aarch64),
+        "x86_64" | "x86_64h" => Some(object::Architecture::X86_64),
+        _ => None,
+    }
+}
+
+/// An archive's embedded external paths cannot be rewritten by argv
+/// relocation. Use canonical layout only if the archive still resolves
+/// every member to its independently mapped input.
+fn thin_archive_members_visible(
+    archive: &Path,
+    identity: &crate::util::ArchiveIdentity,
+    canonical: &CanonicalRustPaths,
+) -> bool {
+    use super::canonical_paths::physical_operand;
+    if identity.external_members.is_empty() {
+        return true;
+    }
+    let Some(physical_archive) = physical_operand(Path::new("/"), archive) else {
+        return false;
+    };
+    let logical_archive = canonical.to_canonical(&physical_archive);
+    let Some(logical_parent) = logical_archive.parent() else {
+        return false;
+    };
+    identity.external_members.iter().all(|member| {
+        let Some(physical) = physical_operand(Path::new("/"), &member.path) else {
+            return false;
+        };
+        if !canonical.root_is_known(&physical) {
+            return false;
+        }
+        let logical = logical_parent.join(&member.name);
+        super::c::normalize_path(&logical) == canonical.to_canonical(&physical)
+    })
 }
 
 fn compilation_target(arguments: &[Argument<ArgData>], host: &str) -> String {
@@ -3674,7 +3737,12 @@ where
             .flatten()
             .cloned()
             .collect::<Vec<_>>();
-        let staticlib_hashes = hash_all_archives(&abs_staticlibs, pool);
+        let archive_target = if !abs_staticlibs.is_empty() && !self.parsed_args.crate_types.cdylib {
+            macho_archive_target(&target, self.parsed_args.target_json.as_deref(), &cwd)
+        } else {
+            None
+        };
+        let staticlib_hashes = hash_all_archives(&abs_staticlibs, pool, archive_target);
 
         // Hash the content of the specified target json file, if any.
         let mut target_json_files = Vec::new();
@@ -3720,6 +3788,29 @@ where
             outputs
         )?;
 
+        let archive_members = staticlib_hashes
+            .iter()
+            .flat_map(|archive| {
+                archive
+                    .external_members
+                    .iter()
+                    .map(|member| member.path.clone())
+            })
+            .collect::<Vec<_>>();
+        if canonical_paths.as_ref().is_some_and(|canonical| {
+            abs_staticlibs
+                .iter()
+                .zip(&staticlib_hashes)
+                .any(|(path, archive)| !thin_archive_members_visible(path, archive, canonical))
+        }) {
+            debug!("Thin archive member paths require physical input layout");
+            canonical_paths = None;
+        }
+        let staticlib_hashes = staticlib_hashes
+            .into_iter()
+            .map(|archive| archive.digest)
+            .collect::<Vec<_>>();
+
         let extern_hashes = if selected_externs_only {
             selected_extern_hashes(&abs_externs, &source_files, &source_hashes)
         } else {
@@ -3731,6 +3822,7 @@ where
                 .iter()
                 .chain(abs_externs.iter())
                 .chain(abs_staticlibs.iter())
+                .chain(archive_members.iter())
                 .chain(target_json_files.iter())
                 // An rmeta can implicitly load a host proc macro through -L
                 // dependency, even when no direct --extern names that macro.
@@ -4207,6 +4299,7 @@ where
             .filter(|path| !precise_dependencies || !path.starts_with(&physical_sysroot))
             .chain(abs_externs.iter())
             .chain(abs_staticlibs.iter())
+            .chain(archive_members.iter())
             .chain(target_json_files.iter())
             .cloned()
             .collect();

@@ -3041,6 +3041,44 @@ fn native_rust_bundled_archive_identity_follows_search_precedence() -> Result<()
     let ((same, source_kind), bytes) = compile(["two", "one"], "metadata")?;
     assert_eq!((same, source_kind), (metadata_key, "hit".into()));
     assert_eq!(metadata, bytes);
+    // A GNU thin archive has no embedded object bytes. Recompiling the
+    // external object must invalidate the bundled rlib even when the archive
+    // itself (including all its headers and symbol index) is unchanged.
+    let thin = source.join("one/libprobe.a");
+    fs::remove_file(&thin)?;
+    fs::copy(source.join("probe.o"), source.join("one/member.o"))?;
+    let status = Command::new("/usr/bin/ar")
+        .args(["crsT", "libprobe.a", "member.o"])
+        .current_dir(source.join("one"))
+        .status()?;
+    ensure!(status.success(), "thin archive creation failed");
+    let archive_bytes = fs::read(&thin)?;
+    let ((thin_key, source_kind), first) = compile(["one", "two"], "link")?;
+    assert_eq!(source_kind, "worker");
+    assert!(has_member(&first, b"member.o")?);
+    fs::write(
+        source.join("probe.c"),
+        b"int native_value(void) { return 17; }",
+    )?;
+    let object = service
+        .command(env!("CARGO_BIN_EXE_sccache"))
+        .args(["/usr/bin/gcc", "-c", "probe.c", "-o", "one/member.o"])
+        .current_dir(&source)
+        .env("SCCACHE_CONF", &config)
+        .output()?;
+    ensure!(
+        object.status.success(),
+        "thin member compilation failed: {}",
+        String::from_utf8_lossy(&object.stderr)
+    );
+    assert_eq!(fs::read(&thin)?, archive_bytes);
+    let ((changed, source_kind), second) = compile(["one", "two"], "link")?;
+    assert_eq!(source_kind, "worker");
+    assert_ne!(changed, thin_key);
+    assert_ne!(first, second);
+    let ((same, source_kind), third) = compile(["one", "two"], "link")?;
+    assert_eq!((same, source_kind), (changed, "hit".into()));
+    assert_eq!(second, third);
     service.stop()?;
     fleet.finish()?;
     Ok(())

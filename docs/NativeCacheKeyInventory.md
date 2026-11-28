@@ -69,6 +69,12 @@ target filename convention and ordered native search directories. Shadowed
 archives, unrelated filename conventions, and archives not used by metadata-only
 compilation do not participate. Selected archive digests retain the request
 order, including missing slots; archive locations do not identify results.
+Ordered member names and content digests are framed independently, without
+archive timestamps, ownership, or index offsets. Thin archives contribute the
+actual external member bytes and their embedded names; those members are also
+packaged as compiler inputs. A Mach-O fat archive contributes only the first
+matching architecture slice when rustc selects that slice for bundling. Native
+linker consumption retains the complete architecture-to-content association.
 
 Standard Cargo build paths used by compiler environment observations are
 normalized for both key and execution. The build-script output root is

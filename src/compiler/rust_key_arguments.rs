@@ -27,7 +27,7 @@ enum Field {
     Ordered,
 }
 
-/// These are the setter semantics in rustc_session's CodegenOptions table.
+/// These are the setter semantics in `rustc_session`'s `CodegenOptions` table.
 /// Cross-group mitigation flags and unknown options retain their raw position.
 fn codegen_field(name: &str) -> Option<Field> {
     Some(match name {
@@ -116,14 +116,14 @@ fn scalar(name: &str, value: Option<&str>) -> Option<String> {
         | "overflow-checks"
         | "prefer-dynamic"
         | "rpath"
-        | "save-temps" => boolean(value).or(value),
+        | "save-temps"
+        | "linker-plugin-lto" => boolean(value).or(value),
         "instrument-coverage" => match value {
             Some("all") => Some("yes"),
             Some("0") => Some("no"),
             _ => boolean(value).or(value),
         },
         "lto" => value.map(|value| boolean(Some(value)).unwrap_or(value)),
-        "linker-plugin-lto" => boolean(value).or(value),
         _ => value,
     };
     if matches!(name, "codegen-units" | "dwarf-version") {
