@@ -295,7 +295,12 @@ terminal publication error. Impossible single reservations are rejected
 without eviction. Admission never performs eviction or GC. Background maintenance replenishes
 headroom proactively to the retention target (4 GiB below the hard limit
 in the fleet), and observes larger rejected reservations as demand for
-additional headroom. It never holds the admission lock during reclamation. Compiler input leases are released before output publication.
+additional headroom. New reservations and writable execution pressure wake an
+idle maintenance pass. While bounded passes are making progress, their delay
+falls continuously from one second to 50 ms as the soft-to-hard buffer fills;
+if all reclaimable roots are pinned or reclamation is stalled, the regular
+one-second observation avoids repeated scans. Admission remains separate from
+reclamation, and compiler input leases are released before output publication.
 
 Under cache pressure, eviction ranks roots by the expected reuse cost per
 byte that deleting them could actually reclaim. It follows the transactional
@@ -1445,10 +1450,13 @@ private staging inode only after the result is committed and retained.
 The compiler's input manifest uses the same content ID as a materialized input,
 so a resident artifact does not need to pass through the launcher or compiler
 client. Locally executed build scripts, linkers, proc macros, and other readers
-receive verified bytes on demand. Mutable operations detach from the immutable
-content, preserving hardlinks and ordinary file metadata; truncation need not
-read the old bytes. Multiple local reads share one verified private spool per
-content identity. Spools and namespace data are temporary, not another cache.
+receive verified bytes on data open, before a compiler can fault a remote
+read through an mmap. Identity-only descriptor probes do not open file data.
+Mutable operations detach from the immutable content, preserving hardlinks
+and ordinary file metadata; truncation need not read the old bytes. Multiple
+local reads share one verified private anonymous spool per content identity,
+held until the build mount exits. Spools and namespace data are temporary,
+not another cache.
 
 An expired or unavailable lease fails the affected operation rather than
 exposing an empty placeholder or inventing a new content identity. Scratch

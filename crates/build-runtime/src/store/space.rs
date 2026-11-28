@@ -98,6 +98,25 @@ pub(super) struct SpaceState {
     waiting: u64,
 }
 
+const IDLE_MAINTENANCE: Duration = Duration::from_secs(1);
+const URGENT_MAINTENANCE: Duration = Duration::from_millis(50);
+
+// Increase the pass rate continuously as the soft-to-hard buffer is
+// consumed, without changing either watermark or the bound on each pass.
+fn pressure_delay(deficit: u64, buffer: u64) -> Duration {
+    if deficit == 0 {
+        return IDLE_MAINTENANCE;
+    }
+    if deficit >= buffer {
+        return URGENT_MAINTENANCE;
+    }
+    let idle = IDLE_MAINTENANCE.as_millis();
+    let urgent = URGENT_MAINTENANCE.as_millis();
+    let remaining = u128::from(buffer - deficit);
+    let millis = urgent + (idle - urgent) * remaining / u128::from(buffer);
+    Duration::from_millis(u64::try_from(millis).expect("maintenance delay is at most one second"))
+}
+
 /// Result of a bounded physical-space and resident-content maintenance pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpaceReport {
@@ -107,6 +126,10 @@ pub struct SpaceReport {
     pub evicted_roots: usize,
     /// Both physical free space and resident-budget admission are satisfied.
     pub minimum_satisfied: bool,
+    /// The proactive retention and observed admission demand are satisfied.
+    pub target_satisfied: bool,
+    /// Wait before another bounded pass; stalled reclamation backs off.
+    pub next_pass_after: Duration,
 }
 
 /// Read-only filesystem and staging-budget observation. Physical free space
@@ -173,6 +196,9 @@ impl NativeStore {
     pub(crate) fn check_execution_space(&self) -> Result<()> {
         if let Some(policy) = self.inner.space_policy {
             let available = self.available_bytes()?;
+            if available < policy.target_available_bytes {
+                self.inner.space_wakeup.notify_one();
+            }
             ensure!(
                 available >= policy.min_available_bytes,
                 "native execution filesystem pressure: {available} bytes available, {} required",
@@ -304,6 +330,19 @@ impl NativeStore {
         }
     }
 
+    /// Wait between bounded maintenance passes. An admission or execution
+    /// consuming the ready buffer can wake an otherwise idle pass immediately.
+    /// If reclaiming is stalled (for example all roots are pinned), ignore
+    /// further wakeups until the next regular observation.
+    pub async fn wait_for_space_maintenance(&self, previous: Option<SpaceReport>) {
+        let delay = previous.map_or(IDLE_MAINTENANCE, |report| report.next_pass_after);
+        if previous.is_some_and(|report| report.target_satisfied) {
+            let _ = tokio::time::timeout(delay, self.inner.space_wakeup.notified()).await;
+        } else {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     /// Reclaim queued garbage before considering eviction. Keep leases intact
     /// and recheck filesystem allocation after each bounded GC pass.
     ///
@@ -367,7 +406,7 @@ impl NativeStore {
         let available_target = policy
             .target_available_bytes
             .max(policy.min_available_bytes.saturating_add(incoming));
-        self.collect_garbage(policy.gc_batch)?;
+        let mut progress = self.collect_garbage(policy.gc_batch)?.blobs != 0;
         let mut observe = || -> Result<(u64, u64, u64)> {
             let reserved = reservations()?;
             Ok((
@@ -389,7 +428,9 @@ impl NativeStore {
                 policy.max_evictions_per_pass,
                 free.saturating_sub(reserved) < available_target,
             )?;
+            let previous_free = free;
             (free, resident, reserved) = observe()?;
+            progress |= free > previous_free;
             for candidate in candidates {
                 if reserved > staging_limit.saturating_sub(incoming)
                     || (free.saturating_sub(reserved) >= available_target
@@ -399,6 +440,7 @@ impl NativeStore {
                 }
                 if matches!(candidate.evict(self)?, Eviction::Removed { .. }) {
                     evicted_roots += 1;
+                    progress = true;
                     self.collect_garbage(policy.gc_batch)?;
                 }
                 // Observe current reservations after every eviction. The
@@ -406,13 +448,31 @@ impl NativeStore {
                 (free, resident, reserved) = observe()?;
             }
         }
+        let net_available = free.saturating_sub(reserved);
+        let physical_deficit = available_target.saturating_sub(net_available);
+        let resident_deficit = resident.saturating_sub(resident_target);
+        let target_satisfied = physical_deficit == 0 && resident_deficit == 0;
+        let next_pass_after = if progress {
+            pressure_delay(
+                physical_deficit,
+                available_target.saturating_sub(policy.min_available_bytes),
+            )
+            .min(pressure_delay(
+                resident_deficit,
+                policy.resident_limit().saturating_sub(resident_target),
+            ))
+        } else {
+            IDLE_MAINTENANCE
+        };
         Ok(SpaceReport {
             available_bytes: free,
             reserved_bytes: reserved,
             resident_bytes: resident,
             evicted_roots,
-            minimum_satisfied: free.saturating_sub(reserved) >= policy.min_available_bytes
+            minimum_satisfied: net_available >= policy.min_available_bytes
                 && resident <= policy.resident_limit(),
+            target_satisfied,
+            next_pass_after,
         })
     }
 
@@ -853,19 +913,28 @@ impl StageBudget {
             // Maintenance defers eviction while outstanding reservations
             // alone make admission impossible.
             state.waiting = state.waiting.max(extra);
-            return Err(StageSpaceExhausted {
+            let error = StageSpaceExhausted {
                 requested: extra,
                 reserved: state.reserved,
                 resident,
                 available,
                 limit,
                 evicted: 0,
-            }
-            .into());
+            };
+            drop(state);
+            self.store.inner.space_wakeup.notify_one();
+            return Err(error.into());
         }
         state.reserved = need;
         self.reserved = size;
         drop(state);
+        if available.saturating_sub(need) < policy.target_available_bytes
+            || policy
+                .target_resident_bytes
+                .is_some_and(|target| resident > target)
+        {
+            self.store.inner.space_wakeup.notify_one();
+        }
         Ok(())
     }
     /// Hold exact staged bytes until the file is committed or discarded.

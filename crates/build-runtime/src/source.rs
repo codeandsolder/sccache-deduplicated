@@ -10,11 +10,16 @@ use rustix::{
 };
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "store")]
-use std::{collections::BTreeMap, ffi::OsStr, fs::File, os::unix::ffi::OsStrExt};
+use std::{collections::BTreeMap, ffi::OsStr, os::unix::ffi::OsStrExt};
+use std::{fs::File, os::fd::AsRawFd, path::PathBuf};
 
 #[cfg(feature = "store")]
 use crate::{BlobRef, TreeEntry, TreeManifest, TreePath};
 use crate::{TreeMetadata, TreeTimestamp};
+
+pub fn descriptor_path(file: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
 
 pub fn timestamp(stat: &Stat) -> Result<TreeTimestamp> {
     Ok(TreeTimestamp {

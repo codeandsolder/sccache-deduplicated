@@ -103,7 +103,7 @@ mod source;
 pub use mapped::{
     DescriptorDigestProvider, DescriptorMemo, InstallationCatalog, InstallationReport,
     MappedMetadata, MappedTree, PreparedTree, ReferenceBlobProvider, ReferenceResolver,
-    SourceDigestCache, hash_descriptor,
+    SourceDigestCache, hash_descriptor, open_input_data, open_input_descriptor,
 };
 
 // Cluster principals are independent of socket endpoints and TLS implementation.

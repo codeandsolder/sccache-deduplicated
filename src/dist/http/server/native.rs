@@ -482,27 +482,37 @@ where
     thread::Builder::new()
         .name("native-cache-maintenance".into())
         .spawn(move || {
+            let mut previous = None;
+            let mut next_reap = Instant::now();
             loop {
-                thread::sleep(Duration::from_secs(1));
                 let Some(maintenance) = maintenance.upgrade() else {
                     break;
                 };
-                if let Err(error) = maintenance.reap() {
-                    error!("native cache session reap failed: {error:#}");
-                }
-                match maintenance.store().maintain_space() {
-                    Ok(Some(report)) if !report.minimum_satisfied => {
-                        warn!("native cache space pressure: {report:?}");
+                runtime.block_on(maintenance.store().wait_for_space_maintenance(previous));
+                if Instant::now() >= next_reap {
+                    if let Err(error) = maintenance.reap() {
+                        error!("native cache session reap failed: {error:#}");
                     }
-                    Ok(_) => {}
+                    next_reap = Instant::now() + Duration::from_secs(1);
+                }
+                previous = match maintenance.store().maintain_space() {
+                    Ok(report) => {
+                        if let Some(report) = report
+                            && !report.minimum_satisfied
+                        {
+                            warn!("native cache space pressure: {report:?}");
+                        }
+                        report
+                    }
                     Err(error) => {
                         if maintenance.store().index_requires_restart() {
                             error!("native cache index requires reopening; terminating for supervised recovery: {error:#}");
                             std::process::exit(1);
                         }
                         error!("native cache space maintenance failed: {error:#}");
+                        None
                     }
-                }
+                };
             }
         })?;
     thread::Builder::new()

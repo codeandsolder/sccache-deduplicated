@@ -14,10 +14,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{FileExt, MetadataExt, PermissionsExt},
-    },
+    os::unix::fs::{FileExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, SystemTime},
@@ -102,7 +99,7 @@ struct Node {
 }
 impl Node {
     fn path(&self) -> PathBuf {
-        PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd()))
+        crate::source::descriptor_path(&self.fd)
     }
     fn open(&self, flags: OFlags) -> Result<File> {
         Ok(rfs::open(self.path(), flags | OFlags::CLOEXEC, Mode::empty())?.into())
@@ -231,7 +228,7 @@ impl Namespace {
         }
     }
 }
-type Spool = Arc<Mutex<Option<tempfile::TempPath>>>;
+type Spool = Arc<Mutex<Option<Arc<File>>>>;
 struct IntermediateFs {
     session: Ticket,
     content: Arc<dyn IntermediateContent>,
@@ -280,13 +277,13 @@ impl IntermediateFs {
             )
         };
         let mut file = lock(&slot)?;
-        if let Some(file) = file.as_ref() {
-            return Ok(Arc::new(File::open(file)?));
+        if let Some(reader) = file.as_ref() {
+            return Ok(Arc::clone(reader));
         }
-        let mut staged = tempfile::NamedTempFile::new_in(&self.scratch)?;
-        self.content.fetch(reference, staged.as_file_mut())?;
+        let mut staged = tempfile::tempfile_in(&self.scratch)?;
+        self.content.fetch(reference, &mut staged)?;
         ensure!(
-            staged.as_file().metadata()?.len() == reference.blob.size,
+            staged.metadata()?.len() == reference.blob.size,
             "intermediate length mismatch"
         );
         staged.seek(SeekFrom::Start(0))?;
@@ -303,8 +300,8 @@ impl IntermediateFs {
             hasher.finalize().as_bytes() == &reference.blob.id.0,
             "intermediate digest mismatch"
         );
-        let reader = Arc::new(staged.reopen()?);
-        *file = Some(staged.into_temp_path());
+        let reader = Arc::new(staged);
+        *file = Some(Arc::clone(&reader));
         drop(file);
         Ok(reader)
     }
@@ -350,6 +347,12 @@ impl IntermediateFs {
         // through to pwrite, which ignores its offset on Linux O_APPEND FDs.
         let flags = flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_APPEND | libc::O_NOFOLLOW);
         let file = Arc::new(node.open(OFlags::from_bits_truncate(flags.cast_unsigned()))?);
+        // FUSE read errors during mmap page faults become SIGBUS. Finish
+        // remote retrieval before reporting a successful data open. O_PATH
+        // identity-only opens never invoke this callback.
+        if let Some(reference) = node.reference()? {
+            self.spool(reference)?;
+        }
         drop(guard);
         lock(&self.namespace)?.handle(ino, Handle::File { ino, file })
     }
@@ -470,8 +473,20 @@ pub fn intermediate_reference(file: &File) -> Result<Option<IntermediateReferenc
         return Ok(None);
     }
     let mut bytes = [0; 72];
-    match rfs::fgetxattr(file, REFERENCE_XATTR, &mut bytes[..]) {
+    // fgetxattr rejects O_PATH; its procfd magic link resolves the
+    // same pinned inode without opening the data.
+    match rfs::getxattr(
+        crate::source::descriptor_path(file),
+        REFERENCE_XATTR,
+        &mut bytes[..],
+    ) {
         Ok(n) => {
+            rfs::accessat(
+                file,
+                "",
+                rfs::Access::READ_OK,
+                AtFlags::EMPTY_PATH | AtFlags::EACCESS,
+            )?;
             let reference = IntermediateReference::decode(&bytes[..n])?;
             ensure!(
                 reference.blob.size == file.metadata()?.len(),
