@@ -499,11 +499,22 @@ bundle through FUSE inside Bubblewrap. Replay cannot query the origin.
 An unobserved operation or incomplete replay prevents result publication,
 even if the compiler ignored the filesystem error and exited successfully.
 
-The replay mounts currently require disjoint, empty mountpoints in the
+Live observation is a unique, refresh-only action. Its discovery declaration
+contains logical roots and a nonce; it returns the reserved discovery tree
+artifact, not a reusable compiler result. The assigned worker uses a
+sequenced scheduler mailbox to request logical observations. Only the
+originating authenticated client can respond. Content delivery is authorized
+by a recorded file observation and uses the ordinary verified CAS tree
+transfer. The scheduler verifies the origin seal and the resulting bundle
+manifest before accepting publication. No origin credentials or physical
+paths enter the compiler namespace.
+
+Discovery mounts currently require disjoint, empty mountpoints in the
 immutable root. Writable output and scratch regions remain separate.
-Scheduler-mediated live discovery and compiler-stage integration are still
-under development; the ordinary compiler planner does not yet request
-these bundles.
+The direct native client can service live discovery; namespace IPC, compiler
+planner integration, and indexing previously sealed transcripts for refresh
+are still under development. The ordinary compiler planner does not yet
+request live bundles.
 
 ## Validation
 
