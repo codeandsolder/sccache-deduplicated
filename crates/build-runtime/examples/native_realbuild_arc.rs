@@ -185,6 +185,7 @@ mod linux {
     ) -> Result<ExecutionSpec> {
         Ok(ExecutionSpec {
             compiler_result: None,
+            working_inputs: Default::default(),
             platform,
             root: ExecutionRoot { id: root, recipe },
             mounts: BTreeMap::new(),

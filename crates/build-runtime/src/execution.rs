@@ -238,9 +238,14 @@ struct GeneratedBaseline {
 }
 
 impl GeneratedBaseline {
-    fn capture(directory: &File, relative: &Path, input: &TreeManifest) -> Result<Self> {
+    fn capture(
+        directory: &File,
+        relative: &Path,
+        input: &TreeManifest,
+        immutable: &TreeManifest,
+    ) -> Result<Self> {
         let mut files = BTreeMap::new();
-        let tree = crate::source::capture_tree(directory, |path, _, stat| {
+        let mut tree = crate::source::capture_tree(directory, |path, _, stat| {
             let logical = relative.join(host_path(path.as_bytes()));
             let key = TreePath::new(logical.as_os_str().as_bytes().to_vec())?;
             let entry = input
@@ -262,9 +267,26 @@ impl GeneratedBaseline {
                 u64::try_from(stat.st_size)? == blob.size,
                 "materialized input size changed"
             );
-            files.insert(path.clone(), *stat);
+            if immutable.entries.contains_key(&key) {
+                files.insert(path.clone(), *stat);
+            }
             Ok(*blob)
         })?;
+        let owned = tree
+            .entries
+            .keys()
+            .filter_map(|path| {
+                let logical = relative.join(host_path(path.as_bytes()));
+                (!immutable
+                    .entries
+                    .contains_key(logical.as_os_str().as_bytes()))
+                .then_some(path.clone())
+            })
+            .collect::<Vec<_>>();
+        for path in owned {
+            tree.entries.remove(&path);
+        }
+        tree.validate()?;
         Ok(Self { tree, files })
     }
 
@@ -436,6 +458,7 @@ fn capture_locations(
     spec: &ExecutionSpec,
     views: &BTreeMap<BuildPath, MountedTree>,
     writable: &BTreeSet<BuildPath>,
+    immutable_root: Option<&TreeManifest>,
 ) -> Result<BTreeMap<String, OutputLocation>> {
     let mut outputs = BTreeMap::new();
     for (name, output) in &spec.outputs {
@@ -459,6 +482,11 @@ fn capture_locations(
                 &directory,
                 relative(&output.path, point)?,
                 view.manifest(),
+                if point.as_bytes() == b"/" {
+                    immutable_root.unwrap_or_else(|| view.manifest())
+                } else {
+                    view.manifest()
+                },
             )?);
         }
         outputs.insert(name.clone(), location);
@@ -630,7 +658,23 @@ impl PreparedBuild {
             )?;
         }
         bind_file_overlays(&mut plan, &views)?;
-        let outputs = capture_locations(spec, &views, &writable)?;
+        let immutable_root = if spec.working_inputs.is_empty() {
+            None
+        } else {
+            let mut recipe = spec.root.recipe.clone();
+            recipe.layers.retain(|layer| {
+                !layer
+                    .destination
+                    .as_ref()
+                    .is_some_and(|path| spec.working_inputs.contains(path))
+            });
+            let manifests = inputs
+                .iter()
+                .map(|(id, lease)| (*id, lease.manifest()))
+                .collect();
+            Some(recipe.compose(&manifests)?)
+        };
+        let outputs = capture_locations(spec, &views, &writable, immutable_root.as_ref())?;
         Ok(Self {
             plan,
             outputs,

@@ -81,7 +81,7 @@ pub enum Response {
 /// Maximum application payload in a transfer frame. The framing envelope
 /// stays well below the default 8 MiB IPC frame limit.
 pub const TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
-pub const NAMESPACE_PROTOCOL_VERSION: u32 = 8;
+pub const NAMESPACE_PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum StorageBlob {
@@ -238,8 +238,10 @@ pub struct NamespaceRunSpec {
 pub enum CompileResponse {
     /// The compilation was started.
     CompileStarted,
-    /// The server could not handle this compilation request.
-    UnhandledCompile,
+    /// A verified non-compilation compiler query.
+    CompilerQuery,
+    /// A compilation cannot be executed under the remote action contract.
+    RejectedCompilation(String),
     /// The compiler was not supported.
     UnsupportedCompiler(OsString),
 }
@@ -250,16 +252,25 @@ pub struct NativeCompileReport {
     pub key: crate::build_runtime::ActionKey,
     pub mode: crate::build_runtime::ActionMode,
     pub source: NativeBuildSource,
+    pub stage: NativeStage,
+    pub successful: bool,
+    pub duration: std::time::Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeStage {
+    Compile,
+    Codegen,
+    Link,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeBuildSource {
     Hit,
-    Local,
     Worker(crate::build_runtime::PeerId),
 }
 
-/// Information about a finished compile, either from cache or executed locally.
+/// Information about a finished scheduler-owned compiler request.
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct CompileFinished {
     /// The return code of the compile process, if available.
@@ -272,8 +283,8 @@ pub struct CompileFinished {
     pub stderr: Vec<u8>,
     /// The state of any compiler options passed to control color output.
     pub color_mode: ColorMode,
-    /// Exact native action identity and outcome, absent for uncached work.
-    pub native: Option<NativeCompileReport>,
+    /// Native actions and outcomes, in dependency order.
+    pub native: Vec<NativeCompileReport>,
 }
 
 /// The contents of a compile request from a client.

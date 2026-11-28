@@ -23,6 +23,7 @@ fn action(root: &TreeManifest) -> Result<ExecutionSpec> {
     let id = root.id()?;
     Ok(ExecutionSpec {
         compiler_result: None,
+        working_inputs: Default::default(),
         platform: ContentId::of(b"test-platform"),
         root: ExecutionRoot::resolve(
             TreeRecipe::union(

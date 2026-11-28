@@ -24,7 +24,7 @@ use crate::{
 };
 
 use super::{
-    LocalExecutor, NativeBuildPolicy, NativeBuildResult, NativeBuildSource, NativeCacheClient,
+    NativeBuildPolicy, NativeBuildResult, NativeBuildSource, NativeCacheClient,
     client::{
         BlobSink, InputBlob, InputProvider, LocalInputs, NativeProgress, Outcome, failed_output,
         fetch_result, validate_manifest, verify_destinations,
@@ -146,18 +146,16 @@ pub fn serve_action(
     client: &NativeCacheClient,
     policy: &NativeNamespacePolicy,
     mut stream: DaemonStream,
-    local: Option<&LocalExecutor>,
     registry: &super::result_session::Registry,
     uid: u32,
 ) -> Result<()> {
-    serve_inner(client, policy, &mut stream, local, registry, uid)
+    serve_inner(client, policy, &mut stream, registry, uid)
 }
 
 fn serve_inner(
     client: &NativeCacheClient,
     policy: &NativeNamespacePolicy,
     stream: &mut DaemonStream,
-    local: Option<&LocalExecutor>,
     registry: &super::result_session::Registry,
     uid: u32,
 ) -> Result<()> {
@@ -190,7 +188,7 @@ fn serve_inner(
         limit: policy.max_metadata_bytes,
         trace,
     };
-    match client.acquire_action(&spec, &mut inputs, &build_policy, local, &selected)? {
+    match client.acquire_action(&spec, &mut inputs, &build_policy, &selected)? {
         Outcome::Failed { source, failure } => {
             send(
                 stream,
@@ -252,6 +250,7 @@ pub async fn run_action(
     mode: ActionMode,
     inputs: Vec<PreparedTree>,
     destinations: BTreeMap<String, PathBuf>,
+    retained: BTreeSet<crate::build_runtime::wire::Ticket>,
 ) -> Result<NativeBuildResult> {
     ensure!(
         spec.platform == policy.platform,
@@ -276,6 +275,7 @@ pub async fn run_action(
                 mode,
                 &inputs,
                 &destinations,
+                retained,
             );
             let request = if result.is_ok() {
                 TransferRequest::NativeEnd
@@ -305,10 +305,12 @@ fn run_inner(
     mode: ActionMode,
     inputs: &LocalInputs<'_>,
     destinations: &BTreeMap<String, PathBuf>,
+    mut retained: BTreeSet<crate::build_runtime::wire::Ticket>,
 ) -> Result<NativeBuildResult> {
     let limit = policy.max_metadata_bytes;
     let destinations = super::intermediate::Destinations::new(destinations.clone())?;
     let selected = destinations.eager.keys().cloned().collect::<BTreeSet<_>>();
+    retained.extend(destinations.sessions());
     send(
         stream,
         &(
@@ -316,7 +318,7 @@ fn run_inner(
             spec,
             mode,
             selected,
-            destinations.sessions(),
+            retained,
         ),
         limit,
     )?;
@@ -378,7 +380,11 @@ fn run_inner(
                         let references = destinations.stage(&manifest)?;
                         let output = staged.install()?;
                         references.install()?;
-                        return Ok(NativeBuildResult { source, output });
+                        return Ok(NativeBuildResult {
+                            source,
+                            output,
+                            manifest: Some(manifest),
+                        });
                     }
                     _ => bail!("unexpected native result completion"),
                 }
@@ -387,6 +393,7 @@ fn run_inner(
                 return Ok(NativeBuildResult {
                     source,
                     output: failed_output(failure)?,
+                    manifest: None,
                 });
             }
             Event::Done => bail!("unexpected native action completion"),

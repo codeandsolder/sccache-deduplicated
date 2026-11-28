@@ -4,7 +4,7 @@
 //! a compilation is cacheable and supply its input closure.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process,
@@ -16,27 +16,25 @@ use anyhow::{Context, Result, ensure};
 
 use crate::{
     build_runtime::{
-        ActionKey, ActionMode, BuildPath, CommandSpec, CompilerResultIdentity, ContentId,
+        ActionMode, Artifact, BuildPath, CommandSpec, CompilerResultIdentity, ContentId,
         DescriptorDigestProvider, ExecutionRoot, ExecutionSpec, OutputKind, OutputSpec,
-        PreparedTree, SourceDigestCache, TreeEntry, TreeId, TreeManifest, TreeRecipe,
-        TreeTimestamp,
+        PreparedTree, ReferenceBlobProvider, ResultManifest, SourceDigestCache, TreeEntry, TreeId,
+        TreeLayer, TreeManifest, TreePath, TreeRecipe, TreeTimestamp,
     },
     cache::FileObjectSource,
     client::{SharedConnection, connection_task},
     config::{DistAuth, DistToolchainConfig, HTTPUrl, NativeClientConfig},
     dist::{
         self,
-        native::{LocalExecutor, NativeBuildResult, NativeCacheClient, broker},
+        native::{NativeBuildResult, NativeCacheClient, broker},
         pkg,
     },
     mock_command::CommandCreatorSync,
     protocol::{NativeNamespacePolicy, Request, Response},
-    server::{DistClientContainer, DistInfo, SccacheService},
+    server::{DistClientContainer, DistInfo},
 };
 
-use super::{
-    CacheControl, Cacheable, Compilation, CompileResult, CompileTransport, DistPackagers, DistType,
-};
+use super::{CacheControl, Cacheable, Compilation, CompileResult, CompileTransport, DistPackagers};
 
 struct DirectEndpoint {
     config: NativeClientConfig,
@@ -44,7 +42,6 @@ struct DirectEndpoint {
     cluster: Option<sccache_peer_identity::PeerConfig>,
     client: std::sync::Mutex<Option<NativeCacheClient>>,
     auth: DistAuth,
-    local: Option<LocalExecutor>,
     intermediates: crate::dist::native::result_session::Registry,
 }
 
@@ -95,10 +92,6 @@ impl NativeCompilerClient {
             max_metadata_bytes: config.max_metadata_bytes,
             max_result_bytes: config.max_result_bytes,
         };
-        let local = config
-            .local_execution
-            .clone()
-            .map(|config| LocalExecutor::new(config, policy.platform));
         Self {
             endpoint: Endpoint::Direct(Box::new(DirectEndpoint {
                 config,
@@ -106,7 +99,6 @@ impl NativeCompilerClient {
                 cluster,
                 client: std::sync::Mutex::new(None),
                 auth,
-                local,
                 intermediates: crate::dist::native::result_session::Registry::default(),
             })),
             policy,
@@ -214,14 +206,7 @@ impl NativeCompilerClient {
         let Endpoint::Direct(endpoint) = &self.endpoint else {
             anyhow::bail!("native namespace endpoint cannot serve");
         };
-        broker::serve_action(
-            &client,
-            &self.policy,
-            stream,
-            endpoint.local.as_ref(),
-            &endpoint.intermediates,
-            uid,
-        )
+        broker::serve_action(&client, &self.policy, stream, &endpoint.intermediates, uid)
     }
 
     pub(crate) fn open_intermediate(
@@ -352,10 +337,47 @@ impl NativeCompilerClient {
         Ok(client)
     }
 
+    async fn stage_lease(self: &Arc<Self>, pool: &tokio::runtime::Handle) -> Result<StageLease> {
+        use crate::build_runtime::ReferenceBlobProvider;
+        let client = Arc::clone(self);
+        pool.spawn_blocking(move || {
+            match &client.endpoint {
+                Endpoint::Direct(_) => {
+                    // SAFETY: geteuid only queries process credentials.
+                    let (token, group) = client.open_intermediate(unsafe { libc::geteuid() })?;
+                    let provider =
+                        ReferenceBlobProvider::new(move |blob| Ok(Box::new(group.read(blob)?)));
+                    Ok(StageLease { token, provider })
+                }
+                Endpoint::Namespace { .. } => {
+                    use crate::build_runtime::intermediate_fs::IntermediateReference;
+                    use crate::dist::native::intermediate;
+                    let (token, connection) = intermediate::open()?;
+                    // Keep the daemon-owned retention group alive for every
+                    // reference handed to a dependent action.
+                    let lease = std::sync::Mutex::new(connection);
+                    let provider = ReferenceBlobProvider::new(move |blob| {
+                        let _lease = lease
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("stage lease poisoned"))?;
+                        intermediate::source(IntermediateReference {
+                            session: token,
+                            blob,
+                        })
+                        .open(blob)
+                    });
+                    Ok(StageLease { token, provider })
+                }
+            }
+        })
+        .await?
+    }
+
     async fn execute(
         self: Arc<Self>,
         plan: CompilerPlan,
         mode: ActionMode,
+        retained: BTreeSet<crate::build_runtime::wire::Ticket>,
         pool: &tokio::runtime::Handle,
     ) -> Result<(NativeBuildResult, crate::build_runtime::ActionKey)> {
         let fingerprint = plan.spec.action_request()?.action_fingerprint()?;
@@ -376,12 +398,12 @@ impl NativeCompilerClient {
                         &plan.inputs,
                         &plan.destinations,
                         &self.policy.build_policy(mode),
-                        endpoint.local.as_ref(),
                         (
                             &endpoint.intermediates,
                             // SAFETY: geteuid only queries process credentials.
                             unsafe { libc::geteuid() },
                         ),
+                        retained,
                     )
                 }))
                 .await?
@@ -398,12 +420,18 @@ impl NativeCompilerClient {
                     mode,
                     plan.inputs,
                     plan.destinations,
+                    retained,
                 )
                 .await
             }
         }?;
         Ok((result, key))
     }
+}
+
+struct StageLease {
+    token: crate::build_runtime::wire::Ticket,
+    provider: crate::build_runtime::ReferenceBlobProvider,
 }
 
 struct NativeOutput {
@@ -605,6 +633,7 @@ fn compiler_environment(command: &CommandSpec, policy: ResultIdentityPolicy) -> 
     ContentId(*digest.finalize().as_bytes())
 }
 
+#[derive(Clone)]
 struct CompilerPlan {
     spec: ExecutionSpec,
     inputs: Vec<PreparedTree>,
@@ -704,6 +733,7 @@ impl CompilerPlan {
             result_policy.identity(key, &command, inputs[0].id(), inputs[1].manifest())?;
         let spec = ExecutionSpec {
             compiler_result,
+            working_inputs: Default::default(),
             platform,
             root,
             mounts: BTreeMap::new(),
@@ -722,12 +752,12 @@ impl CompilerPlan {
 /// Split a Rust action without changing its logical cwd, argument ordering,
 /// target, or environment. The private delivery directories are independent
 /// of all of those key fields.
+mod link_inputs;
+
 struct NativeLink {
+    inputs: link_inputs::LinkInputs,
     workspace: super::rust_link::NativeLinkWorkspace,
     layout: super::rust_link::NativeLinkLayout,
-    executable: PathBuf,
-    logical_cwd: PathBuf,
-    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     expected: Vec<FileObjectSource>,
     physical_cwd: PathBuf,
 }
@@ -738,18 +768,24 @@ impl NativeLink {
         remote: &mut dist::CompileCommand,
         transformer: &dist::PathTransformer,
         scratch: &Path,
-        local_environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
         expected: Vec<FileObjectSource>,
         physical_cwd: PathBuf,
     ) -> Result<Self> {
         use super::rust_link::{NativeLinkWorkspace, RustLinkStages};
 
-        let args = remote
+        let args: Vec<std::ffi::OsString> = remote
             .arguments
             .iter()
             .map(std::ffi::OsString::from)
             .collect();
         let logical_cwd = PathBuf::from(&remote.cwd);
+        let inputs = link_inputs::LinkInputs::new(
+            transformer.to_local(&remote.executable)?,
+            physical_cwd.clone(),
+            layout.environment.clone(),
+            transformer,
+            args.clone(),
+        );
         let stages = RustLinkStages::from_expanded(args, &logical_cwd, |cwd, path| {
             let logical = cwd.join(path);
             let physical = transformer
@@ -783,14 +819,20 @@ impl NativeLink {
             "native worker would expand a literal response-file operand"
         );
         Ok(Self {
+            inputs,
             workspace,
             layout,
-            executable: PathBuf::from(&remote.executable),
-            logical_cwd,
-            environment: local_environment,
             expected,
             physical_cwd,
         })
+    }
+
+    fn linker_inputs(
+        &self,
+        cache: &SourceDigestCache,
+        client: Option<&NativeCompilerClient>,
+    ) -> Result<Vec<PreparedTree>> {
+        self.inputs.prepare(cache, client)
     }
 
     fn outputs(&self) -> Vec<NativeOutput> {
@@ -807,55 +849,91 @@ impl NativeLink {
             .collect()
     }
 
-    async fn finish<T: CommandCreatorSync>(
+    /// Reuse codegen's immutable inputs and add leased generated files at
+    /// their exact logical locations. No codegen bytes travel via the caller.
+    fn plan(
         &self,
-        creator: &T,
-        mut generated: process::Output,
-    ) -> Result<process::Output> {
-        use crate::errors::ProcessError;
-        use crate::mock_command::RunCommand;
-        let mut args = self.layout.mounts.clone();
-        args.extend(self.workspace.overlay_arguments()?);
-        args.extend([
-            "--chdir".into(),
-            self.logical_cwd.clone().into_os_string(),
-            "--".into(),
-            self.executable.clone().into_os_string(),
-        ]);
-        args.extend(self.workspace.link_arguments()?);
+        base: &CompilerPlan,
+        generated: &ResultManifest,
+        provider: &ReferenceBlobProvider,
+        linker_inputs: Vec<PreparedTree>,
+    ) -> Result<(CompilerPlan, PathBuf)> {
+        base.spec.action_request()?.validate_result(generated)?;
+        let mut plan = base.clone();
+        let mut recipe = plan.spec.root.recipe.clone();
+        let mut artifact = None;
+        for (index, (logical, _, _)) in self.workspace.outputs().enumerate() {
+            let name = format!("codegen-{index}");
+            let Artifact::GeneratedTree(tree) = generated
+                .outputs
+                .get(&name)
+                .context("missing codegen tree")?
+            else {
+                anyhow::bail!("unexpected codegen result kind");
+            };
+            for (relative, entry) in &tree.entries {
+                let path = logical.join(std::ffi::OsStr::from_bytes(relative.as_bytes()));
+                if path.starts_with(self.workspace.codegen_directory())
+                    && path.extension().is_some_and(|ext| ext == "rlink")
+                {
+                    ensure!(
+                        matches!(entry, TreeEntry::File { .. }),
+                        "invalid .rlink artifact type"
+                    );
+                    ensure!(
+                        artifact.replace(path).is_none(),
+                        "multiple .rlink artifacts"
+                    );
+                }
+            }
+            let prepared = PreparedTree::from_references(tree.clone(), provider)?;
+            let destination =
+                TreePath::new(logical.strip_prefix("/")?.as_os_str().as_bytes().to_vec())?;
+            recipe.layers.push(TreeLayer {
+                tree: prepared.id(),
+                source: None,
+                destination: Some(destination.clone()),
+            });
+            plan.spec.working_inputs.insert(destination);
+            plan.inputs.push(prepared);
+        }
+        let artifact = artifact.context("missing .rlink artifact")?;
+        for prepared in linker_inputs {
+            recipe.layers.push(TreeLayer {
+                tree: prepared.id(),
+                source: None,
+                destination: None,
+            });
+            plan.inputs.push(prepared);
+        }
+        plan.spec.root = ExecutionRoot::resolve(
+            recipe,
+            &plan
+                .inputs
+                .iter()
+                .map(|tree| (tree.id(), tree.manifest()))
+                .collect(),
+        )?;
+        // Linking uses the exact action contract, including all link arguments,
+        // external dependencies, and generated codegen content.
+        plan.spec.compiler_result = None;
+        plan.spec.command.arguments = self
+            .workspace
+            .link_arguments(&artifact)
+            .into_iter()
+            .map(|arg| arg.as_os_str().as_bytes().to_vec())
+            .collect();
+        plan.spec.validate()?;
+        Ok((plan, artifact))
+    }
 
-        let mut command = creator.clone().new_command_sync("/usr/bin/bwrap");
-        command
-            .args(&args)
-            .env_clear()
-            .envs(self.environment.clone())
-            .current_dir("/");
-        command.share_jobserver();
-        let linked = match crate::util::run_input_output(command, None).await {
-            Ok(output) => output,
-            Err(error) => match error.downcast::<ProcessError>() {
-                Ok(ProcessError(output)) => output,
-                Err(error) => return Err(error),
-            },
-        };
-        if linked.status.success() {
-            self.workspace.publish(
-                &self.expected,
-                &self.physical_cwd,
-                self.layout.dep_info.as_deref(),
-            )?;
-        }
-        if !linked.status.success() {
-            debug!(
-                "native local link failed with {}: {}",
-                linked.status,
-                String::from_utf8_lossy(&linked.stderr)
-            );
-        }
-        generated.status = linked.status;
-        generated.stdout.extend(linked.stdout);
-        generated.stderr.extend(linked.stderr);
-        Ok(generated)
+    fn publish(&self, artifact: &Path) -> Result<()> {
+        self.workspace.publish(
+            artifact,
+            &self.expected,
+            &self.physical_cwd,
+            self.layout.dep_info.as_deref(),
+        )
     }
 }
 
@@ -864,7 +942,6 @@ fn prepare_dispatch(
     remote: &mut dist::CompileCommand,
     transformer: dist::PathTransformer,
     cwd: &Path,
-    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     scratch: &mut Option<tempfile::TempDir>,
     split: &mut Option<NativeLink>,
 ) -> Result<(Vec<NativeOutput>, dist::PathTransformer, DistPackagers)> {
@@ -885,7 +962,6 @@ fn prepare_dispatch(
             remote,
             &transformer,
             directory.path(),
-            environment,
             expected,
             cwd.to_owned(),
         )?;
@@ -907,25 +983,9 @@ fn prepare_dispatch(
     Ok((outputs, layout, packagers))
 }
 
-async fn finish_link<T: CommandCreatorSync>(
-    result: Result<(NativeBuildResult, ActionKey)>,
-    split: Option<&NativeLink>,
-    creator: &T,
-) -> Result<(NativeBuildResult, ActionKey)> {
-    match (result, split) {
-        (Ok((mut result, key)), Some(link)) if result.output.status.success() => {
-            crate::server::activity::phase(crate::server::activity::Phase::LocalCompile);
-            result.output = link.finish(creator, result.output).await?;
-            Ok((result, key))
-        }
-        (result, _) => result,
-    }
-}
-
 pub(super) async fn compile<T: CommandCreatorSync>(
     client: Arc<NativeCompilerClient>,
-    service: &SccacheService<T>,
-    creator: T,
+    _creator: T,
     cwd: PathBuf,
     compilation: Box<dyn Compilation<T>>,
     identity: (CacheControl, &str),
@@ -939,101 +999,138 @@ pub(super) async fn compile<T: CommandCreatorSync>(
     let mut transformer = dist::PathTransformer::new();
     let (local, remote, cacheable) =
         compilation.generate_compile_commands(&mut transformer, CompileTransport::Native)?;
-    let eligible = control != CacheControl::ForceNoCache
-        && cacheable == Cacheable::Yes
-        && compilation.is_locally_preprocessed()
-        && compilation.automatic_dist_toolchain_is_ready()
-        && client.allows_automatic_toolchain(&local.get_executable());
+    ensure!(
+        control != CacheControl::ForceNoCache,
+        "native compile requires a cacheable identity; uncached execution is prohibited"
+    );
+    ensure!(
+        cacheable == Cacheable::Yes,
+        "compiler invocation is not cacheable"
+    );
+    ensure!(
+        compilation.is_locally_preprocessed(),
+        "native compile input discovery is incomplete"
+    );
+    ensure!(
+        compilation.automatic_dist_toolchain_is_ready(),
+        "automatic distributed compiler toolchain is incomplete"
+    );
+    ensure!(
+        client.allows_automatic_toolchain(&local.get_executable()),
+        "compiler toolchain policy prohibits native distributed execution"
+    );
+    let mut remote = remote.context("compiler invocation has no native distributed command")?;
     let mode = if control == CacheControl::ForceRecache {
         ActionMode::Refresh
     } else {
         ActionMode::Reuse
     };
-    let mut fallback = DistType::NoDist;
-    if let Some(mut remote) = remote.filter(|_| eligible) {
-        // Hold the temporary parent until link completion and artifact
-        // publication. It is private scratch, not a cache tier.
-        let mut scratch = None;
-        let mut split = None;
-        let result = (|| {
-            let (outputs, layout, packagers) = prepare_dispatch(
-                compilation,
-                &mut remote,
-                transformer,
+    // Hold the private delivery directories until split-link completion.
+    let mut scratch = None;
+    let mut split = None;
+    let (outputs, layout, packagers) = prepare_dispatch(
+        compilation,
+        &mut remote,
+        transformer,
+        &cwd,
+        &mut scratch,
+        &mut split,
+    )?;
+    let preparation_client = Arc::clone(&client);
+    let plan = pool
+        .spawn_blocking(move || {
+            CompilerPlan::prepare(
+                remote,
                 &cwd,
-                local.get_env_vars(),
-                &mut scratch,
-                &mut split,
-            )?;
+                outputs,
+                layout,
+                packagers,
+                (preparation_client.policy.platform, result_policy, &key),
+                (
+                    &preparation_client.toolchain_digests,
+                    Some(&preparation_client),
+                ),
+            )
+        })
+        .await??;
+    crate::server::activity::phase(crate::server::activity::Phase::RunDistributed);
+    use crate::protocol::{NativeCompileReport, NativeStage};
+    let mut reports = Vec::new();
+    let result = if let Some(link) = split {
+        let stage_start = Instant::now();
+        let lease = client.stage_lease(pool).await?;
+        let mut codegen = plan.clone();
+        codegen.destinations.clear();
+        let (mut generated, generated_key) = Arc::clone(&client)
+            .execute(codegen, mode, BTreeSet::from([lease.token]), pool)
+            .await?;
+        reports.push(NativeCompileReport {
+            key: generated_key,
+            mode,
+            source: generated.source,
+            stage: NativeStage::Codegen,
+            successful: generated.output.status.success(),
+            duration: stage_start.elapsed(),
+        });
+        if generated.output.status.success() {
             let preparation_client = Arc::clone(&client);
-            Ok::<_, anyhow::Error>(pool.spawn_blocking(move || {
-                CompilerPlan::prepare(
-                    remote,
-                    &cwd,
-                    outputs,
-                    layout,
-                    packagers,
-                    (preparation_client.policy.platform, result_policy, &key),
-                    (
+            let manifest = generated
+                .manifest
+                .take()
+                .context("missing successful codegen manifest")?;
+            let (link, link_plan, artifact) = pool
+                .spawn_blocking(move || {
+                    let inputs = link.linker_inputs(
                         &preparation_client.toolchain_digests,
                         Some(&preparation_client),
-                    ),
-                )
-            }))
-        })();
-        let result = match result {
-            Ok(task) => match task.await? {
-                Ok(plan) => {
-                    crate::server::activity::phase(crate::server::activity::Phase::RunDistributed);
-                    client.execute(plan, mode, pool).await
-                }
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
-        };
-        let result = finish_link(result, split.as_ref(), &creator).await;
-        // Explicit drop order: the workspace's TempDirs reference scratch.
-        drop(split);
-        drop(scratch);
-        match result {
-            Ok((result, key)) if result.output.status.success() => {
-                let report = crate::protocol::NativeCompileReport {
-                    key,
-                    mode,
-                    source: result.source,
-                };
-                return Ok((
-                    CompileResult::Native(report, start.elapsed()),
-                    result.output,
-                ));
+                    )?;
+                    let (link_plan, artifact) =
+                        link.plan(&plan, &manifest, &lease.provider, inputs)?;
+                    Ok::<_, anyhow::Error>((link, link_plan, artifact))
+                })
+                .await??;
+            let stage_start = Instant::now();
+            let (mut linked, key) = client
+                .execute(link_plan, mode, BTreeSet::new(), pool)
+                .await?;
+            if linked.output.status.success() {
+                pool.spawn_blocking(move || link.publish(&artifact))
+                    .await??;
             }
-            Ok((result, _)) => {
-                // Incomplete compiler environment discovery can also produce
-                // an ordinary nonzero exit. Preserve caller semantics by
-                // rerunning locally without writing an archive cache.
-                warn!(
-                    "native compilation failed on {:?} with {}; retrying locally: {}",
-                    result.source,
-                    result.output.status,
-                    String::from_utf8_lossy(&result.output.stderr)
-                );
-                fallback = DistType::Error;
-            }
-            Err(error) if error.is::<crate::client::IpcTransportFailure>() => return Err(error),
-            Err(error) => {
-                warn!("native compilation unavailable; compiling locally: {error:#}");
-                fallback = DistType::Error;
-            }
+            generated.output.stdout.append(&mut linked.output.stdout);
+            generated.output.stderr.append(&mut linked.output.stderr);
+            linked.output.stdout = generated.output.stdout;
+            linked.output.stderr = generated.output.stderr;
+            reports.push(NativeCompileReport {
+                key,
+                mode,
+                source: linked.source,
+                stage: NativeStage::Link,
+                successful: linked.output.status.success(),
+                duration: stage_start.elapsed(),
+            });
+            linked
+        } else {
+            generated
         }
-    }
-    crate::server::activity::phase(crate::server::activity::Phase::LocalCompile);
-    let output = local.execute(service, &creator).await?;
-    let result = if output.status.success() {
-        CompileResult::NotCached(fallback, start.elapsed())
     } else {
-        CompileResult::CompileFailed(fallback, start.elapsed())
+        let stage_start = Instant::now();
+        let (result, key) = client.execute(plan, mode, BTreeSet::new(), pool).await?;
+        reports.push(NativeCompileReport {
+            key,
+            mode,
+            source: result.source,
+            stage: NativeStage::Compile,
+            successful: result.output.status.success(),
+            duration: stage_start.elapsed(),
+        });
+        result
     };
-    Ok((result, output))
+    drop(scratch);
+    Ok((
+        CompileResult::Native(reports, start.elapsed()),
+        result.output,
+    ))
 }
 
 #[cfg(all(test, feature = "native-store"))]
@@ -1061,7 +1158,6 @@ mod tests {
             renewal_interval_secs: 1,
             max_metadata_bytes: 64 * 1024 * 1024,
             max_result_bytes: 64 * 1024 * 1024,
-            local_execution: None,
         });
         Ok(config)
     }
@@ -1143,7 +1239,6 @@ mod tests {
                 &mut remote,
                 &transformer,
                 &cwd,
-                environment.clone(),
                 expected.clone(),
                 cwd.clone(),
             )?;
@@ -1208,19 +1303,72 @@ mod tests {
         plan.spec.action_request()?.validate_result(manifest)?;
         let mut replayed = BTreeMap::new();
         if let Some(link) = &replay {
-            use crate::build_runtime::{Artifact, materialize_tree};
+            use crate::build_runtime::materialize_tree;
+            let readers = manifest
+                .blobs()?
+                .into_iter()
+                .map(|(id, _)| Ok((id, result.open_file(id)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            let encoding = result.physical_encoding();
+            let provider = ReferenceBlobProvider::new(move |blob| {
+                let file = readers
+                    .get(&blob.id)
+                    .context("missing captured blob")?
+                    .try_clone()?;
+                Ok(Box::new(crate::build_runtime::BlobReader::open(
+                    file, encoding,
+                )?))
+            });
+            let (link_plan, artifact) = link.plan(
+                &plan,
+                manifest,
+                &provider,
+                link.linker_inputs(&SourceDigestCache::default(), None)?,
+            )?;
+            let leases = link_plan
+                .inputs
+                .iter()
+                .map(|tree| tree.import(&store).map(Arc::new))
+                .collect::<Result<Vec<_>>>()?;
+            let linked = execute(
+                &link_plan.spec,
+                &store,
+                &ExecutionPolicy {
+                    platform,
+                    bubblewrap: "/usr/bin/bwrap".into(),
+                    scratch: cwd.clone(),
+                    timeout: Duration::from_secs(60),
+                    max_result_bytes: 64 * 1024 * 1024,
+                },
+                &leases,
+                None,
+                || Ok(()),
+                |_| {},
+            )?;
+            if !linked.status().success() {
+                let mut stderr = Vec::new();
+                if let Some(blob) = linked.diagnostics().1 {
+                    linked.open_blob(blob.id)?.read_to_end(&mut stderr)?;
+                }
+                anyhow::bail!(
+                    "isolated link task failed: {}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            let manifest = linked
+                .successful_result()
+                .context("missing successful link manifest")?;
             for (index, (_, _, destination)) in link.workspace.outputs().enumerate() {
-                let Artifact::GeneratedTree(manifest) =
-                    &manifest.outputs[&format!("codegen-{index}")]
+                let Artifact::GeneratedTree(tree) = &manifest.outputs[&format!("codegen-{index}")]
                 else {
-                    anyhow::bail!("expected generated codegen tree");
+                    anyhow::bail!("expected final generated tree");
                 };
                 let staged = materialize_tree(
-                    manifest,
+                    tree,
                     destination.parent().context("stage parent")?,
                     |blob, path| {
                         std::io::copy(
-                            &mut result.open_blob(blob.id)?,
+                            &mut linked.open_blob(blob.id)?,
                             &mut std::fs::File::create(path)?,
                         )?;
                         Ok(())
@@ -1228,19 +1376,7 @@ mod tests {
                 )?;
                 staged.publish(destination)?;
             }
-            let output = rt.block_on(link.finish(
-                &creator,
-                process::Output {
-                    status: result.status(),
-                    stdout: vec![],
-                    stderr: vec![],
-                },
-            ))?;
-            ensure!(
-                output.status.success(),
-                "native link failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            link.publish(&artifact)?;
             for output in &link.expected {
                 let physical = cwd.join(&output.path);
                 if output.optional && !physical.exists() {
@@ -1250,7 +1386,7 @@ mod tests {
             }
             ensure!(
                 !replayed.is_empty(),
-                "local link did not produce an artifact"
+                "remote link task did not produce an artifact"
             );
             assert!(!cwd.join("build/input-stage.rlink").exists());
         }

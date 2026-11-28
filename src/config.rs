@@ -853,44 +853,6 @@ impl Default for DistAuth {
     }
 }
 
-/// Select the executor for an admitted native cache miss.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NativeExecutionPreference {
-    Local,
-    RemoteFirst,
-}
-
-/// Owner-local input store and sandbox settings. The caller never chooses
-/// these paths through the namespace protocol.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NativeLocalConfig {
-    pub preference: NativeExecutionPreference,
-    pub max_jobs: usize,
-    pub directory: PathBuf,
-    pub scratch: PathBuf,
-    pub bubblewrap: PathBuf,
-    pub space: crate::build_runtime::SpacePolicy,
-}
-
-impl NativeLocalConfig {
-    pub(crate) fn validate(&self) -> Result<()> {
-        anyhow::ensure!(
-            self.directory.is_absolute()
-                && self.scratch.is_absolute()
-                && self.bubblewrap.is_absolute(),
-            "native local execution paths must be absolute"
-        );
-        anyhow::ensure!(
-            self.max_jobs > 0,
-            "native local execution requires at least one slot"
-        );
-        self.space.validate()?;
-        Ok(())
-    }
-}
-
 /// Explicit scheduler-owned cache and execution policy for a native client.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -905,7 +867,6 @@ pub struct NativeClientConfig {
     pub renewal_interval_secs: u64,
     pub max_metadata_bytes: u64,
     pub max_result_bytes: u64,
-    pub local_execution: Option<NativeLocalConfig>,
 }
 
 impl NativeClientConfig {
@@ -929,9 +890,6 @@ impl NativeClientConfig {
                 && self.max_result_bytes < u64::MAX,
             "invalid native compiler client limits or platform contract"
         );
-        if let Some(local) = &self.local_execution {
-            local.validate()?;
-        }
         Ok(())
     }
 }
@@ -1196,15 +1154,13 @@ pub struct FileConfig {
     pub traces: Option<crate::latency_trace::TraceConfig>,
 }
 
-// If the file doesn't exist or we can't read it, log the issue and proceed. If the
-// config exists but doesn't parse then something is wrong - return an error.
 /// Read and parse a configuration file.
 ///
-/// Missing or unreadable files are treated as absent and return `Ok(None)`.
+/// Only a missing file is treated as absent.
 ///
 /// # Errors
 ///
-/// Returns an error when a present file cannot be parsed as the requested type.
+/// Returns an error for unreadable files or invalid configuration.
 pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     debug!(
         "Attempting to read config file at {}",
@@ -1212,20 +1168,15 @@ pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T
     );
     let mut file = match File::open(path) {
         Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
-            debug!("Couldn't open config file: {e}");
-            return Ok(None);
+            return Err(e).with_context(|| format!("Cannot open config file {}", path.display()));
         }
     };
 
     let mut string = String::new();
-    match file.read_to_string(&mut string) {
-        Ok(_) => (),
-        Err(e) => {
-            warn!("Failed to read config file: {e}");
-            return Ok(None);
-        }
-    }
+    file.read_to_string(&mut string)
+        .with_context(|| format!("Cannot read config file {}", path.display()))?;
 
     let res = if path.extension().is_some_and(|e| e == "json") {
         serde_json::from_str(&string)
@@ -1879,9 +1830,15 @@ impl Config {
         let skip_cache_check = skip_cache_check_from_env(environment)?;
 
         let file_conf_path = config_file_with_environment(environment, "SCCACHE_CONF", "config")?;
-        let file_conf = try_read_config_file(&file_conf_path)
-            .context("Failed to load config file")?
-            .unwrap_or_default();
+        let file_conf =
+            match try_read_config_file(&file_conf_path).context("Failed to load config file")? {
+                Some(config) => config,
+                None if environment.var_os("SCCACHE_CONF").is_some() => bail!(
+                    "Configured sccache file does not exist: {}",
+                    file_conf_path.display()
+                ),
+                None => FileConfig::default(),
+            };
 
         let mut config = Self::from_env_and_file_configs(env_conf, file_conf)?;
         if let Some(cache_dir) = environment
@@ -1975,12 +1932,6 @@ impl Config {
             anyhow::ensure!(
                 !client_side_mode,
                 "shared daemon cannot use caller-owned compilation"
-            );
-            anyhow::ensure!(
-                dist.native
-                    .as_ref()
-                    .is_none_or(|native| native.local_execution.is_none()),
-                "shared daemon cannot run native actions with the daemon's credentials"
             );
         }
         if let Some(native) = &dist.native {

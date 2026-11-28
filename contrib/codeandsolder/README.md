@@ -90,8 +90,7 @@ a pathname Unix socket under canonical root-owned non-writable directories,
 and a service with the namespace/credential/ptrace capabilities required
 for its authorized users. Initial support is restricted to the daemon's user
 namespace; a separate mount namespace is supported. Remapped user namespaces
-fail closed. Do not enable native local execution in the root daemon: local
-fallback must execute in the credential-isolated helper instead.
+fail closed. Native actions execute exclusively on scheduler-assigned workers.
 
 Example service configuration (replace both numbers with the actual local
 authorized UID and socket-access group):

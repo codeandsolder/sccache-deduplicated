@@ -2533,6 +2533,93 @@ fn native_link_only_argument(argument: &Argument<ArgData>) -> bool {
     )
 }
 
+#[cfg(all(feature = "dist-client", target_os = "linux"))]
+#[derive(Default)]
+pub(super) struct NativeLinkDiscovery {
+    pub target: Option<OsString>,
+    pub linker: Option<OsString>,
+    pub flavor: Option<String>,
+    pub search_paths: Vec<PathBuf>,
+    pub link_arguments: Vec<String>,
+}
+
+#[cfg(all(feature = "dist-client", target_os = "linux"))]
+pub(super) fn native_link_discovery(args: &[OsString]) -> Result<NativeLinkDiscovery> {
+    let mut discovery = NativeLinkDiscovery::default();
+    for argument in ArgsIter::new(args.iter().cloned(), &ARGS[..]).with_double_dashes() {
+        let argument = argument?;
+        match argument.get_data() {
+            Some(Target(target)) => discovery.target = Some(target.clone().into_arg_os_string()),
+            Some(LinkPath(ArgLinkPath { kind, path })) if kind == "native" || kind == "all" => {
+                discovery.search_paths.push(path.clone())
+            }
+            Some(CodeGen(ArgCodegen {
+                opt,
+                value: Some(value),
+            })) => match opt.as_str() {
+                "linker" => discovery.linker = Some(value.into()),
+                "linker-flavor" => discovery.flavor = Some(value.clone()),
+                "link-arg" | "link_arg" => discovery.link_arguments.push(value.clone()),
+                "link-args" | "link_args" => discovery
+                    .link_arguments
+                    .extend(value.split_whitespace().map(str::to_owned)),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    Ok(discovery)
+}
+
+pub(super) fn is_compiler_query(args: &[OsString], cwd: &Path) -> bool {
+    let Ok(expanded) = super::rust_response::expand(args, cwd) else {
+        return false;
+    };
+    let mut query = false;
+    for argument in ArgsIter::new(expanded.into_iter(), &ARGS[..]).with_double_dashes() {
+        let Ok(argument) = argument else {
+            return false;
+        };
+        match argument.get_data() {
+            Some(NotCompilationFlag) => query = true,
+            Some(NotCompilation(value)) if argument.flag_str() == Some("--print") => {
+                let Some(value) = value.to_str() else {
+                    return false;
+                };
+                if !matches!(
+                    value,
+                    "cfg"
+                        | "check-cfg"
+                        | "crate-name"
+                        | "file-names"
+                        | "sysroot"
+                        | "target-libdir"
+                        | "target-list"
+                        | "target-spec-json"
+                        | "target-cpus"
+                        | "target-features"
+                        | "relocation-models"
+                        | "code-models"
+                        | "tls-models"
+                        | "calling-conventions"
+                        | "stack-protector-strategies"
+                        | "deployment-target"
+                        | "all-target-specs-json"
+                        | "host-tuple"
+                        | "split-debuginfo"
+                ) {
+                    return false;
+                }
+                query = true;
+            }
+            Some(NotCompilation(_)) if argument.flag_str() == Some("--explain") => query = true,
+            Some(NotCompilation(_)) => return false,
+            _ => {}
+        }
+    }
+    query
+}
+
 /// Identify the source operand using the same typed argument grammar as
 /// compiler hashing. Retain the expanded argv itself, not a reserialization:
 /// linker options, repeated options, and option spellings remain exact.
@@ -3583,11 +3670,11 @@ where
         #[cfg(all(feature = "dist-client", target_os = "linux"))]
         let native_link = self.parsed_args.split_link.then(|| {
             super::rust_link::NativeLinkLayout::new(
-                canonical_paths.as_ref(),
                 self.parsed_args
                     .dep_info
                     .as_ref()
                     .map(|name| cwd.join(&self.parsed_args.output_dir).join(name)),
+                env_vars.clone(),
             )
         });
         Ok(HashResult {

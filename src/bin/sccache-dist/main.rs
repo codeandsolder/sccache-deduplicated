@@ -3191,6 +3191,7 @@ mod scheduler_tests {
             delivery_profile: None,
             spec: ExecutionSpec {
                 compiler_result: None,
+                working_inputs: Default::default(),
                 platform,
                 root: ExecutionRoot {
                     id: TreeId([0; 32]),

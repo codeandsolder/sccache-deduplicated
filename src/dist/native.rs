@@ -684,7 +684,7 @@ impl NativeCacheClient {
         self.control("poll_input", &ticket)
     }
 
-    #[cfg(any(feature = "dist-client", test))]
+    #[cfg(test)]
     pub(super) fn inputs_staged(&self, ticket: Ticket) -> Result<()> {
         self.control("inputs_staged", &ticket)
     }
@@ -2000,13 +2000,9 @@ pub use worker::{
 #[cfg(all(target_os = "linux", feature = "dist-client"))]
 mod client;
 #[cfg(all(target_os = "linux", feature = "dist-client"))]
-mod local;
-#[cfg(all(target_os = "linux", feature = "dist-client"))]
 pub use crate::protocol::NativeBuildSource;
 #[cfg(all(target_os = "linux", feature = "dist-client"))]
 pub use client::{NativeBuildPolicy, NativeBuildResult};
-#[cfg(all(target_os = "linux", feature = "dist-client"))]
-pub use local::LocalExecutor;
 
 #[cfg(all(target_os = "linux", feature = "dist-client"))]
 pub(crate) mod broker;

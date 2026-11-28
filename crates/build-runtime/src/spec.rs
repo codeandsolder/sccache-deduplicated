@@ -178,6 +178,9 @@ pub struct CompilerResultIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionSpec {
     pub compiler_result: Option<CompilerResultIdentity>,
+    /// Root-relative destinations of recipe layers whose files belong to this
+    /// action's generated output tree. Other input files remain immutable.
+    pub working_inputs: BTreeSet<TreePath>,
     pub platform: ContentId,
     pub root: ExecutionRoot,
     pub mounts: BTreeMap<BuildPath, TreeId>,
@@ -239,6 +242,49 @@ impl ExecutionSpec {
                 ensure!(!paths.contains(&path[..index]), "overlapping output paths");
             }
         }
+        if !self.working_inputs.is_empty() {
+            ensure!(
+                self.compiler_result.is_none(),
+                "working inputs require exact action identity"
+            );
+            for path in &self.working_inputs {
+                let mut absolute = vec![b'/'];
+                absolute.extend_from_slice(path.as_bytes());
+                let absolute = BuildPath::new(absolute)?;
+                ensure!(
+                    self.root
+                        .recipe
+                        .layers
+                        .iter()
+                        .filter(|layer| layer.destination.as_ref() == Some(path))
+                        .count()
+                        == 1,
+                    "working input must name exactly one root recipe layer"
+                );
+                ensure!(
+                    self.outputs
+                        .values()
+                        .any(|output| output.kind == OutputKind::GeneratedTree
+                            && absolute.within(output.path.as_bytes())),
+                    "working input must lie in a generated output tree"
+                );
+                ensure!(
+                    !self
+                        .mounts
+                        .keys()
+                        .any(|mount| absolute.within(mount.as_bytes())
+                            || mount.within(absolute.as_bytes())),
+                    "working input conflicts with a mounted tree"
+                );
+            }
+            ensure!(
+                self.root.recipe.layers.iter().any(|layer| !layer
+                    .destination
+                    .as_ref()
+                    .is_some_and(|path| self.working_inputs.contains(path))),
+                "working inputs require an immutable root"
+            );
+        }
         Ok(())
     }
 
@@ -250,6 +296,24 @@ impl ExecutionSpec {
         self.validate()?;
         let mut components = self.command.input_components()?;
         components.insert("platform".into(), self.platform);
+        if !self.working_inputs.is_empty() {
+            let layers = self
+                .working_inputs
+                .iter()
+                .map(|path| {
+                    self.root
+                        .recipe
+                        .layers
+                        .iter()
+                        .find(|layer| layer.destination.as_ref() == Some(path))
+                        .ok_or_else(|| anyhow::anyhow!("missing working layer"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            components.insert(
+                "output/working-inputs".into(),
+                ContentId(typed_digest(b"native-working-inputs-v1\0", &layers)?),
+            );
+        }
         let mut trees: BTreeSet<_> = self
             .root
             .recipe
@@ -344,6 +408,7 @@ mod tests {
     fn spec() -> Result<ExecutionSpec> {
         Ok(ExecutionSpec {
             compiler_result: None,
+            working_inputs: Default::default(),
             platform: ContentId::of(b"platform"),
             root: ExecutionRoot {
                 id: TreeId([1; 32]),

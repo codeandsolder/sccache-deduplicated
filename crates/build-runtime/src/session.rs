@@ -520,7 +520,7 @@ impl Session {
     }
 
     fn negotiated_result(&self) -> Option<&ResultManifest> {
-        // Local execution and trees keep their existing publication semantics.
+        // Only delegated worker actions have a negotiated result preview.
         self.allocation.as_ref()?;
         match &self.phase {
             Phase::Pending(pending) => match &**pending {
@@ -1309,6 +1309,10 @@ impl NativeSessions {
         publisher: Publisher,
         request: &ActionRequest,
     ) -> Result<()> {
+        ensure!(
+            matches!(publisher, Publisher::Worker { .. }),
+            "native action execution requires a scheduler-assigned worker"
+        );
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.authorize(&mut state, publisher)?;
@@ -1393,6 +1397,10 @@ impl NativeSessions {
         publisher: Publisher,
         manifest: ResultManifest,
     ) -> Result<BeginResult> {
+        ensure!(
+            matches!(publisher, Publisher::Worker { .. }),
+            "native action execution requires a scheduler-assigned worker"
+        );
         let session = self.get(ticket)?;
         {
             let mut state = Self::lock(&session)?;
@@ -1467,6 +1475,10 @@ impl NativeSessions {
         reader: Publisher,
         action_ticket: Ticket,
     ) -> Result<TreeRead> {
+        ensure!(
+            matches!(reader, Publisher::Worker { .. }),
+            "native action input delivery requires a scheduler-assigned worker"
+        );
         self.reap()?;
         let action = self.get(action_ticket)?;
         let mut state = Self::lock(&action)?;
@@ -1583,6 +1595,10 @@ impl NativeSessions {
         let session = self.get(ticket)?;
         {
             let mut state = Self::lock(&session)?;
+            ensure!(
+                state.kind != Kind::Action || matches!(publisher, Publisher::Worker { .. }),
+                "native action upload requires a scheduler-assigned worker"
+            );
             self.authorize(&mut state, publisher)?;
             let Phase::Pending(pending) = &mut state.phase else {
                 bail!("no active native upload");
@@ -1699,6 +1715,10 @@ impl NativeSessions {
         publisher: Publisher,
         kind: Kind,
     ) -> Result<CommitStart> {
+        ensure!(
+            kind != Kind::Action || matches!(publisher, Publisher::Worker { .. }),
+            "native action publication requires a scheduler-assigned worker"
+        );
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.authorize(&mut state, publisher)?;
@@ -2264,6 +2284,10 @@ impl NativeSessions {
     /// # Errors
     /// Returns an error for an invalid or unauthorized action ticket.
     pub fn inputs_staged(&self, ticket: Ticket, publisher: Publisher) -> Result<()> {
+        ensure!(
+            matches!(publisher, Publisher::Worker { .. }),
+            "native action execution requires a scheduler-assigned worker"
+        );
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.authorize(&mut state, publisher)?;

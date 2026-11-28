@@ -19,10 +19,10 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use tempfile::NamedTempFile;
 
-use super::{LocalExecutor, NativeCacheClient, copy_verified, retryable_transport_error};
+use super::{NativeCacheClient, copy_verified, retryable_transport_error};
 use crate::build_runtime::{
-    ActionMode, Artifact, BlobRef, CapturedExecution, ContentId, ExecutionSpec, MaterializedTree,
-    PreparedTree, ResultManifest, TreeId, TreeManifest, materialize_tree,
+    ActionMode, Artifact, BlobRef, ContentId, ExecutionSpec, MaterializedTree, PreparedTree,
+    ResultManifest, TreeId, TreeManifest, materialize_tree,
     wire::{
         ClientDeliveryObservation, InputDemand, InputPoll, NativeAdmission, NativeRunResult,
         NativeStatus, ScheduleReply, Ticket, WorkerAllocation,
@@ -44,6 +44,7 @@ use crate::{latency_trace::TraceContext, protocol::NativeBuildSource};
 pub struct NativeBuildResult {
     pub source: NativeBuildSource,
     pub output: Output,
+    pub manifest: Option<ResultManifest>,
 }
 
 /// An input reader that can be abandoned on a direct upload, or drained
@@ -278,9 +279,9 @@ impl Write for BlobSink<'_> {
 
 type BlobDownload<'a> = dyn FnMut(BlobRef, &mut BlobSink<'_>) -> Result<()> + 'a;
 
-pub(super) enum Delivery<'a> {
-    Scheduler(Pin<'a>, Option<Box<Publication>>),
-    Local(Box<CapturedExecution>, Pin<'a>),
+pub(super) struct Delivery<'a> {
+    pin: Pin<'a>,
+    publication: Option<Box<Publication>>,
 }
 
 pub(super) struct Publication {
@@ -319,21 +320,14 @@ impl Delivery<'_> {
         manifest: &ResultManifest,
         interval: Duration,
     ) -> Result<()> {
-        match self {
-            Self::Scheduler(pin, publication) => {
-                pin.client.with_renewal(pin.ticket, interval, |check| {
-                    check()?;
-                    if let Some(pending) = publication.take() {
-                        pending.confirm(pin)?;
-                    }
-                    session.retain(pin.ticket, manifest)
-                })
+        let Self { pin, publication } = self;
+        pin.client.with_renewal(pin.ticket, interval, |check| {
+            check()?;
+            if let Some(pending) = publication.take() {
+                pending.confirm(pin)?;
             }
-            Self::Local(_, pin) => pin.client.with_renewal(pin.ticket, interval, |check| {
-                check()?;
-                session.retain(pin.ticket, manifest)
-            }),
-        }
+            session.retain(pin.ticket, manifest)
+        })
     }
 
     pub(super) fn with_download<T>(
@@ -342,45 +336,39 @@ impl Delivery<'_> {
         declared: &BTreeMap<crate::build_runtime::ContentId, u64>,
         operation: impl FnOnce(&mut BlobDownload<'_>) -> Result<T>,
     ) -> Result<T> {
-        match self {
-            Self::Scheduler(pin, publication) => {
-                let started = Instant::now();
-                let (value, observation) =
-                    pin.client
-                        .with_renewal(pin.ticket, renewal_interval, |check| {
-                            let mut delivery = super::peer_delivery::ResultDelivery::new(
-                                pin.client,
-                                pin.ticket,
-                                declared,
-                                publication.as_ref().map(|pending| pending.deadline),
-                            );
-                            let result = operation(&mut |blob, output| {
-                                check()?;
-                                delivery.download(blob, output)
-                            })?;
-                            check()?;
-                            if let Some(publication) = publication {
-                                publication.confirm(pin)?;
-                            }
-                            Ok((result, delivery.observation(started.elapsed())))
-                        })?;
-                *publication = None;
-                if pin.assigned {
-                    pin.delivery = Some(observation);
-                }
-                Ok(value)
-            }
-            Self::Local(captured, _) => operation(&mut |blob, output| {
-                copy_verified(captured.open_blob(blob.id)?, blob, output)
-            }),
+        let Self { pin, publication } = self;
+        let started = Instant::now();
+        let (value, observation) =
+            pin.client
+                .with_renewal(pin.ticket, renewal_interval, |check| {
+                    let mut delivery = super::peer_delivery::ResultDelivery::new(
+                        pin.client,
+                        pin.ticket,
+                        declared,
+                        publication.as_ref().map(|pending| pending.deadline),
+                    );
+                    let result = operation(&mut |blob, output| {
+                        check()?;
+                        delivery.download(blob, output)
+                    })?;
+                    check()?;
+                    if let Some(publication) = publication {
+                        publication.confirm(pin)?;
+                    }
+                    Ok((result, delivery.observation(started.elapsed())))
+                })?;
+        *publication = None;
+        if pin.assigned {
+            pin.delivery = Some(observation);
         }
+        Ok(value)
     }
 }
 
 impl NativeCacheClient {
     /// Admit an exact native action, supply only absent inputs, and execute
-    /// in the configured exact sandbox when needed. Remote results use the
-    /// fastest authorized source; local results use captured descriptors directly.
+    /// on a scheduler-assigned worker when needed. Results use the fastest
+    /// authorized verified source.
     /// The caller may select any subset of declared outputs (including none).
     /// All outputs are still captured and validated under the same action key.
     /// No result is repackaged into the legacy cache.
@@ -394,9 +382,8 @@ impl NativeCacheClient {
         inputs: &[PreparedTree],
         destinations: &BTreeMap<String, PathBuf>,
         policy: &NativeBuildPolicy,
-        local: Option<&LocalExecutor>,
     ) -> Result<NativeBuildResult> {
-        self.run_action_inner(spec, inputs, destinations, policy, local, None)
+        self.run_action_inner(spec, inputs, destinations, policy, None, BTreeSet::new())
     }
 
     pub(crate) fn run_action_retained(
@@ -405,10 +392,17 @@ impl NativeCacheClient {
         inputs: &[PreparedTree],
         destinations: &BTreeMap<String, PathBuf>,
         policy: &NativeBuildPolicy,
-        local: Option<&LocalExecutor>,
         retention: (&super::result_session::Registry, u32),
+        retained: BTreeSet<Ticket>,
     ) -> Result<NativeBuildResult> {
-        self.run_action_inner(spec, inputs, destinations, policy, local, Some(retention))
+        self.run_action_inner(
+            spec,
+            inputs,
+            destinations,
+            policy,
+            Some(retention),
+            retained,
+        )
     }
 
     fn run_action_inner(
@@ -417,14 +411,14 @@ impl NativeCacheClient {
         inputs: &[PreparedTree],
         destinations: &BTreeMap<String, PathBuf>,
         policy: &NativeBuildPolicy,
-        local: Option<&LocalExecutor>,
         retention: Option<(&super::result_session::Registry, u32)>,
+        mut retained: BTreeSet<Ticket>,
     ) -> Result<NativeBuildResult> {
         let mut inputs = LocalInputs::new(spec, inputs)?;
         let destinations = verify_destinations(spec, destinations)?;
         let destinations = super::intermediate::Destinations::new(destinations)?;
-        let groups = destinations
-            .sessions()
+        retained.extend(destinations.sessions());
+        let groups = retained
             .into_iter()
             .map(|token| {
                 let (registry, uid) = retention.context("retention registry unavailable")?;
@@ -432,7 +426,7 @@ impl NativeCacheClient {
             })
             .collect::<Result<Vec<_>>>()?;
         let selected = destinations.eager.keys().cloned().collect();
-        match self.acquire_action(spec, &mut inputs, policy, local, &selected)? {
+        match self.acquire_action(spec, &mut inputs, policy, &selected)? {
             Outcome::Ready {
                 mut delivery,
                 source,
@@ -458,11 +452,16 @@ impl NativeCacheClient {
                 let references = destinations.stage(&manifest)?;
                 let output = staged.install()?;
                 references.install()?;
-                Ok(NativeBuildResult { source, output })
+                Ok(NativeBuildResult {
+                    source,
+                    output,
+                    manifest: Some(manifest),
+                })
             }
             Outcome::Failed { source, failure } => Ok(NativeBuildResult {
                 source,
                 output: failed_output(failure)?,
+                manifest: None,
             }),
         }
     }
@@ -472,7 +471,6 @@ impl NativeCacheClient {
         spec: &ExecutionSpec,
         inputs: &mut impl InputProvider,
         policy: &NativeBuildPolicy,
-        local: Option<&LocalExecutor>,
         selected: &BTreeSet<String>,
     ) -> Result<Outcome<'_>> {
         validate_policy(policy)?;
@@ -503,7 +501,10 @@ impl NativeCacheClient {
                         delivery: None,
                     };
                     return Ok(Outcome::Ready {
-                        delivery: Box::new(Delivery::Scheduler(pin, None)),
+                        delivery: Box::new(Delivery {
+                            pin,
+                            publication: None,
+                        }),
                         source: NativeBuildSource::Hit,
                         manifest,
                     });
@@ -550,7 +551,7 @@ impl NativeCacheClient {
                         selected: selected.clone(),
                         delivery: None,
                     };
-                    return self.run_admitted(pin, spec, inputs, policy, start, local);
+                    return self.run_admitted(pin, spec, inputs, policy, start);
                 }
             }
         }
@@ -587,19 +588,12 @@ impl NativeCacheClient {
         inputs: &mut impl InputProvider,
         policy: &NativeBuildPolicy,
         start: Instant,
-        local: Option<&LocalExecutor>,
     ) -> Result<Outcome<'a>> {
-        if let Some(local) = local.filter(|executor| executor.prefers_local()) {
-            return self.run_local(pin, spec, inputs, policy, start, local);
-        }
         inputs.progress(NativeProgress::Phase(Phase::AllocateWorker))?;
         let reply = self.schedule_with_retry(&pin, spec, start, policy.timeout)?;
         let allocation = match reply {
             ScheduleReply::Assigned(allocation) => allocation,
             ScheduleReply::Unavailable { message } => {
-                if let Some(local) = local {
-                    return self.run_local(pin, spec, inputs, policy, start, local);
-                }
                 bail!("native worker unavailable: {message}");
             }
         };
@@ -668,7 +662,10 @@ impl NativeCacheClient {
                     max_result_bytes: policy.max_result_bytes,
                 };
                 return Ok(Outcome::Ready {
-                    delivery: Box::new(Delivery::Scheduler(pin, Some(Box::new(publication)))),
+                    delivery: Box::new(Delivery {
+                        pin,
+                        publication: Some(Box::new(publication)),
+                    }),
                     source,
                     manifest,
                 });
@@ -705,7 +702,10 @@ impl NativeCacheClient {
         // terminal response was lost, expired, or the worker restarted.
         match (self.status(pin.ticket), error) {
             (Ok(NativeStatus::Ready(manifest)), _) => Ok(Outcome::Ready {
-                delivery: Box::new(Delivery::Scheduler(pin, None)),
+                delivery: Box::new(Delivery {
+                    pin,
+                    publication: None,
+                }),
                 source,
                 manifest,
             }),
@@ -806,32 +806,6 @@ impl NativeCacheClient {
                 }
                 Err(error) => return Err(error),
             }
-        }
-    }
-
-    fn run_local<'a>(
-        &self,
-        pin: Pin<'a>,
-        spec: &ExecutionSpec,
-        inputs: &mut impl InputProvider,
-        policy: &NativeBuildPolicy,
-        start: Instant,
-        local: &LocalExecutor,
-    ) -> Result<Outcome<'a>> {
-        inputs.progress(NativeProgress::Phase(Phase::LocalCompile))?;
-        let captured = local.execute(self, pin.ticket, spec, inputs, policy, start)?;
-        let source = NativeBuildSource::Local;
-        if let Some(manifest) = captured.successful_result() {
-            Ok(Outcome::Ready {
-                manifest: manifest.clone(),
-                source,
-                delivery: Box::new(Delivery::Local(Box::new(captured), pin)),
-            })
-        } else {
-            Ok(Outcome::Failed {
-                source,
-                failure: captured.failure_result()?,
-            })
         }
     }
 }
@@ -1218,6 +1192,7 @@ mod result_tests {
         let intermediate = intermediate.prepare()?;
         let spec = ExecutionSpec {
             compiler_result: None,
+            working_inputs: Default::default(),
             platform: ContentId::of(b"platform"),
             root: ExecutionRoot::resolve(
                 TreeRecipe::union(metadata(0o755), [input.id()]),

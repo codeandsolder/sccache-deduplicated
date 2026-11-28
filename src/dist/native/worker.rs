@@ -225,15 +225,6 @@ pub struct WorkerDelivery<'a> {
     pub artifact_grace: Option<&'a super::ArtifactGrace>,
 }
 
-#[cfg(feature = "dist-client")]
-#[derive(Clone, Copy)]
-pub(super) struct ExecutionControl<'a> {
-    pub renewal_interval: Duration,
-    pub queue: Option<&'a crate::dist::execution_queue::ExecutionQueue>,
-    pub grace: Option<&'a super::ArtifactGrace>,
-    pub transport: Option<&'a PackageTransportTracker>,
-}
-
 #[cfg(test)]
 mod transport_tests {
     use super::*;
@@ -645,117 +636,6 @@ impl NativeCacheClient {
                 Err(error) => return Err(error),
             }
         }
-    }
-
-    #[cfg(feature = "dist-client")]
-    pub(super) fn execute_admitted(
-        &self,
-        ticket: Ticket,
-        spec: &ExecutionSpec,
-        store: &NativeStore,
-        policy: &ExecutionPolicy,
-        control: ExecutionControl<'_>,
-        mut fetch: impl FnMut(TreeId, &LeaseCheck<'_>) -> Result<TreeLease>,
-    ) -> Result<CapturedExecution> {
-        let context = ExecutionContext {
-            ticket,
-            spec,
-            store,
-            policy,
-        };
-        let result = self.with_renewal(ticket, control.renewal_interval, |check| {
-            self.verify_execution(ticket, spec.clone())?;
-            let mut prepared = self.prepare_execution(
-                context,
-                control.grace,
-                |id, check, _| fetch(id, check),
-                check,
-                &mut |_| {},
-            )?;
-            let inputs = std::mem::take(&mut prepared.inputs);
-            let captured = compile(
-                context,
-                control.queue,
-                control.transport,
-                &inputs,
-                prepared.grace.is_some(),
-                check,
-                |_| {},
-            )?;
-            drop(inputs);
-            crate::http_client::io_runtime()?.block_on(self.publish_execution(
-                context,
-                prepared,
-                captured,
-                control.transport,
-                check,
-            ))
-        });
-        if result.is_err() {
-            let _ = self.fail(ticket);
-        }
-        result
-    }
-
-    #[cfg(feature = "dist-client")]
-    fn prepare_execution(
-        &self,
-        context: ExecutionContext<'_>,
-        grace: Option<&super::ArtifactGrace>,
-        mut fetch: impl FnMut(TreeId, &LeaseCheck<'_>, &mut dyn FnMut(&TreeLease)) -> Result<TreeLease>,
-        check: &LeaseCheck<'_>,
-        on_tree: &mut dyn FnMut(&TreeLease),
-    ) -> Result<PreparedExecution> {
-        let started = Instant::now();
-        let mut warm = true;
-        let ExecutionContext {
-            ticket,
-            spec,
-            store,
-            policy,
-        } = context;
-        let request = spec.action_request()?;
-        ensure!(
-            spec.platform == policy.platform,
-            "native executor platform mismatch"
-        );
-        let mut inputs = Vec::new();
-        for id in &request.input_trees {
-            check()?;
-            let (tree, hit) = if let Some(tree) = store.lookup_resident_tree(*id)? {
-                (tree, true)
-            } else {
-                warm = false;
-                let (tree, hit) = store.acquire_tree(*id, check, || fetch(*id, check, on_tree))?;
-                (store.remember_resident_tree(tree)?, hit)
-            };
-            trace_tree_access(*id, &tree, hit)?;
-            on_tree(&tree);
-            inputs.push(tree);
-        }
-        // The notification is idempotent. A lost response must not
-        // discard the already pinned input closure.
-        let announced = Instant::now();
-        loop {
-            check()?;
-            match self.inputs_staged(ticket) {
-                Ok(()) => break,
-                Err(error)
-                    if retryable_transport_error(&error)
-                        && announced.elapsed() < policy.timeout =>
-                {
-                    warm = false;
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(PreparedExecution {
-            request,
-            inputs,
-            grace: grace.cloned(),
-            warm_staging: warm.then(|| started.elapsed()),
-        })
     }
 
     async fn upload_result_blobs(

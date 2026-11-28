@@ -8,6 +8,7 @@ fn spec(args: &[&str]) -> anyhow::Result<ExecutionSpec> {
     let root = TreeId([0; 32]);
     Ok(ExecutionSpec {
         compiler_result: None,
+        working_inputs: Default::default(),
         platform: ContentId::of(b"platform"),
         root: ExecutionRoot {
             id: root,

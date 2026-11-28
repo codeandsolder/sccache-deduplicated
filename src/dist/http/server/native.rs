@@ -602,7 +602,6 @@ where
             ),
         );
     for (path, role, operation) in [
-        ("/api/v5/native/client/commit", "client", "commit"),
         ("/api/v5/native/worker/commit", "worker", "commit"),
         ("/api/v5/native/client/tree_commit", "client", "tree_commit"),
     ] {
@@ -1111,7 +1110,7 @@ fn dispatch(
         "poll_input" if publisher == Publisher::Client => {
             encode(&sessions.poll_input(metadata(request, limit)?)?, limit)
         }
-        "inputs_staged" => {
+        "inputs_staged" if matches!(publisher, Publisher::Worker { .. }) => {
             sessions.inputs_staged(metadata(request, limit)?, publisher)?;
             if let Publisher::Worker { peer, job } = publisher {
                 observe_result(
@@ -1251,7 +1250,7 @@ fn dispatch(
         "tree_offer" if publisher == Publisher::Client => {
             encode(&sessions.offer_tree(metadata(request, limit)?)?, limit)
         }
-        "tree_open" => {
+        "tree_open" if matches!(publisher, Publisher::Worker { .. }) => {
             let OpenTreeRequest { action, tree } = metadata(request, limit)?;
             encode(&sessions.open_tree(tree, publisher, action)?, limit)
         }
@@ -1267,12 +1266,12 @@ fn dispatch(
                 limit,
             )
         }
-        "verify" => {
+        "verify" if matches!(publisher, Publisher::Worker { .. }) => {
             let ExecutionRequest { ticket, spec } = metadata(request, limit)?;
             sessions.verify_execution(ticket, publisher, &spec.action_request()?)?;
             encode(&(), limit)
         }
-        "begin" => {
+        "begin" if matches!(publisher, Publisher::Worker { .. }) => {
             let ManifestRequest { ticket, manifest } = metadata(request, limit)?;
             let reply = sessions.begin(ticket, publisher, manifest)?;
             if let Publisher::Worker { peer, job } = publisher {

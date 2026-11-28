@@ -650,41 +650,21 @@ impl PrivateOutputTree {
 #[cfg(feature = "dist-client")]
 #[derive(Debug, Clone)]
 pub struct NativeLinkLayout {
-    pub(crate) mounts: Vec<OsString>,
     pub(crate) dep_info: Option<PathBuf>,
+    pub(crate) environment: Vec<(OsString, OsString)>,
 }
 
 #[cfg(feature = "dist-client")]
 impl NativeLinkLayout {
-    pub(crate) fn new(
-        canonical: Option<&super::canonical_paths::CanonicalRustPaths>,
-        dep_info: Option<PathBuf>,
-    ) -> Self {
-        let mounts = canonical.map_or_else(
-            || {
-                [
-                    "--die-with-parent",
-                    "--bind",
-                    "/",
-                    "/",
-                    "--dev-bind",
-                    "/dev",
-                    "/dev",
-                ]
-                .map(OsString::from)
-                .to_vec()
-            },
-            super::canonical_paths::CanonicalRustPaths::bwrap_mount_arguments,
-        );
-        Self { mounts, dep_info }
+    pub(crate) fn new(dep_info: Option<PathBuf>, environment: Vec<(OsString, OsString)>) -> Self {
+        Self {
+            dep_info,
+            environment,
+        }
     }
 }
 
-/// Prepared native Rust codegen delivery and local replay roots.
-///
-/// Each returned directory is mounted over the current caller's lower directory,
-/// so native dependencies remain live at the same logical paths. There is no
-/// archive or copied staging tree between CAS delivery and linking.
+/// Logical stage topology and private final-result delivery destinations.
 pub struct NativeLinkWorkspace {
     stages: RustLinkStages,
     roots: BTreeMap<PathBuf, NativeLinkRoot>,
@@ -743,41 +723,12 @@ impl NativeLinkWorkspace {
         })
     }
 
-    /// All output overlays to append after base namespace bindings.
-    /// # Errors
-    /// Returns an error if a lower directory is no longer available.
-    pub fn overlay_arguments(&self) -> Result<Vec<OsString>> {
-        let mut arguments = Vec::new();
-        for (logical, root) in &self.roots {
-            ensure!(
-                root.tree.generated_root().is_dir(),
-                "native codegen output has not been delivered"
-            );
-            arguments.extend(root.tree.overlay_arguments(&root.physical, logical)?);
-        }
-        Ok(arguments)
+    pub(crate) fn link_arguments(&self, artifact: &Path) -> Vec<OsString> {
+        self.stages.link_arguments(artifact)
     }
 
-    /// Locate the generated artifact in the private delivery tree and prepare
-    /// the original logical command for local linking.
-    /// # Errors
-    /// Returns an error if codegen did not deliver exactly one link artifact.
-    pub fn link_arguments(&self) -> Result<Vec<OsString>> {
-        Ok(self.stages.link_arguments(&self.link_artifact()?))
-    }
-
-    fn link_artifact(&self) -> Result<PathBuf> {
-        let directory = self.stages.codegen_directory();
-        let (logical, root) = self
-            .roots
-            .iter()
-            .find(|(logical, _)| directory.starts_with(logical))
-            .context("missing native codegen root")?;
-        let generated = root
-            .tree
-            .generated_root()
-            .join(directory.strip_prefix(logical)?);
-        RustLinkStages::link_artifact(&generated, directory)
+    pub(crate) fn codegen_directory(&self) -> &Path {
+        self.stages.codegen_directory()
     }
 
     /// Install the surviving outputs of the successful link stage.
@@ -791,13 +742,13 @@ impl NativeLinkWorkspace {
     #[cfg(feature = "dist-client")]
     pub(crate) fn publish(
         &self,
+        artifact: &Path,
         expected: &[crate::cache::FileObjectSource],
         cwd: &Path,
         dep_info: Option<&Path>,
     ) -> Result<()> {
         use std::collections::BTreeSet;
 
-        let artifact = self.link_artifact()?;
         let mut entries = Vec::new();
         let mut seen = BTreeSet::new();
         for (logical, root) in &self.roots {

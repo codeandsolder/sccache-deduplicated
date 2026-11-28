@@ -56,7 +56,7 @@ impl CompileLimits {
         Duration::from_secs(match phase {
             Phase::HashInputs
             | Phase::RunDistributed
-            | Phase::LocalCompile
+            | Phase::CompilerQuery
             | Phase::WaitForProducer => self.execution_timeout_secs,
             _ => self.phase_timeout_secs,
         })
@@ -79,7 +79,7 @@ pub enum Phase {
     UploadToolchain,
     StageInputs,
     RunDistributed,
-    LocalCompile,
+    CompilerQuery,
     PublishOutputs,
     PackResult,
     RecordResult,
@@ -112,7 +112,7 @@ impl Phase {
             Self::UploadToolchain => "upload_toolchain",
             Self::StageInputs => "stage_inputs",
             Self::RunDistributed => "run_distributed",
-            Self::LocalCompile => "local_compile",
+            Self::CompilerQuery => "compiler_query",
             Self::PublishOutputs => "publish_outputs",
             Self::PackResult => "pack_result",
             Self::RecordResult => "record_result",
@@ -525,11 +525,10 @@ impl Activity {
 
     pub(super) fn finished(&self, result: &CompileFinished) {
         let mut state = lock(&self.state);
-        if let Some(report) = result.native {
+        if let Some(report) = result.native.last() {
             state.history.action = Some(report.key);
             state.history.outcome = Some(match report.source {
                 NativeBuildSource::Hit => TraceOutcome::Hit,
-                NativeBuildSource::Local => TraceOutcome::Local,
                 NativeBuildSource::Worker(_) => TraceOutcome::Worker,
             });
         }

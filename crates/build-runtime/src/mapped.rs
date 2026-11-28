@@ -345,9 +345,9 @@ impl MappedTree {
         let id = manifest.id()?;
         Ok(PreparedTree {
             id,
-            manifest,
-            sources,
-            references,
+            manifest: Arc::new(manifest),
+            sources: Arc::new(sources),
+            references: Arc::new(references),
         })
     }
 }
@@ -438,11 +438,12 @@ enum PreparedSource {
 
 /// A validated mapped manifest and direct readers for its unique content.
 /// No local CAS, temporary archive, or persistent staging is needed.
+#[derive(Clone)]
 pub struct PreparedTree {
     id: TreeId,
-    manifest: TreeManifest,
-    sources: BTreeMap<ContentId, PreparedSource>,
-    references: References,
+    manifest: Arc<TreeManifest>,
+    sources: Arc<BTreeMap<ContentId, PreparedSource>>,
+    references: Arc<References>,
 }
 
 impl PreparedTree {
@@ -461,9 +462,9 @@ impl PreparedTree {
             .collect();
         Ok(Self {
             id,
-            manifest,
-            sources: BTreeMap::new(),
-            references,
+            manifest: Arc::new(manifest),
+            sources: Arc::new(BTreeMap::new()),
+            references: Arc::new(references),
         })
     }
 
@@ -473,7 +474,7 @@ impl PreparedTree {
     }
 
     #[must_use = "the manifest describes the selected build inputs"]
-    pub const fn manifest(&self) -> &TreeManifest {
+    pub fn manifest(&self) -> &TreeManifest {
         &self.manifest
     }
 

@@ -271,7 +271,7 @@ gc_batch = 1024
 ```
 
 The native store uses one transactional index, lease/GC implementation, and
-usage-aware eviction policy on scheduler, worker and local executor. The
+usage-aware eviction policy on scheduler and worker. The
 resident budget counts uncompressed live blobs and queued garbage conservatively;
 ZFS separately compresses them and the filesystem free-space watermarks still
 apply. For actual physical cache isolation, place each store on a quota-managed
@@ -449,44 +449,6 @@ precedes publication. No client or daemon archive staging is required.
 The stream has bounded queues, frame limits and an absolute deadline;
 disconnect releases or expires the native action pins.
 
-## Local exact-sandbox execution
-
-Opt in on the managed sccache daemon (or a directly configured compiler
-service) using the same native client configuration and platform contract:
-
-```toml
-[dist.native.local_execution]
-preference = "remote_first" # or "local"
-max_jobs = 4
-directory = "/path/to/native-local-input-store"
-scratch = "/path/to/native-local-scratch"
-bubblewrap = "/usr/bin/bwrap"
-
-[dist.native.local_execution.space]
-min_available_bytes = 2147483648
-target_available_bytes = 4294967296
-max_evictions_per_pass = 128
-gc_batch = 1024
-```
-
-The local executor owns an explicit quota-managed input CAS and private
-scratch directory. It uses the same execution specification, verified root
-composition, Bubblewrap runner, output capture, scheduler ticket and atomic
-publication as a remote worker. Ordinary hits bypass execution. With the
-local preference, missing input trees are first staged from the caller;
-only missing content goes to the scheduler from those exact verified files.
-With remote-first, local execution is selected only on an explicit unavailable
-allocation, never after an ambiguous or successful remote assignment.
-The local executor imports missing input bytes directly from caller-provided
-sources, including through the scoped networkless namespace stream. Local
-misses publish to the scheduler and deliver the captured descriptors directly
-to the caller; they do not download the just-published result or populate a
-second local action cache. A bounded local job pool renews the action lease
-while waiting. Both local and worker execution require an administrator-
-attested matching platform contract. Unconstrained local fallbacks remain
-uncached. Native control and result publication work even when no compatible
-remote worker is available, provided the scheduler cache service is reachable.
-
 ## Toolchain discovery and mapped trees
 
 The Linux C and Rust toolchain packagers share their existing dependency and
@@ -556,9 +518,20 @@ intending to transform the input directory instead declare a complete tree.
 Both worker capture and client delivery account for logical file bytes
 independently of content deduplication. All staged directory contents are
 validated and materialized before publication at a previously absent
-destination. The caller can mount a generated-only result over its original
-live input directory for native linking, without replacing its dependencies
-with stale worker copies.
+destination. Rust linking is a dependent native action, not a local replay. Codegen's
+result is retained by the scheduler and used as a recipe layer in the
+link action. Its owned files can be consumed or replaced by the link
+stage; all external inputs are still immutable. The worker constructs
+the filesystem with Bubblewrap from verified CAS content. There is no
+requirement that the worker has the same installed linker or libraries.
+The final generated tree, rather than the intermediate codegen tree,
+is delivered to the caller. Each stage has its own action key and
+cache/worker statistics.
+
+The compiler client requires a native scheduler; an unavailable worker,
+unsupported compile or failed remote command returns an error. Only
+explicit compiler information queries and input discovery are executed
+in the caller namespace.
 
 ### Inspecting key relevance
 

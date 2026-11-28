@@ -568,19 +568,19 @@ fn handle_compile_finished(
     }
 
     trace!("handle_compile_finished");
-    if let Some(report) = response.native {
+    for report in &response.native {
         use crate::protocol::NativeBuildSource;
         let source = match report.source {
             NativeBuildSource::Hit => "hit",
-            NativeBuildSource::Local => "local",
             NativeBuildSource::Worker(_) => "worker",
         };
         let mode = match report.mode {
             crate::build_runtime::ActionMode::Reuse => "reuse",
             crate::build_runtime::ActionMode::Refresh => "refresh",
         };
-        log::info!(target: "sccache::native_action", "native_action {} {source} {mode}",
-            blake3::Hash::from_bytes(report.key.0).to_hex());
+        log::info!(target: "sccache::native_action", "native_action {} {source} {mode} {:?} {}",
+            blake3::Hash::from_bytes(report.key.0).to_hex(), report.stage,
+            if report.successful { "success" } else { "failed" });
     }
     // It might be nice if the server sent stdout/stderr as the process
     // ran, but then it would have to also save them in the cache as
@@ -629,7 +629,7 @@ pub struct CompileInvocation<'a> {
 ///
 /// If the server returned `CompileStarted`, read its terminal result.
 /// An ambiguous disconnect must not launch another compiler against the
-/// same outputs. Only an explicit unhandled response permits local execution.
+/// same outputs. Only a verified compiler query permits local execution.
 fn handle_compile_response<T>(
     creator: T,
     runtime: &Runtime,
@@ -705,12 +705,15 @@ where
             );
             bail!("Compiler not supported: {}", crate::util::debug_display(&s));
         }
-        CompileResponse::UnhandledCompile => {
-            debug!("Server sent UnhandledCompile");
+        CompileResponse::RejectedCompilation(reason) => {
+            bail!("Remote compilation rejected: {reason}")
+        }
+        CompileResponse::CompilerQuery => {
+            debug!("Server accepted compiler query");
         }
     }
 
-    // Only an explicit UnhandledCompile reaches this point. Preserve the
+    // Only a verified compiler query reaches this point. Preserve the
     // original path and environment rather than inventing a canonical layout.
     let mut cmd = creator.new_command_sync(invocation.exe);
     cmd.args(&invocation.cmdline)
@@ -721,7 +724,7 @@ where
         trace!("running command: {cmd:?}");
     }
 
-    server::activity::phase(server::activity::Phase::LocalCompile);
+    server::activity::phase(server::activity::Phase::CompilerQuery);
     let status = cmd
         .spawn()
         .await?
@@ -1253,60 +1256,23 @@ mod test {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn test_unhandled_rust_compile_falls_back_with_physical_arguments() -> Result<()> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
+    fn test_rejected_compilation_never_starts_local_compiler() -> Result<()> {
+        let runtime = make_runtime();
         let client = Client::new_num(1);
         let creator = Arc::new(Mutex::new(MockCommandCreator::new(&client)));
-        let cmdline = vec![
-            OsString::from("--crate-name"),
-            OsString::from("build_script_build"),
-            OsString::from("build.rs"),
-            OsString::from("--emit=dep-info,link"),
-        ];
-        let expected = cmdline.clone();
-
-        creator
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .next_command_calls(move |args| {
-                assert_eq!(args, expected.as_slice());
-                Ok(MockChild::new(exit_status(0), "", ""))
-            });
-
         let invocation = CompileInvocation {
             exe: Path::new("/rust/bin/rustc"),
-            cmdline,
+            cmdline: vec!["build.rs".into(), "--emit=link".into()],
             cwd: Path::new("/work/project"),
-            env_vars: vec![
-                (
-                    OsString::from("SCCACHE_EXPERIMENTAL_CANONICAL_RUST"),
-                    OsString::from("1"),
-                ),
-                (
-                    OsString::from("SCCACHE_CANONICAL_BUILD_ROOT"),
-                    OsString::from("/work/project"),
-                ),
-                (
-                    OsString::from("SCCACHE_CANONICAL_TARGET_ROOT"),
-                    OsString::from("/work/project/target"),
-                ),
-            ],
+            env_vars: vec![],
         };
-        let mut stdout = vec![];
-        let mut stderr = vec![];
-
-        let code = runtime
-            .block_on(resolve_compile_result(
-                creator,
-                CompileResponse::UnhandledCompile,
-                None,
-                &invocation,
-            ))?
-            .finish(&mut stdout, &mut stderr)?;
-
-        assert_eq!(code, 0);
+        let result = runtime.block_on(resolve_compile_result(
+            creator,
+            CompileResponse::RejectedCompilation("unsupported invocation".into()),
+            None,
+            &invocation,
+        ));
+        assert!(result.is_err());
         Ok(())
     }
 

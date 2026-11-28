@@ -16,8 +16,7 @@ use crate::cache::readonly::ReadOnlyStorage;
 use crate::cache::{CacheMode, Storage, storage_from_config};
 use crate::compiler::{
     CacheCompileContext, CacheControl, CompileResult, Compiler, CompilerArguments,
-    CompilerCachePolicy, CompilerHasher, CompilerKind, CompilerProxy, DistType, Language, MissType,
-    get_compiler_info,
+    CompilerCachePolicy, CompilerHasher, CompilerKind, CompilerProxy, Language, get_compiler_info,
 };
 #[cfg(feature = "dist-client")]
 use crate::config;
@@ -316,23 +315,10 @@ impl DistClientContainer {
             ));
         }
 
-        let config = DistClientConfig {
-            pool: pool.clone(),
-            scheduler_url: config.dist.scheduler_url.clone(),
-            cluster: config.dist.cluster.clone(),
-            auth: config.dist.auth.clone(),
-            cache_dir: config.dist.cache_dir.clone(),
-            toolchain_cache_size: config.dist.toolchain_cache_size,
-            toolchains: config.dist.toolchains.clone(),
-            rewrite_includes_only: config.dist.rewrite_includes_only,
-        };
-        let state = Self::create_state(config);
-        let state = pool.block_on(state);
-        Self {
-            state: futures::lock::Mutex::new(state),
-            #[cfg(target_os = "linux")]
-            native: None,
-        }
+        // A missing native configuration is an explicit disabled state.
+        // Never create a legacy archive client or its local cache.
+        let _ = pool;
+        Self::new_disabled()
     }
 
     #[cfg(target_os = "linux")]
@@ -1370,48 +1356,6 @@ where
         }
     }
 
-    #[cfg(feature = "dist-client")]
-    pub fn mock_with_dist_client(
-        dist_client: Arc<dyn dist::Client>,
-        storage: Arc<dyn Storage>,
-        rt: tokio::runtime::Handle,
-    ) -> Self {
-        let (tx, _) = mpsc::channel(1);
-        let (_, info) = WaitUntilZero::new();
-        let client = Client::new_num(1);
-        Self {
-            activities: Arc::default(),
-            compile_limits: CompileLimits::default(),
-            stats: Arc::default(),
-            cache_control: CacheControl::Default,
-            dist_client: Arc::new(DistClientContainer::new_with_state(DistClientState::Some(
-                Box::new(DistClientConfig {
-                    pool: rt.clone(),
-                    scheduler_url: None,
-                    cluster: None,
-                    auth: config::DistAuth::Token {
-                        token: String::new(),
-                    },
-                    cache_dir: "".into(),
-                    toolchain_cache_size: 0,
-                    toolchains: vec![],
-                    rewrite_includes_only: false,
-                }),
-                dist_client,
-            ))),
-            storage,
-            compiler_aliases: Arc::default(),
-            compilers: Arc::default(),
-            compiler_proxies: Arc::default(),
-            #[cfg(feature = "dist-client")]
-            namespace_reservations: Arc::default(),
-            rt,
-            creator: C::new(&client),
-            tx,
-            _info: info,
-        }
-    }
-
     async fn dispatch_connection(
         &self,
         req: SccacheRequest,
@@ -1935,17 +1879,7 @@ where
             _ => resolved_compiler_path,
         };
 
-        let dist_info = match self.dist_client.get_client().await {
-            Ok(Some(ref client)) => client
-                .get_custom_toolchain(&resolved_compiler_path)
-                .and_then(|archive| {
-                    metadata(&archive)
-                        .and_then(|attr| attr.modified())
-                        .ok()
-                        .map(|mtime| (archive, mtime))
-                }),
-            _ => None,
-        };
+        let dist_info = None;
 
         let cached = match self.compilers.read().await.get(&resolved_compiler_path) {
             Some(Some(entry)) if entry.mtime == mtime && entry.dist_info == dist_info => {
@@ -2022,8 +1956,21 @@ where
                         }
                         let mut stats = self.stats.lock().await;
                         stats.record_not_cacheable(why, extra_info.as_deref());
+                        return Message::WithoutBody(Response::Compile(
+                            CompileResponse::RejectedCompilation(match extra_info {
+                                Some(extra) => format!("{why}: {extra}"),
+                                None => why.to_string(),
+                            }),
+                        ));
                     }
                     CompilerArguments::NotCompilation => {
+                        if !crate::compiler::is_compiler_query(&c.kind(), &cmd, &cwd) {
+                            return Message::WithoutBody(Response::Compile(
+                                CompileResponse::RejectedCompilation(
+                                    "compiler invocation has no remote action planner".into(),
+                                ),
+                            ));
+                        }
                         debug!("parse_arguments: NotCompilation: {cmd:?}");
                         self.stats.lock().await.requests_not_compile += 1;
                     }
@@ -2031,7 +1978,7 @@ where
             }
         }
 
-        let res = CompileResponse::UnhandledCompile;
+        let res = CompileResponse::CompilerQuery;
         Message::WithoutBody(Response::Compile(res))
     }
 
@@ -2081,20 +2028,18 @@ where
         let me = self.clone();
 
         util::spawn_on(&self.rt, activity::inherit(async move {
-            let result = match me.dist_client.get_client().await {
-                Ok(client) => std::panic::AssertUnwindSafe(hasher.get_cached_or_compile(
-                    CacheCompileContext {
-                        service: &me,
-                        dist_client: client,
-                        creator: me.creator.clone(),
-                        storage: me.storage.clone(),
-                        arguments,
-                        cwd,
-                        env_vars,
-                        cache_control,
-                        pool: me.rt.clone(),
-                    },
-                ))
+            let result = std::panic::AssertUnwindSafe(hasher.get_cached_or_compile(
+                CacheCompileContext {
+                    service: &me,
+                    creator: me.creator.clone(),
+                    storage: me.storage.clone(),
+                    arguments,
+                    cwd,
+                    env_vars,
+                    cache_control,
+                    pool: me.rt.clone(),
+                },
+            ))
                 .catch_unwind()
                 .await
                 .map_err(|e| {
@@ -2113,12 +2058,9 @@ where
                         anyhow!("thread '{thread_name}' panicked: {panic}")
                     }
                 })
-                .and_then(std::convert::identity),
-                Err(e) => Err(e),
-            };
+                .and_then(std::convert::identity);
 
             activity::phase(Phase::RecordResult);
-            let mut cache_write = None;
             let mut res = CompileFinished {
                 color_mode,
                 ..Default::default()
@@ -2128,92 +2070,40 @@ where
 
             match result {
                 Ok((compile_result, out)) => {
-                    let mut dist_type = DistType::NoDist;
-
                     match compile_result {
                         CompileResult::Error => {
-                            debug!("[{out_pretty}]: compile result: cache error");
-
-                            stats.cache_errors.increment(&kind, lang);
-                        }
-                        CompileResult::CacheHit(duration) => {
-                            activity::outcome(activity::TraceOutcome::Hit);
-                            debug!("[{out_pretty}]: compile result: cache hit");
-
-                            stats.cache_hits.increment(&kind, lang);
-                            stats.cache_read_hit_duration += duration;
-                        }
-                        CompileResult::CacheMiss(miss_type, dt, duration, future) => {
-                            activity::outcome(activity::TraceOutcome::Miss);
-                            debug!("[{out_pretty}]: compile result: cache miss");
-                            dist_type = dt;
-
-                            match miss_type {
-                                MissType::Normal | MissType::ForcedNoCache => {}
-                                MissType::ForcedRecache => {
-                                    stats.forced_recaches += 1;
-                                }
-                                MissType::TimedOut => {
-                                    stats.cache_timeouts += 1;
-                                }
-                                MissType::CacheReadError => {
-                                    stats.cache_errors.increment(&kind, lang);
-                                }
-                            }
-                            stats.compilations += 1;
-                            stats.cache_misses.increment(&kind, lang);
-                            stats.compiler_write_duration += duration;
-                            debug!("stats after compile result: {stats:?}");
-                            cache_write = Some(future);
-                        }
-                        CompileResult::Native(report, duration) => {
-                            use crate::protocol::NativeBuildSource;
-                            res.native = Some(report);
-                            if report.source == NativeBuildSource::Hit {
-                                stats.cache_hits.increment(&kind, lang);
-                                stats.cache_read_hit_duration += duration;
-                            } else {
-                                if report.mode == crate::build_runtime::ActionMode::Refresh {
-                                    stats.forced_recaches += 1;
-                                }
-                                if let NativeBuildSource::Worker(addr) = report.source {
-                                    dist_type = DistType::Ok(addr.to_string());
-                                }
-                                stats.compilations += 1;
-                                stats.cache_misses.increment(&kind, lang);
-                                stats.compiler_write_duration += duration;
-                                stats.cache_writes += 1;
-                            }
-                        }
-                        CompileResult::NotCached(dt, duration) => {
-                            debug!("[{out_pretty}]: compile result: not cached");
-                            dist_type = dt;
-                            stats.compilations += 1;
-                            stats.compiler_write_duration += duration;
-                        }
-                        CompileResult::NotCacheable(dt, duration) => {
-                            debug!("[{out_pretty}]: compile result: not cacheable");
-                            dist_type = dt;
-                            stats.compilations += 1;
-                            stats.compiler_write_duration += duration;
-                            stats.non_cacheable_compilations += 1;
-                        }
-                        CompileResult::CompileFailed(dt, duration) => {
-                            warn!("[{out_pretty}]: compiler exited {}: {}", out.status, String::from_utf8_lossy(&out.stderr));
-                            dist_type = dt;
-                            stats.compilations += 1;
-                            stats.compiler_write_duration += duration;
                             stats.compile_fails += 1;
                         }
-                    }
-
-                    match dist_type {
-                        DistType::NoDist => {}
-                        DistType::Ok(worker_label) => {
-                            let server_count = stats.dist_compiles.entry(worker_label).or_insert(0);
-                            *server_count += 1;
+                        CompileResult::Native(reports, duration) => {
+                            use crate::protocol::NativeBuildSource;
+                            // Each stage has its own cache result and placement.
+                            for report in &reports {
+                                match report.source {
+                                    NativeBuildSource::Hit => {
+                                        stats.cache_hits.increment(&kind, lang);
+                                        stats.cache_read_hit_duration += report.duration;
+                                    }
+                                    NativeBuildSource::Worker(peer) => {
+                                        if report.mode == crate::build_runtime::ActionMode::Refresh {
+                                            stats.forced_recaches += 1;
+                                        }
+                                        stats.compilations += 1;
+                                        stats.cache_misses.increment(&kind, lang);
+                                        stats.compiler_write_duration += report.duration;
+                                        if report.successful {
+                                            stats.cache_writes += 1;
+                                        }
+                                        *stats.dist_compiles.entry(peer.to_string()).or_insert(0) += 1;
+                                    }
+                                }
+                            }
+                            debug!("[{out_pretty}]: native pipeline took {duration:?}");
+                            if !out.status.success() {
+                                stats.compile_fails += 1;
+                                warn!("[{out_pretty}]: compiler exited {}: {}", out.status, String::from_utf8_lossy(&out.stderr));
+                            }
+                            res.native = reports;
                         }
-                        DistType::Error => stats.dist_errors += 1,
                     }
 
                     // Make sure the write guard has been dropped ASAP.
@@ -2290,27 +2180,6 @@ where
                                 res.stderr = fatal_error_message(&err).into_bytes();
                             }
                         },
-                    }
-                }
-            }
-
-            if let Some(cache_write) = cache_write {
-                activity::phase(Phase::WriteCache);
-                match cache_write.await {
-                    Err(e) => {
-                        debug!("Error executing cache write: {e}");
-                        me.stats.lock().await.cache_write_errors += 1;
-                    }
-                    //TODO: save cache stats!
-                    Ok(info) => {
-                        debug!(
-                            "[{}]: Cache write finished in {}",
-                            info.object_file_pretty,
-                            util::fmt_duration_as_secs(&info.duration)
-                        );
-                        let mut stats = me.stats.lock().await;
-                        stats.cache_writes += 1;
-                        stats.cache_write_duration += info.duration;
                     }
                 }
             }
@@ -2431,7 +2300,7 @@ pub struct ServerStats {
     /// The count of compilations that were successfully distributed indexed
     /// by the server that ran those compilations.
     pub dist_compiles: HashMap<String, usize>,
-    /// The count of compilations that were distributed but failed and had to be re-run locally
+    /// The count of distributed execution infrastructure failures
     pub dist_errors: u64,
     /// Multi-level cache statistics (if multi-level caching is enabled)
     pub multi_level: Option<crate::cache::multilevel::MultiLevelStats>,
@@ -3484,7 +3353,7 @@ mod tests {
         let mut sink = tx.sink_err_into::<Error>();
         let work = activity::scope(activity, async {
             time::sleep(Duration::from_secs(10)).await;
-            activity::phase(Phase::LocalCompile);
+            activity::phase(Phase::CompilerQuery);
             time::sleep(Duration::from_secs(60)).await;
             Ok::<_, Error>(42)
         });
@@ -3501,7 +3370,7 @@ mod tests {
             else {
                 bail!("not a progress notification");
             };
-            assert_eq!(snapshot.phase, Phase::LocalCompile);
+            assert_eq!(snapshot.phase, Phase::CompilerQuery);
             assert_eq!(snapshot.phase_age_ms, age);
         }
         assert_eq!(monitor.await?, 42);

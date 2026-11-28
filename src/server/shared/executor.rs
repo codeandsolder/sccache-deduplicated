@@ -210,10 +210,12 @@ async fn compile(
         CompileResponse::UnsupportedCompiler(exe) => {
             bail!("Compiler not supported: {}", exe.to_string_lossy())
         }
-        CompileResponse::UnhandledCompile => {
-            // The client must never execute this fallback. It runs here, in
-            // the exact same credential and filesystem context as cache hits.
-            activity::phase(activity::Phase::LocalCompile);
+        CompileResponse::RejectedCompilation(reason) => {
+            bail!("Remote compilation rejected: {reason}")
+        }
+        CompileResponse::CompilerQuery => {
+            // Compiler queries run with the request's credentials and paths.
+            activity::phase(activity::Phase::CompilerQuery);
             let mut child = activity::ChildActivity::waiting();
             let _token = jobserver.acquire().await?;
             child.started();

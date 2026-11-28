@@ -232,12 +232,7 @@ impl SharedExecutor {
         jobserver: Client,
     ) -> Result<Self> {
         ensure!(
-            !config.client_side_mode
-                && config
-                    .dist
-                    .native
-                    .as_ref()
-                    .is_none_or(|native| native.local_execution.is_none()),
+            !config.client_side_mode,
             "shared daemon requires credential-isolated execution"
         );
         let capacity = policy.max_executors.map_or_else(

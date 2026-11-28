@@ -165,6 +165,7 @@ fn shell_output_fixture(
 ) -> Result<(ExecutionSpec, ExecutionPolicy)> {
     let spec = ExecutionSpec {
         compiler_result: None,
+        working_inputs: Default::default(),
         platform,
         root: ExecutionRoot {
             id: first,
@@ -354,6 +355,7 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
     let platform = ContentId::of(b"test platform");
     let mut spec = ExecutionSpec {
         compiler_result: None,
+        working_inputs: Default::default(),
         platform, root: ExecutionRoot { id: root, recipe: TreeRecipe::union(metadata(0o755), [root]) },
         mounts: BTreeMap::from([(BuildPath::new(b"/src".to_vec())?, src)]),
         command: CommandSpec {
@@ -569,6 +571,7 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
     };
     let spec = ExecutionSpec {
         compiler_result: None,
+        working_inputs: Default::default(),
         platform: ContentId::of(b"platform"),
         root: ExecutionRoot {
             id: crate::TreeId([0; 32]),
@@ -791,5 +794,90 @@ fn capture_without_resident_headroom_still_has_verified_delivery_bytes() -> Resu
     let mut decoded = Vec::new();
     reader.read_to_end(&mut decoded)?;
     assert_eq!(decoded, bytes);
+    Ok(())
+}
+
+/// Stage-owned files are inputs to this task's identity, but unlike external
+/// inputs may be consumed, replaced, or returned as surviving outputs.
+#[test]
+#[ignore = "requires Linux Bubblewrap and ldd"]
+fn dependent_action_consumes_owned_inputs_and_preserves_immutable_inputs() -> Result<()> {
+    use crate::{OutputKind, TreeLayer};
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(&temp.path().join("store"))?;
+    let shell = shell_root(&store)?;
+    let shell = store.lookup_tree(shell)?.context("missing shell")?;
+    let external = store.stage(&b"external"[..])?;
+    let mut immutable = shell.manifest().clone();
+    immutable.entries.insert(
+        TreePath::new(b"out/library".to_vec())?,
+        TreeEntry::File {
+            blob: external.reference(),
+            metadata: metadata(0o644),
+        },
+    );
+    let base = store.publish_tree(&immutable, vec![external])?;
+    let (mut codegen, policy) = shell_output_fixture(
+        temp.path(),
+        base,
+        ContentId::of(b"stage tasks"),
+        b"printf object > /out/working; printf metadata > /out/metadata",
+    )?;
+    codegen.outputs = BTreeMap::from([(
+        "generated".into(),
+        OutputSpec {
+            path: BuildPath::new(b"/out".to_vec())?,
+            required: true,
+            kind: OutputKind::GeneratedTree,
+        },
+    )]);
+    let generated = execute_test(&codegen, &store, &policy, None, || Ok(()))?;
+    let manifest = generated
+        .successful_result()
+        .context("codegen task failed")?;
+    let Artifact::GeneratedTree(tree) = &manifest.outputs["generated"] else {
+        anyhow::bail!("wrong codegen output");
+    };
+    let staged = tree
+        .blobs()?
+        .into_iter()
+        .map(|(id, size)| {
+            store.stage_expected(crate::BlobRef { id, size }, generated.open_blob(id)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let stage = store.publish_tree(tree, staged)?;
+    let mut recipe = codegen.root.recipe.clone();
+    recipe.layers.push(TreeLayer {
+        tree: stage,
+        source: None,
+        destination: Some(TreePath::new(b"out".to_vec())?),
+    });
+    let mut link = codegen.clone();
+    link.root =
+        ExecutionRoot::resolve(recipe, &BTreeMap::from([(base, &immutable), (stage, tree)]))?;
+    link.working_inputs.insert(TreePath::new(b"out".to_vec())?);
+    link.command.arguments[1] = b"IFS= read -r a < /out/working || :; IFS= read -r b < /out/library || :; printf '%s-%s' \"$a\" \"$b\" > /out/working".to_vec();
+    let mut no_ownership = link.clone();
+    no_ownership.working_inputs.clear();
+    assert_ne!(
+        link.action_request()?.action_fingerprint()?.key()?,
+        no_ownership.action_request()?.action_fingerprint()?.key()?
+    );
+    assert!(execute_test(&no_ownership, &store, &policy, None, || Ok(())).is_err());
+    let result = execute_test(&link, &store, &policy, None, || Ok(()))?;
+    let manifest = result
+        .successful_result()
+        .context("dependent task failed")?;
+    let Artifact::GeneratedTree(tree) = &manifest.outputs["generated"] else {
+        anyhow::bail!("wrong dependent result");
+    };
+    assert!(!tree.entries.contains_key(b"library".as_slice()));
+    assert!(tree.entries.contains_key(b"metadata".as_slice()));
+    let TreeEntry::File { blob, .. } = &tree.entries[b"working".as_slice()] else {
+        anyhow::bail!("wrong file");
+    };
+    assert_eq!(blob.id, ContentId::of(b"object-external"));
+    link.command.arguments[1] = b"printf invalid > /out/library".to_vec();
+    assert!(execute_test(&link, &store, &policy, None, || Ok(())).is_err());
     Ok(())
 }
