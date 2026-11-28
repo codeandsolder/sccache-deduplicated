@@ -17,13 +17,13 @@ use std::{
 /// A selected thin member is both a semantic input and a worker input. The
 /// literal archive name matters because rustc preserves it when bundling.
 #[derive(Debug)]
-pub(crate) struct ThinArchiveMember {
+pub struct ThinArchiveMember {
     pub name: PathBuf,
     pub path: PathBuf,
 }
 
 #[derive(Debug)]
-pub(crate) struct ArchiveIdentity {
+pub struct ArchiveIdentity {
     pub digest: String,
     pub external_members: Vec<ThinArchiveMember>,
     /// If present, these exact canonical bytes replace the original in the worker.
@@ -32,7 +32,7 @@ pub(crate) struct ArchiveIdentity {
 
 /// Archive identity depends on how the compiler consumes the selected file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ArchiveUse {
+pub enum ArchiveUse {
     /// Rebuild an archive from ordered loose object members.
     Members,
     /// Embed the original archive bytes in an rlib wrapper object.
@@ -43,7 +43,7 @@ pub(crate) enum ArchiveUse {
 
 /// Hash only the representation consumed by each selected archive request.
 /// Thin archive members needed by the compiler are also returned for packaging.
-pub(crate) async fn hash_all_archives(
+pub async fn hash_all_archives(
     files: &[(PathBuf, ArchiveUse)],
     pool: &tokio::runtime::Handle,
     macho_target: Option<object::Architecture>,
@@ -93,7 +93,7 @@ fn hash_archive(
             .file_name()
             .and_then(OsStr::to_str)
             .context("packed archive name is not UTF-8")?;
-        let changed = if normalize_serialization {
+        let changed = normalize_serialization && {
             if let Some(canonical) = canonical_gnu_archive(path, &archive)? {
                 let changed = canonical != archive;
                 archive = canonical;
@@ -101,8 +101,6 @@ fn hash_archive(
             } else {
                 normalize_archive_headers(&mut archive)
             }
-        } else {
-            false
         };
         let mut digest = Digest::new();
         digest.delimiter(match usage {
@@ -113,12 +111,14 @@ fn hash_archive(
         digest.update(&(name.len() as u128).to_le_bytes());
         digest.update(name.as_bytes());
         digest.update(blake3::hash(&archive).as_bytes());
-        let mut external_members = Vec::new();
-        if usage == ArchiveUse::Link && archive.starts_with(&object::archive::THIN_MAGIC) {
-            let members = hash_archive_members(path, &archive, macho_target)?;
-            digest.update(members.digest.as_bytes());
-            external_members = members.external_members;
-        }
+        let external_members =
+            if usage == ArchiveUse::Link && archive.starts_with(&object::archive::THIN_MAGIC) {
+                let members = hash_archive_members(path, &archive, macho_target)?;
+                digest.update(members.digest.as_bytes());
+                members.external_members
+            } else {
+                Vec::new()
+            };
         return Ok(ArchiveIdentity {
             digest: digest.finish(),
             external_members,
@@ -511,9 +511,9 @@ fn append_gnu_record(output: &mut Vec<u8>, name: &[u8], bytes: &[u8], special: b
     );
     output.extend_from_slice(name);
     output.extend(std::iter::repeat_n(b' ', 16 - name.len()));
-    write!(
+    writeln!(
         output,
-        "{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+        "{:<12}{:<6}{:<6}{:<8}{:<10}`",
         0,
         0,
         0,

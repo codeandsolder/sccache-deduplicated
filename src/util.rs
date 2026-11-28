@@ -508,7 +508,7 @@ pub(crate) async fn hash_input_batch<I, F, T>(
     mut hash: F,
 ) -> Result<Vec<T>>
 where
-    I: Clone + Send + 'static,
+    I: Clone + Send + Sync + 'static,
     F: FnMut(&I) -> Result<T> + Send + 'static,
     T: Send + 'static,
 {

@@ -250,7 +250,7 @@ fn collect_link_attribute(attribute: &Group, libraries: &mut Vec<Library>) -> Re
 
 /// The expanded AST keeps macro definitions, but ordinary invocations have
 /// already been expanded. Do not visit definition bodies. Compiler built-ins
-/// such as format_args! and asm! are printed using macro syntax even after
+/// such as `format_args!` and `asm!` are printed using macro syntax even after
 /// expansion; their real expression operands must still be visited.
 fn macro_definition_end(tokens: &[TokenTree], start: usize) -> Option<usize> {
     if ident(tokens.get(start), "macro_rules")
