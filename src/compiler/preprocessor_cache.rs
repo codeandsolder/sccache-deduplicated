@@ -44,7 +44,7 @@ use super::c::{
 
 /// The current format is 1 header byte for the version + bincode encoding
 /// of the [`PreprocessorCacheEntry`] struct.
-const FORMAT_VERSION: u8 = 4;
+const FORMAT_VERSION: u8 = 5;
 const MAX_PREPROCESSOR_CACHE_ENTRIES: usize = 100;
 const MAX_PREPROCESSOR_CACHE_FILE_INFO_ENTRIES: usize = 10000;
 
@@ -261,11 +261,6 @@ impl PreprocessorCacheEntry {
 /// Environment variables that are factored into the preprocessor cache entry cached key.
 static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
     [
-        // SCCACHE_C_CUSTOM_CACHE_BUSTER has no particular meaning behind it,
-        // serving as a way for the user to factor custom data into the hash.
-        // One can set it to different values for different invocations
-        // to prevent cache reuse between them.
-        "SCCACHE_C_CUSTOM_CACHE_BUSTER",
         "CPATH",
         "C_INCLUDE_PATH",
         "CPLUS_INCLUDE_PATH",

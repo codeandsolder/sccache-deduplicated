@@ -353,7 +353,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"13";
+const CACHE_VERSION: &[u8] = b"14";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -3866,6 +3866,8 @@ where
             // out, sort them, and append them to the rest of the arguments.
             .partition(|&(arg, _)| arg == "--cfg");
         sortables.sort();
+        // rustc stores cfg predicates in a set. Exact duplicate predicates have no effect.
+        sortables.dedup();
         m.audit_field("sccache.key.arguments");
         hash_rust_argument_pairs(
             &mut m,
@@ -10260,6 +10262,8 @@ version='2.0.0'
                 &[
                     "--emit",
                     "link",
+                    "--cfg",
+                    "feature=a",
                     "--cfg",
                     "feature=a",
                     "foo.rs",

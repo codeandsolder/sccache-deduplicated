@@ -2942,16 +2942,11 @@ pub(super) fn hashed_input_file_name(language: Language, input: &Path) -> Option
 }
 
 /// The cache is versioned by the inputs to `HashKeyParams::compute`.
-pub const CACHE_VERSION: &[u8] = b"17";
+pub const CACHE_VERSION: &[u8] = b"18";
 
 /// Environment variables that are factored into the cache key.
 static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
     [
-        // SCCACHE_C_CUSTOM_CACHE_BUSTER has no particular meaning behind it,
-        // serving as a way for the user to factor custom data into the hash.
-        // One can set it to different values for different invocations
-        // to prevent cache reuse between them.
-        "SCCACHE_C_CUSTOM_CACHE_BUSTER",
         "MACOSX_DEPLOYMENT_TARGET",
         "IPHONEOS_DEPLOYMENT_TARGET",
         "TVOS_DEPLOYMENT_TARGET",
@@ -4238,7 +4233,7 @@ mod test {
     fn test_hash_key_environment_field_boundaries() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let name = OsString::from("SCCACHE_C_CUSTOM_CACHE_BUSTER");
+        let name = OsString::from("SDKROOT");
         let other = OsString::from("MACOSX_DEPLOYMENT_TARGET");
         let collapsed = [(
             name.clone(),
@@ -4257,12 +4252,12 @@ mod test {
     #[test]
     fn test_hash_key_environment_uses_effective_assignments() {
         let base: [(OsString, OsString); 2] = [
-            ("SCCACHE_C_CUSTOM_CACHE_BUSTER".into(), "one".into()),
+            ("SDKROOT".into(), "one".into()),
             ("MACOSX_DEPLOYMENT_TARGET".into(), "two".into()),
         ];
         let reversed = [base[1].clone(), base[0].clone()];
         let overwritten = [
-            ("SCCACHE_C_CUSTOM_CACHE_BUSTER".into(), "discarded".into()),
+            ("SDKROOT".into(), "discarded".into()),
             base[1].clone(),
             base[0].clone(),
         ];
@@ -4274,6 +4269,20 @@ mod test {
         assert_eq!(key(&base), key(&reversed));
         assert_eq!(key(&base), key(&overwritten));
         assert_ne!(key(&base), key(&overwritten[..2]));
+    }
+
+    #[test]
+    fn test_arbitrary_cache_buster_is_not_a_compiler_input() {
+        let env = [(
+            OsString::from("SCCACHE_C_CUSTOM_CACHE_BUSTER"),
+            OsString::from("arbitrary"),
+        )];
+        let key = |env: &[(OsString, OsString)]| {
+            HashKeyParams::new("compiler", Language::C, &[], b"input")
+                .with_env_vars(env)
+                .compute()
+        };
+        assert_eq!(key(&[]), key(&env));
     }
 
     #[test]

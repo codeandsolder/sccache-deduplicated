@@ -21,7 +21,9 @@ hash the actual selected frontend and specs file, not its installation tree.
 Native CPU identity uses the actual lowered target flags in the worker argument
 list, without a separate expansion fingerprint or original native request. Source basenames remain where they identify object contents.
 Hash declared environment dependencies as effective name/value assignments;
-ordering and overridden assignments are not semantic inputs.
+ordering and overridden assignments are not semantic inputs. Arbitrary custom
+cache-buster environment values are not inputs; forced recache is a cache
+operation, not a distinct result identity.
 
 Do not hash native debug compilation directories, directory spellings in line
 markers, debug/file/macro prefix-map operands, or independent output destinations.
@@ -32,7 +34,7 @@ runtime profiling destinations remain meaningful inputs.
 ## Rust
 
 Hash the actual compiler driver and loader-selected compiler libraries, target and
-semantic arguments, selected source and binary dependencies (including selected
+semantic arguments (including deduplicated cfg predicates), selected source and binary dependencies (including selected
 standard libraries), extern name-to-content bindings, auxiliary inputs,
 static libraries, custom target contents and explicitly observed environment.
 Native nightly dep-info reports binary dependencies; stable compilers and
