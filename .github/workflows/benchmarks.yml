@@ -31,7 +31,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         id: rust
         with:
-          toolchain: "nightly-2026-11-26"
+          toolchain: "nightly-2026-11-28"
 
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
