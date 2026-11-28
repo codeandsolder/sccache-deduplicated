@@ -1520,6 +1520,75 @@ mod tests {
         Ok(hashed)
     }
 
+    fn execute_fixture_plan(
+        plan: &CompilerPlan,
+        store: &NativeStore,
+        scratch: &Path,
+    ) -> Result<crate::build_runtime::CapturedExecution> {
+        let leases = plan
+            .inputs
+            .iter()
+            .map(|tree| tree.import(store).map(Arc::new))
+            .collect::<Result<Vec<_>>>()?;
+        let result = execute(
+            &plan.spec,
+            store,
+            &ExecutionPolicy {
+                platform: plan.spec.platform,
+                bubblewrap: "/usr/bin/bwrap".into(),
+                scratch: scratch.to_owned(),
+                timeout: Duration::from_secs(60),
+                max_result_bytes: 64 * 1024 * 1024,
+            },
+            &leases,
+            None,
+            || Ok(()),
+            |_| {},
+        )?;
+        if !result.status().success() {
+            let mut stderr = Vec::new();
+            if let Some(blob) = result.diagnostics().1 {
+                result.open_blob(blob.id)?.read_to_end(&mut stderr)?;
+            }
+            anyhow::bail!(
+                "isolated compiler stage failed: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        let manifest = result
+            .successful_result()
+            .context("missing successful fixture result")?;
+        plan.spec.action_request()?.validate_result(manifest)?;
+        Ok(result)
+    }
+
+    fn publish_fixture_trees(
+        plan: &CompilerPlan,
+        result: &crate::build_runtime::CapturedExecution,
+    ) -> Result<()> {
+        let manifest = result
+            .successful_result()
+            .context("missing fixture result")?;
+        for (name, destination) in &plan.destinations {
+            let Artifact::GeneratedTree(tree) = &manifest.outputs[name] else {
+                anyhow::bail!("expected generated fixture tree");
+            };
+            let staged = crate::build_runtime::materialize_tree(
+                tree,
+                destination.parent().context("stage parent")?,
+                |blob, path| {
+                    std::io::copy(
+                        &mut result.open_blob(blob.id)?,
+                        &mut std::fs::File::create(path)?,
+                    )?;
+                    Ok(())
+                },
+            )?;
+            staged.publish(destination)?;
+        }
+        Ok(())
+    }
+
     fn verify_compilation(
         executable: &Path,
         args: &[&str],
@@ -1625,43 +1694,12 @@ mod tests {
             (&SourceDigestCache::default(), None),
         )?;
         let store = NativeStore::open(&cwd.join("native-store"))?;
-        let leases = plan
-            .inputs
-            .iter()
-            .map(|tree| tree.import(&store).map(std::sync::Arc::new))
-            .collect::<Result<Vec<_>>>()?;
-        let result = execute(
-            &plan.spec,
-            &store,
-            &ExecutionPolicy {
-                platform,
-                bubblewrap: "/usr/bin/bwrap".into(),
-                scratch: cwd.clone(),
-                timeout: Duration::from_secs(60),
-                max_result_bytes: 64 * 1024 * 1024,
-            },
-            &leases,
-            None,
-            || Ok(()),
-            |_| {},
-        )?;
-        if !result.status().success() {
-            let mut stderr = Vec::new();
-            if let Some(blob) = result.diagnostics().1 {
-                result.open_blob(blob.id)?.read_to_end(&mut stderr)?;
-            }
-            anyhow::bail!(
-                "isolated compiler failed: {}",
-                String::from_utf8_lossy(&stderr)
-            );
-        }
+        let result = execute_fixture_plan(&plan, &store, &cwd)?;
         let manifest = result
             .successful_result()
-            .context("compiler produced no result")?;
-        plan.spec.action_request()?.validate_result(manifest)?;
+            .context("missing compiler fixture result")?;
         let mut replayed = BTreeMap::new();
         if let Some(link) = &replay {
-            use crate::build_runtime::materialize_tree;
             let readers = manifest
                 .blobs()?
                 .into_iter()
@@ -1709,51 +1747,8 @@ mod tests {
                     &cwd,
                     &cache,
                 )?;
-                let leases = capture_plan
-                    .inputs
-                    .iter()
-                    .map(|tree| tree.import(&store).map(Arc::new))
-                    .collect::<Result<Vec<_>>>()?;
-                let captured = execute(
-                    &capture_plan.spec,
-                    &store,
-                    &ExecutionPolicy {
-                        platform,
-                        bubblewrap: "/usr/bin/bwrap".into(),
-                        scratch: cwd.clone(),
-                        timeout: Duration::from_secs(60),
-                        max_result_bytes: 64 * 1024 * 1024,
-                    },
-                    &leases,
-                    None,
-                    || Ok(()),
-                    |_| {},
-                )?;
-                ensure!(captured.status().success(), "isolated link planning failed");
-                let manifest = captured
-                    .successful_result()
-                    .context("missing link planning result")?;
-                capture_plan
-                    .spec
-                    .action_request()?
-                    .validate_result(manifest)?;
-                for (name, destination) in &capture_plan.destinations {
-                    let Artifact::GeneratedTree(tree) = &manifest.outputs[name] else {
-                        anyhow::bail!("expected captured invocation tree");
-                    };
-                    let staged = materialize_tree(
-                        tree,
-                        destination.parent().context("stage parent")?,
-                        |blob, path| {
-                            std::io::copy(
-                                &mut captured.open_blob(blob.id)?,
-                                &mut std::fs::File::create(path)?,
-                            )?;
-                            Ok(())
-                        },
-                    )?;
-                    staged.publish(destination)?;
-                }
+                let captured = execute_fixture_plan(&capture_plan, &store, &cwd)?;
+                publish_fixture_trees(&capture_plan, &captured)?;
                 link_plan.complete_link_inputs(&link.inputs, capture.read()?, &cache, None)?;
             } else {
                 link_plan.complete_link_inputs(&link.inputs, Vec::new(), &cache, None)?;
@@ -1774,57 +1769,8 @@ mod tests {
                         .contains_key(&source_path)
                 );
             }
-            let leases = link_plan
-                .inputs
-                .iter()
-                .map(|tree| tree.import(&store).map(Arc::new))
-                .collect::<Result<Vec<_>>>()?;
-            let linked = execute(
-                &link_plan.spec,
-                &store,
-                &ExecutionPolicy {
-                    platform,
-                    bubblewrap: "/usr/bin/bwrap".into(),
-                    scratch: cwd.clone(),
-                    timeout: Duration::from_secs(60),
-                    max_result_bytes: 64 * 1024 * 1024,
-                },
-                &leases,
-                None,
-                || Ok(()),
-                |_| {},
-            )?;
-            if !linked.status().success() {
-                let mut stderr = Vec::new();
-                if let Some(blob) = linked.diagnostics().1 {
-                    linked.open_blob(blob.id)?.read_to_end(&mut stderr)?;
-                }
-                anyhow::bail!(
-                    "isolated link task failed: {}",
-                    String::from_utf8_lossy(&stderr)
-                );
-            }
-            let manifest = linked
-                .successful_result()
-                .context("missing successful link manifest")?;
-            for (index, (_, _, destination)) in link.workspace.outputs().enumerate() {
-                let Artifact::GeneratedTree(tree) = &manifest.outputs[&format!("codegen-{index}")]
-                else {
-                    anyhow::bail!("expected final generated tree");
-                };
-                let staged = materialize_tree(
-                    tree,
-                    destination.parent().context("stage parent")?,
-                    |blob, path| {
-                        std::io::copy(
-                            &mut linked.open_blob(blob.id)?,
-                            &mut std::fs::File::create(path)?,
-                        )?;
-                        Ok(())
-                    },
-                )?;
-                staged.publish(destination)?;
-            }
+            let linked = execute_fixture_plan(&link_plan, &store, &cwd)?;
+            publish_fixture_trees(&link_plan, &linked)?;
             link.publish(&artifact)?;
             for output in &link.expected {
                 let physical = cwd.join(&output.path);
@@ -1985,36 +1931,7 @@ mod tests {
         store: &NativeStore,
         scratch: &Path,
     ) -> Result<crate::build_runtime::ResultManifest> {
-        let leases = plan
-            .inputs
-            .iter()
-            .map(|tree| tree.import(store).map(Arc::new))
-            .collect::<Result<Vec<_>>>()?;
-        let result = execute(
-            &plan.spec,
-            store,
-            &ExecutionPolicy {
-                platform: ContentId::of(b"test"),
-                bubblewrap: "/usr/bin/bwrap".into(),
-                scratch: scratch.to_owned(),
-                timeout: Duration::from_secs(60),
-                max_result_bytes: 64 * 1024 * 1024,
-            },
-            &leases,
-            None,
-            || Ok(()),
-            |_| {},
-        )?;
-        if !result.status().success() {
-            let mut stderr = Vec::new();
-            if let Some(blob) = result.diagnostics().1 {
-                result.open_blob(blob.id)?.read_to_end(&mut stderr)?;
-            }
-            anyhow::bail!(
-                "isolated C++ compile failed: {}",
-                String::from_utf8_lossy(&stderr)
-            );
-        }
+        let result = execute_fixture_plan(plan, store, scratch)?;
         let manifest = result
             .successful_result()
             .context("missing C++ result")?

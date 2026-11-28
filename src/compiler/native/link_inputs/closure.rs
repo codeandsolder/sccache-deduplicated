@@ -906,6 +906,35 @@ mod tests {
         args.iter().map(OsString::from).collect()
     }
 
+    fn observed_linker_inputs(
+        root: &Path,
+        linker: &str,
+        args: &[OsString],
+    ) -> Result<BTreeSet<PathBuf>> {
+        let output = std::process::Command::new(linker)
+            .current_dir(root)
+            .args(args)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{linker}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let dependencies = fs::read_to_string(root.join("dependencies"))?;
+        let first = dependencies
+            .split("\n\n")
+            .next()
+            .context("missing dependency rule")?;
+        let (_, dependencies) = first
+            .split_once(':')
+            .context("missing dependency separator")?;
+        Ok(dependencies
+            .split_whitespace()
+            .filter(|word| *word != "\\")
+            .map(|word| root.join(word))
+            .collect())
+    }
+
     #[test]
     fn response_syntax_preserves_bytes_and_literal_hash() -> Result<()> {
         assert_eq!(
@@ -1058,28 +1087,7 @@ mod tests {
             if !Path::new(linker).exists() {
                 continue;
             }
-            let output = Command::new(linker)
-                .current_dir(root)
-                .args(&args)
-                .output()?;
-            ensure!(
-                output.status.success(),
-                "{linker}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let dependencies = fs::read_to_string(root.join("dependencies"))?;
-            let first_rule = dependencies
-                .split("\n\n")
-                .next()
-                .context("missing dependency rule")?;
-            let (_, dependencies) = first_rule
-                .split_once(':')
-                .context("missing dependency separator")?;
-            let observed = dependencies
-                .split_whitespace()
-                .filter(|word| *word != "\\")
-                .map(|word| root.join(word))
-                .collect::<BTreeSet<_>>();
+            let observed = observed_linker_inputs(root, linker, &args)?;
             assert_eq!(closure.files, observed, "{linker}");
         }
         Ok(())
@@ -1170,25 +1178,7 @@ mod tests {
             &|p| Ok(p.to_owned()),
             &|_| false,
         )?;
-        let output = Command::new("ld").current_dir(root).args(&args).output()?;
-        ensure!(
-            output.status.success(),
-            "GNU ld: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let dependencies = fs::read_to_string(root.join("dependencies"))?;
-        let first = dependencies
-            .split("\n\n")
-            .next()
-            .context("missing dependency rule")?;
-        let (_, dependencies) = first
-            .split_once(':')
-            .context("missing dependency separator")?;
-        let observed = dependencies
-            .split_whitespace()
-            .filter(|word| *word != "\\")
-            .map(|word| root.join(word))
-            .collect::<BTreeSet<_>>();
+        let observed = observed_linker_inputs(root, "ld", &args)?;
         assert_eq!(closure.files, observed);
         assert!(closure.files.contains(&root.join("first/libx.a")));
         assert!(closure.files.contains(&root.join("second/libx.a")));
@@ -1265,28 +1255,7 @@ mod tests {
                 &|p| Ok(p.to_owned()),
                 &|_| false,
             )?;
-            let output = Command::new(linker)
-                .current_dir(root)
-                .args(&args)
-                .output()?;
-            ensure!(
-                output.status.success(),
-                "{linker}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let dependencies = fs::read_to_string(root.join("dependencies"))?;
-            let first = dependencies
-                .split("\n\n")
-                .next()
-                .context("missing dependency rule")?;
-            let (_, dependencies) = first
-                .split_once(':')
-                .context("missing dependency separator")?;
-            let observed = dependencies
-                .split_whitespace()
-                .filter(|word| *word != "\\")
-                .map(|word| root.join(word))
-                .collect::<BTreeSet<_>>();
+            let observed = observed_linker_inputs(root, linker, &args)?;
             assert_eq!(closure.files, observed, "{linker}");
             assert_eq!(closure.files.contains(&root.join("dso/libchild.so")), bfd);
         }
