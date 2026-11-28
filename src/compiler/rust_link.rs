@@ -490,25 +490,6 @@ impl RustLinkStages {
         arguments
     }
 
-    /// Override the executable, not the linker flavor. Preserve the
-    /// compiler's option ordering and place the override before a trailing
-    /// end-of-options marker.
-    #[cfg(test)]
-    pub(crate) fn capture_arguments(&self, artifact: &Path, relay: &Path) -> Vec<OsString> {
-        let mut arguments = self.link_arguments(artifact);
-        let position = if self.arguments.input > 0
-            && self.arguments.original[self.arguments.input - 1] == "--"
-        {
-            self.arguments.input + 1
-        } else {
-            arguments.len()
-        };
-        let mut linker = OsString::from("-Clinker=");
-        linker.push(relay);
-        arguments.insert(position, linker);
-        arguments
-    }
-
     /// Locate the compiler-produced .rlink in the generated output delta.
     /// Neither the crate name, the codegen-unit count nor file naming is
     /// guessed. The returned path refers to the original logical namespace.
@@ -671,20 +652,14 @@ impl PrivateOutputTree {
 pub struct NativeLinkLayout {
     pub(crate) dep_info: Option<PathBuf>,
     pub(crate) environment: Vec<(OsString, OsString)>,
-    pub(crate) split: bool,
 }
 
 #[cfg(feature = "dist-client")]
 impl NativeLinkLayout {
-    pub(crate) fn new(
-        dep_info: Option<PathBuf>,
-        environment: Vec<(OsString, OsString)>,
-        split: bool,
-    ) -> Self {
+    pub(crate) fn new(dep_info: Option<PathBuf>, environment: Vec<(OsString, OsString)>) -> Self {
         Self {
             dep_info,
             environment,
-            split,
         }
     }
 }
@@ -750,11 +725,6 @@ impl NativeLinkWorkspace {
 
     pub(crate) fn link_arguments(&self, artifact: &Path) -> Vec<OsString> {
         self.stages.link_arguments(artifact)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn capture_arguments(&self, artifact: &Path, relay: &Path) -> Vec<OsString> {
-        self.stages.capture_arguments(artifact, relay)
     }
 
     pub(crate) fn codegen_directory(&self) -> &Path {

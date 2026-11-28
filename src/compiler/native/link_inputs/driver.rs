@@ -17,7 +17,7 @@ use crate::compiler::native::link_capture::CapturedInvocation;
 pub(super) struct DriverPlan {
     pub arguments: Vec<OsString>,
     pub tools: BTreeSet<PathBuf>,
-    pub default_search: Vec<PathBuf>,
+    pub search: closure::LinkerSearch,
     pub response_files: BTreeSet<PathBuf>,
 }
 
@@ -162,6 +162,23 @@ fn environment(
     Ok(result)
 }
 
+fn locate(
+    name: &OsStr,
+    cwd: &Path,
+    environment: &BTreeMap<OsString, OsString>,
+    input: &LinkInputs,
+) -> Result<PathBuf> {
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return input.physical(path);
+    }
+    if path.components().count() > 1 {
+        return Ok(cwd.join(path));
+    }
+    which::which_in(path, environment.get(OsStr::new("PATH")), cwd)
+        .with_context(|| format!("captured linker tool {} unavailable", path.display()))
+}
+
 impl DriverPlan {
     pub(super) fn discover(input: &LinkInputs, capture: &CapturedInvocation) -> Result<Self> {
         let (options, spec) = input.target_spec()?;
@@ -215,7 +232,12 @@ impl DriverPlan {
 
         let mut tools = BTreeSet::new();
         let (linker, arguments) = if flavor.ends_with("-cc") {
-            let driver = input.locate(linker_name.unwrap_or_else(|| OsStr::new("cc")))?;
+            let driver = locate(
+                linker_name.unwrap_or_else(|| OsStr::new("cc")),
+                &cwd,
+                &environment,
+                input,
+            )?;
             tools.insert(driver.clone());
             let arguments = expanded
                 .iter()
@@ -234,7 +256,7 @@ impl DriverPlan {
                 String::from_utf8_lossy(&output.stderr)
             );
             let (program, command) = dry_link_command(&output.stderr)?;
-            let program = input.locate(program.as_os_str())?;
+            let program = locate(program.as_os_str(), &cwd, &environment, input)?;
             tools.insert(program.clone());
             let linker = if program.file_name() == Some(OsStr::new("collect2")) {
                 let name =
@@ -253,7 +275,7 @@ impl DriverPlan {
                         .output()?;
                     ensure!(output.status.success(), "linker executable query failed");
                     let name = std::str::from_utf8(&output.stdout)?.trim();
-                    input.locate(OsStr::new(name))?
+                    locate(OsStr::new(name), &cwd, &environment, input)?
                 }
             } else {
                 program
@@ -275,39 +297,35 @@ impl DriverPlan {
                 .collect::<Result<Vec<_>>>()?;
             (linker, arguments)
         } else {
-            let linker = if let Some(name) = linker_name {
-                input.locate(name)?
-            } else if flavor.contains("lld") || flavor.starts_with("wasm") {
-                let target = options
-                    .target
-                    .as_deref()
-                    .and_then(OsStr::to_str)
-                    .or_else(|| spec.get("llvm-target").and_then(serde_json::Value::as_str))
-                    .context("target linker path unavailable")?;
-                let sysroot = input
-                    .compiler
-                    .parent()
-                    .and_then(Path::parent)
-                    .context("compiler sysroot unavailable")?;
-                sysroot
-                    .join("lib/rustlib")
-                    .join(target)
-                    .join("bin/rust-lld")
-            } else {
-                input.locate(OsStr::new("ld"))?
-            };
+            let name = linker_name.unwrap_or_else(|| {
+                if flavor.contains("lld") || flavor.starts_with("wasm") {
+                    OsStr::new("rust-lld")
+                } else {
+                    OsStr::new("ld")
+                }
+            });
+            let linker = locate(name, &cwd, &environment, input)?;
             (linker, expanded)
         };
         tools.insert(linker.clone());
 
-        let version = Command::new(&linker)
-            .current_dir(&cwd)
-            .env_clear()
-            .envs(&environment)
-            .arg("--version")
-            .output()?;
-        ensure!(version.status.success(), "query selected linker version");
-        let default_search = if version.stdout.starts_with(b"GNU ld") {
+        let mut query = Command::new(&linker);
+        query.current_dir(&cwd).env_clear().envs(&environment);
+        // rust-lld is the generic multiplexer. Preserve the captured
+        // -flavor selector when asking it for version information.
+        if let Some(index) = arguments.iter().position(|arg| arg == "-flavor") {
+            query
+                .arg("-flavor")
+                .arg(arguments.get(index + 1).context("missing LLD flavor")?);
+        }
+        let version = query.arg("--version").output()?;
+        ensure!(
+            version.status.success(),
+            "query selected linker version: {}",
+            String::from_utf8_lossy(&version.stderr)
+        );
+        let bfd = version.stdout.starts_with(b"GNU ld");
+        let default_search = if bfd {
             // GNU ld's default script reflects the selected emulation and
             // sysroot; neither is necessarily the compiler's host default.
             let mut command = Command::new(&linker);
@@ -339,7 +357,26 @@ impl DriverPlan {
         Ok(Self {
             arguments,
             tools,
-            default_search,
+            search: closure::LinkerSearch {
+                default_paths: default_search,
+                bfd,
+                native: spec.get("os").and_then(serde_json::Value::as_str) == Some("linux")
+                    && spec
+                        .get("arch")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|arch| {
+                            arch == std::env::consts::ARCH
+                                || (arch == "x86" && std::env::consts::ARCH == "x86_64")
+                        }),
+                ld_library_path: capture
+                    .environment
+                    .get(OsStr::new("LD_LIBRARY_PATH"))
+                    .map_or_else(Vec::new, |value| std::env::split_paths(value).collect()),
+                ld_run_path: capture
+                    .environment
+                    .get(OsStr::new("LD_RUN_PATH"))
+                    .map_or_else(Vec::new, |value| std::env::split_paths(value).collect()),
+            },
             response_files,
         })
     }

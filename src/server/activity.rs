@@ -527,10 +527,17 @@ impl Activity {
         let mut state = lock(&self.state);
         if let Some(report) = result.native.last() {
             state.history.action = Some(report.key);
-            state.history.outcome = Some(match report.source {
-                NativeBuildSource::Hit => TraceOutcome::Hit,
-                NativeBuildSource::Worker(_) => TraceOutcome::Worker,
-            });
+            state.history.outcome = Some(
+                if result
+                    .native
+                    .iter()
+                    .any(|report| matches!(report.source, NativeBuildSource::Worker(_)))
+                {
+                    TraceOutcome::Worker
+                } else {
+                    TraceOutcome::Hit
+                },
+            );
         }
         if result.retcode != Some(0) || result.signal.is_some() {
             state.history.outcome = Some(TraceOutcome::Failed);

@@ -204,6 +204,7 @@ pub struct NativeCompileReport {
 pub enum NativeStage {
     Compile,
     Codegen,
+    LinkPlan,
     Link,
 }
 

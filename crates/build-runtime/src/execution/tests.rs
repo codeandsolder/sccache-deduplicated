@@ -166,6 +166,7 @@ fn shell_output_fixture(
     let spec = ExecutionSpec {
         compiler_result: None,
         working_inputs: Default::default(),
+        scratch: Default::default(),
         platform,
         root: ExecutionRoot {
             id: first,
@@ -356,6 +357,7 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
     let mut spec = ExecutionSpec {
         compiler_result: None,
         working_inputs: Default::default(),
+        scratch: Default::default(),
         platform, root: ExecutionRoot { id: root, recipe: TreeRecipe::union(metadata(0o755), [root]) },
         mounts: BTreeMap::from([(BuildPath::new(b"/src".to_vec())?, src)]),
         command: CommandSpec {
@@ -572,6 +574,7 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
     let spec = ExecutionSpec {
         compiler_result: None,
         working_inputs: Default::default(),
+        scratch: Default::default(),
         platform: ContentId::of(b"platform"),
         root: ExecutionRoot {
             id: crate::TreeId([0; 32]),

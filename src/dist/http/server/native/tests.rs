@@ -24,6 +24,7 @@ fn action(root: &TreeManifest) -> Result<ExecutionSpec> {
     Ok(ExecutionSpec {
         compiler_result: None,
         working_inputs: Default::default(),
+        scratch: Default::default(),
         platform: ContentId::of(b"test-platform"),
         root: ExecutionRoot::resolve(
             TreeRecipe::union(

@@ -412,6 +412,11 @@ fn writable_locations(
 ) -> Result<BTreeSet<BuildPath>> {
     let tmp = BuildPath::new(b"/tmp".to_vec())?;
     let mut writable = BTreeSet::from([tmp]);
+    for path in &spec.scratch {
+        let (mount, tree) = backing(leases, path)?;
+        require_directory(tree, relative(path, mount)?)?;
+        writable.insert(path.clone());
+    }
     for output in spec.outputs.values() {
         let (mount, tree) = backing(leases, &output.path)?;
         let path = relative(&output.path, mount)?;

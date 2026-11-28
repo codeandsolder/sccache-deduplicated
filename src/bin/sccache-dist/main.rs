@@ -3192,6 +3192,7 @@ mod scheduler_tests {
             spec: ExecutionSpec {
                 compiler_result: None,
                 working_inputs: Default::default(),
+                scratch: Default::default(),
                 platform,
                 root: ExecutionRoot {
                     id: TreeId([0; 32]),

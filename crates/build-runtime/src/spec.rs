@@ -181,6 +181,8 @@ pub struct ExecutionSpec {
     /// Root-relative destinations of recipe layers whose files belong to this
     /// action's generated output tree. Other input files remain immutable.
     pub working_inputs: BTreeSet<TreePath>,
+    /// Existing directories made privately writable but never captured as results.
+    pub scratch: BTreeSet<BuildPath>,
     pub platform: ContentId,
     pub root: ExecutionRoot,
     pub mounts: BTreeMap<BuildPath, TreeId>,
@@ -213,6 +215,20 @@ impl ExecutionSpec {
                 "overlapping build mounts"
             );
         }
+        for path in &self.scratch {
+            path.validate()?;
+            ensure!(
+                path.as_bytes() != b"/"
+                    && ![b"/proc".as_slice(), b"/dev"]
+                        .iter().any(|reserved| path.within(reserved))
+                    && !self.mounts.keys().any(|mount| path.within(mount.as_bytes()) || mount.within(path.as_bytes())),
+                "scratch directory conflicts with reserved or mounted path"
+            );
+        }
+        ensure!(
+            self.scratch.is_empty() || self.compiler_result.is_none(),
+            "private scratch requires exact action identity"
+        );
         let mut paths = BTreeSet::new();
         for (name, output) in &self.outputs {
             ensure!(
@@ -265,8 +281,12 @@ impl ExecutionSpec {
                     self.outputs
                         .values()
                         .any(|output| output.kind == OutputKind::GeneratedTree
-                            && absolute.within(output.path.as_bytes())),
-                    "working input must lie in a generated output tree"
+                            && absolute.within(output.path.as_bytes()))
+                        || self
+                            .scratch
+                            .iter()
+                            .any(|path| absolute.within(path.as_bytes())),
+                    "working input must lie in a generated output tree or private scratch"
                 );
                 ensure!(
                     !self
@@ -296,6 +316,12 @@ impl ExecutionSpec {
         self.validate()?;
         let mut components = self.command.input_components()?;
         components.insert("platform".into(), self.platform);
+        if !self.scratch.is_empty() {
+            components.insert(
+                "output/private-scratch".into(),
+                ContentId(typed_digest(b"native-private-scratch-v1\0", &self.scratch)?),
+            );
+        }
         if !self.working_inputs.is_empty() {
             let layers = self
                 .working_inputs
@@ -409,6 +435,7 @@ mod tests {
         Ok(ExecutionSpec {
             compiler_result: None,
             working_inputs: Default::default(),
+            scratch: Default::default(),
             platform: ContentId::of(b"platform"),
             root: ExecutionRoot {
                 id: TreeId([1; 32]),
@@ -440,6 +467,29 @@ mod tests {
                 },
             )]),
         })
+    }
+
+    #[test]
+    fn private_scratch_is_keyed_and_not_an_output() -> Result<()> {
+        let base = spec()?;
+        let mut scratch = base.clone();
+        scratch
+            .scratch
+            .insert(BuildPath::new(b"/tmp/build".to_vec())?);
+        let request = scratch.action_request()?;
+        assert_eq!(
+            request.required_outputs,
+            base.action_request()?.required_outputs
+        );
+        assert_ne!(
+            request.action_fingerprint()?.key()?,
+            base.action_request()?.action_fingerprint()?.key()?
+        );
+        scratch
+            .scratch
+            .insert(BuildPath::new(b"/src/nested".to_vec())?);
+        assert!(scratch.validate().is_err());
+        Ok(())
     }
 
     #[test]

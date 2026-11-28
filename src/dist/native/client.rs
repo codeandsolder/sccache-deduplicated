@@ -1193,6 +1193,7 @@ mod result_tests {
         let spec = ExecutionSpec {
             compiler_result: None,
             working_inputs: Default::default(),
+            scratch: Default::default(),
             platform: ContentId::of(b"platform"),
             root: ExecutionRoot::resolve(
                 TreeRecipe::union(metadata(0o755), [input.id()]),

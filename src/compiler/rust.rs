@@ -237,7 +237,6 @@ pub struct ParsedArguments {
     emit: HashSet<String>,
     /// Metadata-only invocations produce this file regardless of crate type.
     metadata_only_output: Option<String>,
-    native_linked: bool,
     split_link: bool,
     split_link_metadata: Option<String>,
     /// The value of any `--color` option passed on the commandline.
@@ -1545,7 +1544,7 @@ where
             {
                 NativeLinkPolicy::Split
             } else {
-                NativeLinkPolicy::Whole
+                NativeLinkPolicy::Unsupported
             }
         } else {
             NativeLinkPolicy::Unsupported
@@ -2101,7 +2100,6 @@ counted_array!(static ARGS: [ArgInfo<ArgData>; _] = [
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NativeLinkPolicy {
     Unsupported,
-    Whole,
     Split,
 }
 
@@ -2324,29 +2322,21 @@ fn parse_arguments(
         cannot_cache!("unsupported --emit");
     }
     let metadata_only = emit.contains("metadata") && !emit.contains("link");
-    // rustc currently tracks -Zno-link in the crate metadata hash. An
-    // unchanged Rust dependency rebuilt through that path could invalidate
-    // existing downstream artifacts (E0460/E0463). Native consumers need
-    // only the final machine-code/ABI artifact, not a Rust crate identity.
-    // A test harness always emits an executable regardless of crate type.
-    let metadata_bearing =
-        !test_harness && (crate_types.rlib || other_crate_types.iter().any(|kind| kind != "bin"));
+    // -Zno-link is a tracked rustc option. Every linked artifact in the
+    // managed nightly pipeline is produced by the same codegen contract,
+    // including Rust metadata-bearing outputs. Consumers receive the actual
+    // generated crate identity; no unsplit artifact is substituted.
     let native_leaf = test_harness
         || crate_types.staticlib
         || crate_types.cdylib
-        || other_crate_types.contains("bin");
-    let linked = emit.contains("link")
+        || other_crate_types
+            .iter()
+            .any(|kind| matches!(kind.as_str(), "bin" | "dylib" | "proc-macro"));
+    let split_link = native_leaf
+        && emit.contains("link")
         && !metadata_only
-        && (native_leaf
-            || other_crate_types
-                .iter()
-                .any(|kind| matches!(kind.as_str(), "dylib" | "proc-macro")));
-    let native_linked = linked && native_link_policy != NativeLinkPolicy::Unsupported;
-    let split_link = native_linked
-        && native_link_policy == NativeLinkPolicy::Split
-        && native_leaf
-        && !metadata_bearing;
-    if !metadata_only && !native_linked {
+        && native_link_policy == NativeLinkPolicy::Split;
+    if !metadata_only && !split_link {
         // General linked Rust artifacts remain non-cacheable: their native
         // linker inputs are opaque. A test harness always links an executable,
         // irrespective of an explicit crate type.
@@ -2455,7 +2445,6 @@ fn parse_arguments(
         gcno: gcno.map(std::convert::Into::into),
         emit,
         metadata_only_output,
-        native_linked,
         split_link,
         split_link_metadata,
         color_mode,
@@ -2560,50 +2549,43 @@ pub(super) struct NativeLinkDiscovery {
     pub target: Option<OsString>,
     pub linker: Option<OsString>,
     pub flavor: Option<String>,
-    pub search_paths: Vec<PathBuf>,
-    pub link_arguments: Vec<String>,
-    #[cfg(test)]
-    pub external_linker: bool,
+    pub external_linkers: usize,
 }
 
 #[cfg(all(feature = "dist-client", target_os = "linux"))]
 pub(super) fn native_link_discovery(args: &[OsString]) -> Result<NativeLinkDiscovery> {
     let mut discovery = NativeLinkDiscovery::default();
+    let mut kinds = std::collections::BTreeSet::new();
+    let mut test = false;
     for argument in ArgsIter::new(args.iter().cloned(), &ARGS[..]).with_double_dashes() {
         let argument = argument?;
-        #[cfg(test)]
-        {
-            discovery.external_linker |=
-                matches!(&argument, Argument::UnknownFlag(flag) if flag == "--test");
-        }
+        test |= matches!(&argument, Argument::UnknownFlag(flag) if flag == "--test");
         match argument.get_data() {
-            #[cfg(test)]
             Some(CrateType(types)) => {
-                discovery.external_linker |= types.cdylib
-                    || types
+                if types.cdylib {
+                    kinds.insert("cdylib".to_owned());
+                }
+                kinds.extend(
+                    types
                         .others
                         .iter()
-                        .any(|kind| matches!(kind.as_str(), "bin" | "dylib" | "proc-macro"));
+                        .filter(|kind| matches!(kind.as_str(), "bin" | "dylib" | "proc-macro"))
+                        .cloned(),
+                );
             }
             Some(Target(target)) => discovery.target = Some(target.clone().into_arg_os_string()),
-            Some(LinkPath(ArgLinkPath { kind, path })) if kind == "native" || kind == "all" => {
-                discovery.search_paths.push(path.clone())
-            }
             Some(CodeGen(ArgCodegen {
                 opt,
                 value: Some(value),
             })) => match opt.as_str() {
                 "linker" => discovery.linker = Some(value.into()),
                 "linker-flavor" => discovery.flavor = Some(value.clone()),
-                "link-arg" | "link_arg" => discovery.link_arguments.push(value.clone()),
-                "link-args" | "link_args" => discovery
-                    .link_arguments
-                    .extend(value.split_whitespace().map(str::to_owned)),
                 _ => {}
             },
             _ => {}
         }
     }
+    discovery.external_linkers = if test { 1 } else { kinds.len() };
     Ok(discovery)
 }
 
@@ -3704,14 +3686,13 @@ where
         }
 
         #[cfg(all(feature = "dist-client", target_os = "linux"))]
-        let native_link = self.parsed_args.native_linked.then(|| {
+        let native_link = self.parsed_args.split_link.then(|| {
             super::rust_link::NativeLinkLayout::new(
                 self.parsed_args
                     .dep_info
                     .as_ref()
                     .map(|name| cwd.join(&self.parsed_args.output_dir).join(name)),
                 env_vars.clone(),
-                self.parsed_args.split_link,
             )
         });
         Ok(HashResult {
@@ -3726,7 +3707,7 @@ where
                 crate_link_paths: self.parsed_args.crate_link_paths.clone(),
                 crate_name: self.parsed_args.crate_name.clone(),
                 #[cfg(feature = "dist-client")]
-                can_trim_rlibs: !self.parsed_args.native_linked
+                can_trim_rlibs: !self.parsed_args.split_link
                     && (self.parsed_args.metadata_only_output.is_some()
                         || matches!(
                             self.parsed_args.crate_types,
@@ -5683,10 +5664,11 @@ mod test {
     #[test_case::test_case("cdylib", false, true; "native_shared_library")]
     #[test_case::test_case("staticlib", false, true; "native_static_library")]
     #[test_case::test_case("rlib", false, false; "rlib")]
-    #[test_case::test_case("proc-macro", false, false; "proc_macro")]
-    #[test_case::test_case("dylib", false, false; "rust_dynamic_library")]
-    #[test_case::test_case("rlib,cdylib", false, false; "mixed_metadata")]
-    fn native_link_policy_respects_rust_metadata_identity(
+    #[test_case::test_case("proc-macro", false, true; "proc_macro")]
+    #[test_case::test_case("dylib", false, true; "rust_dynamic_library")]
+    #[test_case::test_case("rlib,cdylib", false, true; "mixed_metadata")]
+    #[test_case::test_case("rlib,dylib", false, true; "mixed_rust_metadata")]
+    fn native_link_policy_splits_all_linked_crates(
         crate_type: &str,
         test_harness: bool,
         expected: bool,
@@ -5706,23 +5688,17 @@ mod test {
         if test_harness {
             args.push("--test".into());
         }
-        for policy in [NativeLinkPolicy::Whole, NativeLinkPolicy::Split] {
-            match parse_arguments(&args, Path::new("."), policy) {
-                CompilerArguments::Ok(parsed) => {
+        match parse_arguments(&args, Path::new("."), NativeLinkPolicy::Split) {
+            CompilerArguments::Ok(parsed) => {
+                assert_eq!(parsed.split_link, expected);
+                if expected {
                     assert_eq!(
-                        parsed.split_link,
-                        expected && policy == NativeLinkPolicy::Split
+                        parsed.split_link_metadata.as_deref(),
+                        Some("libprobe.rmeta")
                     );
-                    assert_eq!(parsed.native_linked, crate_type != "rlib" || test_harness);
-                    if parsed.split_link {
-                        assert_eq!(
-                            parsed.split_link_metadata.as_deref(),
-                            Some("libprobe.rmeta")
-                        );
-                    }
                 }
-                other => panic!("unexpected native policy outcome {other:?}"),
             }
+            other => panic!("unexpected native policy outcome {other:?}"),
         }
     }
 
@@ -7136,7 +7112,6 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 dep_info: Some("foo-abc.d".into()),
                 emit,
                 metadata_only_output: None,
-                native_linked: false,
                 split_link: false,
                 split_link_metadata: None,
                 color_mode: ColorMode::Auto,
@@ -7244,7 +7219,6 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 dep_info: None,
                 emit,
                 metadata_only_output: None,
-                native_linked: false,
                 split_link: false,
                 split_link_metadata: None,
                 color_mode: ColorMode::Auto,

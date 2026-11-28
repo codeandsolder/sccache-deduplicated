@@ -641,6 +641,76 @@ struct CompilerPlan {
 }
 
 impl CompilerPlan {
+    /// Classify only files actually observed in private writable locations
+    /// that are absent from the immutable snapshot. The final compiler
+    /// recreates these files; they are not dependencies on the origin.
+    fn generated_paths(
+        &self,
+        invocation: &link_capture::CapturedInvocation,
+    ) -> Result<BTreeSet<PathBuf>> {
+        let mut recipe = self.spec.root.recipe.clone();
+        recipe.layers.retain(|layer| {
+            !layer
+                .destination
+                .as_ref()
+                .is_some_and(|path| self.spec.working_inputs.contains(path))
+        });
+        let immutable = recipe.compose(
+            &self
+                .inputs
+                .iter()
+                .map(|tree| (tree.id(), tree.manifest()))
+                .collect(),
+        )?;
+        let roots = self
+            .spec
+            .outputs
+            .values()
+            .map(|output| {
+                let path = Path::new(std::ffi::OsStr::from_bytes(output.path.as_bytes()));
+                if output.kind.is_tree() {
+                    Ok(path)
+                } else {
+                    path.parent().context("output has no parent")
+                }
+            })
+            .chain(
+                self.spec
+                    .scratch
+                    .iter()
+                    .map(|path| Ok(Path::new(std::ffi::OsStr::from_bytes(path.as_bytes())))),
+            )
+            .chain(std::iter::once(Ok(Path::new("/tmp"))))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(invocation
+            .existing_paths
+            .iter()
+            .filter(|path| {
+                roots.iter().any(|root| path.starts_with(root))
+                    && path.strip_prefix("/").is_ok_and(|relative| {
+                        !immutable
+                            .entries
+                            .contains_key(relative.as_os_str().as_bytes())
+                    })
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn complete_link_inputs(
+        &mut self,
+        inputs: &link_inputs::LinkInputs,
+        captures: Vec<link_capture::CapturedInvocation>,
+        cache: &SourceDigestCache,
+        client: Option<&NativeCompilerClient>,
+    ) -> Result<()> {
+        for invocation in captures {
+            let generated = self.generated_paths(&invocation)?;
+            self.extend_inputs(inputs.prepare_captured(&invocation, &generated, cache, client)?)?;
+        }
+        Ok(())
+    }
+
     /// Extend a completed root using its existing snapshot as the authority.
     /// Different package builders may normalize timestamps differently.
     /// Keep the already-declared inode for an identical file (content and
@@ -803,6 +873,7 @@ impl CompilerPlan {
         let spec = ExecutionSpec {
             compiler_result,
             working_inputs: Default::default(),
+            scratch: Default::default(),
             platform,
             root,
             mounts: BTreeMap::new(),
@@ -821,12 +892,11 @@ impl CompilerPlan {
 /// Split a Rust action without changing its logical cwd, argument ordering,
 /// target, or environment. The private delivery directories are independent
 /// of all of those key fields.
-#[cfg(test)]
 mod link_capture;
 mod link_inputs;
 
 struct NativeLink {
-    inputs: link_inputs::LinkInputs,
+    inputs: Arc<link_inputs::LinkInputs>,
     workspace: super::rust_link::NativeLinkWorkspace,
     layout: super::rust_link::NativeLinkLayout,
     expected: Vec<FileObjectSource>,
@@ -850,13 +920,13 @@ impl NativeLink {
             .map(std::ffi::OsString::from)
             .collect();
         let logical_cwd = PathBuf::from(&remote.cwd);
-        let inputs = link_inputs::LinkInputs::new(
+        let inputs = Arc::new(link_inputs::LinkInputs::new(
             transformer.to_local(&remote.executable)?,
             physical_cwd.clone(),
             layout.environment.clone(),
             transformer,
             args.clone(),
-        );
+        ));
         let stages = RustLinkStages::from_expanded(args, &logical_cwd, |cwd, path| {
             let logical = cwd.join(path);
             let physical = transformer
@@ -898,14 +968,6 @@ impl NativeLink {
         })
     }
 
-    fn linker_inputs(
-        &self,
-        cache: &SourceDigestCache,
-        client: Option<&NativeCompilerClient>,
-    ) -> Result<Vec<PreparedTree>> {
-        self.inputs.prepare(cache, client)
-    }
-
     fn outputs(&self) -> Vec<NativeOutput> {
         self.workspace
             .outputs()
@@ -927,7 +989,6 @@ impl NativeLink {
         base: &CompilerPlan,
         generated: &ResultManifest,
         provider: &ReferenceBlobProvider,
-        linker_inputs: Vec<PreparedTree>,
     ) -> Result<(CompilerPlan, PathBuf)> {
         base.spec.action_request()?.validate_result(generated)?;
         let mut plan = base.clone();
@@ -986,7 +1047,7 @@ impl NativeLink {
             .into_iter()
             .map(|arg| arg.as_os_str().as_bytes().to_vec())
             .collect();
-        plan.extend_inputs(linker_inputs)?;
+        plan.spec.validate()?;
         Ok((plan, artifact))
     }
 
@@ -1007,7 +1068,6 @@ fn prepare_dispatch(
     cwd: &Path,
     scratch: &mut Option<tempfile::TempDir>,
     split: &mut Option<NativeLink>,
-    whole_link: &mut Option<link_inputs::LinkInputs>,
 ) -> Result<(Vec<NativeOutput>, dist::PathTransformer, DistPackagers)> {
     super::core::validate_dist_environment_dependencies(
         remote,
@@ -1017,10 +1077,7 @@ fn prepare_dispatch(
         .outputs()
         .filter(|output| output.key != "d")
         .collect::<Vec<_>>();
-    let outputs = if let Some(layout) = compilation
-        .native_link_layout()
-        .filter(|layout| layout.split)
-    {
+    let outputs = if let Some(layout) = compilation.native_link_layout() {
         let directory = tempfile::Builder::new()
             .prefix("sccache-native-link-")
             .tempdir()?;
@@ -1037,19 +1094,6 @@ fn prepare_dispatch(
         *split = Some(link);
         outputs
     } else {
-        if let Some(link) = compilation.native_link_layout() {
-            *whole_link = Some(link_inputs::LinkInputs::new(
-                transformer.to_local(&remote.executable)?,
-                cwd.to_owned(),
-                link.environment.clone(),
-                &transformer,
-                remote
-                    .arguments
-                    .iter()
-                    .map(std::ffi::OsString::from)
-                    .collect(),
-            ));
-        }
         expected
             .into_iter()
             .map(|output| NativeOutput::file(cwd, output))
@@ -1061,6 +1105,76 @@ fn prepare_dispatch(
     }
     let packagers = compilation.into_dist_packagers(transformer)?;
     Ok((outputs, layout, packagers))
+}
+
+/// Obtain the actual linker command in a scheduler-owned, cacheable
+/// planning task. No generated compiler artifacts are published by this
+/// task. A failing discovery is explicit; there is no broad inventory or
+/// caller-side linking fallback.
+async fn prepare_link_action(
+    client: &Arc<NativeCompilerClient>,
+    plan: &mut CompilerPlan,
+    inputs: Arc<link_inputs::LinkInputs>,
+    mode: ActionMode,
+    pool: &tokio::runtime::Handle,
+    reports: &mut Vec<crate::protocol::NativeCompileReport>,
+) -> Result<Option<NativeBuildResult>> {
+    use crate::protocol::{NativeCompileReport, NativeStage};
+    let start = Instant::now();
+    let scratch = tempfile::Builder::new()
+        .prefix("sccache-link-capture-")
+        .tempdir()?;
+    let directory = scratch.path().to_owned();
+    let preparation_client = Arc::clone(client);
+    let discovery = Arc::clone(&inputs);
+    let base = plan.clone();
+    let prepared = pool
+        .spawn_blocking(move || {
+            discovery
+                .relay()?
+                .map(|(basename, expected)| {
+                    link_capture::LinkCapture::configure(
+                        base,
+                        &basename,
+                        expected,
+                        &directory,
+                        &preparation_client.toolchain_digests,
+                    )
+                })
+                .transpose()
+        })
+        .await??;
+    let Some((capture, capture_plan)) = prepared else {
+        return Ok(None);
+    };
+    let (result, key) = Arc::clone(client)
+        .execute(capture_plan, mode, BTreeSet::new(), pool)
+        .await?;
+    reports.push(NativeCompileReport {
+        key,
+        mode,
+        source: result.source,
+        stage: NativeStage::LinkPlan,
+        successful: result.output.status.success(),
+        duration: start.elapsed(),
+    });
+    if !result.output.status.success() {
+        return Ok(Some(result));
+    }
+    let preparation_client = Arc::clone(client);
+    let mut completed = plan.clone();
+    *plan = pool
+        .spawn_blocking(move || {
+            completed.complete_link_inputs(
+                &inputs,
+                capture.read()?,
+                &preparation_client.toolchain_digests,
+                Some(&preparation_client),
+            )?;
+            Ok::<_, anyhow::Error>(completed)
+        })
+        .await??;
+    Ok(None)
 }
 
 pub(super) async fn compile<T: CommandCreatorSync>(
@@ -1108,7 +1222,6 @@ pub(super) async fn compile<T: CommandCreatorSync>(
     // Hold the private delivery directories until split-link completion.
     let mut scratch = None;
     let mut split = None;
-    let mut whole_link = None;
     let (outputs, layout, packagers) = prepare_dispatch(
         compilation,
         &mut remote,
@@ -1116,12 +1229,11 @@ pub(super) async fn compile<T: CommandCreatorSync>(
         &cwd,
         &mut scratch,
         &mut split,
-        &mut whole_link,
     )?;
     let preparation_client = Arc::clone(&client);
     let plan = pool
         .spawn_blocking(move || {
-            let mut plan = CompilerPlan::prepare(
+            CompilerPlan::prepare(
                 remote,
                 &cwd,
                 outputs,
@@ -1132,14 +1244,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                     &preparation_client.toolchain_digests,
                     Some(&preparation_client),
                 ),
-            )?;
-            if let Some(link) = whole_link {
-                plan.extend_inputs(link.prepare(
-                    &preparation_client.toolchain_digests,
-                    Some(&preparation_client),
-                )?)?;
-            }
-            Ok::<_, anyhow::Error>(plan)
+            )
         })
         .await??;
     crate::server::activity::phase(crate::server::activity::Phase::RunDistributed);
@@ -1162,26 +1267,40 @@ pub(super) async fn compile<T: CommandCreatorSync>(
             duration: stage_start.elapsed(),
         });
         if generated.output.status.success() {
-            let preparation_client = Arc::clone(&client);
             let manifest = generated
                 .manifest
                 .take()
                 .context("missing successful codegen manifest")?;
-            let (link, link_plan, artifact) = pool
+            let (link, mut link_plan, artifact) = pool
                 .spawn_blocking(move || {
-                    let inputs = link.linker_inputs(
-                        &preparation_client.toolchain_digests,
-                        Some(&preparation_client),
-                    )?;
-                    let (link_plan, artifact) =
-                        link.plan(&plan, &manifest, &lease.provider, inputs)?;
+                    let (link_plan, artifact) = link.plan(&plan, &manifest, &lease.provider)?;
                     Ok::<_, anyhow::Error>((link, link_plan, artifact))
                 })
                 .await??;
+            let failure = prepare_link_action(
+                &client,
+                &mut link_plan,
+                Arc::clone(&link.inputs),
+                mode,
+                pool,
+                &mut reports,
+            )
+            .await?;
             let stage_start = Instant::now();
-            let (mut linked, key) = client
-                .execute(link_plan, mode, BTreeSet::new(), pool)
-                .await?;
+            let (mut linked, key) = if let Some(mut failure) = failure {
+                generated.output.stdout.append(&mut failure.output.stdout);
+                generated.output.stderr.append(&mut failure.output.stderr);
+                failure.output.stdout = generated.output.stdout;
+                failure.output.stderr = generated.output.stderr;
+                return Ok((
+                    CompileResult::Native(reports, start.elapsed()),
+                    failure.output,
+                ));
+            } else {
+                client
+                    .execute(link_plan, mode, BTreeSet::new(), pool)
+                    .await?
+            };
             if linked.output.status.success() {
                 pool.spawn_blocking(move || link.publish(&artifact))
                     .await??;
@@ -1409,15 +1528,14 @@ mod tests {
                 )?))
             });
             let cache = SourceDigestCache::default();
-            let (mut link_plan, artifact) = link.plan(&plan, manifest, &provider, Vec::new())?;
+            let (mut link_plan, artifact) = link.plan(&plan, manifest, &provider)?;
             // Exercise the capture action without the external linker closure.
             // No host linker is available to this execution.
-            if let Some(basename) = link.inputs.relay_basename()? {
+            if let Some((basename, expected)) = link.inputs.relay()? {
                 let (capture, capture_plan) = link_capture::LinkCapture::configure(
                     link_plan.clone(),
-                    &link.workspace,
-                    &artifact,
                     &basename,
+                    expected,
                     &cwd,
                     &cache,
                 )?;
@@ -1466,50 +1584,7 @@ mod tests {
                     )?;
                     staged.publish(destination)?;
                 }
-                let invocation = capture.read()?;
-                ensure!(!invocation.arguments.is_empty(), "empty linker invocation");
-                ensure!(invocation.cwd.is_absolute(), "invalid linker cwd");
-                let mut immutable_recipe = link_plan.spec.root.recipe.clone();
-                immutable_recipe.layers.retain(|layer| {
-                    !layer
-                        .destination
-                        .as_ref()
-                        .is_some_and(|path| link_plan.spec.working_inputs.contains(path))
-                });
-                let immutable = immutable_recipe.compose(
-                    &link_plan
-                        .inputs
-                        .iter()
-                        .map(|tree| (tree.id(), tree.manifest()))
-                        .collect(),
-                )?;
-                let generated_roots = link
-                    .workspace
-                    .outputs()
-                    .map(|(root, _, _)| root)
-                    .chain(std::iter::once(Path::new("/tmp")))
-                    .collect::<Vec<_>>();
-                let generated_paths = invocation
-                    .existing_paths
-                    .iter()
-                    .filter(|path| {
-                        generated_roots.iter().any(|root| path.starts_with(root))
-                            && path.strip_prefix("/").is_ok_and(|relative| {
-                                !immutable
-                                    .entries
-                                    .contains_key(relative.as_os_str().as_bytes())
-                            })
-                    })
-                    .cloned()
-                    .collect();
-                link_plan.extend_inputs(link.inputs.prepare_captured(
-                    &invocation,
-                    &generated_paths,
-                    &cache,
-                    None,
-                )?)?;
-            } else {
-                link_plan.extend_inputs(link.linker_inputs(&cache, None)?)?;
+                link_plan.complete_link_inputs(&link.inputs, capture.read()?, &cache, None)?;
             }
             let leases = link_plan
                 .inputs

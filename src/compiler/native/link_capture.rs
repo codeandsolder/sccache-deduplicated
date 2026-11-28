@@ -29,11 +29,14 @@ const OUTPUT_NAME: &str = "link-invocation";
 // The outer wrapper accepts only a complete, single invocation capture.
 const RELAY: &str = r#"#!/bin/sh
 set -eu
-out=/__sccache_link_capture/out
-if [ -e "$out/argv" ]; then
-    : > "$out/duplicate"
-    exit 1
-fi
+base=/__sccache_link_capture/out
+n=0
+while :; do
+    out="$base/invocation-$n"
+    if /usr/bin/mkdir "$out" 2>/dev/null; then break; fi
+    test -d "$out" || exit 1
+    n=$((n + 1))
+done
 printf '%s\0' "$#" "$@" > "$out/argv"
 pwd -P > "$out/cwd"
 /usr/bin/env -0 > "$out/environment"
@@ -69,13 +72,21 @@ done
 "#;
 
 const WRAPPER: &str = r#"
+expected=$1
+shift
 if "$@"; then :; fi
 out=/__sccache_link_capture/out
-test -f "$out/complete" && test -s "$out/argv" && test ! -e "$out/duplicate"
+n=0
+for dir in "$out"/invocation-*; do
+    test -f "$dir/complete" && test -s "$dir/argv" || exit 1
+    n=$((n + 1))
+done
+test "$n" -eq "$expected"
 "#;
 
 pub(super) struct LinkCapture {
     destination: PathBuf,
+    expected: usize,
 }
 
 pub(super) struct CapturedInvocation {
@@ -89,9 +100,8 @@ pub(super) struct CapturedInvocation {
 impl LinkCapture {
     pub(super) fn configure(
         mut plan: CompilerPlan,
-        workspace: &super::super::rust_link::NativeLinkWorkspace,
-        artifact: &Path,
         basename: &OsStr,
+        expected: usize,
         scratch: &Path,
         cache: &SourceDigestCache,
     ) -> Result<(Self, CompilerPlan)> {
@@ -100,6 +110,7 @@ impl LinkCapture {
             matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none(),
             "invalid linker relay basename"
         );
+        ensure!(expected > 0, "capture must expect at least one invocation");
         let relay = Path::new(CAPTURE_ROOT).join("bin").join(basename);
         let directories = pkg::native_directory_metadata()?;
         let relative =
@@ -115,7 +126,7 @@ impl LinkCapture {
             },
         )?;
         let mut tools = pkg::ToolchainPackageBuilder::new();
-        for path in ["/bin/sh", "/usr/bin/env", "/usr/bin/cat"] {
+        for path in ["/bin/sh", "/usr/bin/env", "/usr/bin/cat", "/usr/bin/mkdir"] {
             tools.add_executable_and_deps(PathBuf::from(path))?;
         }
         plan.extend_inputs(vec![
@@ -124,44 +135,67 @@ impl LinkCapture {
         ])?;
 
         let compiler = plan.spec.command.executable.as_bytes().to_vec();
+        let mut compiler_arguments = std::mem::take(&mut plan.spec.command.arguments);
+        let mut linker = b"-Clinker=".to_vec();
+        linker.extend_from_slice(relay.as_os_str().as_bytes());
+        let index = compiler_arguments
+            .iter()
+            .position(|arg| arg == b"--")
+            .unwrap_or(compiler_arguments.len());
+        compiler_arguments.insert(index, linker);
         let mut arguments = vec![
             b"-c".to_vec(),
             WRAPPER.as_bytes().to_vec(),
             b"link-capture".to_vec(),
+            expected.to_string().into_bytes(),
             compiler,
         ];
-        arguments.extend(
-            workspace
-                .capture_arguments(artifact, &relay)
-                .into_iter()
-                .map(OsStringExt::into_vec),
-        );
+        arguments.extend(compiler_arguments);
         plan.spec.command.executable = BuildPath::new(b"/bin/sh".to_vec())?;
         plan.spec.command.arguments = arguments;
-        ensure!(
+        // Original output directories are private scratch, not publication
+        // targets. Capture must not upload another copy of codegen artifacts.
+        for output in std::mem::take(&mut plan.spec.outputs).into_values() {
+            let path = Path::new(OsStr::from_bytes(output.path.as_bytes()));
+            let root = if output.kind.is_tree() {
+                path
+            } else {
+                path.parent().context("output has no parent")?
+            };
             plan.spec
-                .outputs
-                .insert(
-                    OUTPUT_NAME.into(),
-                    OutputSpec {
-                        path: BuildPath::new(CAPTURE_OUTPUT.as_bytes().to_vec())?,
-                        required: true,
-                        kind: OutputKind::GeneratedTree,
-                    }
-                )
-                .is_none(),
-            "link capture output name conflicts with codegen"
+                .scratch
+                .insert(BuildPath::new(root.as_os_str().as_bytes().to_vec())?);
+        }
+        plan.spec.outputs.insert(
+            OUTPUT_NAME.into(),
+            OutputSpec {
+                path: BuildPath::new(CAPTURE_OUTPUT.as_bytes().to_vec())?,
+                required: true,
+                kind: OutputKind::GeneratedTree,
+            },
         );
-        // The intermediate output roots still exist as private writable
-        // working inputs. Only the captured invocation is delivered.
         let destination = scratch.join("link-invocation");
         plan.destinations = BTreeMap::from([(OUTPUT_NAME.into(), destination.clone())]);
         plan.spec.validate()?;
-        Ok((Self { destination }, plan))
+        Ok((
+            Self {
+                destination,
+                expected,
+            },
+            plan,
+        ))
     }
 
-    pub(super) fn read(&self) -> Result<CapturedInvocation> {
-        CapturedInvocation::read(&self.destination)
+    pub(super) fn read(&self) -> Result<Vec<CapturedInvocation>> {
+        ensure!(
+            std::fs::read_dir(&self.destination)?.count() == self.expected,
+            "link capture invocation count mismatch"
+        );
+        (0..self.expected)
+            .map(|index| {
+                CapturedInvocation::read(&self.destination.join(format!("invocation-{index}")))
+            })
+            .collect()
     }
 }
 

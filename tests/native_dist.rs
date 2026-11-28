@@ -1497,6 +1497,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let spec = ExecutionSpec {
         compiler_result: None,
         working_inputs: Default::default(),
+        scratch: Default::default(),
         platform: ContentId::of(PLATFORM.as_bytes()),
         root: ExecutionRoot::resolve(
             TreeRecipe {
@@ -1956,6 +1957,7 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
     let mut spec = ExecutionSpec {
         compiler_result: None,
         working_inputs: Default::default(),
+        scratch: Default::default(),
         platform: ContentId::of(PLATFORM.as_bytes()),
         root: ExecutionRoot::resolve(
             TreeRecipe {
@@ -2516,16 +2518,16 @@ for i in 1 2; do
     build/testcase-stage --quiet
     test ! -e build/testcase-stage.rlink
 done
-# -Zno-link currently changes the crate metadata hash. The native
-# backend must not silently replace a proc macro with an incompatible
-# metadata identity, even though its linker invocation can be replayed.
-"$3" --crate-name identity --crate-type proc-macro --edition=2024 --emit=link,dep-info --out-dir build -Cextra-filename=-stage identity.rs
-"$3" --crate-name intermediate --crate-type rlib --edition=2024 --extern identity=build/libidentity-stage.so intermediate.rs --out-dir build
-rm -f build/libidentity-stage.so
-"$1" "$3" --crate-name identity --crate-type proc-macro --edition=2024 --emit=link,dep-info --out-dir build -Cextra-filename=-stage identity.rs
-"$3" --edition=2024 --extern intermediate=build/libintermediate.rlib -Ldependency=build consumer.rs -o build/consumer
-build/consumer
-test ! -e build/identity-stage.rlink
+# All managed linked crates have the same split-codegen metadata identity.
+# Build the full dependency chain twice to verify both execution and reuse.
+for i in 1 2; do
+    rm -f build/libidentity-stage.so build/libintermediate.rlib build/consumer
+    "$1" "$3" --crate-name identity --crate-type proc-macro --edition=2024 --emit=link,dep-info --out-dir build -Cextra-filename=-stage identity.rs
+    "$1" "$3" --crate-name intermediate --crate-type rlib --edition=2024 --emit=link,dep-info --extern identity=build/libidentity-stage.so intermediate.rs --out-dir build
+    "$1" "$3" --crate-name consumer --crate-type bin --edition=2024 --emit=link,dep-info --extern intermediate=build/libintermediate.rlib -Ldependency=build consumer.rs --out-dir build
+    build/consumer
+    test ! -e build/identity-stage.rlink
+done
 
 "#
 }
@@ -2868,10 +2870,10 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         "direct native compiler path failed"
     );
     let stats = service.stats()?;
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 10);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 19);
     assert_eq!(stats.forced_recaches, 2);
-    assert_eq!(stats.cache_hits.all(), 7);
-    assert_eq!(stats.cache_misses.all(), 10);
+    assert_eq!(stats.cache_hits.all(), 15);
+    assert_eq!(stats.cache_misses.all(), 19);
     assert_eq!(stats.dist_errors, 0);
 
     let visible = root.join("visible");
@@ -2896,8 +2898,8 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     );
     let stats = service.stats()?;
     let namespace_compiles = stats.dist_compiles.values().sum::<usize>();
-    assert!((19..=20).contains(&namespace_compiles));
-    assert_eq!(stats.cache_hits.all() + stats.cache_misses.all(), 34);
+    assert!((37..=38).contains(&namespace_compiles));
+    assert_eq!(stats.cache_hits.all() + stats.cache_misses.all(), 68);
     assert_eq!(stats.forced_recaches, 4);
     assert_eq!(stats.dist_errors, 0);
     assert!(private.join("build/probe.o").is_file());
@@ -2933,7 +2935,7 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     let stats = service.stats()?;
     assert_eq!(
         stats.cache_hits.all(),
-        32 - u64::try_from(namespace_compiles)?
+        98 - u64::try_from(namespace_compiles)?
     );
     assert_eq!(
         stats.dist_compiles.values().sum::<usize>(),

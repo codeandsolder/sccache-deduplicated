@@ -55,6 +55,7 @@ fn assignment(marker: u8) -> Result<NativeAssignment> {
         spec: ExecutionSpec {
             compiler_result: None,
             working_inputs: Default::default(),
+            scratch: Default::default(),
             platform: ContentId::of(b"dispatch-test"),
             root: ExecutionRoot {
                 id: TreeId([0; 32]),

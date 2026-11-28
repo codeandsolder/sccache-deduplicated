@@ -9,6 +9,7 @@ fn spec(args: &[&str]) -> anyhow::Result<ExecutionSpec> {
     Ok(ExecutionSpec {
         compiler_result: None,
         working_inputs: Default::default(),
+        scratch: Default::default(),
         platform: ContentId::of(b"platform"),
         root: ExecutionRoot {
             id: root,

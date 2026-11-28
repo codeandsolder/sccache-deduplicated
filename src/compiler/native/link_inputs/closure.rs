@@ -2,7 +2,7 @@
 //! it never launches the linker or recursively inventories a library directory.
 //! The caller supplies the path mapping and any already-declared virtual files.
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::{OsStr, OsString},
     fs,
     io::Read,
@@ -11,6 +11,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+
+use super::elf::{DynamicInfo, Identity};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum LibraryMode {
@@ -33,6 +35,30 @@ struct CommandInputs {
     search: Vec<PathBuf>,
     sysroot: Option<PathBuf>,
     operands: Vec<Operand>,
+    rpath: Vec<PathBuf>,
+    rpath_link: Vec<PathBuf>,
+    shared: bool,
+    relocatable: bool,
+    allow_shlib_undefined: Option<bool>,
+    copy_needed: bool,
+    as_needed: bool,
+}
+
+#[derive(Default)]
+pub(super) struct LinkerSearch {
+    pub default_paths: Vec<PathBuf>,
+    pub bfd: bool,
+    pub native: bool,
+    pub ld_library_path: Vec<PathBuf>,
+    pub ld_run_path: Vec<PathBuf>,
+}
+
+fn split_paths(value: &OsStr) -> Vec<PathBuf> {
+    value
+        .as_bytes()
+        .split(|byte| *byte == b':')
+        .map(|path| PathBuf::from(OsStr::from_bytes(path)))
+        .collect()
 }
 
 // GNU response files support backslash quoting and either quote style.
@@ -151,10 +177,42 @@ impl CommandInputs {
                 mode = LibraryMode::Static;
             } else if matches!(arg, b"-Bdynamic" | b"-dy" | b"-call_shared") {
                 mode = LibraryMode::Dynamic;
+            } else if matches!(arg, b"-shared" | b"--shared" | b"-Bshareable") {
+                result.shared = true;
+            } else if matches!(arg, b"-r" | b"--relocatable" | b"-Ur") {
+                result.relocatable = true;
+                mode = LibraryMode::Static;
+            } else if arg == b"--allow-shlib-undefined" {
+                result.allow_shlib_undefined = Some(true);
+            } else if arg == b"--no-allow-shlib-undefined" {
+                result.allow_shlib_undefined = Some(false);
+            } else if arg == b"--copy-dt-needed-entries" || arg == b"--add-needed" {
+                result.copy_needed = true;
+            } else if arg == b"--no-copy-dt-needed-entries" || arg == b"--no-add-needed" {
+                result.copy_needed = false;
+            } else if arg == b"--as-needed" {
+                result.as_needed = true;
+            } else if arg == b"--no-as-needed" {
+                result.as_needed = false;
+            } else if let Some(path) = value(arg, b"--rpath-link", None, &mut pending)?.or(value(
+                arg,
+                b"-rpath-link",
+                None,
+                &mut pending,
+            )?) {
+                result.rpath_link.extend(split_paths(&path));
+            } else if let Some(path) = value(arg, b"--rpath", None, &mut pending)?.or(value(
+                arg,
+                b"-rpath",
+                None,
+                &mut pending,
+            )?) {
+                result.rpath.extend(split_paths(&path));
             } else if arg == b"--push-state" {
-                states.push(mode);
+                states.push((mode, result.as_needed, result.copy_needed));
             } else if arg == b"--pop-state" {
-                mode = states.pop().context("unmatched linker --pop-state")?;
+                (mode, result.as_needed, result.copy_needed) =
+                    states.pop().context("unmatched linker --pop-state")?;
             } else if let Some(path) = value(arg, b"--library-path", Some(b"-L"), &mut pending)? {
                 result.search.push(PathBuf::from(path));
             } else if let Some(path) = value(arg, b"--sysroot", None, &mut pending)? {
@@ -216,6 +274,7 @@ impl CommandInputs {
                     b"--plugin",
                     b"-plugin",
                     b"--export-dynamic-symbol-list",
+                    b"--allow-undefined-file",
                 ] {
                     if let Some(path) = value(arg, option, None, &mut pending)? {
                         result
@@ -242,15 +301,12 @@ impl CommandInputs {
                     (b"-dynamic-linker", None),
                     (b"--soname", Some(b"-h")),
                     (b"-soname", None),
-                    (b"--rpath", None),
-                    (b"-rpath", None),
-                    (b"--rpath-link", None),
-                    (b"-rpath-link", None),
                     (b"--Map", None),
                     (b"-Map", None),
                     (b"--dependency-file", None),
                     (b"--why-extract", None),
                     (b"--reproduce", None),
+                    (b"--lto-obj-path", None),
                     (b"--wrap", None),
                     (b"--hash-style", None),
                     (b"--exclude-libs", None),
@@ -261,6 +317,15 @@ impl CommandInputs {
                     (b"--error-limit", None),
                     (b"--threads", None),
                     (b"--image-base", None),
+                    (b"-flavor", None),
+                    (b"--export", None),
+                    (b"--export-if-defined", None),
+                    (b"--export-dynamic-symbol", None),
+                    (b"--initial-memory", None),
+                    (b"--max-memory", None),
+                    (b"--global-base", None),
+                    (b"--table-base", None),
+                    (b"--stack-size", None),
                     (b"--section-start", None),
                     (b"--fuse-ld", None),
                     (b"-fuse-ld", None),
@@ -427,13 +492,22 @@ struct Resolver<'a> {
     sysroot: Option<PathBuf>,
     closure: LinkClosure,
     visited: BTreeSet<PathBuf>,
+    bfd: bool,
+    target: Option<Identity>,
+    shared_libraries: BTreeMap<PathBuf, DynamicInfo>,
+    sonames: BTreeSet<OsString>,
+    follow_needed: bool,
+    as_needed: bool,
+    rpath: Vec<PathBuf>,
+    rpath_link: Vec<PathBuf>,
+    configuration: LinkerSearch,
 }
 
 impl LinkClosure {
     pub(super) fn discover(
         words: Vec<OsString>,
         cwd: &Path,
-        default_search: Vec<PathBuf>,
+        configuration: LinkerSearch,
         physical: &dyn Fn(&Path) -> Result<PathBuf>,
         virtual_file: &dyn Fn(&Path) -> bool,
     ) -> Result<Self> {
@@ -451,7 +525,18 @@ impl LinkClosure {
             search,
             sysroot,
             operands,
+            rpath,
+            rpath_link,
+            shared,
+            relocatable,
+            allow_shlib_undefined,
+            copy_needed,
+            as_needed,
         } = CommandInputs::parse(expanded)?;
+        let bfd = configuration.bfd;
+        let follow_needed =
+            bfd && !relocatable && (copy_needed || !allow_shlib_undefined.unwrap_or(shared));
+        let default_paths = configuration.default_paths.clone();
         let mut resolver = Resolver {
             cwd,
             physical,
@@ -463,9 +548,34 @@ impl LinkClosure {
                 directories: BTreeSet::new(),
             },
             visited: BTreeSet::new(),
+            bfd,
+            target: None,
+            shared_libraries: BTreeMap::new(),
+            sonames: BTreeSet::new(),
+            follow_needed,
+            as_needed,
+            rpath,
+            rpath_link,
+            configuration,
         };
-        for directory in search.into_iter().chain(default_search) {
+        for directory in search.into_iter().chain(default_paths) {
             resolver.add_search(directory)?;
+        }
+        // BFD can inspect and skip incompatible candidates before reaching
+        // a usable library. The actual dependency file includes the skipped
+        // files, so they must also be declared. Infer the target from an
+        // explicit object or archive rather than the worker architecture.
+        if resolver.bfd {
+            for operand in &operands {
+                if let Operand::File(path) = operand
+                    && let Ok(path) = resolver.find(path, None)
+                    && !(resolver.virtual_file)(&path)
+                    && let Some(identity) = Identity::read(&(resolver.physical)(&path)?)?
+                {
+                    resolver.target = Some(identity);
+                    break;
+                }
+            }
         }
         for response in response_files {
             resolver.record(&cwd.join(response))?;
@@ -486,6 +596,7 @@ impl LinkClosure {
                 Operand::Library(name, mode) => resolver.library(&name, mode)?,
             }
         }
+        resolver.transitive_shared_libraries()?;
         Ok(resolver.closure)
     }
 }
@@ -568,15 +679,101 @@ impl Resolver<'_> {
                 LibraryMode::Dynamic => vec![make(b".so"), make(b".a")],
             }
         };
-        for directory in &self.search {
+        for directory in self.search.clone() {
             for name in &names {
                 let candidate = directory.join(name);
                 if self.exists(&candidate)? {
+                    let incompatible = self.bfd
+                        && !(self.virtual_file)(&candidate)
+                        && self.target.is_some()
+                        && Identity::read(&(self.physical)(&candidate)?)?
+                            .is_some_and(|identity| Some(identity) != self.target);
+                    if incompatible {
+                        self.record(&candidate)?;
+                        // A thin archive can cause BFD to open its member
+                        // even while deciding whether the archive matches.
+                        self.file(&candidate, None, mode, false)?;
+                        continue;
+                    }
                     return self.file(&candidate, None, mode, false);
                 }
             }
         }
         bail!("linker library {} not found", name.to_string_lossy())
+    }
+
+    fn transitive_shared_libraries(&mut self) -> Result<()> {
+        if !self.follow_needed {
+            return Ok(());
+        }
+        let mut visited = BTreeSet::new();
+        while let Some(path) = self
+            .shared_libraries
+            .keys()
+            .find(|path| !visited.contains(*path))
+            .cloned()
+        {
+            visited.insert(path.clone());
+            let info = &self.shared_libraries[&path];
+            let mut search = self.rpath_link.clone();
+            search.extend(self.rpath.iter().cloned());
+            if self.configuration.native {
+                if self.rpath_link.is_empty() && self.rpath.is_empty() {
+                    search.extend(self.configuration.ld_run_path.iter().cloned());
+                }
+                search.extend(self.configuration.ld_library_path.iter().cloned());
+                search.extend(info.runpath.as_ref().unwrap_or(&info.rpath).iter().cloned());
+            }
+            // Default directories from the actual linker script, not a
+            // recursive library inventory. Explicit -L is not rpath-link.
+            search.extend(self.configuration.default_paths.iter().cloned());
+            let search = search
+                .into_iter()
+                .map(|directory| expand_runtime_path(&directory, &path, info.identity))
+                .collect::<Vec<_>>();
+            let needed = info.needed.clone();
+            for name in needed {
+                if self.sonames.contains(&name) {
+                    continue;
+                }
+                let mut candidate = None;
+                let mut preferred = false;
+                for directory in &search {
+                    let path = self.cwd.join(directory).join(&name);
+                    if !self.exists(&path)? {
+                        continue;
+                    }
+                    if (self.virtual_file)(&path) {
+                        candidate = Some(path);
+                        break;
+                    }
+                    let physical = (self.physical)(&path)?;
+                    let Some(info) = DynamicInfo::read(&physical)? else {
+                        continue;
+                    };
+                    self.record(&path)?;
+                    if self.target.is_some() && info.identity != self.target {
+                        continue;
+                    }
+                    let libc = info.has_libc();
+                    if candidate.is_none() || (!preferred && libc) {
+                        candidate = Some(path);
+                        preferred = libc;
+                    }
+                    if !self.as_needed || libc {
+                        break;
+                    }
+                }
+                if let Some(path) = candidate {
+                    self.sonames.insert(name);
+                    self.file(&path, None, LibraryMode::Dynamic, false)?;
+                }
+                // A missing DT_NEEDED library is a warning in GNU ld and
+                // can still produce a valid executable. Preserve that
+                // behavior; the final sandbox has the same absence.
+            }
+        }
+        Ok(())
     }
 
     fn record(&mut self, path: &Path) -> Result<()> {
@@ -633,6 +830,19 @@ impl Resolver<'_> {
                 }
                 return Ok(());
             }
+            if self.follow_needed
+                && prefix.starts_with(b"\x7fELF")
+                && let Some(info) = DynamicInfo::read(&physical)?
+                && (self.target.is_none() || info.identity == self.target)
+            {
+                if let Some(soname) = &info.soname {
+                    self.sonames.insert(soname.clone());
+                }
+                if let Some(name) = path.file_name() {
+                    self.sonames.insert(name.to_owned());
+                }
+                self.shared_libraries.insert(path.clone(), info);
+            }
             if prefix.starts_with(b"\x7fELF")
                 || prefix.starts_with(b"!<arch>\n")
                 || prefix.starts_with(b"BC\xc0\xde")
@@ -654,6 +864,38 @@ impl Resolver<'_> {
         }
         Ok(())
     }
+}
+
+fn expand_runtime_path(directory: &Path, parent: &Path, identity: Option<Identity>) -> PathBuf {
+    let origin = parent
+        .parent()
+        .unwrap_or(Path::new("/"))
+        .as_os_str()
+        .as_bytes();
+    let lib = identity.map_or("lib", Identity::lib_directory).as_bytes();
+    let mut remaining = directory.as_os_str().as_bytes();
+    let mut expanded = Vec::new();
+    while !remaining.is_empty() {
+        let mut matched = false;
+        for (token, value) in [
+            (b"${ORIGIN}".as_slice(), origin),
+            (b"$ORIGIN", origin),
+            (b"${LIB}", lib),
+            (b"$LIB", lib),
+        ] {
+            if let Some(rest) = remaining.strip_prefix(token) {
+                expanded.extend_from_slice(value);
+                remaining = rest;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            expanded.push(remaining[0]);
+            remaining = &remaining[1..];
+        }
+    }
+    PathBuf::from(OsString::from_vec(expanded))
 }
 
 #[cfg(test)]
@@ -712,7 +954,7 @@ mod tests {
             LinkClosure::discover(
                 words(&["@args.rsp"]),
                 root,
-                Vec::new(),
+                LinkerSearch::default(),
                 &|p| Ok(p.to_owned()),
                 &|_| false,
             )
@@ -802,7 +1044,7 @@ mod tests {
         let closure = LinkClosure::discover(
             args.clone(),
             root,
-            Vec::new(),
+            LinkerSearch::default(),
             &|path| Ok(path.to_owned()),
             &|_| false,
         )?;
@@ -864,7 +1106,7 @@ mod tests {
         let closure = LinkClosure::discover(
             words(&["libthin.a"]),
             root,
-            Vec::new(),
+            LinkerSearch::default(),
             &|p| Ok(p.to_owned()),
             &|_| false,
         )?;
@@ -878,6 +1120,180 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires GNU ld, ar and an installed C runtime startup object"]
+    fn bfd_records_skipped_incompatible_candidates() -> Result<()> {
+        use std::process::Command;
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        for name in ["first", "second"] {
+            fs::create_dir(root.join(name))?;
+        }
+        let crt = Command::new("cc").arg("-print-file-name=crti.o").output()?;
+        ensure!(crt.status.success(), "C runtime discovery failed");
+        fs::copy(
+            Path::new(std::str::from_utf8(&crt.stdout)?.trim()),
+            root.join("probe.o"),
+        )?;
+        let mut bytes = fs::read(root.join("probe.o"))?;
+        ensure!(bytes[5] == 1, "test requires little-endian ELF host");
+        let host_machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+        let other_machine: u16 = if host_machine == 183 { 62 } else { 183 };
+        bytes[18..20].copy_from_slice(&other_machine.to_le_bytes());
+        fs::write(root.join("first/bad.o"), bytes)?;
+        for (archive, member) in [
+            ("first/libx.a", "first/bad.o"),
+            ("second/libx.a", "probe.o"),
+        ] {
+            let output = Command::new("ar")
+                .current_dir(root)
+                .args(["crs", archive, member])
+                .output()?;
+            ensure!(output.status.success(), "create test archive");
+        }
+        let args = words(&[
+            "-r",
+            "-Lfirst",
+            "-Lsecond",
+            "-lx",
+            "-o",
+            "result.o",
+            "probe.o",
+            "--dependency-file=dependencies",
+        ]);
+        let closure = LinkClosure::discover(
+            args.clone(),
+            root,
+            LinkerSearch {
+                bfd: true,
+                ..Default::default()
+            },
+            &|p| Ok(p.to_owned()),
+            &|_| false,
+        )?;
+        let output = Command::new("ld").current_dir(root).args(&args).output()?;
+        ensure!(
+            output.status.success(),
+            "GNU ld: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let dependencies = fs::read_to_string(root.join("dependencies"))?;
+        let first = dependencies
+            .split("\n\n")
+            .next()
+            .context("missing dependency rule")?;
+        let (_, dependencies) = first
+            .split_once(':')
+            .context("missing dependency separator")?;
+        let observed = dependencies
+            .split_whitespace()
+            .filter(|word| *word != "\\")
+            .map(|word| root.join(word))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(closure.files, observed);
+        assert!(closure.files.contains(&root.join("first/libx.a")));
+        assert!(closure.files.contains(&root.join("second/libx.a")));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GNU ld, LLVM lld and an installed C runtime startup object"]
+    fn bfd_and_lld_have_distinct_transitive_dso_search() -> Result<()> {
+        use std::process::Command;
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        fs::create_dir(root.join("dso"))?;
+        let crt = Command::new("cc").arg("-print-file-name=crti.o").output()?;
+        ensure!(crt.status.success(), "C runtime discovery failed");
+        fs::copy(
+            Path::new(std::str::from_utf8(&crt.stdout)?.trim()),
+            root.join("probe.o"),
+        )?;
+        for arguments in [
+            &[
+                "-shared",
+                "-soname",
+                "libchild.so",
+                "-o",
+                "dso/libchild.so",
+                "probe.o",
+            ][..],
+            &[
+                "-shared",
+                "-soname",
+                "libparent.so",
+                "--no-as-needed",
+                "-Ldso",
+                "-lchild",
+                "-o",
+                "libparent.so",
+            ][..],
+        ] {
+            let output = Command::new("ld")
+                .current_dir(root)
+                .args(arguments)
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "create DSO: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        for (linker, bfd) in [("ld", true), ("ld.lld", false)] {
+            if !Path::new("/usr/bin").join(linker).exists() {
+                continue;
+            }
+            let args = words(&[
+                "-e",
+                "_init",
+                "-L.",
+                "-lparent",
+                "-rpath-link",
+                "dso",
+                "-o",
+                "result",
+                "probe.o",
+                "--dependency-file=dependencies",
+            ]);
+            let closure = LinkClosure::discover(
+                args.clone(),
+                root,
+                LinkerSearch {
+                    bfd,
+                    native: true,
+                    ..Default::default()
+                },
+                &|p| Ok(p.to_owned()),
+                &|_| false,
+            )?;
+            let output = Command::new(linker)
+                .current_dir(root)
+                .args(&args)
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "{linker}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let dependencies = fs::read_to_string(root.join("dependencies"))?;
+            let first = dependencies
+                .split("\n\n")
+                .next()
+                .context("missing dependency rule")?;
+            let (_, dependencies) = first
+                .split_once(':')
+                .context("missing dependency separator")?;
+            let observed = dependencies
+                .split_whitespace()
+                .filter(|word| *word != "\\")
+                .map(|word| root.join(word))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(closure.files, observed, "{linker}");
+            assert_eq!(closure.files.contains(&root.join("dso/libchild.so")), bfd);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn nested_response_cycles_are_rejected() -> Result<()> {
         let dir = tempfile::tempdir()?;
         fs::write(dir.path().join("a"), b"@b")?;
@@ -886,7 +1302,7 @@ mod tests {
             LinkClosure::discover(
                 words(&["@a"]),
                 dir.path(),
-                Vec::new(),
+                LinkerSearch::default(),
                 &|p| Ok(p.to_owned()),
                 &|_| false
             )
