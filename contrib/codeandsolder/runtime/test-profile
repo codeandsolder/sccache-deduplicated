@@ -53,6 +53,17 @@ for invalid in '--allow-unauthenticated' 'file:/tmp/tool.deb' 'foo=1.0' 'pkg*' '
     printf '%s\n' "$invalid" > "$root/invalid"
     reject 65 "$profile" key "$root/invalid"
 done
+digest=sha256:$(printf '%064d' 7)
+url=https://example.com/releases/tool.deb
+printf 'tool %s %s\n' "$digest" "$url" > "$root/pinned"
+printf '  tool  %s  %s # pinned\ntool %s %s\n' "$digest" "$url" "$digest" "$url" > "$root/pinned-equivalent"
+[[ $("$profile" key "$root/pinned") == "$("$profile" key "$root/pinned-equivalent")" ]]
+printf 'tool %s %s\ntool\n' "$digest" "$url" > "$root/invalid"
+reject 65 "$profile" key "$root/invalid"
+for invalid in "tool $digest http://example.com/tool.deb" "tool sha256:bad $url" "tool $digest $url extra"; do
+    printf '%s\n' "$invalid" > "$root/invalid"
+    reject 65 "$profile" key "$root/invalid"
+done
 ln -s "$root/absent" "$root/broken-link"
 reject 65 "$profile" select "$base" "$root/broken-link" "$catalog"
 reject 65 "$profile" register "$base" "$manifest" "$wrong" "$catalog"

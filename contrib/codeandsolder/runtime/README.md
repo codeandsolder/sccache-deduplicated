@@ -205,10 +205,23 @@ a different image. Repeated registration of the same image is idempotent.
 Catalog directories are administrator-managed and readable by build users.
 `fleet/prepare-host` and `fleet/activate-host` stage, install and roll back
 the runner and profile helper as a pair. This needs neither a daemon restart
-nor another compiler cache. Site-specific tools unavailable as Debian
-packages should be published as reviewed versioned packages through a trusted
-signed APT repository configured in the base, rather than mounting host
-`/usr` or executing arbitrary repository install scripts at build time.
+nor another compiler cache. Site-specific tools unavailable in the distribution may be supplied as a
+reviewed Debian package with its exact digest and HTTPS download URL:
+
+```text
+codeandsolder-ngspice47 sha256:d8673acd463eb147370d53f78612526adb5d77e2991c4492115997928c24e31d https://github.com/codeandsolder/ngspice/releases/download/ci-ngspice47-debian13-x86_64-r1/codeandsolder-ngspice47_47-1_amd64.deb
+```
+
+The full declaration (name, digest, URL) enters the request identity. Reject
+multiple different declarations of one name. The provisioner fetches the
+archive over HTTPS and verifies SHA-256; the image build independently
+verifies the digest, package name and installed version, then resolves the
+archive and all ordinary packages together with APT. The archive is mounted
+only during image construction and not copied into a permanent image layer.
+Managed builds still select only the approved image, never fetch or install
+packages themselves. Hosted native CI may install the same digest-pinned
+archive in its disposable runner. This does not import host `/usr` or require
+repository-specific installation scripts in managed builds.
 
 Use `test-profile` for Docker-free catalog/selection regression. For real
 acceptance, run the declared tools in the immutable profile with

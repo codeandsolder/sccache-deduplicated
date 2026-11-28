@@ -18,18 +18,23 @@ EOF
 fail() { printf '%s\n' "$*" >&2; exit 65; }
 valid_image() { [[ $1 =~ ^sha256:[0-9a-f]{64}$ ]] || fail "Expected immutable image ID: $1"; }
 normalize() {
-    local manifest=$1 line
+    local manifest=$1 line name digest url extra canonical
+    declare -A seen=()
     [[ -f $manifest && -r $manifest ]] || fail "Cannot read runtime package manifest: $manifest"
     while IFS= read -r line || [[ -n $line ]]; do
-        # One concrete Debian binary package per line. Comments and whitespace
-        # are not part of the request identity. No options, patterns or URLs.
         line=${line%%#*}
-        line=${line#"${line%%[![:space:]]*}"}
-        line=${line%"${line##*[![:space:]]}"}
-        [[ -n $line ]] || continue
-        [[ $line =~ ^[a-z0-9][a-z0-9+.-]+$ ]] || fail "Invalid Debian package name in $manifest: $line"
-        printf '%s\n' "$line"
-    done < "$manifest" | LC_ALL=C sort -u
+        read -r name digest url extra <<< "$line"
+        [[ -n $name ]] || continue
+        [[ $name =~ ^[a-z0-9][a-z0-9+.-]+$ ]] || fail "Invalid Debian package name in $manifest: $name"
+        canonical=$name
+        if [[ -n $digest || -n $url || -n $extra ]]; then
+            [[ $digest =~ ^sha256:[0-9a-f]{64}$ && $url =~ ^https://[a-zA-Z0-9._~:/%+@=-]+\.deb$ && -z $extra ]] || fail "Invalid pinned Debian archive declaration in $manifest: $line"
+            canonical="$name $digest $url"
+        fi
+        [[ ! ${seen[$name]+present} || ${seen[$name]} == "$canonical" ]] || fail "Conflicting declarations for package $name"
+        seen[$name]=$canonical
+    done < "$manifest"
+    if ((${#seen[@]})); then printf '%s\n' "${seen[@]}" | LC_ALL=C sort; fi
 }
 request_key() {
     [[ -n $1 ]] || return 0
@@ -94,7 +99,7 @@ register_image() (
     printf '%s\n' "$image"
 )
 build_image() (
-    local base=$1 manifest=$2 request key scratch here base_tag tag image
+    local base=$1 manifest=$2 request key scratch here base_tag tag image name digest url
     valid_image "$base"
     [[ $(image_field "$base" '{{.Id}}') == "$base" && $(label "$base" version) == 1 ]] || fail "Base runtime is not resident or compatible: $base"
     request=$(normalize "$manifest")
@@ -105,6 +110,12 @@ build_image() (
     scratch=$(mktemp -d)
     trap 'rm -rf -- "$scratch"' EXIT
     printf '%s\n' "$request" > "$scratch/request"
+    mkdir -- "$scratch/debs"
+    while read -r name digest url; do
+        [[ -n $digest ]] || continue
+        curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --retry 3 --max-time 300 --output "$scratch/debs/$name.deb" "$url" >&2
+        printf '%s  %s\n' "${digest#sha256:}" "$scratch/debs/$name.deb" | sha256sum -c - >&2
+    done <<< "$request"
     # Docker's local builder needs a FROM name. This alias is named by the
     # complete base ID and is checked both before and after the build.
     base_tag=local/sccache-runtime-base:sha256-${base#sha256:}
