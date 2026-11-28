@@ -27,8 +27,7 @@ const OUTPUT_NAME: &str = "link-invocation";
 // returns success to prevent rustc from retrying a different linker. Rustc may
 // subsequently try to process a nonexistent executable (e.g. packed DWARF).
 // The outer wrapper accepts only a complete, single invocation capture.
-const RELAY: &str = r#"#!/bin/sh
-set -eu
+const RELAY: &str = r#"set -eu
 base=/__sccache_link_capture/out
 n=0
 while :; do
@@ -41,6 +40,7 @@ printf '%s\0' "$#" "$@" > "$out/argv"
 pwd -P > "$out/cwd"
 /usr/bin/env -0 > "$out/environment"
 i=0
+search_next=0
 : > "$out/existing-paths"
 for arg do
     case "$arg" in
@@ -53,18 +53,28 @@ for arg do
     if [ -f "$arg" ]; then
         printf '%s\0' "$arg" >> "$out/existing-paths"
     fi
-    # rustc can generate libraries in a private -L directory. Record only
-    # filenames in those actual search locations, not file contents.
-    case "$arg" in
-        -L?*) directory=${arg#-L} ;;
-        *) directory=$arg ;;
-    esac
-    if [ -d "$directory" ]; then
-        for file in "$directory"/*; do
-            if [ -f "$file" ]; then
-                printf '%s\0' "$file" >> "$out/existing-paths"
-            fi
-        done
+    # Only generated native libraries in rustc's private writable search
+    # directories need existence capture. All declared project and installed
+    # libraries are resolved by exact name against the origin's inputs.
+    directory=
+    if [ "$search_next" = 1 ]; then
+        directory=$arg
+        search_next=0
+    else
+        case "$arg" in
+            -L) search_next=1 ;;
+            -L?*) directory=${arg#-L} ;;
+        esac
+    fi
+    if [ -n "$directory" ] && [ -d "$directory" ]; then
+        directory=$(cd -P -- "$directory" && pwd -P)
+        if private_search "$directory"; then
+            for file in "$directory"/*; do
+                if [ -f "$file" ]; then
+                    printf '%s\0' "$file" >> "$out/existing-paths"
+                fi
+            done
+        fi
     fi
     i=$((i + 1))
 done
@@ -117,9 +127,45 @@ impl LinkCapture {
             |path: &Path| TreePath::new(path.strip_prefix("/")?.as_os_str().as_bytes().to_vec());
         let mut mapping = MappedTree::new(directories);
         mapping.add_directory(relative(Path::new(CAPTURE_OUTPUT))?)?;
+        // A search root can only be enumerated if it is inside a private
+        // generated output or scratch tree. The shell patterns quote all
+        // path bytes; only the trailing descendant wildcard is active.
+        let mut private = BTreeSet::from([PathBuf::from("/tmp")]);
+        for output in plan.spec.outputs.values() {
+            let path = Path::new(OsStr::from_bytes(output.path.as_bytes()));
+            private.insert(if output.kind.is_tree() {
+                path.to_owned()
+            } else {
+                path.parent().context("output has no parent")?.to_owned()
+            });
+        }
+        private.extend(
+            plan.spec
+                .scratch
+                .iter()
+                .map(|path| PathBuf::from(OsStr::from_bytes(path.as_bytes()))),
+        );
+        let mut script = b"#!/bin/sh\nprivate_search() {\n    case \"$1\" in\n".to_vec();
+        for root in private {
+            ensure!(
+                root.is_absolute() && root != Path::new("/"),
+                "invalid private link root"
+            );
+            script.extend_from_slice(b"        '");
+            for &byte in root.as_os_str().as_bytes() {
+                if byte == b'\'' {
+                    script.extend_from_slice(b"'\\''");
+                } else {
+                    script.push(byte);
+                }
+            }
+            script.extend_from_slice(b"/'*) return 0 ;;\n");
+        }
+        script.extend_from_slice(b"    esac\n    return 1\n}\n");
+        script.extend_from_slice(RELAY.as_bytes());
         mapping.add_bytes(
             relative(&relay)?,
-            RELAY.as_bytes().to_vec(),
+            script,
             TreeMetadata {
                 mode: 0o755,
                 modified: directories.modified,

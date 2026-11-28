@@ -684,6 +684,20 @@ impl CompilerPlan {
             .collect())
     }
 
+    fn declare_link_inputs(
+        &mut self,
+        inputs: &link_inputs::LinkInputs,
+        client: Option<&NativeCompilerClient>,
+    ) -> Result<()> {
+        let additional = inputs.prepare_declared(client)?;
+        // If a file has both roles, retain it during source projection.
+        for tree in &additional {
+            self.codegen_only
+                .retain(|path| !tree.manifest().entries.contains_key(path));
+        }
+        self.extend_inputs(additional)
+    }
+
     fn complete_link_inputs(
         &mut self,
         inputs: &link_inputs::LinkInputs,
@@ -1172,24 +1186,36 @@ async fn prepare_link_action(
     let directory = scratch.path().to_owned();
     let preparation_client = Arc::clone(client);
     let discovery = Arc::clone(&inputs);
-    let base = plan.clone();
+    let mut base = plan.clone();
     let prepared = pool
         .spawn_blocking(move || {
-            discovery
+            base.declare_link_inputs(&discovery, Some(&preparation_client))?;
+            let capture = discovery
                 .relay()?
                 .map(|(basename, expected)| {
                     link_capture::LinkCapture::configure(
-                        base,
+                        base.clone(),
                         &basename,
                         expected,
                         &directory,
                         &preparation_client.toolchain_digests,
                     )
                 })
-                .transpose()
+                .transpose()?;
+            if capture.is_none() {
+                base.complete_link_inputs(
+                    &discovery,
+                    Vec::new(),
+                    &preparation_client.toolchain_digests,
+                    Some(&preparation_client),
+                )?;
+            }
+            Ok::<_, anyhow::Error>((base, capture))
         })
         .await??;
-    let Some((capture, capture_plan)) = prepared else {
+    let (base, capture) = prepared;
+    *plan = base;
+    let Some((capture, capture_plan)) = capture else {
         return Ok(None);
     };
     let (result, key) = Arc::clone(client)
@@ -1422,6 +1448,31 @@ mod tests {
         let cwd = temp.path().canonicalize()?;
         std::fs::write(cwd.join(name), source)?;
         std::fs::create_dir(cwd.join("build"))?;
+        if args.contains(&"static=fixture") {
+            for directory in ["first", "second"] {
+                std::fs::create_dir(cwd.join(directory))?;
+                std::fs::write(
+                    cwd.join(directory).join("fixture.c"),
+                    "int fixture(void) { return 49; }\n",
+                )?;
+                ensure!(
+                    process::Command::new("cc")
+                        .current_dir(cwd.join(directory))
+                        .args(["-c", "fixture.c", "-o", "fixture.o"])
+                        .status()?
+                        .success(),
+                    "fixture C compile failed"
+                );
+                ensure!(
+                    process::Command::new("ar")
+                        .current_dir(cwd.join(directory))
+                        .args(["crs", "libfixture.a", "fixture.o"])
+                        .status()?
+                        .success(),
+                    "fixture archive creation failed"
+                );
+            }
+        }
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
         let environment = vec![("PATH".into(), "/usr/bin:/bin".into())];
         let rt = tokio::runtime::Runtime::new()?;
@@ -1568,6 +1619,28 @@ mod tests {
             });
             let cache = SourceDigestCache::default();
             let (mut link_plan, artifact) = link.plan(&plan, manifest, &provider)?;
+            link_plan.declare_link_inputs(&link.inputs, None)?;
+            if args.iter().any(|arg| arg == "static=fixture") {
+                let root = link_plan.spec.root.recipe.compose(
+                    &link_plan
+                        .inputs
+                        .iter()
+                        .map(|tree| (tree.id(), tree.manifest()))
+                        .collect(),
+                )?;
+                for (directory, selected) in [("first", true), ("second", false)] {
+                    let path = TreePath::new(
+                        cwd.join(directory)
+                            .join("libfixture.a")
+                            .strip_prefix("/")?
+                            .as_os_str()
+                            .as_bytes()
+                            .to_vec(),
+                    )?;
+                    assert_eq!(root.entries.contains_key(&path), selected);
+                }
+            }
+
             // Exercise the capture action without the external linker closure.
             // No host linker is available to this execution.
             if let Some((basename, expected)) = link.inputs.relay()? {
@@ -1624,6 +1697,10 @@ mod tests {
                     staged.publish(destination)?;
                 }
                 link_plan.complete_link_inputs(&link.inputs, capture.read()?, &cache, None)?;
+            } else {
+                link_plan.complete_link_inputs(&link.inputs, Vec::new(), &cache, None)?;
+            }
+            {
                 let source_path = TreePath::new(
                     cwd.join(name)
                         .strip_prefix("/")?
@@ -1786,6 +1863,37 @@ mod tests {
                 "pub fn square(x: i32) -> i32 { x*x }\n"
             },
             split_link,
+        )
+    }
+
+    #[test]
+    #[ignore = "requires nightly Rust, native archive tools and Bubblewrap"]
+    fn native_rust_compiler_plan_static_archive() -> Result<()> {
+        let sysroot = process::Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()?;
+        ensure!(sysroot.status.success(), "rustc sysroot lookup failed");
+        let sysroot = PathBuf::from(String::from_utf8(sysroot.stdout)?.trim());
+        verify_compilation(
+            &sysroot.join("bin/rustc"),
+            &[
+                "--crate-name",
+                "input",
+                "--crate-type",
+                "staticlib",
+                "--emit=link,dep-info",
+                "--out-dir",
+                "build",
+                "-Cextra-filename=-stage",
+                "-Lnative=first",
+                "-Lnative=second",
+                "-l",
+                "static=fixture",
+                "input.rs",
+            ],
+            "input.rs",
+            "extern \"C\" { fn fixture() -> i32; } pub fn value() -> i32 { unsafe { fixture() } }\n",
+            true,
         )
     }
 }

@@ -2486,6 +2486,8 @@ pub(super) struct NativeLinkDiscovery {
     pub linker: Option<OsString>,
     pub flavor: Option<String>,
     pub external_linkers: usize,
+    pub static_libraries: Vec<(String, bool)>,
+    pub native_paths: Vec<PathBuf>,
 }
 
 #[cfg(all(feature = "dist-client", target_os = "linux"))]
@@ -2508,6 +2510,23 @@ pub(super) fn native_link_discovery(args: &[OsString]) -> Result<NativeLinkDisco
                         .filter(|kind| matches!(kind.as_str(), "bin" | "dylib" | "proc-macro"))
                         .cloned(),
                 );
+            }
+            Some(LinkLibrary(ArgLinkLibrary { kind, name })) => {
+                let (kind, modifiers) = kind.as_deref().map_or(("static", ""), |kind| {
+                    kind.split_once(':').unwrap_or((kind, ""))
+                });
+                if kind == "static" {
+                    let name = name
+                        .split_once(':')
+                        .map_or(name.as_str(), |(_, renamed)| renamed);
+                    discovery.static_libraries.push((
+                        name.to_owned(),
+                        modifiers.split(',').any(|m| m == "+verbatim"),
+                    ));
+                }
+            }
+            Some(LinkPath(ArgLinkPath { kind, path })) if kind == "native" || kind == "all" => {
+                discovery.native_paths.push(path.clone());
             }
             Some(Target(target)) => discovery.target = Some(target.clone().into_arg_os_string()),
             Some(CodeGen(ArgCodegen {
