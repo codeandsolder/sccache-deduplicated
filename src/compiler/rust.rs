@@ -375,6 +375,33 @@ struct RustDepInfoRequest<'a, T> {
     discover_native_libraries: bool,
 }
 
+fn dependency_probe_arguments(
+    arguments: &[OsString],
+    dep_file: &Path,
+    binary_dependencies: bool,
+    discover_native_libraries: bool,
+) -> Vec<OsString> {
+    let mut arguments = arguments.to_vec();
+    if discover_native_libraries {
+        // Unlike -o, an explicit dep-info destination also writes the
+        // dependency file when rustc prints its expanded source.
+        let mut emit = OsString::from("--emit=dep-info=");
+        emit.push(dep_file);
+        arguments.extend([emit, OsString::from("-Zunpretty=expanded")]);
+    } else {
+        arguments.extend([
+            OsString::from("--emit"),
+            OsString::from("dep-info"),
+            OsString::from("-o"),
+            dep_file.as_os_str().to_owned(),
+        ]);
+    }
+    if binary_dependencies {
+        arguments.extend([OsString::from("-Z"), OsString::from("binary-dep-depinfo")]);
+    }
+    arguments
+}
+
 /// Run `rustc --emit=dep-info` to discover source files and env-deps.
 ///
 /// The raw dep-info is retained so the caller can derive the real compilation's
@@ -403,25 +430,12 @@ where
         .tempdir()
         .context("Failed to create temp dir")?;
     let dep_file = temp_dir.path().join("deps.d");
-    let mut spawn_arguments = arguments.to_vec();
-    if discover_native_libraries {
-        // Unlike -o, an explicit dep-info destination also writes the
-        // dependency file when rustc prints its expanded source.
-        spawn_arguments.extend([
-            OsString::from(format!("--emit=dep-info={}", dep_file.display())),
-            OsString::from("-Zunpretty=expanded"),
-        ]);
-    } else {
-        spawn_arguments.extend([
-            OsString::from("--emit"),
-            OsString::from("dep-info"),
-            OsString::from("-o"),
-            dep_file.as_os_str().to_owned(),
-        ]);
-    }
-    if binary_dependencies {
-        spawn_arguments.extend([OsString::from("-Z"), OsString::from("binary-dep-depinfo")]);
-    }
+    let spawn_arguments = dependency_probe_arguments(
+        arguments,
+        &dep_file,
+        binary_dependencies,
+        discover_native_libraries,
+    );
     let prepared = super::rust_response::prepare(executable, &spawn_arguments)?;
     let access_log = temp_dir.path().join("reads");
     let response_scratch = prepared.scratch_path().map(Path::to_owned);

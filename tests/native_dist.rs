@@ -3103,14 +3103,41 @@ fn native_compiler_semantic_reuse_across_ephemeral_inputs() -> Result<()> {
     Ok(())
 }
 
+fn embedded_native_probe_member(bytes: &[u8]) -> Result<Vec<u8>> {
+    use object::{Object, ObjectSection};
+    use std::io::Read;
+    let mut rlib = ar::Archive::new(bytes);
+    while let Some(entry) = rlib.next_entry() {
+        let mut entry = entry?;
+        if entry.header().identifier() != b"libprobe.a" {
+            continue;
+        }
+        let mut wrapper = Vec::new();
+        entry.read_to_end(&mut wrapper)?;
+        let object = object::File::parse(wrapper.as_slice())?;
+        let section = object
+            .section_by_name(".bundled_lib")
+            .context("missing packed archive section")?;
+        let bytes = section.data()?;
+        let archive = object::read::archive::ArchiveFile::parse(bytes)?;
+        assert!(!archive.is_thin());
+        let index = archive.symbols()?.context("missing symbol index")?;
+        for symbol in index {
+            let symbol = symbol?;
+            if symbol.name() == b"native_value" {
+                return Ok(archive.member(symbol.offset())?.data(bytes)?.to_vec());
+            }
+        }
+    }
+    anyhow::bail!("missing packed native object")
+}
+
 fn run_packed_archive_audit(
     service: &LocalService,
     source: &Path,
     rustc: &Path,
     config: &Path,
 ) -> Result<()> {
-    use object::{Object, ObjectSection};
-    use std::io::Read;
     fs::write(
         source.join("packed.rs"),
         br#"
@@ -3164,36 +3191,10 @@ fn run_packed_archive_audit(
             fs::read(source.join("build/libpacked.rlib"))?,
         ))
     };
-    let embedded_member = |bytes: &[u8]| -> Result<Vec<u8>> {
-        let mut rlib = ar::Archive::new(bytes);
-        while let Some(entry) = rlib.next_entry() {
-            let mut entry = entry?;
-            if entry.header().identifier() != b"libprobe.a" {
-                continue;
-            }
-            let mut wrapper = Vec::new();
-            entry.read_to_end(&mut wrapper)?;
-            let object = object::File::parse(wrapper.as_slice())?;
-            let section = object
-                .section_by_name(".bundled_lib")
-                .context("missing packed archive section")?;
-            let bytes = section.data()?;
-            let archive = object::read::archive::ArchiveFile::parse(bytes)?;
-            assert!(!archive.is_thin());
-            let index = archive.symbols()?.context("missing symbol index")?;
-            for symbol in index {
-                let symbol = symbol?;
-                if symbol.name() == b"native_value" {
-                    return Ok(archive.member(symbol.offset())?.data(bytes)?.to_vec());
-                }
-            }
-        }
-        anyhow::bail!("missing packed native object")
-    };
     make_archive("crs")?;
     let ((key, kind), first) = compile()?;
     assert_eq!(kind, "worker");
-    assert_eq!(embedded_member(&first)?, fs::read(&member)?);
+    assert_eq!(embedded_native_probe_member(&first)?, fs::read(&member)?);
     let mut archive_bytes = fs::read(&archive_path)?;
     archive_bytes[24..36].copy_from_slice(b"123456      ");
     fs::write(&archive_path, archive_bytes)?;
@@ -3210,7 +3211,7 @@ fn run_packed_archive_audit(
     let ((changed, kind), fourth) = compile()?;
     assert_eq!(kind, "worker");
     assert_ne!(changed, key);
-    assert_eq!(embedded_member(&fourth)?, fs::read(member)?);
+    assert_eq!(embedded_native_probe_member(&fourth)?, fs::read(member)?);
     assert_ne!(first, fourth);
     Ok(())
 }
