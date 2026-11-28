@@ -121,9 +121,10 @@ jobs:
           contrib/codeandsolder/fleet/test-native-only-config
           contrib/codeandsolder/test-native-cache-reuse --self-test
           sudo contrib/codeandsolder/fleet/test-activate-host
-          shellcheck -x contrib/codeandsolder/runtime/{build-image,run,test-run,test-runtime}
+          shellcheck -x contrib/codeandsolder/runtime/{build-image,run,sccache-runtime-profile,test-run,test-runtime,test-profile}
           shellcheck -x scripts/ci-{prepare-linux-tests,linux-test-shard,build-dist-tests,dist-test-shard}.sh
           contrib/codeandsolder/runtime/test-run
+          contrib/codeandsolder/runtime/test-profile
 
   toml_format:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}

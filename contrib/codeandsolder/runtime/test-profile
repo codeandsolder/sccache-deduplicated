@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Hermetic selection and publication regression using a fake Docker inspector.
+set -euo pipefail
+here=$(dirname -- "$(realpath -- "$0")")
+root=$(mktemp -d)
+trap 'rm -rf -- "$root"' EXIT
+mkdir "$root/bin"
+base=sha256:$(printf '%064d' 1)
+image=sha256:$(printf '%064d' 2)
+other=sha256:$(printf '%064d' 3)
+wrong=sha256:$(printf '%064d' 4)
+manifest=$root/manifest
+catalog=$root/catalog
+printf '  ripgrep  # tool\npoppler-utils\nripgrep\n\n' > "$manifest"
+printf 'poppler-utils\nripgrep' > "$root/equivalent"
+printf 'libfontconfig-dev\n' > "$root/other"
+printf '# nothing\n' > "$root/empty"
+profile=$here/sccache-runtime-profile
+key=$("$profile" key "$manifest")
+[[ $key == "$("$profile" key "$root/equivalent")" ]]
+[[ $key != "$("$profile" key "$root/other")" ]]
+# Export only fake Docker metadata to the test process.
+export TEST_BASE=$base TEST_IMAGE=$image TEST_OTHER=$other TEST_WRONG=$wrong TEST_KEY=$key
+cat > "$root/bin/docker" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $1 == image && $2 == inspect && $3 == --format ]]
+case "$4" in
+    '{{.Id}}') printf '%s\n' "$5" ;;
+    *'profile-request'*) printf '%s\n' "$TEST_KEY" ;;
+    *'profile-base'*) printf '%s\n' "$TEST_BASE" ;;
+    *'version'*) printf '1\n' ;;
+    *'RootFS.Layers'*)
+        if [[ $5 == "$TEST_WRONG" ]]; then printf 'wrong\nextra\n'; exit; fi
+        printf 'base-layer\n'
+        if [[ $5 != "$TEST_BASE" ]]; then printf 'profile-layer\n'; fi ;;
+    *) exit 1 ;;
+esac
+MOCK
+chmod +x "$root/bin/docker"
+export PATH="$root/bin:$PATH"
+reject() {
+    local expected=$1 status=0
+    shift
+    "$@" > "$root/rejection" 2>&1 || status=$?
+    [[ $status == "$expected" ]] || { cat "$root/rejection" >&2; printf 'Expected %s, got %s\n' "$expected" "$status" >&2; exit 1; }
+}
+[[ $("$profile" select "$base" "$root/absent" "$catalog") == "$base" ]]
+[[ $("$profile" select "$base" "$root/empty" "$catalog") == "$base" ]]
+reject 69 "$profile" select "$base" "$manifest" "$catalog"
+rg -q 'poppler-utils' "$root/rejection"
+for invalid in '--allow-unauthenticated' 'file:/tmp/tool.deb' 'foo=1.0' 'pkg*' 'foo bar'; do
+    printf '%s\n' "$invalid" > "$root/invalid"
+    reject 65 "$profile" key "$root/invalid"
+done
+ln -s "$root/absent" "$root/broken-link"
+reject 65 "$profile" select "$base" "$root/broken-link" "$catalog"
+reject 65 "$profile" register "$base" "$manifest" "$wrong" "$catalog"
+[[ $("$profile" register "$base" "$manifest" "$image" "$catalog") == "$image" ]]
+[[ $("$profile" register "$base" "$root/equivalent" "$image" "$catalog") == "$image" ]]
+[[ $("$profile" select "$base" "$root/equivalent" "$catalog") == "$image" ]]
+[[ $("$profile" provision "$base" "$catalog" "$manifest" "$root/equivalent" "$root/empty") == "$key"$'\t'"$image" ]]
+[[ -z $("$profile" provision "$base" "$catalog" "$root/empty") ]]
+reject 65 "$profile" register "$base" "$manifest" "$other" "$catalog"
+reject 69 "$profile" select "$other" "$manifest" "$catalog"
+reject 65 "$profile" verify "$image" "$root/other"
+"$profile" verify "$image" "$root/equivalent"
+[[ $(find "$catalog" -type f | wc -l) == 1 ]]
+printf 'debian:latest\n' > "$catalog/${base#sha256:}/$key"
+reject 65 "$profile" select "$base" "$manifest" "$catalog"
+echo 'Immutable runtime profile normalization, explicit selection, ancestry and atomic registration passed'

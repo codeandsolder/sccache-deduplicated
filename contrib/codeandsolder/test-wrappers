@@ -50,7 +50,41 @@ grep -Fxq 'args=+nightly check ' "$CARGO_LOG"
 
 # shellcheck source=contrib/codeandsolder/cargo-wrapper
 source contrib/codeandsolder/cargo-wrapper
-(cargo_wrapper_main "$root/bin/sccache" +1.99.0 test --locked -- --exact "with spaces")
-grep -Fxq 'args=--cargo-final -- +1.99.0 test --locked -- --exact with\ spaces ' "$CARGO_REAL_LOG"
-
-echo 'codeandsolder wrapper routing tests passed'
+cat >"$root/bin/sccache-runtime" <<'SH'
+#!/usr/bin/env bash
+printf 'args=' >>"$RUNTIME_LOG"
+printf '%q ' "$@" >>"$RUNTIME_LOG"
+printf '\n' >>"$RUNTIME_LOG"
+SH
+chmod +x "$root/bin/sccache-runtime"
+ln -s "$(realpath contrib/codeandsolder/runtime/sccache-runtime-profile)" "$root/bin/sccache-runtime-profile"
+export RUNTIME_LOG="$root/runtime.log"
+export PATH="$root/bin:$PATH"
+(cargo_wrapper_main "$root/bin/sccache" "$root/bin/sccache-runtime" "$root/absent-marker" +1.99.0 test --locked -- --exact "with spaces")
+rg -Fxq "args=--project-dir $(printf '%q' "$(pwd -P)") --host-toolchain --leased-intermediates -- cargo +1.99.0 test --locked -- --exact with\\ spaces " "$RUNTIME_LOG"
+touch "$root/marker"
+(cargo_wrapper_main "$root/bin/sccache" "$root/bin/sccache-runtime" "$root/marker" +1.99.0 test --locked)
+rg -Fxq 'args=--cargo-final -- +1.99.0 test --locked ' "$CARGO_REAL_LOG"
+if (cargo_wrapper_main "$root/bin/sccache" "$root/absent-runtime" "$root/absent-marker" +1.99.0 build); then
+    echo 'missing runtime unexpectedly succeeded' >&2
+    exit 1
+else
+    [[ $? == 69 ]]
+fi
+[[ $(wc -l <"$RUNTIME_LOG") == 1 ]]
+mkdir -p "$root/project with spaces/rust"
+printf '[package]\n' > "$root/project with spaces/rust/Cargo.toml"
+printf 'poppler-utils\n' > "$root/project with spaces/.sccache-runtime-packages"
+# Git root discovery must agree for explicit manifests and nested builds.
+git init -q "$root/project with spaces"
+(cargo_wrapper_main "$root/bin/sccache" "$root/bin/sccache-runtime" "$root/absent-marker" +1.99.0 test --manifest-path "$root/project with spaces/rust/Cargo.toml")
+rg -Fq -- "--project-dir $(printf '%q' "$root/project with spaces/rust") --host-toolchain" "$RUNTIME_LOG" || exit 1
+if (cargo_wrapper_main "$root/bin/sccache" "$root/bin/sccache-runtime" "$root/marker" +1.99.0 test --manifest-path "$root/project with spaces/rust/Cargo.toml"); then
+    echo 'nested Cargo unexpectedly accepted a different profile' >&2
+    exit 1
+else
+    [[ $? == 69 ]]
+fi
+printf 'image\n%s\n' "$("$root/bin/sccache-runtime-profile" key "$root/project with spaces/.sccache-runtime-packages")" > "$root/marker"
+(cargo_wrapper_main "$root/bin/sccache" "$root/bin/sccache-runtime" "$root/marker" +1.99.0 test --manifest-path "$root/project with spaces/rust/Cargo.toml")
+echo 'Managed Cargo defaults to common runtime; nested invocation and missing-runtime refusal verified.'

@@ -1,14 +1,77 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# The binary owns Cargo scratch leases and invokes the selected upstream
-# toolchain. Do not parse or rewrite Cargo's command line here.
+# Only inspect Cargo's directory selectors. Preserve all original arguments
+# and stop at the application/compiler argument delimiter.
+cargo_project_directory() {
+    local directory manifest='' manifest_seen=false
+    directory=$(pwd -P)
+    while (($#)); do
+        case "$1" in
+            --) break ;;
+            -C)
+                (($# >= 2)) || return 64
+                directory=$(cd -- "$directory" && cd -- "$2" && pwd -P) || return
+                shift ;;
+            -C?*) directory=$(cd -- "$directory" && cd -- "${1:2}" && pwd -P) || return ;;
+            --manifest-path)
+                (($# >= 2)) || return 64
+                manifest=$2
+                manifest_seen=true
+                shift ;;
+            --manifest-path=*) manifest=${1#*=}; manifest_seen=true ;;
+        esac
+        shift
+    done
+    if [[ $manifest_seen == true ]]; then
+        [[ -n $manifest ]] || return 64
+        if [[ $manifest != /* ]]; then manifest=$directory/$manifest; fi
+        manifest=$(realpath -e -- "$manifest") || return
+        [[ -f $manifest ]] || return 64
+        directory=$(dirname -- "$manifest")
+    fi
+    printf '%s\n' "$directory"
+}
+
+# The managed site always builds within a provisioned immutable runtime.
+# Nested Cargo invocations already share that runtime. Cargo's remaining
+# command line is opaque to this launcher.
 cargo_wrapper_main() {
-    local binary="$1"
-    shift
-    exec "$binary" --cargo-final -- "$@"
+    local binary="$1" runtime="$2" marker="$3"
+    shift 3
+    local project profile manifest requested active
+    project=$(cargo_project_directory "$@") || return
+    profile=$(dirname -- "$runtime")/sccache-runtime-profile
+    if [[ -e $marker ]]; then
+        manifest=$("$profile" manifest "$project")
+        if [[ -e $manifest || -L $manifest ]]; then
+            requested=$("$profile" key "$manifest")
+            active=$(sed -n '2p' "$marker")
+            if [[ -n $requested && $requested != "$active" ]]; then
+                printf 'Nested Cargo requires a different runtime package profile: %s\n' "$manifest" >&2
+                return 69
+            fi
+        fi
+        exec "$binary" --cargo-final -- "$@"
+    fi
+    if [[ ! -x $runtime ]]; then
+        printf 'Managed compiler runtime is unavailable: %s\n' "$runtime" >&2
+        return 69
+    fi
+    local selection
+    if [[ ${1:-} == +* ]]; then
+        selection="${1:1}"
+        shift
+    else
+        selection=$(rustup show active-toolchain)
+        selection="${selection%% *}"
+    fi
+    # Resolve exactly the toolchain the caller selected, without replacing
+    # it with the image's bundled toolchain.
+    rustup which --toolchain "$selection" rustc >/dev/null
+    exec "$runtime" --project-dir "$project" --host-toolchain --leased-intermediates -- cargo "+$selection" "$@"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    cargo_wrapper_main /usr/local/bin/sccache "$@"
+    cargo_wrapper_main /usr/local/bin/sccache /usr/local/bin/sccache-runtime /run/sccache-runtime-session "$@"
 fi

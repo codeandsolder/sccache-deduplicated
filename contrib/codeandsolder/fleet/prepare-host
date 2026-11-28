@@ -172,7 +172,13 @@ install -m 0700 "$repo/host-native-metadata" "$stage/host-native-metadata"
 install -m 0700 "$repo/fleet/activate-host" "$stage/activate-host"
 install -m 0600 "$repo/native-action-report.awk" "$stage/native-action-report.awk"
 if [[ -x /usr/bin/rustup && -f /usr/local/bin/cargo ]]; then
+  [[ -r /etc/sccache/runtime-image ]] || { echo "Managed Cargo requires a provisioned common runtime image" >&2; exit 69; }
+  read -r runtime_image < /etc/sccache/runtime-image
+  [[ "$runtime_image" =~ ^sha256:[0-9a-f]{64}$ ]]
+  [[ "$(docker image inspect --format '{{.Id}}' "$runtime_image")" == "$runtime_image" ]]
   install -m 0700 "$repo/cargo-wrapper" "$stage/cargo-wrapper"
+  install -m 0700 "$repo/runtime/run" "$stage/runtime-run"
+  install -m 0700 "$repo/runtime/sccache-runtime-profile" "$stage/runtime-profile"
 fi
 for helper in sccache-cmake-launcher sccache-dist-client-preflight; do
   if [[ -f "/usr/local/libexec/$helper" ]]; then

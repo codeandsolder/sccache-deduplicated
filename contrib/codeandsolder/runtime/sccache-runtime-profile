@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# Provision separately from execution. The catalog binds a package request and
+# an exact base image to a single approved, immutable derived image.
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: sccache-runtime-profile manifest PROJECT_DIRECTORY
+       sccache-runtime-profile key MANIFEST
+       sccache-runtime-profile build BASE_IMAGE_ID MANIFEST
+       sccache-runtime-profile provision BASE_IMAGE_ID CATALOG_DIR MANIFEST...
+       sccache-runtime-profile register BASE_IMAGE_ID MANIFEST IMAGE_ID CATALOG_DIR
+       sccache-runtime-profile select BASE_IMAGE_ID MANIFEST CATALOG_DIR
+       sccache-runtime-profile verify IMAGE_ID MANIFEST
+EOF
+    exit 64
+}
+fail() { printf '%s\n' "$*" >&2; exit 65; }
+valid_image() { [[ $1 =~ ^sha256:[0-9a-f]{64}$ ]] || fail "Expected immutable image ID: $1"; }
+normalize() {
+    local manifest=$1 line
+    [[ -f $manifest && -r $manifest ]] || fail "Cannot read runtime package manifest: $manifest"
+    while IFS= read -r line || [[ -n $line ]]; do
+        # One concrete Debian binary package per line. Comments and whitespace
+        # are not part of the request identity. No options, patterns or URLs.
+        line=${line%%#*}
+        line=${line#"${line%%[![:space:]]*}"}
+        line=${line%"${line##*[![:space:]]}"}
+        [[ -n $line ]] || continue
+        [[ $line =~ ^[a-z0-9][a-z0-9+.-]+$ ]] || fail "Invalid Debian package name in $manifest: $line"
+        printf '%s\n' "$line"
+    done < "$manifest" | LC_ALL=C sort -u
+}
+request_key() {
+    [[ -n $1 ]] || return 0
+    printf '%s\n' "$1" | sha256sum | cut -d ' ' -f1
+}
+image_field() { docker image inspect --format "$2" "$1"; }
+label() { image_field "$1" "{{index .Config.Labels \"org.codeandsolder.sccache-runtime.$2\"}}"; }
+verify_image() {
+    local image=$1 key=$2 base=${3:-} actual_base
+    valid_image "$image"
+    [[ $(image_field "$image" '{{.Id}}') == "$image" ]] || fail "Runtime profile is not resident: $image"
+    [[ $(label "$image" version) == 1 && $(label "$image" profile-request) == "$key" ]] || fail "Runtime profile does not match package request $key: $image"
+    actual_base=$(label "$image" profile-base)
+    valid_image "$actual_base"
+    [[ -z $base || $actual_base == "$base" ]] || fail "Runtime profile was built for a different base: $actual_base"
+}
+verify_ancestry() {
+    local base=$1 image=$2 parent child
+    parent=$(image_field "$base" '{{range .RootFS.Layers}}{{println .}}{{end}}')
+    child=$(image_field "$image" '{{range .RootFS.Layers}}{{println .}}{{end}}')
+    [[ -n $parent && $child == "$parent"$'\n'* ]] || fail "Runtime profile does not extend its declared base: $image"
+}
+select_image() {
+    local base=$1 manifest=$2 catalog=$3 request key record image
+    valid_image "$base"
+    if [[ ! -e $manifest && ! -L $manifest ]]; then printf '%s\n' "$base"; return; fi
+    request=$(normalize "$manifest")
+    if [[ -z $request ]]; then printf '%s\n' "$base"; return; fi
+    key=$(request_key "$request")
+    record=$catalog/${base#sha256:}/$key
+    [[ -f $record && ! -L $record && -r $record ]] || {
+        printf 'Runtime package profile not provisioned for %s (base %s, request %s).\n' "$manifest" "$base" "$key" >&2
+        printf 'Required packages:\n%s\n' "$request" >&2
+        exit 69
+    }
+    image=$(cat -- "$record")
+    verify_image "$image" "$key" "$base"
+    printf '%s\n' "$image"
+}
+register_image() (
+    local base=$1 manifest=$2 image=$3 catalog=$4 request key directory record temporary
+    valid_image "$base"
+    request=$(normalize "$manifest")
+    [[ -n $request ]] || fail 'Empty package requests use the base image directly'
+    key=$(request_key "$request")
+    verify_image "$image" "$key" "$base"
+    verify_ancestry "$base" "$image"
+    directory=$catalog/${base#sha256:}
+    mkdir -p -- "$directory"
+    record=$directory/$key
+    temporary=$(mktemp -- "$directory/.register.XXXXXXXX")
+    trap 'rm -f -- "$temporary"' EXIT
+    printf '%s\n' "$image" > "$temporary"
+    chmod 0644 "$temporary"
+    # Atomic create, not a mutable tag or last-writer-wins registry. Concurrent
+    # identical registrations are harmless; a different resolution is rejected.
+    if ! ln -- "$temporary" "$record" 2>/dev/null; then
+        [[ -f $record && ! -L $record && $(cat -- "$record") == "$image" ]] || fail "A different runtime image is already registered for $key and $base"
+    fi
+    rm -f -- "$temporary"
+    trap - EXIT
+    printf '%s\n' "$image"
+)
+build_image() (
+    local base=$1 manifest=$2 request key scratch here base_tag tag image
+    valid_image "$base"
+    [[ $(image_field "$base" '{{.Id}}') == "$base" && $(label "$base" version) == 1 ]] || fail "Base runtime is not resident or compatible: $base"
+    request=$(normalize "$manifest")
+    [[ -n $request ]] || fail 'Empty package requests use the base image directly'
+    key=$(request_key "$request")
+    here=$(dirname -- "$(realpath -- "$0")")
+    [[ -r $here/Dockerfile.profile ]] || fail 'Build profiles from the reviewed runtime source directory'
+    scratch=$(mktemp -d)
+    trap 'rm -rf -- "$scratch"' EXIT
+    printf '%s\n' "$request" > "$scratch/request"
+    # Docker's local builder needs a FROM name. This alias is named by the
+    # complete base ID and is checked both before and after the build.
+    base_tag=local/sccache-runtime-base:sha256-${base#sha256:}
+    docker image tag "$base" "$base_tag"
+    [[ $(image_field "$base_tag" '{{.Id}}') == "$base" ]] || fail 'Base image alias mismatch'
+    tag=local/sccache-runtime-profile:${base:7:32}-$key
+    docker build --pull=false --provenance=false --sbom=false --iidfile "$scratch/image-id" \
+        -t "$tag" -f "$here/Dockerfile.profile" --build-arg "BASE=$base_tag" \
+        --build-arg "BASE_ID=$base" --build-arg "REQUEST_DIGEST=$key" "$scratch" >&2
+    [[ $(image_field "$base_tag" '{{.Id}}') == "$base" ]] || fail 'Base image changed during profile build'
+    image=$(cat -- "$scratch/image-id")
+    verify_image "$image" "$key" "$base"
+    verify_ancestry "$base" "$image"
+    rm -rf -- "$scratch"
+    trap - EXIT
+    printf '%s\n' "$image"
+)
+
+# Resolve each distinct request once, retaining existing immutable mappings.
+# Holding a lock on the catalog's base directory avoids duplicate concurrent
+# resolution without introducing persistent lock or package-cache files.
+provision_images() (
+    local base=$1 catalog=$2 manifest request key record image directory lockfd
+    shift 2
+    valid_image "$base"
+    declare -A requests=()
+    for manifest do
+        request=$(normalize "$manifest")
+        [[ -n $request ]] || continue
+        key=$(request_key "$request")
+        requests[$key]=$manifest
+    done
+    ((${#requests[@]})) || return 0
+    directory=$catalog/${base#sha256:}
+    mkdir -p -- "$directory"
+    exec {lockfd}<"$directory"
+    flock -x "$lockfd"
+    while IFS= read -r key; do
+        manifest=${requests[$key]}
+        record=$directory/$key
+        if [[ -e $record || -L $record ]]; then
+            image=$(select_image "$base" "$manifest" "$catalog")
+        else
+            image=$(build_image "$base" "$manifest")
+            register_image "$base" "$manifest" "$image" "$catalog" >/dev/null
+        fi
+        printf '%s\t%s\n' "$key" "$image"
+    done < <(printf '%s\n' "${!requests[@]}" | LC_ALL=C sort)
+)
+
+case ${1:-} in
+    manifest)
+        [[ $# == 2 ]] || usage
+        directory=$(realpath -e -- "$2")
+        [[ -d $directory ]] || fail "Not a project directory: $directory"
+        root=$(git -C "$directory" rev-parse --show-toplevel 2>/dev/null || printf '%s\n' "$directory")
+        printf '%s/.sccache-runtime-packages\n' "$root" ;;
+    key) [[ $# == 2 ]] || usage; request=$(normalize "$2"); request_key "$request" ;;
+    select) [[ $# == 4 ]] || usage; select_image "$2" "$3" "$4" ;;
+    register) [[ $# == 5 ]] || usage; register_image "$2" "$3" "$4" "$5" ;;
+    build) [[ $# == 3 ]] || usage; build_image "$2" "$3" ;;
+    provision) [[ $# -ge 4 ]] || usage; provision_images "${@:2}" ;;
+    verify)
+        [[ $# == 3 ]] || usage
+        valid_image "$2"
+        if [[ -e $3 || -L $3 ]]; then
+            request=$(normalize "$3")
+            if [[ -n $request ]]; then verify_image "$2" "$(request_key "$request")"; fi
+        fi ;;
+    *) usage ;;
+esac
