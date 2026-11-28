@@ -206,13 +206,7 @@ fn test_dist_c_debug_compilation_directory_is_cache_identity() -> Result<()> {
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
     system.add_scheduler();
     system.add_server(&[]);
-    let mut config = dist_test_sccache_client_cfg(&system);
-    config
-        .cache
-        .disk
-        .as_mut()
-        .context("missing disk cache")?
-        .size = 128 * 1024 * 1024;
+    let config = dist_test_sccache_client_cfg(&system);
     let config_path = root.join("sccache-cfg.json");
     write_json_cfg(root, "sccache-cfg.json", &config);
     let cached_config = root.join("sccache-cached-cfg");
@@ -350,15 +344,7 @@ fn test_dist_c_native_target_codegen_and_cache() -> Result<()> {
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
     system.add_scheduler();
     system.add_server(&[]);
-    let mut config = dist_test_sccache_client_cfg(&system);
-    // Unlike the minimal distribution smoke test, retain objects for the
-    // repeat-request cache verification.
-    config
-        .cache
-        .disk
-        .as_mut()
-        .context("missing test disk cache")?
-        .size = 128 * 1024 * 1024;
+    let config = dist_test_sccache_client_cfg(&system);
     let config_path = root.join("sccache-cfg.json");
     write_json_cfg(root, "sccache-cfg.json", &config);
     let cached_config = root.join("sccache-cached-cfg");

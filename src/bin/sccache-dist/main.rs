@@ -1202,15 +1202,6 @@ impl Default for Scheduler {
     }
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "Worker admission weights are approximate floating-point CPU capacity estimates"
-)]
-fn admission_weight(job_count: usize, cpu_capacity: f64, job_slack: JobSlackConfig) -> Option<f64> {
-    (job_count < job_slack.max_jobs(cpu_capacity))
-        .then_some((cpu_capacity - job_count as f64).max(0.0) + 0.5)
-}
-
 struct Reservation {
     #[cfg(feature = "scheduler-dashboard")]
     trace: Option<sccache::latency_trace::TraceContext>,
@@ -2560,8 +2551,6 @@ mod scheduler_tests {
         for cores in [1, 2, 7, 8, 12, 16, 64] {
             assert_eq!(slack.max_jobs(cores as f64), cores + 1 + cores / 8);
         }
-        assert!(admission_weight(13, 12.0, slack).is_some());
-        assert!(admission_weight(14, 12.0, slack).is_none());
     }
 
     #[test]
@@ -2572,26 +2561,8 @@ mod scheduler_tests {
         };
 
         assert_eq!(slack.max_jobs(12.0), 36);
-        assert!(admission_weight(35, 12.0, slack).is_some());
-        assert!(admission_weight(36, 12.0, slack).is_none());
         assert_eq!(slack.max_jobs(0.0), 1);
         assert_eq!(JobSlackConfig::default().max_jobs(0.0), 2);
-    }
-
-    #[test]
-    fn free_cpu_weight_accounts_for_reservations_and_capacity_changes() {
-        let slack = JobSlackConfig {
-            static_jobs: 0,
-            percent: 400.0,
-        };
-        assert_eq!(admission_weight(0, 2.5, slack), Some(3.0));
-        assert_eq!(admission_weight(0, 0.01, slack), Some(0.51));
-        assert_eq!(admission_weight(1, 2.5, slack), Some(2.0));
-        assert_eq!(admission_weight(2, 2.5, slack), Some(1.0));
-        assert_eq!(admission_weight(3, 2.5, slack), Some(0.5));
-        assert_eq!(admission_weight(0, 0.0, slack), Some(0.5));
-        assert!(admission_weight(1, 0.0, slack).is_none());
-        assert!(admission_weight(0, f64::NAN, slack).is_none());
     }
 
     pub(super) struct TestJobAuthorizer;

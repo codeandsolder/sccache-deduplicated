@@ -45,7 +45,6 @@ fn generate_implicit_auth_config() -> sccache::config::DistAuth {
 
 fn config_with_dist_auth(auth_config: sccache::config::DistAuth) -> sccache::config::FileConfig {
     sccache::config::FileConfig {
-        cache: Default::default(),
         dist: sccache::config::DistConfig {
             auth: auth_config,
             cluster: None,

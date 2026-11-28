@@ -3320,7 +3320,7 @@ fn native_rust_bundled_archive_identity_follows_search_precedence() -> Result<()
         .tempdir_in("/tmp")?;
     let root = temp.path().canonicalize()?;
     let fleet = Fleet::start(&root, BTreeMap::new())?;
-    let mut service = LocalService::start(&root, &fleet, None)?;
+    let mut service = LocalService::start(&root, &fleet)?;
     let config = root.join("direct.toml");
     fs::write(&config, "client_side_mode = false\n")?;
     let sysroot = Command::new("rustc")

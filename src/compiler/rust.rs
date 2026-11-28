@@ -7386,25 +7386,18 @@ LLVM version: 15.0.2
             let mut args = base.to_vec();
             args[5] = emit;
             args.extend_from_slice(directories);
-            hash_key(
-                &f,
-                &args,
-                &[],
-                |root| {
-                    for (directory, byte) in [("one", first), ("two", second)] {
-                        let dir = root.join(directory);
-                        fs::create_dir_all(&dir)?;
-                        create_file(&dir, "libprobe.a", |file| {
-                            let mut archive = ar::Builder::new(file);
-                            archive
-                                .append(&ar::Header::new(b"probe.o".to_vec(), 1), &[byte][..])?;
-                            Ok(())
-                        })?;
-                    }
-                    Ok(())
-                },
-                false,
-            )
+            hash_key(&f, &args, &[], |root| {
+                for (directory, byte) in [("one", first), ("two", second)] {
+                    let dir = root.join(directory);
+                    fs::create_dir_all(&dir)?;
+                    create_file(&dir, "libprobe.a", |file| {
+                        let mut archive = ar::Builder::new(file);
+                        archive.append(&ar::Header::new(b"probe.o".to_vec(), 1), &[byte][..])?;
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            })
         };
         let forward = ["-Lnative=one", "-Lnative=two"];
         let reverse = ["-Lnative=two", "-Lnative=one"];

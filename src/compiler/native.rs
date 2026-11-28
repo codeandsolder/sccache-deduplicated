@@ -18,8 +18,8 @@ use crate::{
     build_runtime::{
         ActionMode, Artifact, BuildPath, CommandSpec, CompilerResultIdentity, ContentId,
         DescriptorDigestProvider, ExecutionRoot, ExecutionSpec, OutputKind, OutputSpec,
-        PreparedTree, ReferenceBlobProvider, ResultManifest, SourceDigestCache, TreeEntry, TreeId,
-        TreeLayer, TreeManifest, TreePath, TreeRecipe, TreeTimestamp,
+        PreparedTree, ReferenceBlobProvider, ResultManifest, SourceDigestCache, TreeEntry,
+        TreeLayer, TreeManifest, TreePath, TreeRecipe,
     },
     cache::FileObjectSource,
     client::{SharedConnection, connection_task},
