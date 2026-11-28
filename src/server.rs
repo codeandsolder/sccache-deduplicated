@@ -239,7 +239,6 @@ impl DistClientContainer {
                 config.dist.scheduler_url.clone(),
                 config.dist.cluster.clone(),
                 config.dist.auth.clone(),
-                config.dist.toolchains.clone(),
                 &config.dist.native_installation_catalogs,
             ));
         }

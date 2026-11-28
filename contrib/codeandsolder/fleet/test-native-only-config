@@ -50,6 +50,7 @@ size = 1073741824
 cache_dir = "/old/client"
 toolchain_cache_size = 1073741824
 toolchains = []
+rewrite_includes_only = true
 scheduler_url = "https://127.0.0.1:10600"
 native_installation_catalogs = ["/catalog"]
 
@@ -63,7 +64,15 @@ TOML
 rg -Fxq 'native_installation_catalogs = ["/catalog"]' "$root/native-client"
 rg -Fxq 'directory = "/identity"' "$root/native-client"
 rg -Fxq 'endpoint = "https://127.0.0.1:10602"' "$root/native-client"
-if rg -q 'cache_dir|toolchain_cache_size|/old/|\[cache.disk\]' "$root/native-client"; then exit 1; fi
+if rg -q 'cache_dir|toolchain_cache_size|toolchains|rewrite_includes_only|/old/|\[cache.disk\]' "$root/native-client"; then exit 1; fi
 "$here/native-only-config" client "$root/native-client" > "$root/repeat"
 cmp "$root/native-client" "$root/repeat"
+cat >> "$root/client" <<'TOML'
+[[dist.toolchains]]
+type = "path_override"
+compiler_executable = "/usr/bin/gcc"
+archive = "/old/compiler.tar.gz"
+archive_compiler_executable = "/bin/gcc"
+TOML
+if "$here/native-only-config" client "$root/client" > "$root/invalid"; then exit 1; fi
 echo "Native-only configuration migration passed."

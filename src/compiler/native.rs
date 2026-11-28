@@ -23,7 +23,7 @@ use crate::{
     },
     cache::FileObjectSource,
     client::{SharedConnection, connection_task},
-    config::{DistAuth, DistToolchainConfig, HTTPUrl, NativeClientConfig},
+    config::{DistAuth, HTTPUrl, NativeClientConfig},
     dist::{
         self,
         native::{NativeBuildResult, NativeCacheClient, broker},
@@ -56,7 +56,6 @@ enum Endpoint {
 pub struct NativeCompilerClient {
     endpoint: Endpoint,
     policy: NativeNamespacePolicy,
-    toolchains: Vec<DistToolchainConfig>,
     toolchain_digests: Arc<SourceDigestCache>,
 }
 
@@ -82,7 +81,6 @@ impl NativeCompilerClient {
         scheduler: Option<HTTPUrl>,
         cluster: Option<sccache_peer_identity::PeerConfig>,
         auth: DistAuth,
-        toolchains: Vec<DistToolchainConfig>,
         catalogs: &[PathBuf],
     ) -> Self {
         let policy = NativeNamespacePolicy {
@@ -102,7 +100,6 @@ impl NativeCompilerClient {
                 intermediates: crate::dist::native::result_session::Registry::default(),
             })),
             policy,
-            toolchains,
             toolchain_digests: installed_digest_cache(catalogs, None),
         }
     }
@@ -111,7 +108,6 @@ impl NativeCompilerClient {
         connection: SharedConnection,
         chunk_bytes: usize,
         policy: NativeNamespacePolicy,
-        toolchains: Vec<DistToolchainConfig>,
         catalogs: &[PathBuf],
         provider: Option<DescriptorDigestProvider>,
     ) -> Self {
@@ -121,7 +117,6 @@ impl NativeCompilerClient {
                 chunk_bytes,
             },
             policy,
-            toolchains,
             toolchain_digests: installed_digest_cache(catalogs, provider),
         }
     }
@@ -283,18 +278,6 @@ impl NativeCompilerClient {
         let client = Arc::clone(self);
         let transport = tokio::task::spawn_blocking(move || client.connect_http()).await??;
         transport.report_live_traces(report).await
-    }
-
-    fn allows_automatic_toolchain(&self, executable: &Path) -> bool {
-        !self.toolchains.iter().any(|configured| match configured {
-            DistToolchainConfig::NoDist {
-                compiler_executable,
-            }
-            | DistToolchainConfig::PathOverride {
-                compiler_executable,
-                ..
-            } => compiler_executable == executable,
-        })
     }
 
     fn connect_http(&self) -> Result<NativeCacheClient> {
@@ -1250,7 +1233,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
     let key = key.to_owned();
     crate::server::activity::phase(crate::server::activity::Phase::PlanCompile);
     let mut transformer = dist::PathTransformer::new();
-    let (local, remote, cacheable) =
+    let (_, remote, cacheable) =
         compilation.generate_compile_commands(&mut transformer, CompileTransport::Native)?;
     ensure!(
         control != CacheControl::ForceNoCache,
@@ -1267,10 +1250,6 @@ pub(super) async fn compile<T: CommandCreatorSync>(
     ensure!(
         compilation.automatic_dist_toolchain_is_ready(),
         "automatic distributed compiler toolchain is incomplete"
-    );
-    ensure!(
-        client.allows_automatic_toolchain(&local.get_executable()),
-        "compiler toolchain policy prohibits native distributed execution"
     );
     let mut remote = remote.context("compiler invocation has no native distributed command")?;
     let mode = if control == CacheControl::ForceRecache {
@@ -1446,7 +1425,6 @@ mod tests {
         let pool = rt.handle();
         let mut config = config()?;
         config.fallback_cache.dir = cwd.join("unexpected-archive-cache");
-        config.dist.cache_dir = cwd.join("unexpected-toolchain-cache");
         let storage = storage_from_config(&config, pool)?;
         assert_eq!(storage.cache_type_name(), "native");
         let creator = ProcessCommandCreator::new(&Client::new_num(1));
@@ -1754,7 +1732,6 @@ mod tests {
             }
         }
         assert!(!config.fallback_cache.dir.exists());
-        assert!(!config.dist.cache_dir.exists());
         Ok(())
     }
 

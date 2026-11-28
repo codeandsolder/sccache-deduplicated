@@ -171,7 +171,6 @@ async fn compile(
         activity_id: _,
         mut compile,
         aliases,
-        toolchains,
         catalogs,
     } = job;
     // Use the attested real executable for both cacheable work and the
@@ -180,7 +179,6 @@ async fn compile(
     let storage = IpcStorage::connect(ServerConnection::new(Box::new(broker))?).await?;
     let conn = storage.conn();
     let config = DistConfig {
-        toolchains: serde_json::from_slice(&toolchains)?,
         native_installation_catalogs: catalogs,
         ..DistConfig::default()
     };

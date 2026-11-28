@@ -63,15 +63,6 @@ Install the release updater service and timer from this directory under
 `/etc/systemd/system/`. Use systemd drop-ins for host-specific settings such
 as managed endpoints; keep the service and timer templates shared.
 
-On hosts that need the distributed-client startup preflight, install
-`sccache-dist-client-preflight` under `/usr/local/libexec/` and call it as an
-`ExecStartPre` for the managed local daemon with the same
-`SCCACHE_DIST_CLIENT_CACHE_DIR` as the service. The preflight only removes
-the disposable `client/toolchain_tmp` directory documented by
-`ClientToolchains::new`; it rejects unexpected files and symlinks. Run
-`test-dist-client-preflight` for the filesystem contract. Do not invoke
-the preflight against a running daemon.
-
 ## Shared multi-UID daemon (Linux)
 
 The opt-in shared daemon serves normal compiler requests from multiple local

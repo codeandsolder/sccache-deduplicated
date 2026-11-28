@@ -191,7 +191,6 @@ case "$phase" in
     [[ ! -f 90-real-binary.conf ]] || files+=(/etc/systemd/system/sccache-strict-local.service.d/90-real-binary.conf)
     [[ ! -f cargo-wrapper ]] || files+=(/usr/local/bin/cargo)
     [[ ! -f sccache-cmake-launcher ]] || files+=(/usr/local/libexec/sccache-cmake-launcher)
-    [[ ! -f sccache-dist-client-preflight ]] || files+=(/usr/local/libexec/sccache-dist-client-preflight)
     for f in "${state_files[@]}"; do files+=("$state/$f"); done
     files+=("$state/release.json")
     for f in "${files[@]}"; do snapshot_file "$f"; done
@@ -237,7 +236,6 @@ case "$phase" in
     install_atomic host-native-metadata /usr/local/libexec/host-native-metadata 0755
     if [[ -f cargo-wrapper ]]; then install_atomic cargo-wrapper /usr/local/bin/cargo 0755; fi
     if [[ -f sccache-cmake-launcher ]]; then install_atomic sccache-cmake-launcher /usr/local/libexec/sccache-cmake-launcher 0755; fi
-    if [[ -f sccache-dist-client-preflight ]]; then install_atomic sccache-dist-client-preflight /usr/local/libexec/sccache-dist-client-preflight 0755; fi
     install_atomic client-shared.toml /etc/sccache/client-shared.toml 0600
     install_atomic cluster-ca.pem /etc/sccache/cluster-ca.pem 0644
     install -d -m 0700 /var/lib/sccache-cluster/client

@@ -6,7 +6,6 @@ use sccache::config::HTTPUrl;
 use sccache::dist::{self, SchedulerStatusResult, ServerId};
 use sccache::server::ServerInfo;
 use std::env;
-use std::fs::remove_dir_all;
 use std::io::Write;
 #[cfg(feature = "dist-server")]
 use std::net::{self, SocketAddr};
@@ -36,7 +35,6 @@ const DIST_DOCKERFILE: &str = include_str!("Dockerfile.sccache-dist");
 const DIST_IMAGE_BWRAP_PATH: &str = "/usr/bin/bwrap";
 #[cfg(feature = "dist-server")]
 const MAX_STARTUP_WAIT: Duration = Duration::from_secs(30);
-const DIST_CACHE_RELPATH: &str = "client-dist-cache";
 
 #[cfg(feature = "dist-server")]
 const DIST_SERVER_TOKEN: &str = "THIS IS THE TEST TOKEN";
@@ -86,9 +84,6 @@ fn loopback_listener() -> net::TcpListener {
     net::TcpListener::bind("127.0.0.1:0").unwrap()
 }
 
-// A current Rust sysroot plus cross-target runtimes can exceed 1 GiB.
-// Keep normal test worker archives and extractions resident across requests.
-const TC_CACHE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 #[cfg(feature = "dist-server")]
 pub const TEST_PLATFORM: &str = "native-distributed-regression";
 
@@ -123,14 +118,6 @@ pub fn stop_local_daemon() -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
-}
-
-#[must_use = "the result indicates whether the cache was cleared"]
-pub fn clear_cache_local_daemon(tmpdir: &Path) -> bool {
-    trace!("clear local cache daemon");
-    let client_build_dir = tmpdir.join(DIST_CACHE_RELPATH);
-    assert!(client_build_dir.exists());
-    remove_dir_all(client_build_dir).is_ok()
 }
 
 pub fn get_stats<F: 'static + Fn(ServerInfo)>(f: F) {
@@ -246,9 +233,7 @@ pub fn sccache_client_cfg(
     preprocessor_cache_mode: bool,
 ) -> sccache::config::FileConfig {
     let cache_relpath = "client-cache";
-    let dist_cache_relpath = DIST_CACHE_RELPATH;
     fs::create_dir(tmpdir.join(cache_relpath)).unwrap();
-    fs::create_dir(tmpdir.join(dist_cache_relpath)).unwrap();
 
     let disk_cache = sccache::config::DiskCacheConfig {
         dir: tmpdir.join(cache_relpath),
@@ -276,10 +261,6 @@ pub fn sccache_client_cfg(
             cluster: None,
             auth: Default::default(), // dangerously_insecure
             scheduler_url: None,
-            cache_dir: tmpdir.join(dist_cache_relpath),
-            toolchains: vec![],
-            toolchain_cache_size: TC_CACHE_SIZE,
-            rewrite_includes_only: false, // TODO
             native: None,
             native_installation_catalogs: Vec::new(),
         },

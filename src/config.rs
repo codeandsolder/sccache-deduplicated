@@ -96,7 +96,6 @@ static CACHED_CONFIG: Mutex<Option<(PathBuf, CachedFileConfig)>> = Mutex::new(No
 
 const ORGANIZATION: &str = "Mozilla";
 const APP_NAME: &str = "sccache";
-const DIST_APP_NAME: &str = "sccache-dist-client";
 const TEN_GIGS: u64 = 10 * 1024 * 1024 * 1024;
 
 pub const INSECURE_DIST_CLIENT_TOKEN: &str = "dangerously_insecure_client";
@@ -110,22 +109,9 @@ pub fn default_disk_cache_dir() -> PathBuf {
         |dirs| dirs.cache_dir().to_owned(),
     )
 }
-// ...whereas subdirectories are used of this one
-#[must_use = "the returned path identifies the default distributed cache location"]
-pub fn default_dist_cache_dir() -> PathBuf {
-    ProjectDirs::from("", ORGANIZATION, DIST_APP_NAME).map_or_else(
-        || env::temp_dir().join(DIST_APP_NAME),
-        |dirs| dirs.cache_dir().to_owned(),
-    )
-}
-
 const fn default_disk_cache_size() -> u64 {
     TEN_GIGS
 }
-const fn default_toolchain_cache_size() -> u64 {
-    TEN_GIGS
-}
-
 struct StringOrU64Visitor;
 
 impl de::Visitor<'_> for StringOrU64Visitor {
@@ -768,21 +754,6 @@ impl CacheConfigs {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(tag = "type")]
-pub enum DistToolchainConfig {
-    #[serde(rename = "no_dist")]
-    NoDist { compiler_executable: PathBuf },
-    #[serde(rename = "path_override")]
-    PathOverride {
-        compiler_executable: PathBuf,
-        archive: PathBuf,
-        archive_compiler_executable: String,
-        archive_cargo_executable: Option<String>,
-    },
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "type")]
 pub enum DistAuth {
@@ -904,11 +875,6 @@ pub struct DistConfig {
     pub scheduler_url: Option<HTTPUrl>,
     #[cfg(not(any(feature = "dist-client", feature = "dist-server")))]
     pub scheduler_url: Option<String>,
-    pub cache_dir: PathBuf,
-    pub toolchains: Vec<DistToolchainConfig>,
-    #[serde(deserialize_with = "deserialize_size_from_str")]
-    pub toolchain_cache_size: u64,
-    pub rewrite_includes_only: bool,
     pub native: Option<NativeClientConfig>,
     pub native_installation_catalogs: Vec<PathBuf>,
 }
@@ -919,10 +885,6 @@ impl Default for DistConfig {
             auth: DistAuth::default(),
             cluster: None,
             scheduler_url: Option::default(),
-            cache_dir: default_dist_cache_dir(),
-            toolchains: Vec::default(),
-            toolchain_cache_size: default_toolchain_cache_size(),
-            rewrite_includes_only: false,
             native: None,
             native_installation_catalogs: Vec::new(),
         }
@@ -1841,12 +1803,6 @@ impl Config {
             };
 
         let mut config = Self::from_env_and_file_configs(env_conf, file_conf)?;
-        if let Some(cache_dir) = environment
-            .var_os("SCCACHE_DIST_CLIENT_CACHE_DIR")
-            .filter(|value| !value.is_empty())
-        {
-            config.dist.cache_dir = cache_dir.into();
-        }
         config.skip_cache_check = skip_cache_check;
         Ok(config)
     }
@@ -3630,45 +3586,19 @@ fn test_gcs_service_account() {
 }
 
 #[test]
-fn dist_path_override_cargo_path_is_optional() {
-    let with_cargo: DistToolchainConfig = toml::from_str(
-        r#"
-type = "path_override"
-compiler_executable = "/local/rustc"
-archive = "/toolchains/rust.tar.gz"
-archive_compiler_executable = "/archive/rustc"
-archive_cargo_executable = "/archive/cargo"
-"#,
-    )
-    .expect("custom Rust toolchain config must parse");
-    assert_eq!(
-        with_cargo,
-        DistToolchainConfig::PathOverride {
-            compiler_executable: "/local/rustc".into(),
-            archive: "/toolchains/rust.tar.gz".into(),
-            archive_compiler_executable: "/archive/rustc".to_owned(),
-            archive_cargo_executable: Some("/archive/cargo".to_owned()),
-        }
-    );
-
-    let legacy: DistToolchainConfig = toml::from_str(
-        r#"
-type = "path_override"
-compiler_executable = "/local/clang"
-archive = "/toolchains/clang.tar.gz"
-archive_compiler_executable = "/archive/clang"
-"#,
-    )
-    .expect("legacy custom toolchain config must keep parsing");
-    assert_eq!(
-        legacy,
-        DistToolchainConfig::PathOverride {
-            compiler_executable: "/local/clang".into(),
-            archive: "/toolchains/clang.tar.gz".into(),
-            archive_compiler_executable: "/archive/clang".to_owned(),
-            archive_cargo_executable: None,
-        }
-    );
+fn rejects_retired_client_archive_configuration() {
+    for field in [
+        "cache_dir = \"/tmp/archive\"",
+        "toolchain_cache_size = 100",
+        "rewrite_includes_only = true",
+        "toolchains = []",
+        "[[dist.toolchains]]\ntype = \"no_dist\"\ncompiler_executable = \"/usr/bin/gcc\"",
+    ] {
+        assert!(
+            toml::from_str::<FileConfig>(&format!("[dist]\n{field}")).is_err(),
+            "{field}"
+        );
+    }
 }
 
 #[test]
@@ -3679,11 +3609,6 @@ server_startup_timeout_ms = 10000
 [dist]
 # where to find the scheduler
 scheduler_url = "http://1.2.3.4:10600"
-# a set of prepackaged toolchains
-toolchains = []
-# the maximum size of the toolchain cache in bytes
-toolchain_cache_size = 5_368_709_120
-cache_dir = "/home/user/.cache/sccache-dist-client"
 
 [dist.auth]
 type = "token"
@@ -3865,10 +3790,6 @@ key_prefix = "cosprefix"
                 ),
                 #[cfg(not(any(feature = "dist-client", feature = "dist-server")))]
                 scheduler_url: Some("http://1.2.3.4:10600".to_owned()),
-                cache_dir: PathBuf::from("/home/user/.cache/sccache-dist-client"),
-                toolchains: vec![],
-                toolchain_cache_size: 5_368_709_120,
-                rewrite_includes_only: false,
                 native: None,
                 native_installation_catalogs: Vec::new(),
             },
@@ -3949,9 +3870,6 @@ gc_batch = 1024
 #[test]
 fn human_units_parse() {
     const CONFIG_STR: &str = r#"
-[dist]
-toolchain_cache_size = "5g"
-
 [cache.disk]
 size = "7g"
 "#;
@@ -3967,10 +3885,7 @@ size = "7g"
                 }),
                 ..Default::default()
             },
-            dist: DistConfig {
-                toolchain_cache_size: 5 * 1024 * 1024 * 1024,
-                ..Default::default()
-            },
+            dist: DistConfig::default(),
             server_startup_timeout_ms: None,
             basedirs: vec![],
             client_side_mode: false,
@@ -3994,29 +3909,6 @@ fn rejects_zero_compile_deadlines() -> Result<()> {
     let config = Config::from_env_and_file_configs(EnvConfig::default(), file)?;
     assert_eq!(config.compile_limits.phase_timeout_secs, 42);
     assert_eq!(config.compile_limits.execution_timeout_secs, 3600);
-    Ok(())
-}
-
-#[test]
-fn test_dist_client_cache_dir_env_overrides_file_config() -> Result<()> {
-    let mut environment = Environment::default();
-    let temp = tempfile::tempdir()?;
-    let config_path = temp.path().join("config");
-    let env_cache_dir = temp.path().join("root-dist-cache");
-    std::fs::write(&config_path, "[dist]\ncache_dir = \"/file-cache\"\n")?;
-
-    {
-        environment.set("SCCACHE_CONF", &config_path);
-        environment.set("SCCACHE_DIST_CLIENT_CACHE_DIR", &env_cache_dir);
-    }
-    let config = Config::load_from_environment(&environment);
-    {
-        environment.remove("SCCACHE_DIST_CLIENT_CACHE_DIR");
-        environment.remove("SCCACHE_CONF");
-    }
-
-    let config = config?;
-    assert_eq!(config.dist.cache_dir, env_cache_dir);
     Ok(())
 }
 

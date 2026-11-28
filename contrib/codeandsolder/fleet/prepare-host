@@ -156,7 +156,7 @@ Environment=SCCACHE_CONF=/etc/sccache/client-shared.toml
 Environment=SCCACHE_SERVER_UDS=/run/sccache-shared/sccache.sock
 Environment=SCCACHE_START_SERVER=1
 Environment=SCCACHE_NO_DAEMON=1
-UnsetEnvironment=SCCACHE_SERVER_PORT SCCACHE_CLIENT_SIDE SCCACHE_DIST_CLIENT_CACHE_DIR
+UnsetEnvironment=SCCACHE_SERVER_PORT SCCACHE_CLIENT_SIDE
 UNIT
 cat > "$stage/wrapper.conf" <<'ROUTING'
 user_endpoint=unix:/run/sccache-shared/sccache.sock
@@ -174,11 +174,9 @@ install -m 0600 "$repo/native-action-report.awk" "$stage/native-action-report.aw
 if [[ -x /usr/bin/rustup && -f /usr/local/bin/cargo ]]; then
   install -m 0700 "$repo/cargo-wrapper" "$stage/cargo-wrapper"
 fi
-for helper in sccache-cmake-launcher sccache-dist-client-preflight; do
-  if [[ -f "/usr/local/libexec/$helper" ]]; then
-    install -m 0700 "$repo/$helper" "$stage/$helper"
-  fi
-done
+if [[ -f /usr/local/libexec/sccache-cmake-launcher ]]; then
+  install -m 0700 "$repo/sccache-cmake-launcher" "$stage/sccache-cmake-launcher"
+fi
 case "$role" in
   wsl) sed -i 's| /usr/bin/rustup | /home/jan/.cargo/bin/rustup |' "$stage/sccache-client" ;;
   cold-storage) sed -i 's| /usr/bin/rustup | /var/lib/sccache-native-builder/cargo/bin/rustup |' "$stage/sccache-client" ;;

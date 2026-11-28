@@ -6,11 +6,23 @@ mode=${1:?client or worker}
 source=${2:?source TOML}
 case "$mode" in
   client)
+    # An archive override used to change which compiler actually executed.
+    # Do not silently reinterpret such a configuration as the host compiler.
+    if ! awk '
+      /^[[:space:]]*\[\[/ && /dist\.toolchains/ { exit 1 }
+      /^[[:space:]]*\[/ { section=$0 }
+      section ~ /^[[:space:]]*\[dist\][[:space:]]*$/ &&
+        /^[[:space:]]*toolchains[[:space:]]*=/ &&
+        $0 !~ /^[[:space:]]*toolchains[[:space:]]*=[[:space:]]*\[[[:space:]]*\][[:space:]]*(#.*)?$/ { exit 1 }
+    ' "$source"; then
+      echo "Archive toolchain overrides must be replaced with native toolchain provisioning before migration" >&2
+      exit 1
+    fi
     awk '
       /^[[:space:]]*\[/ { section=$0 }
       section ~ /^[[:space:]]*\[cache\.disk\][[:space:]]*$/ { next }
       section ~ /^[[:space:]]*\[dist\][[:space:]]*$/ &&
-        /^[[:space:]]*(cache_dir|toolchain_cache_size)[[:space:]]*=/ { next }
+        /^[[:space:]]*(cache_dir|toolchain_cache_size|rewrite_includes_only|toolchains)[[:space:]]*=/ { next }
       { print }
     ' "$source"
     ;;

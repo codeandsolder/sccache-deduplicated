@@ -2262,7 +2262,6 @@ impl LocalService {
             max_result_bytes: 64 * 1024 * 1024,
         });
         config.fallback_cache.dir = root.join("unexpected-archive-cache");
-        config.dist.cache_dir = root.join("unexpected-toolchain-cache");
         let address = sccache::server::SocketAddr::parse_uds(
             socket
                 .to_str()
@@ -2903,7 +2902,6 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     assert!(private.join("build/libprobe.rlib").is_file());
     assert!(!visible.join("build").exists());
     assert!(!root.join("unexpected-archive-cache").exists());
-    assert!(!root.join("unexpected-toolchain-cache").exists());
 
     // Changing only whether the caller can reuse a verified digest must
     // preserve the exact action key, including in a fresh networkless CLI.

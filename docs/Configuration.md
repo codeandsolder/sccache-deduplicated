@@ -36,11 +36,6 @@ basedirs = ["/home/user/project"]
 [dist]
 # where to find the scheduler
 scheduler_url = "https://1.2.3.4:10600"
-# a set of prepackaged toolchains
-toolchains = []
-# the maximum size of the toolchain cache in bytes
-toolchain_cache_size = 5368709120
-cache_dir = "/home/user/.cache/sccache-dist-client"
 
 [dist.auth]
 type = "token"
@@ -50,6 +45,15 @@ token = "secrettoken"
 directory = "/home/user/.local/state/sccache-cluster"
 ca_certificate = "/etc/sccache/cluster-ca.pem"
 scheduler_id = "<64-digit scheduler peer ID>"
+
+[dist.native]
+endpoint = "https://1.2.3.4:10502"
+platform_contract = "site-defined-linux-execution-contract-v1"
+request_timeout_secs = 120
+build_timeout_secs = 600
+renewal_interval_secs = 15
+max_metadata_bytes = 67108864
+max_result_bytes = 1073741824
 
 # Multi-level cache configuration
 # Define cache levels in order (fast to slow).
@@ -208,7 +212,6 @@ Note that some env variables may need sccache server restart to take effect.
 * `SCCACHE_CONF` configuration file path
 * `SCCACHE_BASEDIRS` base directory (or directories) to strip from paths for cache key computation. This is similar to ccache's `CCACHE_BASEDIR` and enables cache hits across different absolute paths when compiling the same source code. Multiple directories can be separated by `;` on Windows hosts and by `:` on any other operating system. When multiple directories are specified, the longest matching prefix is used. Path matching is **case-insensitive** on Windows and **case-sensitive** on other operating systems. Environment variable takes precedence over file configuration. Only absolute paths are supported; relative paths will cause an error and prevent the server from start.
 * `SCCACHE_CACHED_CONF`
-* `SCCACHE_DIST_CLIENT_CACHE_DIR` distributed toolchain cache directory; overrides `[dist].cache_dir` from the configuration file. Use a distinct directory for clients whose packaged compiler layout differs (for example, different absolute rustup roots).
 * `SCCACHE_DIST_WORKER_NAME` stable distributed worker display name used by client statistics and telemetry. Workers default to their OS hostname. Named workers register this metadata through an additive scheduler side channel; legacy workers remain fully compatible and continue to appear by transport address until upgraded.
 * `SCCACHE_MIN_JOBS` minimum local compiler jobserver capacity, default `12`. Higher detected CPU counts are preserved; `0` disables the floor. Restart an existing daemon to change its capacity. Set upstream Cargo build.jobs in the managed Cargo configuration to supply sufficient work; sccache cannot increase the number of requests submitted by an external build tool.
 * `SCCACHE_IDLE_TIMEOUT` how long the local daemon process waits for more client requests before exiting, in seconds. Set to `0` to run sccache permanently

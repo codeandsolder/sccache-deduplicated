@@ -52,9 +52,6 @@ struct Job {
     activity_id: String,
     compile: Compile,
     aliases: CompilerAliases,
-    // Tagged serde enums are not supported by bincode. These contain
-    // administrator-approved toolchain mappings only, never scheduler auth.
-    toolchains: Vec<u8>,
     catalogs: Vec<std::path::PathBuf>,
 }
 
@@ -69,7 +66,6 @@ pub(super) struct SharedExecutor {
     jobserver: Client,
     executors: tokio::sync::Semaphore,
     aliases: CompilerAliases,
-    toolchains: Vec<u8>,
     catalogs: Vec<std::path::PathBuf>,
     #[cfg(feature = "dist-client")]
     digest_memo: Arc<crate::build_runtime::DescriptorMemo>,
@@ -248,7 +244,6 @@ impl SharedExecutor {
             jobserver,
             executors: tokio::sync::Semaphore::new(capacity),
             aliases: config.compiler_aliases.clone(),
-            toolchains: serde_json::to_vec(&config.dist.toolchains)?,
             catalogs: config.dist.native_installation_catalogs.clone(),
             #[cfg(feature = "dist-client")]
             digest_memo: Arc::default(),
@@ -354,7 +349,6 @@ impl SharedExecutor {
             activity_id: activity.snapshot().id,
             compile,
             aliases: self.aliases.clone(),
-            toolchains: self.toolchains.clone(),
             catalogs: self.catalogs.clone(),
         };
         input.write_all(&frame(&peer.credentials)?).await?;

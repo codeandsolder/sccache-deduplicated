@@ -533,8 +533,6 @@ cmp initial.rmeta libprobe.rmeta
         .arg(&config)
         .arg("--tmpfs")
         .arg(root.join("client-cache"))
-        .arg("--tmpfs")
-        .arg(root.join("client-dist-cache"))
         .arg("--chdir")
         .arg(&visible)
         .args(["--", "/bin/sh", "-c", script, "namespace-test"])

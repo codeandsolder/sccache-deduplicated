@@ -102,7 +102,6 @@ impl IpcStorage {
                     self.conn(),
                     self.handshake.transfer_chunk_bytes,
                     policy.clone(),
-                    config.toolchains.clone(),
                     &config.native_installation_catalogs,
                     digest_provider,
                 ),
