@@ -31,7 +31,7 @@ runtime profiling destinations remain meaningful inputs.
 
 ## Rust
 
-Hash the actual compiler driver and compiler library contents, target and
+Hash the actual compiler driver and loader-selected compiler libraries, target and
 semantic arguments, selected source and binary dependencies (including selected
 standard libraries), extern name-to-content bindings, auxiliary inputs,
 static libraries, custom target contents and explicitly observed environment.
@@ -40,7 +40,11 @@ proc-macro compilations discover successful file reads in the dependency probe,
 rather than treating a package tree as a dependency. The trace tool is part of
 the managed runtime. Fixed system runtime files and probe scratch are not
 project dependencies. The compiler version banner is discovery data, not an
-additional digest input. Explicit externs are keyed once by name, modifiers
+additional digest input. Resolve the actual ELF dependency closure, including
+versioned LLVM shared libraries, not every file with a shared-library suffix
+in the installation. Managed system runtime libraries do not contribute to
+private toolchain identity. Native execution does not compute an archive
+transport key or read target installation ledgers. Explicit externs are keyed once by name, modifiers
 and content, independently of filename ordering or repeated discovery.
 An originating CPU profile is only hashed if the effective invocation still
 requests native CPU or tuning; successfully lowered explicit target arguments
@@ -58,6 +62,8 @@ normalized for both key and execution. The build-script output root is
 `/generated`. Do not hash the native working directory or all Cargo environment
 variables. Retain the actual package identity where ordinary proc macros use it,
 compiler switches supplied through the environment, and Clippy policy and flags.
+Resolve duplicate environment assignments before discovery, hashing or execution;
+explicit observations are not repeated in the native compiler environment group.
 Keep Rust metadata/output-name salts: changing `-C extra-filename` was verified
 to change both rlib and rmeta contents even with identical metadata salt.
 

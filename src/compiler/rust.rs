@@ -43,7 +43,7 @@ use log::Level::Trace;
 use semver::Version;
 use serde::Serialize;
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env::consts::DLL_EXTENSION;
 #[cfg(feature = "dist-client")]
 use std::env::consts::DLL_PREFIX;
@@ -165,7 +165,8 @@ pub struct Rust {
     version: String,
     /// The path to the rustc sysroot.
     sysroot: PathBuf,
-    /// The digests of all the shared libraries in rustc's $sysroot/lib (or /bin on Windows).
+    /// Archive-transport compiler inventory. Native identity resolves loaded
+    /// compiler files at invocation time.
     compiler_shlibs_digests: Vec<String>,
     /// The custom dist toolchain archive for this rustc, if configured.
     dist_archive: Option<PathBuf>,
@@ -185,7 +186,8 @@ pub struct RustHasher {
     version: String,
     /// The path to the rustc sysroot.
     sysroot: PathBuf,
-    /// The digests of all the shared libraries in rustc's $sysroot/lib (or /bin on Windows).
+    /// Archive-transport compiler inventory. Native identity resolves loaded
+    /// compiler files at invocation time.
     compiler_shlibs_digests: Vec<String>,
     /// The custom dist toolchain archive for this rustc, if configured.
     dist_archive: Option<PathBuf>,
@@ -351,7 +353,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"11";
+const CACHE_VERSION: &[u8] = b"12";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -1168,6 +1170,16 @@ fn rust_execution_variable(name: &OsStr, clippy: bool) -> bool {
         ))
 }
 
+fn effective_environment(
+    assignments: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    assignments
+        .into_iter()
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect()
+}
+
 fn compiler_execution_environment(
     env: &[(OsString, OsString)],
     observed: &HashSet<OsString>,
@@ -1189,8 +1201,7 @@ fn compiler_execution_environment(
             result.push((name.into(), value.into()));
         }
     }
-    result.sort();
-    result
+    effective_environment(result)
 }
 
 fn is_clippy_driver(executable: &Path) -> bool {
@@ -1750,8 +1761,7 @@ async fn discover_rust_sysroot<T: CommandCreatorSync>(
     mut creator: T,
     executable: &Path,
     env_vars: &[(OsString, OsString)],
-    dist_archive: Option<PathBuf>,
-) -> Result<(PathBuf, Vec<PathBuf>)> {
+) -> Result<PathBuf> {
     let mut cmd = creator.new_command_sync(executable);
     cmd.stdout(process::Stdio::piped())
         .stderr(process::Stdio::null())
@@ -1760,7 +1770,10 @@ async fn discover_rust_sysroot<T: CommandCreatorSync>(
         .envs(env_vars.to_vec());
     let output = run_input_output(cmd, None).await?;
     let outstr = String::from_utf8(output.stdout).context("Error parsing sysroot")?;
-    let sysroot = PathBuf::from(outstr.trim_end());
+    Ok(PathBuf::from(outstr.trim_end()))
+}
+
+fn installed_rust_libraries(sysroot: &Path, dist_archive: Option<PathBuf>) -> Result<Vec<PathBuf>> {
     let libs_path = sysroot.join(LIBS_DIR);
     let mut libs = fs::read_dir(&libs_path)
         .with_context(|| {
@@ -1792,12 +1805,43 @@ async fn discover_rust_sysroot<T: CommandCreatorSync>(
         libs.push(path);
     }
     libs.sort();
-    Ok((sysroot, libs))
+    Ok(libs)
+}
+
+#[cfg(all(
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn native_rust_compiler_files(
+    executable: &Path,
+    sysroot: &Path,
+    cwd: &Path,
+    environment: &[(OsString, OsString)],
+) -> Result<Vec<PathBuf>> {
+    let root = sysroot.canonicalize()?;
+    let compiler = executable.canonicalize()?;
+    let mut selected = vec![compiler.clone()];
+    let mut seen = HashSet::from([compiler]);
+    for library in super::c_toolchain::selected_loader_files(executable, environment, cwd)? {
+        let path = library.canonicalize()?;
+        // A private toolchain supplies compiler code, not the fixed managed
+        // system runtime. A system-installed compiler has no separate private
+        // root, so its actual selected closure under the sysroot remains input.
+        let system_runtime = ["/usr", "/lib", "/lib64", "/etc"]
+            .iter()
+            .any(|directory| path.starts_with(directory));
+        if (path.starts_with(&root) || !system_runtime) && seen.insert(path.clone()) {
+            selected.push(path);
+        }
+    }
+    Ok(selected)
 }
 
 impl Rust {
-    /// Create a new Rust compiler instance, calculating the hashes of
-    /// all the shared libraries in its sysroot.
+    /// Discover a Rust compiler. Native results resolve their actual loaded
+    /// compiler libraries per invocation; archive transport uses its installed
+    /// toolchain inventory.
     pub async fn new<T>(
         creator: T,
         executable: PathBuf,
@@ -1817,14 +1861,32 @@ impl Rust {
             .context("rustc verbose version didn't have a line for `host:`")?
             .to_string();
 
-        let sysroot_and_libs = discover_rust_sysroot(
-            creator,
-            &executable,
-            env_vars,
-            discovery.dist_archive.clone(),
-        );
-        let (sysroot, mut libs) = sysroot_and_libs.await?;
-        libs.push(executable.clone());
+        let sysroot = discover_rust_sysroot(creator, &executable, env_vars).await?;
+        #[cfg(all(
+            feature = "dist-client",
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let native_identity = discovery.native_digests.is_some();
+        #[cfg(not(all(
+            feature = "dist-client",
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        let native_identity = false;
+        let dist_archive = if native_identity {
+            None
+        } else {
+            discovery.dist_archive.clone()
+        };
+        let mut libs = if native_identity {
+            Vec::new()
+        } else {
+            installed_rust_libraries(&sysroot, dist_archive.clone())?
+        };
+        if !native_identity {
+            libs.push(executable.clone());
+        }
         #[cfg(feature = "dist-client")]
         let rlib_dep_reader = match RlibDepReader::from_version(
             executable.clone(),
@@ -1845,7 +1907,7 @@ impl Rust {
             version: rustc_verbose_version.to_string(),
             sysroot,
             compiler_shlibs_digests: digests,
-            dist_archive: discovery.dist_archive,
+            dist_archive,
             #[cfg(feature = "dist-client")]
             rlib_dep_reader,
         })
@@ -3002,11 +3064,45 @@ where
             cache_control,
             ..
         } = context;
+        let env_vars = effective_environment(env_vars);
         trace!("[{}]: generate_hash_key", self.parsed_args.crate_name);
 
         let shadow_log_path = std::env::var_os(RUST_SHADOW_LOG_ENV)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
+        #[cfg(all(
+            feature = "dist-client",
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let compiler_shlibs_digests: Cow<'_, [String]> = if let Some(native) = &native {
+            let executable = self.executable.clone();
+            let sysroot = self.sysroot.clone();
+            let directory = cwd.clone();
+            let environment = compiler_execution_environment(
+                &env_vars,
+                &HashSet::new(),
+                is_clippy_driver(&executable),
+            );
+            let files = pool
+                .spawn_blocking(move || {
+                    native_rust_compiler_files(&executable, &sysroot, &directory, &environment)
+                })
+                .await??;
+            Cow::Owned(
+                native
+                    .hash_compiler_inputs(&files, &self.sysroot, pool)
+                    .await?,
+            )
+        } else {
+            Cow::Borrowed(self.compiler_shlibs_digests.as_slice())
+        };
+        #[cfg(not(all(
+            feature = "dist-client",
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        let compiler_shlibs_digests = Cow::Borrowed(self.compiler_shlibs_digests.as_slice());
         let mut effective_arguments = self.parsed_args.arguments.clone();
         let needs_literal_argfile = effective_arguments
             .iter()
@@ -3183,9 +3279,10 @@ where
         }
 
         #[cfg(all(feature = "dist-client", target_os = "linux"))]
-        let native_discovery = native.is_some() && allow_dist;
+        let native_backend = native.is_some();
         #[cfg(not(all(feature = "dist-client", target_os = "linux")))]
-        let native_discovery = false;
+        let native_backend = false;
+        let native_discovery = native_backend && allow_dist;
         let output_dir = cwd.join(&self.parsed_args.output_dir);
         let canonical_output_dir =
             super::canonical_paths::physical_operand(&cwd, &self.parsed_args.output_dir);
@@ -3641,7 +3738,7 @@ where
         }
         // 2. compiler_shlibs_digests
         m.audit_field("sccache.key.compiler_libraries");
-        for d in &self.compiler_shlibs_digests {
+        for d in compiler_shlibs_digests.iter() {
             m.update(d.as_bytes());
         }
         m.audit_field("sccache.key.layout");
@@ -3654,22 +3751,26 @@ where
         // host-only archive cannot be reused for a later cross-target compile,
         // and installing a previously-missing target invalidates a failed/stale
         // archive without perturbing the normal compilation cache key.
-        let target_std_manifest = self
-            .sysroot
-            .join(LIBS_DIR)
-            .join("rustlib")
-            .join(format!("manifest-rust-std-{target}"));
-        let target_std_manifest_digest = if target_std_manifest.is_file() {
-            Some(Digest::file(target_std_manifest, pool).await?)
+        let weak_toolchain_key = if native_backend {
+            String::new()
         } else {
-            None
+            let target_std_manifest = self
+                .sysroot
+                .join(LIBS_DIR)
+                .join("rustlib")
+                .join(format!("manifest-rust-std-{target}"));
+            let target_std_manifest_digest = if target_std_manifest.is_file() {
+                Some(Digest::file(target_std_manifest, pool).await?)
+            } else {
+                None
+            };
+            dist_toolchain_weak_key(
+                &compiler_shlibs_digests,
+                &target,
+                target_std_manifest_digest.as_deref(),
+                canonical_paths.is_none().then_some(self.sysroot.as_path()),
+            )
         };
-        let weak_toolchain_key = dist_toolchain_weak_key(
-            &self.compiler_shlibs_digests,
-            &target,
-            target_std_manifest_digest.as_deref(),
-            canonical_paths.is_none().then_some(self.sysroot.as_path()),
-        );
         // The same selected auxiliary closure participates in both result
         // identity and the weak-to-strong archive mapping. Changing the
         // assembler, DLL generator, or any loaded library cannot reuse an
@@ -3678,10 +3779,14 @@ where
         let weak_toolchain_key = if let Some(plan) = &dlltool_plan {
             m.delimiter(b"rust-dlltool-closure-v1");
             m.delimiter(plan.identity.as_bytes());
-            let mut weak = Digest::new();
-            weak.delimiter(weak_toolchain_key.as_bytes());
-            weak.delimiter(plan.identity.as_bytes());
-            weak.finish()
+            if native_backend {
+                weak_toolchain_key
+            } else {
+                let mut weak = Digest::new();
+                weak.delimiter(weak_toolchain_key.as_bytes());
+                weak.delimiter(plan.identity.as_bytes());
+                weak.finish()
+            }
         } else {
             weak_toolchain_key
         };
@@ -3756,6 +3861,7 @@ where
         //    since those are not listed in dep-info but affect cacheability.
         m.audit_field("sccache.key.observed_environment");
         env_deps.sort();
+        env_deps.dedup();
         if canonical_paths.is_none() && !env_deps.is_empty() {
             // Earlier physical-layout distributed builds could rewrite explicit
             // observations. Do not reuse those entries. Keep normal canonical
@@ -3816,6 +3922,9 @@ where
         if native_discovery {
             m.delimiter(b"native-compiler-environment-contract-v2");
             for (name, value) in &env_vars {
+                if env_deps.iter().any(|(observed, _)| observed == name) {
+                    continue;
+                }
                 if matches!(
                     name.to_str(),
                     Some("RUSTC_BOOTSTRAP" | "RUSTC_FORCE_UNSTABLE" | "SOURCE_DATE_EPOCH")
@@ -4049,7 +4158,7 @@ where
                     host: self.host.clone(),
                     target: target.clone(),
                     compiler_version: self.version.clone(),
-                    compiler_shlibs_digests: self.compiler_shlibs_digests.clone(),
+                    compiler_shlibs_digests: compiler_shlibs_digests.to_vec(),
                     cache_control: format!("{effective_cache_control:?}"),
                     may_dist,
                     allow_dist,
@@ -9733,6 +9842,67 @@ version='2.0.0'
         )?;
         assert_eq!(read_opened_inputs(&log, &scratch, None)?, vec![sidecar]);
         Ok(())
+    }
+
+    #[cfg(all(
+        feature = "dist-client",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn native_rust_compiler_files_exclude_unloaded_inventory() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let driver = root.join("rustc");
+        fs::copy("/bin/true", &driver)?;
+        fs::write(root.join("unused.so"), b"not loaded")?;
+        let selected = native_rust_compiler_files(&driver, root, root, &[])?;
+        assert_eq!(selected, vec![driver.canonicalize()?]);
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "dist-client",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    #[ignore = "requires a real Rust toolchain and ELF loader"]
+    fn native_rust_compiler_files_include_actual_versioned_libraries() -> Result<()> {
+        let sysroot = process::Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()?;
+        anyhow::ensure!(sysroot.status.success(), "could not discover Rust sysroot");
+        let root = PathBuf::from(String::from_utf8(sysroot.stdout)?.trim()).canonicalize()?;
+        let driver = root.join("bin/rustc");
+        let selected = native_rust_compiler_files(&driver, &root, &root, &[])?;
+        assert!(selected.contains(&driver.canonicalize()?));
+        let actual = super::super::dynamic_dependencies::find_ldd_libraries(&driver, Some(&[]))?;
+        for path in actual {
+            let path = path.canonicalize()?;
+            if path.starts_with(&root) {
+                assert!(selected.contains(&path), "missing {}", path.display());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compiler_environment_uses_last_assignment() {
+        let env = vec![
+            ("PATH".into(), "/z".into()),
+            ("CARGO_PKG_NAME".into(), "test".into()),
+            ("PATH".into(), "/a".into()),
+        ];
+        let expected = vec![
+            ("CARGO_PKG_NAME".into(), "test".into()),
+            ("PATH".into(), "/a".into()),
+        ];
+        assert_eq!(effective_environment(env.clone()), expected);
+        assert_eq!(
+            compiler_execution_environment(&env, &HashSet::new(), false),
+            compiler_execution_environment(&expected, &HashSet::new(), false),
+        );
     }
 
     #[test]

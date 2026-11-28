@@ -241,6 +241,24 @@ fn search_contract(
     Ok((Some(path), selected))
 }
 
+/// Resolve the actual loader-selected files in requested-library-name order.
+/// Result identity can use this without constructing a delivery package.
+pub(super) fn selected_loader_files(
+    executable: &Path,
+    environment: &[(OsString, OsString)],
+    cwd: &Path,
+) -> Result<Vec<PathBuf>> {
+    let path = environment
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "LD_LIBRARY_PATH")
+        .map(|(_, value)| value.as_os_str());
+    Ok(LoaderProbe::open(executable.to_owned())?
+        .resolve(environment, cwd, path, true)?
+        .into_values()
+        .collect())
+}
+
 pub(super) fn prepare_loader_search(
     builder: &mut ToolchainPackageBuilder,
     executables: &[PathBuf],
