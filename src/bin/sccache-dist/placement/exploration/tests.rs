@@ -37,7 +37,6 @@ fn register(
         &[],
         Box::new(TestJobAuthorizer),
         dist::WorkerCapabilities {
-            archive: false,
             native_platform: Some(ContentId::of(b"test")),
             native_placement: Some(placement),
         },

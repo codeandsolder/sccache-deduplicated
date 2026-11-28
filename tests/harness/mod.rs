@@ -35,7 +35,7 @@ const DIST_DOCKERFILE: &str = include_str!("Dockerfile.sccache-dist");
 #[cfg(feature = "dist-server")]
 const DIST_IMAGE_BWRAP_PATH: &str = "/usr/bin/bwrap";
 #[cfg(feature = "dist-server")]
-const MAX_STARTUP_WAIT: Duration = Duration::from_secs(5);
+const MAX_STARTUP_WAIT: Duration = Duration::from_secs(30);
 const DIST_CACHE_RELPATH: &str = "client-dist-cache";
 
 #[cfg(feature = "dist-server")]
@@ -48,8 +48,6 @@ pub const CUSTOM_SERVER_TOKEN_ENV: &str = "SCCACHE_TEST_CUSTOM_SERVER_TOKEN";
 
 #[cfg(feature = "dist-server")]
 const CONFIGS_CONTAINER_PATH: &str = "/sccache-bits";
-#[cfg(feature = "dist-server")]
-const BUILD_DIR_CONTAINER_PATH: &str = "/sccache-bits/build-dir";
 // Per-fixture endpoints avoid touching the managed build cache or other
 // distributed test processes on the host.
 #[cfg(all(unix, feature = "dist-server"))]
@@ -92,7 +90,7 @@ fn loopback_listener() -> net::TcpListener {
 // Keep normal test worker archives and extractions resident across requests.
 const TC_CACHE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 #[cfg(feature = "dist-server")]
-const EXTRACTED_TC_CACHE_SIZE: u64 = 8 * 1024 * 1024 * 1024;
+pub const TEST_PLATFORM: &str = "native-distributed-regression";
 
 pub fn start_local_daemon(cfg_path: &Path, cached_cfg_path: &Path) {
     // Don't run this with run() because on Windows `wait_with_output`
@@ -296,12 +294,44 @@ pub fn sccache_client_cfg(
 }
 
 #[cfg(feature = "dist-server")]
-fn sccache_scheduler_cfg(address: SocketAddr) -> sccache::config::scheduler::Config {
+fn test_space() -> sccache::build_runtime::SpacePolicy {
+    sccache::build_runtime::SpacePolicy {
+        min_available_bytes: 1024 * 1024,
+        target_available_bytes: 2 * 1024 * 1024,
+        max_resident_bytes: u64::MAX,
+        target_resident_bytes: u64::MAX,
+        max_evictions_per_pass: 8,
+        gc_batch: 128,
+    }
+}
+
+#[cfg(feature = "dist-server")]
+fn sccache_scheduler_cfg(
+    address: SocketAddr,
+    cache_addr: SocketAddr,
+) -> sccache::config::scheduler::Config {
     sccache::config::scheduler::Config {
         cluster_directory: Path::new(CONFIGS_CONTAINER_PATH).join("cluster"),
         maintenance_drain_file: None,
         dashboard: None,
-        native_cache: None,
+        native_cache: Some(sccache::config::scheduler::NativeCacheConfig {
+            public_addr: cache_addr,
+            bind_address: Some(cache_addr),
+            directory: Path::new(CONFIGS_CONTAINER_PATH).join("scheduler-store"),
+            space: test_space(),
+            idle_timeout_secs: 300,
+            max_sessions: 128,
+            max_result_bytes: 512 * 1024 * 1024,
+            max_result_blobs: 4096,
+            max_tree_bytes: 8 * 1024 * 1024 * 1024,
+            max_tree_blobs: 65_536,
+            max_concurrent_uploads: 4,
+            max_total_uploads: 8,
+            http_threads: 16,
+            max_metadata_bytes: 64 * 1024 * 1024,
+            package_import: None,
+            package_upstreams: Default::default(),
+        }),
         local_worker: None,
         traces: None,
         job_slack: Default::default(),
@@ -318,13 +348,14 @@ fn sccache_server_cfg(
     tmpdir: &Path,
     scheduler_url: HTTPUrl,
     server_addr: SocketAddr,
+    cache_addr: SocketAddr,
 ) -> sccache::config::server::Config {
-    let relpath = "server-cache";
+    let relpath = format!("worker-store-{}", server_addr.port());
     let scheduler_id = sccache_cluster_identity::Identity::open(&tmpdir.join("cluster/key.pem"))
         .unwrap()
         .id()
         .unwrap();
-    fs::create_dir(tmpdir.join(relpath)).unwrap();
+    fs::create_dir(tmpdir.join(&relpath)).unwrap();
 
     sccache::config::server::Config {
         cluster: sccache_peer_identity::PeerConfig {
@@ -333,21 +364,34 @@ fn sccache_server_cfg(
             ca_certificate: Path::new(CONFIGS_CONTAINER_PATH).join("cluster/ca.pem"),
             scheduler_id,
         },
-        builder: sccache::config::server::BuilderType::Overlay {
-            build_dir: BUILD_DIR_CONTAINER_PATH.into(),
-            bwrap_path: DIST_IMAGE_BWRAP_PATH.into(),
-            extracted_toolchain_cache_size: EXTRACTED_TC_CACHE_SIZE,
-        },
-        cache_dir: Some(Path::new(CONFIGS_CONTAINER_PATH).join(relpath)),
+        builder: sccache::config::server::BuilderType::Native,
         public_addr: server_addr,
         bind_address: Some(server_addr),
         scheduler_url,
         scheduler_auth: sccache::config::server::SchedulerAuth::Token {
             token: DIST_SERVER_TOKEN.to_owned(),
         },
-        toolchain_cache_size: TC_CACHE_SIZE,
-        toolchain_archive_sources: vec![],
-        native_worker: None,
+        native_worker: Some(sccache::config::server::NativeWorkerConfig {
+            cache_url: HTTPUrl::from_url(
+                url::Url::parse(&format!("https://{cache_addr}")).unwrap(),
+            ),
+            directory: Some(Path::new(CONFIGS_CONTAINER_PATH).join(&relpath)),
+            space: Some(test_space()),
+            scratch: Path::new(CONFIGS_CONTAINER_PATH)
+                .join(format!("scratch-{}", server_addr.port())),
+            bubblewrap: DIST_IMAGE_BWRAP_PATH.into(),
+            platform_contract: TEST_PLATFORM.into(),
+            renewal_interval_secs: 1,
+            request_timeout_secs: 60,
+            execution_timeout_secs: 180,
+            max_result_bytes: 512 * 1024 * 1024,
+            max_metadata_bytes: 64 * 1024 * 1024,
+            artifact_grace_secs: 300,
+            artifact_grace_bytes: None,
+            max_inflight_jobs: None,
+            package_import: None,
+            package_transfer: Default::default(),
+        }),
         traces: None,
     }
 }
@@ -372,6 +416,8 @@ pub struct DistSystem {
 
     scheduler_addr: SocketAddr,
     scheduler_listener: Option<net::TcpListener>,
+    cache_listener: Option<net::TcpListener>,
+    cache_addr: SocketAddr,
     #[cfg(unix)]
     daemon_socket: Option<DistDaemonSocket>,
     scheduler_name: Option<String>,
@@ -428,11 +474,15 @@ impl DistSystem {
 
         let scheduler_listener = loopback_listener();
         let scheduler_addr = scheduler_listener.local_addr().unwrap();
+        let cache_listener = loopback_listener();
+        let cache_addr = cache_listener.local_addr().unwrap();
         #[cfg(unix)]
         let daemon_socket = Some(DistDaemonSocket::new(tmpdir.join("client.sock")));
         Self {
             scheduler_addr,
             scheduler_listener: Some(scheduler_listener),
+            cache_listener: Some(cache_listener),
+            cache_addr,
             #[cfg(unix)]
             daemon_socket,
             sccache_dist: sccache_dist.to_owned(),
@@ -449,7 +499,7 @@ impl DistSystem {
         let scheduler_cfg_path = self.tmpdir.join(scheduler_cfg_relpath);
         let scheduler_cfg_container_path =
             Path::new(CONFIGS_CONTAINER_PATH).join(scheduler_cfg_relpath);
-        let scheduler_cfg = sccache_scheduler_cfg(self.scheduler_addr);
+        let scheduler_cfg = sccache_scheduler_cfg(self.scheduler_addr, self.cache_addr);
         fs::File::create(scheduler_cfg_path)
             .unwrap()
             .write_all(&serde_json::to_vec(&scheduler_cfg).unwrap())
@@ -459,6 +509,7 @@ impl DistSystem {
         let scheduler_name = make_container_name("scheduler");
         // Reserve until immediately before the service binds.
         drop(self.scheduler_listener.take());
+        drop(self.cache_listener.take());
         let output = Command::new("docker")
             .args([
                 "run",
@@ -577,7 +628,12 @@ impl DistSystem {
 
         let listener = loopback_listener();
         let server_addr = listener.local_addr().unwrap();
-        let server_cfg = sccache_server_cfg(&self.tmpdir, self.scheduler_url(), server_addr);
+        let server_cfg = sccache_server_cfg(
+            &self.tmpdir,
+            self.scheduler_url(),
+            server_addr,
+            self.cache_addr,
+        );
         fs::File::create(&server_cfg_path)
             .unwrap()
             .write_all(&serde_json::to_vec(&server_cfg).unwrap())
@@ -647,31 +703,6 @@ impl DistSystem {
         }
         self.wait_server_ready(handle)
     }
-    pub fn count_toolchains_on_server(&mut self, handle: &ServerHandle) -> usize {
-        match handle {
-            ServerHandle::Container { cid, url: _ } => {
-                let output = Command::new("docker")
-                    .args([
-                        "exec",
-                        "-t",
-                        cid,
-                        "ls",
-                        "-1",
-                        &format!("{BUILD_DIR_CONTAINER_PATH}/toolchains"),
-                    ])
-                    .output()
-                    .unwrap();
-                check_output(&output);
-                println!("{output:?}");
-                let str_output = String::from_utf8_lossy(&output.stdout);
-                str_output.lines().filter(|&part| !part.is_empty()).count()
-            }
-            ServerHandle::Process { pid: _, url: _ } => {
-                panic!("restart not yet implemented for pids")
-            }
-        }
-    }
-
     pub fn wait_server_ready(&mut self, handle: &ServerHandle) {
         let url = match handle {
             ServerHandle::Container { cid: _, url } | ServerHandle::Process { pid: _, url } => {
@@ -704,6 +735,22 @@ impl DistSystem {
     pub fn scheduler_url(&self) -> HTTPUrl {
         let url = format!("https://{}", self.scheduler_addr);
         HTTPUrl::from_url(url::Url::parse(&url).unwrap())
+    }
+
+    pub fn configure_client(&self, config: &mut sccache::config::FileConfig) {
+        config.dist.scheduler_url = Some(self.scheduler_url());
+        config.dist.cluster = Some(self.cluster_config());
+        config.dist.native = Some(sccache::config::NativeClientConfig {
+            endpoint: HTTPUrl::from_url(
+                url::Url::parse(&format!("https://{}", self.cache_addr)).unwrap(),
+            ),
+            platform_contract: TEST_PLATFORM.into(),
+            request_timeout_secs: 60,
+            build_timeout_secs: 300,
+            renewal_interval_secs: 1,
+            max_metadata_bytes: 64 * 1024 * 1024,
+            max_result_bytes: 512 * 1024 * 1024,
+        });
     }
 
     pub fn cluster_config(&self) -> sccache_peer_identity::PeerConfig {

@@ -13,26 +13,16 @@
 // limitations under the License.
 
 use crate::compiler;
-use crate::compression::ZstdFrame;
+#[cfg(feature = "dist-server")]
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fmt;
-use std::io::{self, Read};
-use std::path::{Path, PathBuf};
-use std::process;
 use std::str::FromStr;
-#[cfg(feature = "dist-server")]
-use std::sync::Mutex;
 
 #[cfg(feature = "dist-server")]
-use crate::errors::Error;
-use crate::errors::Result;
-#[cfg(unix)]
-use crate::errors::bail;
+use crate::errors::{Error, Result};
 
-#[cfg(any(feature = "dist-client", feature = "dist-server"))]
-mod cache;
 #[cfg(feature = "dist-client")]
 pub mod client_auth;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
@@ -45,13 +35,8 @@ pub mod execution_queue;
 pub mod http;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 pub mod native;
-#[cfg(all(target_os = "linux", feature = "dist-server"))]
-pub mod rooted_fs;
 #[cfg(test)]
 mod test;
-
-#[cfg(any(feature = "dist-client", feature = "dist-server"))]
-pub use crate::dist::cache::{StagedToolchainArchive, TcCache};
 
 // TODO: paths (particularly outputs, which are accessed by an unsandboxed program)
 // should be some pre-sanitised AbsPath type
@@ -511,134 +496,6 @@ pub fn try_compile_command_to_dist(
     })
 }
 
-/// A BLAKE3 archive digest in the canonical lowercase hexadecimal wire format.
-///
-/// Validating at deserialization and construction prevents malformed archive
-/// IDs from becoming filesystem components or container image names.
-#[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize)]
-#[serde(transparent)]
-pub struct ArchiveId(String);
-
-impl ArchiveId {
-    #[must_use = "the returned archive identifier is required to address the archive"]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct InvalidArchiveId;
-
-impl fmt::Display for InvalidArchiveId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("toolchain archive ID must be 64 lowercase hexadecimal characters")
-    }
-}
-
-impl std::error::Error for InvalidArchiveId {}
-
-impl TryFrom<String> for ArchiveId {
-    type Error = InvalidArchiveId;
-
-    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
-        if value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-        {
-            Ok(Self(value))
-        } else {
-            Err(InvalidArchiveId)
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for ArchiveId {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        Self::try_from(value).map_err(serde::de::Error::custom)
-    }
-}
-
-impl fmt::Display for ArchiveId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl std::ops::Deref for ArchiveId {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl AsRef<str> for ArchiveId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<std::ffi::OsStr> for ArchiveId {
-    fn as_ref(&self) -> &std::ffi::OsStr {
-        self.0.as_ref()
-    }
-}
-
-impl AsRef<Path> for ArchiveId {
-    fn as_ref(&self) -> &Path {
-        self.0.as_ref()
-    }
-}
-
-#[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Toolchain {
-    pub archive_id: ArchiveId,
-}
-
-#[cfg(test)]
-mod archive_id_tests {
-    use super::*;
-
-    #[test]
-    fn accepted_archive_ids_round_trip_through_toolchain_json() -> anyhow::Result<()> {
-        let digest = crate::util::Digest::reader_sync(b"test archive".as_slice())?;
-        let tc = Toolchain {
-            archive_id: ArchiveId::try_from(digest.clone())?,
-        };
-        let encoded = serde_json::to_string(&tc)?;
-        assert_eq!(encoded, format!(r#"{{"archive_id":"{digest}"}}"#));
-        assert_eq!(serde_json::from_str::<Toolchain>(&encoded)?, tc);
-        Ok(())
-    }
-
-    #[test]
-    fn malformed_archive_ids_are_rejected() {
-        for value in [
-            "",
-            "a",
-            "../escape",
-            "/absolute",
-            "é",
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ] {
-            assert!(ArchiveId::try_from(value.to_owned()).is_err(), "{value:?}");
-            let encoded = serde_json::json!({"archive_id": value});
-            assert!(
-                serde_json::from_value::<Toolchain>(encoded).is_err(),
-                "{value:?}"
-            );
-        }
-    }
-}
-
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobId(pub u64);
@@ -712,96 +569,6 @@ impl fmt::Debug for CompileCommand {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CustomToolchainOverride {
-    pub compiler_executable: String,
-    pub archive: PathBuf,
-    pub cargo_executable: Option<String>,
-}
-
-// process::Output is not serialize so we have a custom Output type. However,
-// we cannot encode all information in here, such as Unix signals, as the other
-// end may not understand them (e.g. if it's Windows)
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProcessOutput {
-    pub code: i32,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-}
-impl ProcessOutput {
-    /// Convert a process output into the cross-platform distributed representation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the process terminated without a portable exit code.
-    #[cfg(unix)]
-    pub fn try_from(o: process::Output) -> Result<Self> {
-        let code = match (o.status.code(), o.status.signal()) {
-            (Some(c), _) => c,
-            (None, Some(s)) => bail!("Process status {} terminated with signal {s}", o.status),
-            (None, None) => bail!("Process status {} has no exit code or signal", o.status),
-        };
-        Ok(Self {
-            code,
-            stdout: o.stdout,
-            stderr: o.stderr,
-        })
-    }
-    #[cfg(test)]
-    #[must_use = "the constructed compiler output must be returned to the invoking test or caller"]
-    pub const fn fake_output(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
-        Self {
-            code,
-            stdout,
-            stderr,
-        }
-    }
-}
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
-impl From<ProcessOutput> for process::Output {
-    fn from(o: ProcessOutput) -> Self {
-        // TODO: handle signals, i.e. None code
-        Self {
-            status: crate::util::exit_status_from_code(o.code),
-            stdout: o.stdout,
-            stderr: o.stderr,
-        }
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn test_distributed_process_output_preserves_exit_codes() {
-    for code in [0, 1, 2, 101, 126, 127, 254, 255] {
-        let output: process::Output =
-            ProcessOutput::fake_output(code, b"stdout".to_vec(), b"stderr".to_vec()).into();
-        assert_eq!(output.status.code(), Some(code), "exit code {code}");
-        assert_eq!(output.status.success(), code == 0);
-        assert_eq!(output.stdout, b"stdout");
-        assert_eq!(output.stderr, b"stderr");
-        #[cfg(unix)]
-        assert_eq!(
-            output.status.signal(),
-            None,
-            "exit code {code} misread as signal"
-        );
-    }
-}
-
-/// Requested output paths and the receiving client's cache compression level.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OutputRequest {
-    pub paths: Vec<String>,
-    pub compression_level: i32,
-}
-
-// TODO: standardise on compressed or not for inputs and toolchain
-
-// TODO: make fields not public
-
 // AllocJob
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -814,13 +581,8 @@ pub struct JobAlloc {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum AllocJobResult {
-    Success {
-        job_alloc: JobAlloc,
-        need_toolchain: bool,
-    },
-    Fail {
-        msg: String,
-    },
+    Success { job_alloc: JobAlloc },
+    Fail { msg: String },
 }
 
 // AssignJob
@@ -829,7 +591,6 @@ pub enum AllocJobResult {
 #[serde(deny_unknown_fields)]
 pub struct AssignJobResult {
     pub state: JobState,
-    pub need_toolchain: bool,
 }
 
 // JobState
@@ -851,21 +612,6 @@ pub struct HeartbeatServerResult {
     pub assigned_job_ids: Vec<JobId>,
 }
 
-// RunJob
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub enum RunJobResult {
-    JobNotFound,
-    Complete(JobComplete),
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct JobComplete {
-    pub output: ProcessOutput,
-    pub outputs: Vec<(String, ZstdFrame)>,
-}
-
 // Status
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -876,96 +622,6 @@ pub struct SchedulerStatusResult {
     pub in_progress: usize,
     pub max_jobs: usize,
     pub available_jobs: usize,
-}
-
-// SubmitToolchain
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub enum SubmitToolchainResult {
-    Success,
-    JobNotFound,
-    CannotCache,
-}
-
-///////////////////
-
-// BuildResult
-
-pub struct BuildResult {
-    pub output: ProcessOutput,
-    pub outputs: Vec<(String, ZstdFrame)>,
-}
-
-///////////////////
-
-// TODO: it's unfortunate all these are public, but in order to describe the trait
-// bound on the instance (e.g. scheduler) we pass to the actual communication (e.g.
-// http implementation) they need to be public, which has knock-on effects for private
-// structs
-
-pub struct ToolchainReader<'a>(Box<dyn Read + 'a>);
-impl<'a> ToolchainReader<'a> {
-    /// Wrap a reader for a distributed toolchain upload.
-    #[must_use = "the returned reader owns the toolchain upload stream"]
-    pub fn new(reader: Box<dyn Read + 'a>) -> Self {
-        Self(reader)
-    }
-}
-impl Read for ToolchainReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-
-#[cfg(feature = "dist-server")]
-pub struct InputsReader<'a>(Box<dyn Read + Send + 'a>);
-#[cfg(feature = "dist-server")]
-impl<'a> InputsReader<'a> {
-    /// Wrap a reader for a distributed compilation's input stream.
-    #[must_use = "the returned reader owns the compiler input upload stream"]
-    pub fn new(reader: Box<dyn Read + Send + 'a>) -> Self {
-        Self(reader)
-    }
-}
-#[cfg(feature = "dist-server")]
-impl<'a> InputsReader<'a> {
-    /// Receive the complete compressed input archive before preparing a toolchain
-    /// or waiting for a compiler slot. The anonymous file is owned by the job
-    /// and removed on every completion, cancellation or I/O failure.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if receiving, staging or rewinding the archive fails.
-    pub fn stage(mut self, directory: &Path) -> io::Result<InputsReader<'static>> {
-        use std::io::Seek;
-
-        let mut file = tempfile::tempfile_in(directory)?;
-        io::copy(&mut self.0, &mut file)?;
-        file.rewind()?;
-        Ok(InputsReader::new(Box::new(file)))
-    }
-
-    /// Create the decoder on the thread consuming the transport stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the codec cannot be initialized.
-    pub fn into_decoded(self) -> io::Result<impl Read + 'a> {
-        crate::compression::deflate::InflateReader::zlib(self.0)
-    }
-
-    /// Extract input files, including validation of the compressed stream trailer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if decoding or extraction fails.
-    pub fn unpack(self, path: &Path) -> io::Result<()> {
-        let mut archive = tar::Archive::new(self.into_decoded()?);
-        archive.unpack(path)?;
-        io::copy(&mut archive.into_inner(), &mut io::sink())?;
-        Ok(())
-    }
 }
 
 #[cfg(feature = "dist-server")]
@@ -988,13 +644,6 @@ pub struct NativeAssignment {
     pub delivery_profile: Option<crate::build_runtime::ContentId>,
 }
 
-/// One scheduler assignment routed through the common capacity accounting.
-#[cfg(feature = "dist-server")]
-pub enum JobAssignment {
-    Archive(Toolchain),
-    Native(Box<NativeAssignment>),
-}
-
 #[cfg(feature = "dist-server")]
 #[async_trait]
 pub trait SchedulerOutgoing: Send + Sync {
@@ -1005,7 +654,7 @@ pub trait SchedulerOutgoing: Send + Sync {
         &self,
         server_id: ServerId,
         job_id: JobId,
-        assignment: JobAssignment,
+        assignment: NativeAssignment,
         auth: String,
     ) -> Result<AssignJobResult>;
 }
@@ -1173,31 +822,13 @@ pub enum NativeLifecycleEvent<'a> {
 #[cfg(feature = "dist-server")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerCapabilities {
-    pub archive: bool,
     pub native_platform: Option<crate::build_runtime::ContentId>,
     pub native_placement: Option<NativePlacement>,
 }
 
 #[cfg(feature = "dist-server")]
-impl WorkerCapabilities {
-    pub const ARCHIVE: Self = Self {
-        archive: true,
-        native_platform: None,
-        native_placement: None,
-    };
-}
-
-#[cfg(feature = "dist-server")]
 #[async_trait]
 pub trait SchedulerIncoming: Send + Sync + 'static {
-    // From Client
-    /// # Errors
-    /// Worker selection or assignment failed.
-    async fn handle_alloc_job(
-        self: std::sync::Arc<Self>,
-        requester: &dyn SchedulerOutgoing,
-        tc: Toolchain,
-    ) -> ExtResult<AllocJobResult, Error>;
     /// Allocate a native action from the shared worker capacity pool.
     ///
     /// # Errors
@@ -1291,10 +922,6 @@ pub trait SchedulerIncoming: Send + Sync + 'static {
 pub trait ServerIncoming: Send + Sync {
     /// Compiler slots in use, excluding jobs waiting for input or a slot.
     fn executing_jobs(&self) -> usize;
-    // From Scheduler
-    /// # Errors
-    /// The worker could not reserve the assignment.
-    fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> ExtResult<AssignJobResult, Error>;
     fn capabilities(&self) -> WorkerCapabilities;
     fn native_metadata_limit(&self) -> Option<usize>;
     /// Open an exact local CAS blob for an authenticated scheduler request.
@@ -1332,91 +959,4 @@ pub trait ServerIncoming: Send + Sync {
         assigned_job_ids: &[JobId],
         heartbeat_started_at: std::time::Instant,
     ) -> ExtResult<usize, Error>;
-    // From Client
-    /// # Errors
-    /// The uploaded toolchain could not be validated or installed.
-    fn handle_submit_toolchain(
-        &self,
-        requester: &dyn ServerOutgoing,
-        job_id: JobId,
-        tc_rdr: ToolchainReader<'_>,
-    ) -> ExtResult<SubmitToolchainResult, Error>;
-    // From Client
-    /// # Errors
-    /// The worker could not execute or report the assigned build.
-    fn handle_run_job(
-        &self,
-        requester: &dyn ServerOutgoing,
-        job_id: JobId,
-        command: CompileCommand,
-        outputs: OutputRequest,
-        inputs_rdr: InputsReader<'_>,
-    ) -> ExtResult<RunJobResult, Error>;
-}
-
-#[cfg(feature = "dist-server")]
-pub trait BuilderIncoming: Send + Sync {
-    // From Server
-    /// # Errors
-    /// The builder could not prepare or execute the compilation.
-    fn run_build(
-        &self,
-        job_id: JobId,
-        toolchain: Toolchain,
-        command: CompileCommand,
-        outputs: OutputRequest,
-        inputs_rdr: InputsReader<'_>,
-        cache: &Mutex<TcCache>,
-    ) -> ExtResult<BuildResult, Error>;
-}
-
-/////////
-#[async_trait]
-pub trait Client: Send + Sync {
-    // To Scheduler
-    async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult>;
-    // To Scheduler
-    async fn do_get_status(&self) -> Result<SchedulerStatusResult>;
-    // To Server
-    async fn do_submit_toolchain(
-        &self,
-        job_alloc: JobAlloc,
-        tc: Toolchain,
-    ) -> Result<SubmitToolchainResult>;
-    // To Server
-    async fn do_run_job(
-        &self,
-        job_alloc: JobAlloc,
-        command: CompileCommand,
-        outputs: Vec<String>,
-        inputs_packager: Box<dyn pkg::InputsPackager>,
-    ) -> Result<RunJobResult>;
-    async fn worker_label(&self, server_id: ServerId) -> String {
-        server_id.to_string()
-    }
-    async fn put_toolchain(
-        &self,
-        compiler_path: PathBuf,
-        weak_key: String,
-        toolchain_packager: Box<dyn pkg::ToolchainPackager>,
-    ) -> Result<(Toolchain, Option<CustomToolchainOverride>)>;
-    // The daemon-side broker uses the same toolchain store as its ordinary
-    // distributed client, but package construction happens in the namespace.
-    async fn lookup_namespace_toolchain(
-        &self,
-        _compiler: PathBuf,
-        _key: String,
-    ) -> Result<(Option<Toolchain>, u64)> {
-        Err(anyhow::anyhow!("client does not own a toolchain store"))
-    }
-    async fn import_namespace_toolchain(
-        &self,
-        _compiler: PathBuf,
-        _key: String,
-        _package: std::fs::File,
-    ) -> Result<Toolchain> {
-        Err(anyhow::anyhow!("client does not own a toolchain store"))
-    }
-    fn rewrite_includes_only(&self) -> bool;
-    fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf>;
 }

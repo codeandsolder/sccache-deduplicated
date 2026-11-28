@@ -159,15 +159,12 @@ fn native_worker_config(
         traces: None,
         cluster,
         builder: server::BuilderType::Native,
-        cache_dir: None,
         public_addr: worker_address,
         bind_address: None,
         scheduler_url: HTTPUrl::from_url(scheduler_url),
         scheduler_auth: server::SchedulerAuth::Token {
             token: WORKER_TOKEN.into(),
         },
-        toolchain_cache_size: 0,
-        toolchain_archive_sources: Vec::new(),
         native_worker: Some(server::NativeWorkerConfig {
             cache_url: HTTPUrl::from_url(cache_url),
             directory: Some(root.join("worker-store")),

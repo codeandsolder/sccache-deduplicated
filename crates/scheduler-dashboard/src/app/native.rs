@@ -301,10 +301,8 @@ mod admission_tests {
 
     #[test]
     fn worker_label_reports_both_capabilities_independently() {
-        assert_eq!(execution_protocols(false, true), "CAS execution");
-        assert_eq!(execution_protocols(true, false), "Legacy archive");
-        assert_eq!(execution_protocols(true, true), "CAS + legacy archive");
-        assert_eq!(execution_protocols(false, false), "No execution protocol");
+        assert_eq!(execution_protocols(true), "CAS execution");
+        assert_eq!(execution_protocols(false), "No execution protocol");
     }
 }
 
@@ -427,12 +425,11 @@ fn WorkerTable(workers: Memo<Vec<Worker>>, sampled_at: Memo<Option<u64>>) -> imp
     }.into_any()
 }
 
-const fn execution_protocols(archive: bool, native: bool) -> &'static str {
-    match (archive, native) {
-        (true, true) => "CAS + legacy archive",
-        (false, true) => "CAS execution",
-        (true, false) => "Legacy archive",
-        (false, false) => "No execution protocol",
+const fn execution_protocols(native: bool) -> &'static str {
+    if native {
+        "CAS execution"
+    } else {
+        "No execution protocol"
     }
 }
 
@@ -476,7 +473,7 @@ fn WorkerCells(worker: Memo<Option<Worker>>, sampled_at: Memo<Option<u64>>) -> i
     });
     view! {
         <td><b>{row_text(worker, |worker| worker.name.clone())}</b><small title=identity>{identity}</small>
-            <small>{row_text(worker, |worker| execution_protocols(worker.archive_available.is_some(), worker.native_available.is_some()).into())}</small>
+            <small>{row_text(worker, |worker| execution_protocols(worker.native_available.is_some()).into())}</small>
         </td>
         <td>
             <span class=move || if worker.with(|worker| worker.as_ref().is_some_and(|worker| sampled_at.get().is_some_and(|now| now.saturating_mul(1000).saturating_sub(worker.heartbeat_at_ms)>15_000))) {styles::warning} else {styles::healthy}>
@@ -488,7 +485,6 @@ fn WorkerCells(worker: Memo<Option<Worker>>, sampled_at: Memo<Option<u64>>) -> i
         <td>{row_text(worker, |worker| worker.assigned.to_string())}<small>{row_text(worker, |worker| format!("{} assigning",worker.assigning))}</small></td>
         <td>{row_text(worker, |worker| format!("{} / {}",worker.compiler_demand,worker.max_jobs))}</td>
         <td>{row_text(worker, |worker| worker.available.to_string())}
-            <small>{row_text(worker, |worker| format!("Legacy: {}",worker.archive_available.map_or_else(||"—".into(),|value|value.to_string())))}</small>
             <small>{row_text(worker, |worker| format!("CAS: {}",worker.native_available.map_or_else(||"—".into(),|value|value.to_string())))}</small></td>
         <td>{native_text(worker, |native| format!("{} / {}", native.compiler_active, native.compiler_slots))}</td>
         <td>{native_text(worker, |native| format!("{} / {}", native.reservations, native.capacity))}</td>

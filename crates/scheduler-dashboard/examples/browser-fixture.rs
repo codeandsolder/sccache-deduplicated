@@ -142,7 +142,6 @@ fn snapshot(phase: u64) -> Snapshot {
         compiler_demand: jobs.len(),
         max_jobs: 12,
         available: 12 - jobs.len(),
-        archive_available: None,
         native_available: Some(12 - jobs.len()),
         native: Some(NativeWorker {
             cache_analytics: Some(analytics().site_summary()),

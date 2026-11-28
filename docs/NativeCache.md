@@ -1,4 +1,4 @@
-# Native scheduler cache (experimental)
+# Native scheduler cache
 
 The native runtime in `crates/build-runtime` is a separate explicit action
 protocol. It does not reinterpret the archive compiler protocol's keys and
@@ -242,8 +242,7 @@ cache address, not necessarily the example loopback address). Select
 `builder.type = "native"` in the main worker configuration and omit archive
 `cache_dir` and archive sources. This worker never constructs the legacy
 overlay builder or archive cache, and cannot be scheduled for archive jobs.
-A worker with a legacy builder and a native worker section supports both
-protocols, sharing its advertised capacity.
+Legacy archive builders and their configuration fields have been removed.
 
 ```toml
 [builder]

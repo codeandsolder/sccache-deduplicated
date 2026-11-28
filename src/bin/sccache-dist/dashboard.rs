@@ -154,7 +154,6 @@ fn worker(id: ServerId, details: &ServerDetails, scheduler: &Scheduler, draining
     } else {
         max_jobs.saturating_sub(demand)
     };
-    let archive_available = details.capabilities.archive.then_some(slots);
     let native_available = native
         .as_ref()
         .map(|_| slots.min(details.native_headroom()));
@@ -171,8 +170,7 @@ fn worker(id: ServerId, details: &ServerDetails, scheduler: &Scheduler, draining
         assigning: details.jobs_assigning.len(),
         compiler_demand: demand,
         max_jobs,
-        available: archive_available.unwrap_or_else(|| native_available.unwrap_or(0)),
-        archive_available,
+        available: native_available.unwrap_or(0),
         native_available,
         native,
     }

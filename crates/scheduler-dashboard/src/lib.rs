@@ -56,7 +56,6 @@ pub struct Worker {
     pub compiler_demand: usize,
     pub max_jobs: usize,
     pub available: usize,
-    pub archive_available: Option<usize>,
     pub native_available: Option<usize>,
     pub native: Option<NativeWorker>,
 }
