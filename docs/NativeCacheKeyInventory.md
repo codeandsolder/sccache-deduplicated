@@ -42,6 +42,9 @@ the managed runtime. Fixed system runtime files and probe scratch are not
 project dependencies. The compiler version banner is discovery data, not an
 additional digest input. Explicit externs are keyed once by name, modifiers
 and content, independently of filename ordering or repeated discovery.
+An originating CPU profile is only hashed if the effective invocation still
+requests native CPU or tuning; successfully lowered explicit target arguments
+already identify the worker compilation.
 Metadata-only results do not depend on unselected linkable siblings of rmeta
 inputs; the execution packager can still deliver those siblings.
 

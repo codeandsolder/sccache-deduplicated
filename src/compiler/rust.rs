@@ -3608,11 +3608,11 @@ where
                 .collect::<Vec<_>>()
         });
         m.audit_field("sccache.key.native_cpu");
-        if native_requested {
-            // Keep the resolved host profile in the cache identity even when
-            // `native` was rewritten to a proven-equivalent explicit CPU for
-            // distributed execution. This prevents cross-host cache aliasing if
-            // LLVM exposes host details not represented in rustc cfg features.
+        if native_target_requested(&effective_arguments)
+            || native_tune_requested(&effective_arguments)
+        {
+            // Only a command that still asks LLVM to select its native CPU
+            // needs host identity. Explicit lowering is already in argv.
             if let Some(profile) = resolved_native_profile.as_ref() {
                 profile.hash(&mut HashToDigest { digest: &mut m });
             } else {
@@ -8558,7 +8558,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             let mut hasher = RustHasher {
                 executable: "rustc".into(),
                 host: "x86_64-unknown-linux-gnu".to_owned(),
-                version: TEST_RUSTC_VERSION.to_string(),
+                version: format!("{TEST_RUSTC_VERSION} {profile:?}"),
                 sysroot: f.tempdir.path().join("sysroot"),
                 compiler_shlibs_digests: vec![],
                 dist_archive: None,
@@ -8609,6 +8609,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
 
         let dist_znver2 = run(Some("znver2|+avx2"), true)?;
         assert_eq!(dist_znver2.cache_control, CacheControl::Default);
+        let dist_other_host = run(Some("znver5|+avx512f"), true)?;
+        assert_eq!(
+            dist_znver2.key, dist_other_host.key,
+            "identical lowered argv must not depend on the originating CPU profile"
+        );
 
         let unresolved_native = run(None, false)?;
         assert_eq!(
