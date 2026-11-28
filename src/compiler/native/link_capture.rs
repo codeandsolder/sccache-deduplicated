@@ -2,7 +2,7 @@
 //! The relay records arguments but never invokes a real linker. A planning
 //! result is separate from the final link result and cannot publish binaries.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Component, Path, PathBuf},
@@ -38,13 +38,31 @@ printf '%s\0' "$#" "$@" > "$out/argv"
 pwd -P > "$out/cwd"
 /usr/bin/env -0 > "$out/environment"
 i=0
+: > "$out/existing-paths"
 for arg do
     case "$arg" in
         @*) file=${arg#@}
             if [ -f "$file" ]; then
                 /usr/bin/cat -- "$file" > "$out/response-$i"
+                printf '%s\0' "$file" >> "$out/existing-paths"
             fi ;;
     esac
+    if [ -f "$arg" ]; then
+        printf '%s\0' "$arg" >> "$out/existing-paths"
+    fi
+    # rustc can generate libraries in a private -L directory. Record only
+    # filenames in those actual search locations, not file contents.
+    case "$arg" in
+        -L?*) directory=${arg#-L} ;;
+        *) directory=$arg ;;
+    esac
+    if [ -d "$directory" ]; then
+        for file in "$directory"/*; do
+            if [ -f "$file" ]; then
+                printf '%s\0' "$file" >> "$out/existing-paths"
+            fi
+        done
+    fi
     i=$((i + 1))
 done
 : > "$out/complete"
@@ -65,6 +83,7 @@ pub(super) struct CapturedInvocation {
     pub cwd: PathBuf,
     pub environment: BTreeMap<OsString, OsString>,
     pub responses: BTreeMap<usize, Vec<u8>>,
+    pub existing_paths: BTreeSet<PathBuf>,
 }
 
 impl LinkCapture {
@@ -203,11 +222,21 @@ impl CapturedInvocation {
                 Err(error) => return Err(error.into()),
             }
         }
+        let raw = std::fs::read(path.join("existing-paths"))?;
+        let existing_paths = if raw.is_empty() {
+            BTreeSet::new()
+        } else {
+            nul_fields(&raw)?
+                .into_iter()
+                .map(|name| cwd.join(OsStr::from_bytes(name)))
+                .collect()
+        };
         Ok(Self {
             arguments,
             cwd,
             environment,
             responses,
+            existing_paths,
         })
     }
 }
@@ -225,6 +254,7 @@ mod tests {
         std::fs::write(path.join("cwd"), b"/work\n")?;
         std::fs::write(path.join("environment"), b"PATH=/bin:/usr/bin\0VAR=a=b\0")?;
         std::fs::write(path.join("response-3"), b"\"a b\" -lm\n")?;
+        std::fs::write(path.join("existing-paths"), b"relative.o\0/absolute.o\0")?;
         let capture = CapturedInvocation::read(path)?;
         assert_eq!(
             capture.arguments,
@@ -233,6 +263,15 @@ mod tests {
         assert_eq!(capture.cwd, Path::new("/work"));
         assert_eq!(capture.environment[OsStr::new("VAR")], "a=b");
         assert_eq!(capture.responses[&3], b"\"a b\" -lm\n");
+        assert_eq!(
+            capture.existing_paths,
+            [
+                PathBuf::from("/work/relative.o"),
+                PathBuf::from("/absolute.o")
+            ]
+            .into_iter()
+            .collect()
+        );
         std::fs::write(path.join("duplicate"), b"")?;
         assert!(CapturedInvocation::read(path).is_err());
         Ok(())

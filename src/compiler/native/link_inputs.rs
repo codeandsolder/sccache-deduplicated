@@ -8,6 +8,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+#[cfg(test)]
+mod closure;
+#[cfg(test)]
+mod driver;
 
 use crate::{
     build_runtime::{PreparedTree, SourceDigestCache},
@@ -147,6 +151,63 @@ impl LinkInputs {
                 .context("linker has no basename")?
                 .to_owned(),
         ))
+    }
+
+    #[cfg(test)]
+    pub(super) fn prepare_captured(
+        &self,
+        capture: &super::link_capture::CapturedInvocation,
+        generated_paths: &BTreeSet<PathBuf>,
+        cache: &SourceDigestCache,
+        client: Option<&super::NativeCompilerClient>,
+    ) -> Result<Vec<PreparedTree>> {
+        let driver = driver::DriverPlan::discover(self, capture)?;
+        // Captured generated paths are created by rustc itself in the final
+        // action. All other paths have to be resolved in the caller's view.
+        let generated = |path: &Path| generated_paths.contains(path);
+        let closure = closure::LinkClosure::discover(
+            driver.arguments,
+            &capture.cwd,
+            driver.default_search,
+            &|path| self.physical(path),
+            &generated,
+        )?;
+        let mut tools = pkg::ToolchainPackageBuilder::new();
+        for (physical, logical) in self.transformer.path_mappings() {
+            tools.add_root_mapping(physical, PathBuf::from(logical));
+        }
+        tools.add_common()?;
+        for tool in driver.tools {
+            tools.add_executable_and_deps(tool)?;
+        }
+        // Use the physical-path-aware package builder for both tools and
+        // data; system library aliases such as /lib -> /usr/lib must retain
+        // the same symlink topology as the compiler toolchain.
+        let mut inputs = pkg::ToolchainPackageBuilder::new();
+        for (physical, logical) in self.transformer.path_mappings() {
+            inputs.add_root_mapping(physical, PathBuf::from(logical));
+        }
+        for directory in closure.directories {
+            let physical = self.physical(&directory)?;
+            if physical.is_dir() {
+                inputs.add_dir(physical)?;
+            }
+        }
+        for file in closure.files.into_iter().chain(driver.response_files) {
+            if !generated(&file) {
+                inputs.add_file(self.physical(&file)?)?;
+            }
+        }
+        let mapped = inputs.into_native_mapping()?;
+        let inputs = if let Some(client) = client {
+            mapped.prepare_with_references(&|file, _| client.reference(file))?
+        } else {
+            mapped.prepare()?
+        };
+        Ok(vec![
+            tools.into_native_mapping()?.prepare_with_cache(cache)?,
+            inputs,
+        ])
     }
 
     pub(super) fn prepare(

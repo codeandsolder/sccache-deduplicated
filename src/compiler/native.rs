@@ -641,30 +641,71 @@ struct CompilerPlan {
 }
 
 impl CompilerPlan {
+    /// Extend a completed root using its existing snapshot as the authority.
+    /// Different package builders may normalize timestamps differently.
+    /// Keep the already-declared inode for an identical file (content and
+    /// permissions) or symlink; never silently replace different content.
     fn extend_inputs(&mut self, additional: Vec<PreparedTree>) -> Result<()> {
         let mut recipe = self.spec.root.recipe.clone();
-        for prepared in additional {
-            if !self
-                .inputs
-                .iter()
-                .any(|existing| existing.id() == prepared.id())
-            {
-                recipe.layers.push(TreeLayer {
-                    tree: prepared.id(),
-                    source: None,
-                    destination: None,
-                });
-                self.inputs.push(prepared);
-            }
-        }
-        self.spec.root = ExecutionRoot::resolve(
-            recipe,
+        let mut root = recipe.compose(
             &self
                 .inputs
                 .iter()
                 .map(|tree| (tree.id(), tree.manifest()))
                 .collect(),
         )?;
+        for prepared in additional {
+            let mut selected = Vec::new();
+            for (path, entry) in &prepared.manifest().entries {
+                let Some(existing) = root.entries.get(path) else {
+                    selected.push(path.clone());
+                    continue;
+                };
+                let equal = match (existing, entry) {
+                    (TreeEntry::Directory(_), TreeEntry::Directory(_)) => true,
+                    (
+                        TreeEntry::File {
+                            blob: a,
+                            metadata: am,
+                        },
+                        TreeEntry::File {
+                            blob: b,
+                            metadata: bm,
+                        },
+                    ) => a == b && am.mode == bm.mode,
+                    (
+                        TreeEntry::Symlink { target: a, .. },
+                        TreeEntry::Symlink { target: b, .. },
+                    ) => a == b,
+                    _ => existing == entry,
+                };
+                ensure!(
+                    equal,
+                    "additional native input conflicts with existing snapshot: {path:?}"
+                );
+            }
+            if selected.is_empty() {
+                continue;
+            }
+            let prepared = prepared.select_paths(selected)?;
+            recipe.layers.push(TreeLayer {
+                tree: prepared.id(),
+                source: None,
+                destination: None,
+            });
+            self.inputs.push(prepared);
+            root = recipe.compose(
+                &self
+                    .inputs
+                    .iter()
+                    .map(|tree| (tree.id(), tree.manifest()))
+                    .collect(),
+            )?;
+        }
+        self.spec.root = ExecutionRoot {
+            id: root.id()?,
+            recipe,
+        };
         self.spec.compiler_result = None;
         self.spec.validate()
     }
@@ -928,14 +969,6 @@ impl NativeLink {
             plan.inputs.push(prepared);
         }
         let artifact = artifact.context("missing .rlink artifact")?;
-        for prepared in linker_inputs {
-            recipe.layers.push(TreeLayer {
-                tree: prepared.id(),
-                source: None,
-                destination: None,
-            });
-            plan.inputs.push(prepared);
-        }
         plan.spec.root = ExecutionRoot::resolve(
             recipe,
             &plan
@@ -953,7 +986,7 @@ impl NativeLink {
             .into_iter()
             .map(|arg| arg.as_os_str().as_bytes().to_vec())
             .collect();
-        plan.spec.validate()?;
+        plan.extend_inputs(linker_inputs)?;
         Ok((plan, artifact))
     }
 
@@ -1436,8 +1469,48 @@ mod tests {
                 let invocation = capture.read()?;
                 ensure!(!invocation.arguments.is_empty(), "empty linker invocation");
                 ensure!(invocation.cwd.is_absolute(), "invalid linker cwd");
+                let mut immutable_recipe = link_plan.spec.root.recipe.clone();
+                immutable_recipe.layers.retain(|layer| {
+                    !layer
+                        .destination
+                        .as_ref()
+                        .is_some_and(|path| link_plan.spec.working_inputs.contains(path))
+                });
+                let immutable = immutable_recipe.compose(
+                    &link_plan
+                        .inputs
+                        .iter()
+                        .map(|tree| (tree.id(), tree.manifest()))
+                        .collect(),
+                )?;
+                let generated_roots = link
+                    .workspace
+                    .outputs()
+                    .map(|(root, _, _)| root)
+                    .chain(std::iter::once(Path::new("/tmp")))
+                    .collect::<Vec<_>>();
+                let generated_paths = invocation
+                    .existing_paths
+                    .iter()
+                    .filter(|path| {
+                        generated_roots.iter().any(|root| path.starts_with(root))
+                            && path.strip_prefix("/").is_ok_and(|relative| {
+                                !immutable
+                                    .entries
+                                    .contains_key(relative.as_os_str().as_bytes())
+                            })
+                    })
+                    .cloned()
+                    .collect();
+                link_plan.extend_inputs(link.inputs.prepare_captured(
+                    &invocation,
+                    &generated_paths,
+                    &cache,
+                    None,
+                )?)?;
+            } else {
+                link_plan.extend_inputs(link.linker_inputs(&cache, None)?)?;
             }
-            link_plan.extend_inputs(link.linker_inputs(&cache, None)?)?;
             let leases = link_plan
                 .inputs
                 .iter()
