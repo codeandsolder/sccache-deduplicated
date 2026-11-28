@@ -661,7 +661,7 @@ impl NativeCacheClient {
                     .upload_stored_file_async(
                         ticket,
                         blob,
-                        captured.physical_encoding(),
+                        captured.physical_encoding(blob.id)?,
                         captured.open_file(blob.id)?,
                     )
                     .await;
@@ -856,7 +856,7 @@ fn compile(
     context: ExecutionContext<'_>,
     queue: Option<&crate::dist::execution_queue::ExecutionQueue>,
     transport: Option<&PackageTransportTracker>,
-    inputs: &[Arc<TreeLease>],
+    inputs: crate::build_runtime::ExecutionInputs<'_>,
     retain: bool,
     check: &LeaseCheck<'_>,
     on_phase: impl FnMut(ExecutionPhase),
@@ -1044,11 +1044,32 @@ impl PreparedWorker {
             store,
             policy,
         };
+        let discovery = self.spec.discovery.as_ref().and_then(|discovery| {
+            if matches!(
+                discovery.source,
+                crate::build_runtime::DiscoverySource::Live { .. }
+            ) {
+                Some(Box::new(super::discovery::RemoteDiscovery::new(
+                    self.lease.client.clone(),
+                    self.lease.ticket,
+                    Instant::now() + policy.timeout,
+                    Arc::clone(&self.lease.cancelled),
+                ))
+                    as Box<
+                        dyn crate::build_runtime::discovery::DiscoveryTransport,
+                    >)
+            } else {
+                None
+            }
+        });
         let captured = compile(
             context,
             Some(delivery.execution_queue),
             Some(delivery.transport),
-            &inputs,
+            crate::build_runtime::ExecutionInputs {
+                trees: &inputs,
+                discovery,
+            },
             self.prepared.grace.is_some(),
             &|| self.lease.check(),
             on_phase,

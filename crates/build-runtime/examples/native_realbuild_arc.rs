@@ -501,7 +501,18 @@ mod linux {
         let started = Instant::now();
         let inputs = acquire_execution_inputs(spec, store)?;
         let admission = started.elapsed();
-        let execution = execute(spec, store, policy, &inputs, None, || Ok(()), |_| {})?;
+        let execution = execute(
+            spec,
+            store,
+            policy,
+            sccache_build::ExecutionInputs {
+                trees: &inputs,
+                discovery: None,
+            },
+            None,
+            || Ok(()),
+            |_| {},
+        )?;
         let elapsed = started.elapsed();
         let timing = execution.timings();
         println!(

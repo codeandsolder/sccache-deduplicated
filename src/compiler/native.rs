@@ -1529,7 +1529,10 @@ mod tests {
                 max_discovery_metadata_bytes: 64 * 1024 * 1024,
                 max_result_bytes: 64 * 1024 * 1024,
             },
-            &leases,
+            crate::build_runtime::ExecutionInputs {
+                trees: &leases,
+                discovery: None,
+            },
             None,
             || Ok(()),
             |_| {},
@@ -1554,15 +1557,14 @@ mod tests {
             let readers = manifest
                 .blobs()?
                 .into_iter()
-                .map(|(id, _)| Ok((id, result.open_file(id)?)))
+                .map(|(id, _)| Ok((id, (result.open_file(id)?, result.physical_encoding(id)?))))
                 .collect::<Result<BTreeMap<_, _>>>()?;
-            let encoding = result.physical_encoding();
             let provider = ReferenceBlobProvider::new(move |blob| {
                 use std::os::fd::AsRawFd;
-                let pinned = readers.get(&blob.id).context("missing captured blob")?;
+                let (pinned, encoding) = readers.get(&blob.id).context("missing captured blob")?;
                 let file = std::fs::File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))?;
                 Ok(Box::new(crate::build_runtime::BlobReader::open(
-                    file, encoding,
+                    file, *encoding,
                 )?))
             });
             let cache = SourceDigestCache::default();
@@ -1593,7 +1595,10 @@ mod tests {
                         max_discovery_metadata_bytes: 64 * 1024 * 1024,
                         max_result_bytes: 64 * 1024 * 1024,
                     },
-                    &leases,
+                    crate::build_runtime::ExecutionInputs {
+                        trees: &leases,
+                        discovery: None,
+                    },
                     None,
                     || Ok(()),
                     |_| {},
@@ -1655,7 +1660,10 @@ mod tests {
                     max_discovery_metadata_bytes: 64 * 1024 * 1024,
                     max_result_bytes: 64 * 1024 * 1024,
                 },
-                &leases,
+                crate::build_runtime::ExecutionInputs {
+                    trees: &leases,
+                    discovery: None,
+                },
                 None,
                 || Ok(()),
                 |_| {},

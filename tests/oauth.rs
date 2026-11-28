@@ -4,7 +4,6 @@
 use fs_err as fs;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use thirtyfour::prelude::*;

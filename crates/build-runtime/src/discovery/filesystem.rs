@@ -44,7 +44,7 @@ pub trait DiscoveryTransport: Send {
 
     /// # Errors
     /// Returns an error for unavailable or unauthorized content.
-    fn open_blob(&mut self, blob: BlobRef) -> Result<Box<dyn Read + Send>>;
+    fn stage_blob(&mut self, store: &NativeStore, blob: BlobRef) -> Result<crate::StagedBlob>;
 }
 
 impl DiscoveryTransport for DiscoveryOrigin {
@@ -60,8 +60,8 @@ impl DiscoveryTransport for DiscoveryOrigin {
         Ok(())
     }
 
-    fn open_blob(&mut self, blob: BlobRef) -> Result<Box<dyn Read + Send>> {
-        Ok(Box::new(Self::open_blob(self, blob)?))
+    fn stage_blob(&mut self, store: &NativeStore, blob: BlobRef) -> Result<crate::StagedBlob> {
+        store.stage_expected(blob, Self::open_blob(self, blob)?)
     }
 }
 
@@ -76,7 +76,7 @@ impl DiscoveryTransport for SealedTransport {
     fn seal(&mut self, _: &DiscoveryTranscript) -> Result<()> {
         anyhow::bail!("sealed discovery replay cannot seal live observations")
     }
-    fn open_blob(&mut self, _: BlobRef) -> Result<Box<dyn Read + Send>> {
+    fn stage_blob(&mut self, _: &NativeStore, _: BlobRef) -> Result<crate::StagedBlob> {
         anyhow::bail!("sealed discovery replay input blob missing from CAS")
     }
 }
@@ -152,10 +152,7 @@ impl State {
             let staged = if reservation.missing().is_empty() {
                 Vec::new()
             } else {
-                vec![
-                    self.store
-                        .stage_expected(blob, self.transport.open_blob(blob)?)?,
-                ]
+                vec![self.transport.stage_blob(&self.store, blob)?]
             };
             let lease = self.store.publish_tree_pinned(&manifest, staged)?;
             drop(reservation);
@@ -184,7 +181,7 @@ impl DiscoverySession {
     /// Returns an error for a malformed replay transcript.
     pub fn new(
         store: NativeStore,
-        transport: impl DiscoveryTransport + 'static,
+        transport: Box<dyn DiscoveryTransport>,
         replay: Option<DiscoveryBundle>,
     ) -> Result<Self> {
         let (mode, expected_roots) = match replay {
@@ -195,7 +192,7 @@ impl DiscoverySession {
             None => (Mode::Record(DiscoveryTranscript::default()), None),
         };
         Ok(Self(Arc::new(Mutex::new(State {
-            transport: Box::new(transport),
+            transport,
             mode,
             store,
             content: BTreeMap::new(),
@@ -209,7 +206,7 @@ impl DiscoverySession {
     /// # Errors
     /// Returns an error for an invalid discovery package.
     pub fn replay(store: NativeStore, bundle: DiscoveryBundle) -> Result<Self> {
-        Self::new(store, SealedTransport, Some(bundle))
+        Self::new(store, Box::new(SealedTransport), Some(bundle))
     }
 
     /// Mount a logical directory under a private worker scratch directory.

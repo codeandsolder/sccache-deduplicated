@@ -2,22 +2,30 @@
 //! or an opaque origin path. Its manifest contains only the canonical
 //! observation record and the unique content blobs actually read.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io::Read,
-};
+#[cfg(all(unix, feature = "store"))]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+#[cfg(all(unix, feature = "store"))]
+use std::io::Read;
 
-use anyhow::{Context, Result, ensure};
+#[cfg(all(unix, feature = "store"))]
+use anyhow::Context;
+use anyhow::{Result, ensure};
+#[cfg(all(unix, feature = "store"))]
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 
 use super::{DiscoveryQuery, DiscoveryReply, DiscoveryTranscript};
+use crate::BuildPath;
+#[cfg(all(unix, feature = "store"))]
 use crate::{
-    BlobRef, BuildPath, ContentId, TreeEntry, TreeLease, TreeManifest, TreeMetadata, TreePath,
-    TreeTimestamp, identity::encoding,
+    BlobRef, ContentId, TreeEntry, TreeManifest, TreeMetadata, TreePath, TreeTimestamp,
+    identity::encoding,
 };
 
+#[cfg(all(unix, feature = "store"))]
 const TRANSCRIPT: &[u8] = b"observations-v2";
+#[cfg(all(unix, feature = "store"))]
 const DIRECTORY: TreeMetadata = TreeMetadata {
     mode: 0o755,
     modified: TreeTimestamp {
@@ -25,6 +33,7 @@ const DIRECTORY: TreeMetadata = TreeMetadata {
         nanoseconds: 0,
     },
 };
+#[cfg(all(unix, feature = "store"))]
 const FILE: TreeMetadata = TreeMetadata {
     mode: 0o444,
     ..DIRECTORY
@@ -85,6 +94,7 @@ impl DiscoveryBundle {
         &self.transcript
     }
 
+    #[cfg(all(unix, feature = "store"))]
     fn manifest(&self, encoded: &[u8]) -> Result<TreeManifest> {
         let mut blobs = BTreeMap::new();
         for reply in self.transcript.observations().values() {
@@ -128,7 +138,8 @@ impl DiscoveryBundle {
         })
     }
 
-    pub(super) fn encode(&self) -> Result<(Vec<u8>, TreeManifest)> {
+    #[cfg(all(unix, feature = "store"))]
+    pub(crate) fn encode(&self) -> Result<(Vec<u8>, TreeManifest)> {
         self.validate()?;
         let encoded = encoding().serialize(self)?;
         let manifest = self.manifest(&encoded)?;
@@ -139,7 +150,8 @@ impl DiscoveryBundle {
     /// No origin lookup or filesystem access is authorized by the package.
     /// # Errors
     /// Returns an error for malformed, oversized, or noncanonical content.
-    pub fn load(lease: &TreeLease, max_metadata_bytes: u64) -> Result<Self> {
+    #[cfg(all(unix, feature = "store"))]
+    pub fn load(lease: &crate::TreeLease, max_metadata_bytes: u64) -> Result<Self> {
         let Some(TreeEntry::File { blob, .. }) = lease.manifest().entries.get(TRANSCRIPT) else {
             anyhow::bail!("missing discovery transcript blob");
         };

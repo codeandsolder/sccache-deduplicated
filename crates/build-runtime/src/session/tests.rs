@@ -124,6 +124,7 @@ fn request() -> Result<ActionRequest> {
     let root = empty_root();
     let id = root.id()?;
     Ok(ActionRequest {
+        live_discovery: None,
         result_fingerprint: None,
         fingerprint: ActionFingerprint {
             schema: "test-native-v1".into(),
@@ -2340,5 +2341,233 @@ fn interrupted_incremental_upload_releases_claim_and_rejects_failed_finish() -> 
     complete.feed(b"ject")?;
     service.finish_upload(complete)?;
     assert_eq!(service.commit(ticket, worker)?, output);
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn live_discovery_authority_and_sealed_result_contract() -> Result<()> {
+    use crate::{
+        BuildPath, DISCOVERY_RESULT, DiscoverySource, DiscoverySpec, OutputKind,
+        discovery::{
+            DiscoveryBundle, DiscoveryLimits, DiscoveryOrigin, DiscoveryQuery, DiscoveryReply,
+        },
+        wire::{DiscoveryAnswer, DiscoveryOperation, DiscoveryPoll, DiscoveryRequest},
+    };
+    let temp = tempfile::tempdir()?;
+    let service = service(&temp.path().join("store"))?;
+    let origin_path = temp.path().join("origin");
+    std::fs::create_dir(&origin_path)?;
+    std::fs::write(origin_path.join("selected"), b"chosen")?;
+    let root = BuildPath::new(b"/input".to_vec())?;
+    let mut origin = DiscoveryOrigin::new(DiscoveryLimits {
+        max_queries: 8,
+        max_dirents: 8,
+        max_content_bytes: 4096,
+    })?;
+    origin.add_root(root.clone(), &origin_path)?;
+    let mut req = request()?;
+    req.live_discovery = Some(DiscoverySpec {
+        source: DiscoverySource::Live {
+            nonce: ContentId::of(b"unique task"),
+        },
+        mounts: BTreeSet::from([root.clone()]),
+    });
+    req.required_outputs = BTreeMap::from([(DISCOVERY_RESULT.into(), OutputKind::Tree)]);
+    let NativeAdmission::Compile { ticket } = service.admit(
+        None,
+        req.clone(),
+        Publisher::Client,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
+    else {
+        bail!("expected discovery admission");
+    };
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
+    let client = test_peer(9);
+    service.schedule(
+        ticket,
+        &req,
+        client,
+        DeliverySelection {
+            outputs: BTreeSet::from([DISCOVERY_RESULT.into()]),
+            ..selection()
+        },
+        |_, _| {
+            Ok(ScheduleReply::Assigned(WorkerAllocation {
+                peer: test_peer(1),
+                job: 42,
+                routes: sccache_peer_identity::RouteSet::new("127.0.0.1:10501".parse()?, []),
+                auth: "proof".into(),
+            }))
+        },
+    )?;
+    let initial = DiscoveryRequest {
+        sequence: 0,
+        operation: DiscoveryOperation::Observe(DiscoveryQuery::Lookup(root.clone())),
+    };
+    assert!(
+        service
+            .discovery_request(ticket, worker, initial.clone())
+            .is_err()
+    );
+    service.inputs_staged(ticket, worker)?;
+    assert!(
+        service
+            .discovery_request(ticket, Publisher::Client, initial.clone())
+            .is_err()
+    );
+    assert!(
+        service
+            .discovery_request(
+                ticket,
+                Publisher::Worker {
+                    peer: test_peer(2),
+                    job: 42
+                },
+                initial.clone()
+            )
+            .is_err()
+    );
+    assert!(service.discovery_poll(ticket, test_peer(8)).is_err());
+    assert!(
+        service
+            .discovery_request(
+                ticket,
+                worker,
+                DiscoveryRequest {
+                    sequence: 0,
+                    operation: DiscoveryOperation::Observe(DiscoveryQuery::Lookup(BuildPath::new(
+                        b"/outside".to_vec()
+                    )?))
+                }
+            )
+            .is_err()
+    );
+
+    let observe = |origin: &mut DiscoveryOrigin,
+                   sequence: u64,
+                   query: DiscoveryQuery|
+     -> Result<DiscoveryReply> {
+        let request = DiscoveryRequest {
+            sequence,
+            operation: DiscoveryOperation::Observe(query.clone()),
+        };
+        assert_eq!(
+            service.discovery_request(ticket, worker, request.clone())?,
+            None
+        );
+        assert_eq!(
+            service.discovery_poll(ticket, client)?,
+            DiscoveryPoll::Demand(request.clone())
+        );
+        let reply = origin.query(query)?;
+        let answer = DiscoveryAnswer::Observed(reply.clone());
+        assert!(
+            service
+                .discovery_answer(ticket, test_peer(8), sequence, answer.clone())
+                .is_err()
+        );
+        service.discovery_answer(ticket, client, sequence, answer.clone())?;
+        service.discovery_answer(ticket, client, sequence, answer.clone())?;
+        assert_eq!(
+            service.discovery_request(ticket, worker, request)?,
+            Some(answer)
+        );
+        Ok(reply)
+    };
+    observe(&mut origin, 0, DiscoveryQuery::Lookup(root.clone()))?;
+    let selected = BuildPath::new(b"/input/selected".to_vec())?;
+    observe(&mut origin, 1, DiscoveryQuery::Lookup(selected.clone()))?;
+    let DiscoveryReply::File { blob, .. } =
+        observe(&mut origin, 2, DiscoveryQuery::ReadFile(selected))?
+    else {
+        bail!("expected file observation");
+    };
+    let unknown = BlobRef {
+        id: ContentId::of(b"unknown"),
+        size: 7,
+    };
+    assert!(
+        service
+            .discovery_request(
+                ticket,
+                worker,
+                DiscoveryRequest {
+                    sequence: 3,
+                    operation: DiscoveryOperation::Fetch(unknown)
+                }
+            )
+            .is_err()
+    );
+    assert!(service.discovery_download(ticket, worker, blob).is_err());
+    let fetch = DiscoveryRequest {
+        sequence: 3,
+        operation: DiscoveryOperation::Fetch(blob),
+    };
+    assert_eq!(
+        service.discovery_request(ticket, worker, fetch.clone())?,
+        None
+    );
+    assert!(
+        service
+            .discovery_answer(ticket, client, 3, DiscoveryAnswer::Available)
+            .is_err()
+    );
+    let retention = NativeStore::blob_retention_manifest(blob)?;
+    let store = service.store();
+    let lease = store.publish_tree_pinned(
+        &retention,
+        vec![store.stage_expected(blob, origin.open_blob(blob)?)?],
+    )?;
+    service.discovery_answer(ticket, client, 3, DiscoveryAnswer::Available)?;
+    drop(lease);
+    assert_eq!(
+        service.discovery_request(ticket, worker, fetch)?,
+        Some(DiscoveryAnswer::Available)
+    );
+    let download = service.discovery_download(ticket, worker, blob)?;
+    let mut decoded = Vec::new();
+    crate::BlobReader::open(download.file, download.encoding)?.read_to_end(&mut decoded)?;
+    assert_eq!(decoded, b"chosen");
+    assert!(service.discovery_download(ticket, worker, unknown).is_err());
+
+    let transcript = origin.seal()?.clone();
+    let bundle = DiscoveryBundle::new(BTreeSet::from([root]), transcript.clone())?;
+    let (_, tree) = bundle.encode()?;
+    let result = ResultManifest {
+        outputs: BTreeMap::from([(DISCOVERY_RESULT.into(), Artifact::Tree(tree))]),
+        stdout: None,
+        stderr: None,
+    };
+    assert!(service.begin(ticket, worker, result.clone()).is_err());
+    let seal = DiscoveryRequest {
+        sequence: 4,
+        operation: DiscoveryOperation::Seal(transcript.fingerprint()?),
+    };
+    assert_eq!(
+        service.discovery_request(ticket, worker, seal.clone())?,
+        None
+    );
+    service.discovery_answer(ticket, client, 4, DiscoveryAnswer::Sealed)?;
+    assert_eq!(
+        service.discovery_request(ticket, worker, seal)?,
+        Some(DiscoveryAnswer::Sealed)
+    );
+    assert_eq!(
+        service.discovery_poll(ticket, client)?,
+        DiscoveryPoll::Complete
+    );
+    let mut forged = result.clone();
+    forged
+        .outputs
+        .insert(DISCOVERY_RESULT.into(), Artifact::Tree(empty_root()));
+    assert!(service.begin(ticket, worker, forged).is_err());
+    assert!(service.begin(ticket, worker, result).is_ok());
+    service.close(ticket, Publisher::Client)?;
     Ok(())
 }

@@ -171,7 +171,7 @@ fn serve_inner(
         "invalid namespace trace context"
     );
     ensure!(
-        selected.iter().all(|name| spec.outputs.contains_key(name)),
+        selected.iter().all(|name| spec.output_kind(name).is_some()),
         "undeclared selected result output"
     );
     ensure!(
@@ -182,6 +182,13 @@ fn serve_inner(
         .into_iter()
         .map(|token| registry.get(uid, token))
         .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        !spec.discovery.as_ref().is_some_and(|discovery| matches!(
+            discovery.source,
+            crate::build_runtime::DiscoverySource::Live { .. }
+        )),
+        "namespace live discovery requires an authorized origin channel"
+    );
     let build_policy = policy.build_policy(mode);
     let mut inputs = RemoteInputs {
         stream,

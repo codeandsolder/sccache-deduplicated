@@ -27,7 +27,7 @@ impl DiscoveryTransport for NoOrigin {
         anyhow::bail!("replay attempted to seal a live origin")
     }
 
-    fn open_blob(&mut self, _: BlobRef) -> Result<Box<dyn Read + Send>> {
+    fn stage_blob(&mut self, _: &NativeStore, _: BlobRef) -> Result<crate::StagedBlob> {
         anyhow::bail!("resident CAS content was fetched again")
     }
 }
@@ -44,7 +44,7 @@ fn live_and_replay_mounts_preserve_aliases_and_hash_only_read_files() -> Result<
     fs::write(input.path().join("metadata-only"), b"never read")?;
     fs::write(input.path().join("unrelated"), b"unrelated bytes")?;
 
-    let live = DiscoverySession::new(store.clone(), origin(input.path())?, None)?;
+    let live = DiscoverySession::new(store.clone(), Box::new(origin(input.path())?), None)?;
     let mounted = live.mount(path(b"/inputs")?, scratch.path())?;
     let root = mounted.root();
     let names = fs::read_dir(root)?
@@ -97,7 +97,11 @@ fn live_and_replay_mounts_preserve_aliases_and_hash_only_read_files() -> Result<
         .context("unrelated content invalidated transcript")?;
     assert_eq!(refreshed.seal()?.fingerprint()?, transcript.fingerprint()?);
 
-    let replay = DiscoverySession::new(store.clone(), NoOrigin, Some(discovered.bundle().clone()))?;
+    let replay = DiscoverySession::new(
+        store.clone(),
+        Box::new(NoOrigin),
+        Some(discovered.bundle().clone()),
+    )?;
     let mounted = replay.mount(path(b"/inputs")?, scratch.path())?;
     let root = mounted.root();
     assert_eq!(fs::read_dir(root)?.count(), 5);
@@ -119,7 +123,8 @@ fn live_and_replay_mounts_preserve_aliases_and_hash_only_read_files() -> Result<
         transcript.fingerprint()?
     );
 
-    let invalid = DiscoverySession::new(store, NoOrigin, Some(discovered.bundle().clone()))?;
+    let invalid =
+        DiscoverySession::new(store, Box::new(NoOrigin), Some(discovered.bundle().clone()))?;
     let mounted = invalid.mount(path(b"/inputs")?, scratch.path())?;
     assert_eq!(
         fs::metadata(mounted.root().join("unobserved"))
@@ -138,7 +143,7 @@ fn worker_namespace_defers_content_until_first_read_and_verifies_bytes() -> Resu
     let scratch = tempfile::tempdir()?;
     let store = NativeStore::open(&scratch.path().join("store"))?;
     fs::write(input.path().join("file"), b"contents")?;
-    let session = DiscoverySession::new(store, origin(input.path())?, None)?;
+    let session = DiscoverySession::new(store, Box::new(origin(input.path())?), None)?;
     let filesystem = DiscoveryFs::new(Arc::clone(&session.0), path(b"/inputs")?)?;
     let inode = filesystem
         .call(|ns, state| Ok(ns.lookup(state, INodeNo::ROOT, OsStr::new("file"))?.ino))

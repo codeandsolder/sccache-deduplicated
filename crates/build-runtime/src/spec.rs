@@ -172,9 +172,19 @@ pub struct CompilerResultIdentity {
 /// tree, replayed at its exact declared mountpoints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoverySpec {
-    pub tree: TreeId,
+    pub source: DiscoverySource,
     pub mounts: BTreeSet<BuildPath>,
 }
+
+/// The live phase is explicitly a unique observation task, not a
+/// reusable compiler result. Only the sealed replay is content-keyed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiscoverySource {
+    Sealed(TreeId),
+    Live { nonce: ContentId },
+}
+
+pub const DISCOVERY_RESULT: &str = "__sccache_discovery";
 
 /// All declared inputs to a Linux native build.
 ///
@@ -200,6 +210,20 @@ pub struct ExecutionSpec {
 }
 
 impl ExecutionSpec {
+    #[must_use]
+    pub fn output_kind(&self, name: &str) -> Option<crate::OutputKind> {
+        if name == DISCOVERY_RESULT
+            && self
+                .discovery
+                .as_ref()
+                .is_some_and(|d| matches!(d.source, DiscoverySource::Live { .. }))
+        {
+            Some(crate::OutputKind::Tree)
+        } else {
+            self.outputs.get(name).map(|output| output.kind)
+        }
+    }
+
     /// Validate the complete declaration.
     ///
     /// # Errors
@@ -224,7 +248,17 @@ impl ExecutionSpec {
                 "overlapping build mounts"
             );
         }
+        ensure!(
+            !self.outputs.contains_key(DISCOVERY_RESULT),
+            "reserved discovery output name"
+        );
         if let Some(discovery) = &self.discovery {
+            if matches!(discovery.source, DiscoverySource::Live { .. }) {
+                ensure!(
+                    self.outputs.is_empty(),
+                    "live discovery publishes only the sealed observation package"
+                );
+            }
             ensure!(
                 self.compiler_result.is_none(),
                 "discovery replay requires exact action identity"
@@ -397,14 +431,25 @@ impl ExecutionSpec {
             trees.insert(*tree);
         }
         if let Some(discovery) = &self.discovery {
-            trees.insert(discovery.tree);
+            if let DiscoverySource::Sealed(tree) = discovery.source {
+                trees.insert(tree);
+            }
             components.insert(
-                "input/discovery-replay".into(),
-                ContentId(typed_digest(b"native-discovery-replay-v1\0", discovery)?),
+                "input/discovery".into(),
+                ContentId(typed_digest(b"native-discovery-v2\0", discovery)?),
             );
         }
         let mut required_outputs = BTreeMap::new();
         let mut optional_outputs = BTreeMap::new();
+        let live_discovery = self
+            .discovery
+            .as_ref()
+            .filter(|d| matches!(d.source, DiscoverySource::Live { .. }))
+            .cloned();
+        if live_discovery.is_some() {
+            required_outputs.insert(DISCOVERY_RESULT.into(), crate::OutputKind::Tree);
+        }
+
         for (name, output) in &self.outputs {
             components.insert(
                 format!("output/path/{name}"),
@@ -461,6 +506,7 @@ impl ExecutionSpec {
             );
         }
         Ok(ActionRequest {
+            live_discovery,
             result_fingerprint,
             fingerprint: ActionFingerprint {
                 schema: "native-linux-bwrap-v4".into(),

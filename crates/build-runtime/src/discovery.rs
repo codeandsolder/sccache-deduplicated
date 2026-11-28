@@ -7,36 +7,37 @@
 //! the origin never follows a worker-supplied symlink through an authority
 //! boundary. This module does not run a compiler or grant execution authority.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    ffi::OsStr,
-    fs::File,
-    os::{fd::AsRawFd, unix::ffi::OsStrExt},
-    path::Path,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
+use crate::{BlobRef, BuildPath, ContentId, TreeMetadata, TreeTimestamp, identity::typed_digest};
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
+
+#[cfg(all(target_os = "linux", feature = "mapping"))]
+use crate::{
+    hash_descriptor,
+    source::{metadata, timestamp, unchanged},
+};
+#[cfg(all(target_os = "linux", feature = "mapping"))]
 use rustix::{
     fs::{
         CWD, Dir, FileType, Mode, OFlags, ResolveFlags, Stat, fstat, openat, openat2, readlinkat,
     },
     io::Errno,
 };
-use serde::{Deserialize, Serialize};
-
-use crate::{
-    BlobRef, BuildPath, ContentId, TreeMetadata, TreeTimestamp, hash_descriptor,
-    identity::typed_digest,
-    source::{metadata, timestamp, unchanged},
+#[cfg(all(target_os = "linux", feature = "mapping"))]
+use std::{
+    ffi::OsStr,
+    fs::File,
+    os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    path::Path,
 };
 
-#[cfg(feature = "store")]
 mod bundle;
-#[cfg(feature = "store")]
 pub use bundle::DiscoveryBundle;
-#[cfg(feature = "store")]
+#[cfg(all(target_os = "linux", feature = "store"))]
 mod filesystem;
-#[cfg(feature = "store")]
+#[cfg(all(target_os = "linux", feature = "store"))]
 pub use filesystem::{DiscoveredInputs, DiscoveryMount, DiscoverySession, DiscoveryTransport};
 
 /// A logical operation, not a physical origin path.
@@ -48,13 +49,13 @@ pub enum DiscoveryQuery {
 }
 
 impl DiscoveryQuery {
-    fn path(&self) -> &BuildPath {
+    pub(crate) fn path(&self) -> &BuildPath {
         match self {
             Self::Lookup(path) | Self::ReadDirectory(path) | Self::ReadFile(path) => path,
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         BuildPath::new(self.path().as_bytes().to_vec())?;
         Ok(())
     }
@@ -74,6 +75,7 @@ pub enum DiscoveryKind {
     Unknown,
 }
 
+#[cfg(all(target_os = "linux", feature = "mapping"))]
 impl From<FileType> for DiscoveryKind {
     fn from(kind: FileType) -> Self {
         match kind {
@@ -98,7 +100,7 @@ pub struct DiscoveryInode {
 }
 
 impl DiscoveryInode {
-    #[cfg(feature = "store")]
+    #[cfg(all(target_os = "linux", feature = "store"))]
     fn replay_inode(self) -> Result<u64> {
         ensure!(
             self.device == 0 && self.inode != 0,
@@ -107,6 +109,7 @@ impl DiscoveryInode {
         Ok(self.inode)
     }
 
+    #[cfg(all(target_os = "linux", feature = "mapping"))]
     fn from_stat(stat: &Stat) -> Self {
         Self {
             device: stat.st_dev,
@@ -123,6 +126,7 @@ pub struct DiscoveryMetadata {
 }
 
 impl DiscoveryMetadata {
+    #[cfg(all(target_os = "linux", feature = "mapping"))]
     fn from_stat(stat: &Stat) -> Result<Self> {
         Ok(Self {
             inode: DiscoveryInode::from_stat(stat),
@@ -201,7 +205,7 @@ impl DiscoveryReply {
         Ok(())
     }
 
-    fn validate(&self, query: &DiscoveryQuery) -> Result<()> {
+    pub(crate) fn validate(&self, query: &DiscoveryQuery) -> Result<()> {
         use DiscoveryQuery as Q;
         use DiscoveryReply as R;
         match (query, self) {
@@ -351,7 +355,7 @@ impl DiscoveryReplay {
         Ok(reply)
     }
 
-    #[cfg(feature = "store")]
+    #[cfg(all(target_os = "linux", feature = "store"))]
     fn file_query(
         &self,
         query: DiscoveryQuery,
@@ -404,6 +408,7 @@ pub struct DiscoveryLimits {
 /// roots, never from paths supplied by the executing worker. The longest
 /// matching logical root selects a pinned origin directory. File bytes
 /// remain in pinned descriptors until the discovery session is released.
+#[cfg(all(target_os = "linux", feature = "mapping"))]
 pub struct DiscoveryOrigin {
     roots: BTreeMap<BuildPath, File>,
     files: BTreeMap<ContentId, File>,
@@ -413,6 +418,7 @@ pub struct DiscoveryOrigin {
     content_bytes: u64,
 }
 
+#[cfg(all(target_os = "linux", feature = "mapping"))]
 impl DiscoveryOrigin {
     /// # Errors
     /// Returns an error for a zero resource limit.
@@ -735,7 +741,7 @@ impl DiscoveryOrigin {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux", feature = "mapping"))]
 mod tests {
     use super::*;
     use std::{fs, io::Read, os::unix::fs::symlink};
