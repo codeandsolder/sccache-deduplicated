@@ -1013,6 +1013,7 @@ pub struct Scheduler {
         Mutex<BTreeMap<ServerId, (Instant, sccache::build_runtime::wire::ClientDeliveryRates)>>,
     job_slack: JobSlackConfig,
     maintenance_drain_file: Option<PathBuf>,
+    queue_changed: tokio::sync::Notify,
 
     // Currently running jobs, can never be Complete
     jobs: Mutex<BTreeMap<JobId, JobDetail>>,
@@ -1091,10 +1092,32 @@ impl ServerDetails {
             })
     }
 
-    fn admission_slots(&self, job_slack: JobSlackConfig) -> usize {
-        job_slack
-            .max_jobs(self.cpu_capacity)
-            .saturating_sub(self.compiler_demand())
+    fn archive_slots(&self, job_slack: JobSlackConfig) -> usize {
+        if self.capabilities.archive {
+            job_slack
+                .max_jobs(self.cpu_capacity)
+                .saturating_sub(self.compiler_demand())
+        } else {
+            0
+        }
+    }
+
+    fn max_jobs(&self, job_slack: JobSlackConfig) -> usize {
+        let archive = if self.capabilities.archive {
+            job_slack.max_jobs(self.cpu_capacity)
+        } else {
+            0
+        };
+        let native = self
+            .capabilities
+            .native_placement
+            .as_ref()
+            .map_or(0, |placement| placement.queue.capacity as usize);
+        archive.max(native)
+    }
+
+    fn available_jobs(&self, job_slack: JobSlackConfig) -> usize {
+        self.archive_slots(job_slack).max(self.native_headroom())
     }
 
     fn native_headroom(&self) -> usize {
@@ -1165,6 +1188,7 @@ impl Scheduler {
             dashboard_clients: Mutex::default(),
             job_slack,
             maintenance_drain_file,
+            queue_changed: tokio::sync::Notify::new(),
             jobs: Mutex::new(BTreeMap::new()),
             servers: Mutex::new(HashMap::new()),
             completed_acks: Mutex::new(CompletedJobAcks::default()),
@@ -1286,6 +1310,7 @@ impl Drop for AssignmentGuard {
             entry.jobs_assigned.remove(&self.job_id);
             entry.last_error = Some(Instant::now());
         }
+        self.scheduler.queue_changed.notify_waiters();
         #[cfg(feature = "scheduler-dashboard")]
         self.scheduler.dashboard_changed();
     }
@@ -1354,26 +1379,12 @@ fn collect_candidates(
         if !compatible {
             continue;
         }
-        let native_worker = native.is_some()
-            && details.cpu_capacity > 0.0
-            && details.capabilities.native_placement.is_some();
-        let Some(weight) =
-            admission_weight(details.compiler_demand(), details.cpu_capacity, job_slack)
-        else {
-            saturated_native |= native_worker;
-            continue;
-        };
         let weight = if let (Some(inputs), Some(plan)) = (native_inputs, transfer_plan) {
             let Some(placement) = details.capabilities.native_placement.as_ref() else {
                 continue;
             };
-            if !placement.queue.has_capacity(
-                details
-                    .jobs_assigned
-                    .iter()
-                    .filter_map(|(&id, inputs)| inputs.is_some().then_some(id)),
-            ) {
-                saturated_native |= native_worker;
+            if details.native_headroom() == 0 {
+                saturated_native = true;
                 continue;
             }
             let learned = class.zip(native_platform).map(|(class, platform)| {
@@ -1394,6 +1405,11 @@ fn collect_candidates(
             predictions.insert(server_id, estimate);
             estimate.seconds
         } else {
+            let Some(weight) =
+                admission_weight(details.compiler_demand(), details.cpu_capacity, job_slack)
+            else {
+                continue;
+            };
             weight
         };
         if details
@@ -1472,6 +1488,23 @@ impl Scheduler {
             .servers
             .lock()
             .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
+
+        if let Some(platform) = native_platform {
+            let mut compatible = false;
+            let mut ready = false;
+            for details in servers.values() {
+                if details.capabilities.native_platform == Some(platform) {
+                    compatible = true;
+                    ready |= details.native_headroom() != 0;
+                }
+            }
+            if !ready {
+                return Ok(Err(NoCapacity {
+                    servers: servers.len(),
+                    saturated_native: compatible,
+                }));
+            }
+        }
 
         let cost_book = self
             .cost_book
@@ -1572,50 +1605,64 @@ impl Scheduler {
         network: &NetworkSnapshot,
         packages: &Arc<sccache::build_runtime::PackageCatalog>,
     ) -> Result<AllocJobResult> {
-        let scheduler = Arc::clone(&self);
-        let network = network.clone();
-        let packages = Arc::clone(packages);
-        let prepared = tokio::task::spawn_blocking(move || -> Result<_> {
-            if scheduler.is_draining() {
-                return Ok(Err(AllocJobResult::Fail {
+        let (assignment, reservation, _guard, assigned_at) = loop {
+            // Register before observing capacity to avoid losing a heartbeat
+            // or completion between the failed reservation and the wait.
+            let changed = self.queue_changed.notified();
+            tokio::pin!(changed);
+            let _ = changed.as_mut().enable();
+            if self.is_draining() {
+                return Ok(AllocJobResult::Fail {
                     msg: "scheduler is draining for maintenance".to_owned(),
-                }));
+                });
             }
-            let assigned_at = Instant::now();
-            let reservation =
+            let scheduler = Arc::clone(&self);
+            let network = network.clone();
+            let packages = Arc::clone(packages);
+            let prepared = tokio::task::spawn_blocking(move || -> Result<_> {
+                let assigned_at = Instant::now();
                 match scheduler.reserve_job(&assignment, &network, &packages, assigned_at)? {
-                    Ok(reservation) => reservation,
-                    Err(NoCapacity {
+                    Ok(reservation) => {
+                        let guard = AssignmentGuard {
+                            scheduler: Arc::clone(&scheduler),
+                            server_id: reservation.server_id,
+                            job_id: reservation.job_id,
+                        };
+                        #[cfg(feature = "scheduler-dashboard")]
+                        scheduler.dashboard_changed();
+                        if let JobAssignment::Native(native) = &mut assignment {
+                            native.estimated_result_bytes = reservation.estimated_result_bytes;
+                        }
+                        Ok(Ok((assignment, reservation, guard, assigned_at)))
+                    }
+                    Err(reason) => Ok(Err((assignment, reason))),
+                }
+            })
+            .await??;
+            match prepared {
+                Ok(reservation) => break reservation,
+                Err((
+                    pending,
+                    NoCapacity {
                         saturated_native: true,
                         ..
-                    }) => {
-                        // This ticket remains unassigned. The native HTTP
-                        // service returns 503 and the origin retries within
-                        // its existing allocation deadline.
-                        return Err(sccache::build_runtime::NativeServiceBusy.into());
-                    }
-                    Err(NoCapacity { servers: count, .. }) => {
-                        return Ok(Err(AllocJobResult::Fail {
-                            msg: format!("Insufficient capacity across {count} available servers"),
-                        }));
-                    }
-                };
-            let guard = AssignmentGuard {
-                scheduler: Arc::clone(&scheduler),
-                server_id: reservation.server_id,
-                job_id: reservation.job_id,
-            };
-            #[cfg(feature = "scheduler-dashboard")]
-            scheduler.dashboard_changed();
-            if let JobAssignment::Native(native) = &mut assignment {
-                native.estimated_result_bytes = reservation.estimated_result_bytes;
+                    },
+                )) => {
+                    // The admitted session owns the queued request. Do not
+                    // reject work merely because the bounded worker queues
+                    // are full. Wake on a released reservation or heartbeat;
+                    // a short timer also observes the maintenance drain.
+                    assignment = pending;
+                    let _ = tokio::time::timeout(Duration::from_secs(1), changed).await;
+                }
+                Err((_, NoCapacity { servers: count, .. })) => {
+                    return Ok(AllocJobResult::Fail {
+                        msg: format!(
+                            "No available capacity on compatible workers across {count} servers"
+                        ),
+                    });
+                }
             }
-            Ok(Ok((assignment, reservation, guard, assigned_at)))
-        })
-        .await??;
-        let (assignment, reservation, _guard, assigned_at) = match prepared {
-            Ok(prepared) => prepared,
-            Err(response) => return Ok(response),
         };
         let result = requester
             .do_assign_job(
@@ -2182,6 +2229,7 @@ impl SchedulerIncoming for Scheduler {
                 reconcile_stale_assignments(details, &mut jobs, server_id, active_job_ids, now);
                 let mut assigned_job_ids: Vec<_> = details.jobs_assigned.keys().copied().collect();
                 assigned_job_ids.sort_unstable();
+                self.queue_changed.notify_waiters();
                 return Ok(HeartbeatServerResult {
                     is_new: false,
                     assigned_job_ids,
@@ -2215,6 +2263,7 @@ impl SchedulerIncoming for Scheduler {
         );
         drop(servers);
         drop(jobs);
+        self.queue_changed.notify_waiters();
         Ok(HeartbeatServerResult {
             is_new: true,
             assigned_job_ids: Vec::new(),
@@ -2367,6 +2416,7 @@ impl SchedulerIncoming for Scheduler {
         }
         drop(servers);
         drop(jobs);
+        self.queue_changed.notify_waiters();
         Ok(UpdateJobStateResult::Success)
     }
 
@@ -2420,21 +2470,14 @@ impl SchedulerIncoming for Scheduler {
             in_progress: servers.values().map(|v| v.jobs_assigned.len()).sum(),
             max_jobs: servers
                 .values()
-                .map(|v| self.job_slack.max_jobs(v.cpu_capacity))
+                .map(|v| v.max_jobs(self.job_slack))
                 .fold(0, usize::saturating_add),
             available_jobs: if self.is_draining() {
                 0
             } else {
                 servers
                     .values()
-                    .map(|v| {
-                        let slots = v.admission_slots(self.job_slack);
-                        if v.capabilities.archive {
-                            slots
-                        } else {
-                            slots.min(v.native_headroom())
-                        }
-                    })
+                    .map(|v| v.available_jobs(self.job_slack))
                     .fold(0, usize::saturating_add)
             },
         })
@@ -3603,7 +3646,7 @@ mod scheduler_tests {
     }
 
     #[tokio::test]
-    async fn native_jobs_select_compatible_workers_using_shared_capacity() -> Result<()> {
+    async fn native_jobs_queue_at_zero_cpu_and_wait_for_real_reservation_capacity() -> Result<()> {
         use sccache::build_runtime::ContentId;
         let scheduler = Arc::new(Scheduler::new_with_job_slack(JobSlackConfig {
             static_jobs: 0,
@@ -3617,13 +3660,22 @@ mod scheduler_tests {
         scheduler.handle_heartbeat_server(
             a,
             nonce_a,
-            1.0,
+            0.0,
             &[],
             Box::new(TestJobAuthorizer),
             dist::WorkerCapabilities {
                 archive: false,
                 native_platform: Some(platform),
-                native_placement: Some(dist::NativePlacement::default()),
+                native_placement: Some(dist::NativePlacement {
+                    queue: dist::NativeQueueSnapshot {
+                        capacity: 2,
+                        compiler_slots: 1,
+                        staging_slots: 2,
+                        publication_slots: 2,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
             },
         )?;
         scheduler.handle_heartbeat_server(
@@ -3680,16 +3732,38 @@ mod scheduler_tests {
             assert_eq!(description.input_bytes, 10);
             assert_eq!(description.input_blobs, 1);
         }
-        let saturated = Arc::clone(&scheduler)
+        let AllocJobResult::Success {
+            job_alloc: second, ..
+        } = Arc::clone(&scheduler)
             .handle_alloc_native_job(
                 &AcceptAssign,
                 assignment.clone(),
                 &NetworkSnapshot::default(),
                 Default::default(),
             )
-            .await;
+            .await?
+        else {
+            bail!("second reservation unavailable at zero CPU")
+        };
+        assert_eq!(second.server_id, a);
+        {
+            let servers = scheduler.servers.lock().unwrap();
+            let worker = &servers[&a];
+            assert_eq!(worker.max_jobs(scheduler.job_slack), 2);
+            assert_eq!(worker.available_jobs(scheduler.job_slack), 0);
+        }
+        let network = NetworkSnapshot::default();
+        let waiting = Arc::clone(&scheduler).handle_alloc_native_job(
+            &AcceptAssign,
+            assignment.clone(),
+            &network,
+            Default::default(),
+        );
+        tokio::pin!(waiting);
         assert!(
-            matches!(saturated, Err(error) if error.is::<sccache::build_runtime::NativeServiceBusy>())
+            tokio::time::timeout(Duration::from_millis(50), waiting.as_mut())
+                .await
+                .is_err()
         );
         // Incompatible platforms are not temporary queue pressure.
         let missing =
@@ -3706,16 +3780,10 @@ mod scheduler_tests {
             AllocJobResult::Fail { .. }
         ));
         scheduler.handle_update_job_state(job_alloc.job_id, a, JobState::Complete)?;
-        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
-            .handle_alloc_native_job(
-                &AcceptAssign,
-                assignment,
-                &NetworkSnapshot::default(),
-                Default::default(),
-            )
-            .await?
+        let AllocJobResult::Success { job_alloc, .. } =
+            tokio::time::timeout(Duration::from_secs(5), waiting).await??
         else {
-            bail!("native worker did not become available after completion");
+            bail!("queued work did not become available after completion");
         };
         assert_eq!(job_alloc.server_id, a);
         let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)

@@ -123,10 +123,10 @@ impl NativeStore {
     pub(crate) fn check_transfer_capacity(&self, bytes: u64) -> Result<()> {
         if let Some(policy) = self.inner.space_policy {
             ensure!(
-                bytes <= policy.max_resident_bytes,
+                bytes <= policy.resident_limit(),
                 StageSpaceTooLarge {
                     requested: bytes,
-                    limit: policy.max_resident_bytes,
+                    limit: policy.resident_limit(),
                 }
             );
         }
@@ -327,9 +327,9 @@ impl NativeStore {
     ) -> Result<SpaceReport> {
         // The soft watermarks maintain a ready buffer for new work. A larger
         // observed request can ask the next pass for additional headroom.
-        let resident_target = policy
-            .target_resident_bytes
-            .min(policy.max_resident_bytes.saturating_sub(incoming));
+        let resident_target = policy.target_resident_bytes.map_or(u64::MAX, |target| {
+            target.min(policy.resident_limit().saturating_sub(incoming))
+        });
         let available_target = policy
             .target_available_bytes
             .max(policy.min_available_bytes.saturating_add(incoming));
@@ -346,7 +346,7 @@ impl NativeStore {
         let mut evicted_roots = 0;
         // A transient inability to admit the requested reservation cannot be
         // solved by eviction if active writers alone exceed the ceiling.
-        if reserved <= policy.max_resident_bytes.saturating_sub(incoming)
+        if reserved <= policy.resident_limit().saturating_sub(incoming)
             && (free.saturating_sub(reserved) < available_target || resident > resident_target)
         {
             #[cfg(target_os = "linux")]
@@ -357,7 +357,7 @@ impl NativeStore {
             )?;
             (free, resident, reserved) = observe()?;
             for candidate in candidates {
-                if reserved > policy.max_resident_bytes.saturating_sub(incoming)
+                if reserved > policy.resident_limit().saturating_sub(incoming)
                     || (free.saturating_sub(reserved) >= available_target
                         && resident <= resident_target)
                 {
@@ -378,7 +378,7 @@ impl NativeStore {
             resident_bytes: resident,
             evicted_roots,
             minimum_satisfied: free.saturating_sub(reserved) >= policy.min_available_bytes
-                && resident <= policy.max_resident_bytes,
+                && resident <= policy.resident_limit(),
         })
     }
 
@@ -787,10 +787,10 @@ impl StageBudget {
             return Ok(());
         };
         ensure!(
-            size <= policy.max_resident_bytes,
+            size <= policy.resident_limit(),
             StageSpaceTooLarge {
                 requested: size,
-                limit: policy.max_resident_bytes,
+                limit: policy.resident_limit(),
             }
         );
         if self.reserved >= size {
@@ -811,7 +811,7 @@ impl StageBudget {
         let resident = self.store.resident_bytes()?.saturating_add(need);
         let available = self.store.available_bytes()?;
         if available.saturating_sub(need) < policy.min_available_bytes
-            || resident > policy.max_resident_bytes
+            || resident > policy.resident_limit()
         {
             // No cache scanning, eviction or garbage collection on the
             // admission path. The maintenance service prepares more room.
@@ -823,7 +823,7 @@ impl StageBudget {
                 reserved: state.reserved,
                 resident,
                 available,
-                limit: policy.max_resident_bytes,
+                limit: policy.resident_limit(),
                 evicted: 0,
             }
             .into());

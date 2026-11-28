@@ -20,8 +20,8 @@ fn worker(
             space: Some(SpacePolicy {
                 min_available_bytes: 1 << 20,
                 target_available_bytes: 2 << 20,
-                max_resident_bytes: 1 << 30,
-                target_resident_bytes: 1 << 29,
+                max_resident_bytes: Some(1 << 30),
+                target_resident_bytes: Some(1 << 29),
                 max_evictions_per_pass: 8,
                 gc_batch: 16,
             }),

@@ -623,8 +623,8 @@ async fn captured_output_publication_reuses_original_inode() -> Result<()> {
         SpacePolicy {
             min_available_bytes: 100,
             target_available_bytes: 200,
-            max_resident_bytes: 1024 * 1024,
-            target_resident_bytes: 1024 * 1024,
+            max_resident_bytes: Some(1024 * 1024),
+            target_resident_bytes: Some(1024 * 1024),
             max_evictions_per_pass: 4,
             gc_batch: 16,
         },
@@ -763,8 +763,8 @@ fn capture_without_resident_headroom_still_has_verified_delivery_bytes() -> Resu
         crate::SpacePolicy {
             min_available_bytes: 1,
             target_available_bytes: 1,
-            max_resident_bytes: 8,
-            target_resident_bytes: 8,
+            max_resident_bytes: Some(8),
+            target_resident_bytes: Some(8),
             max_evictions_per_pass: 4,
             gc_batch: 16,
         },

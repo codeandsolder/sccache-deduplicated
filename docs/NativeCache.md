@@ -231,8 +231,7 @@ max_metadata_bytes = 67108864
 [native_cache.space]
 min_available_bytes = 536870912
 target_available_bytes = 2147483648
-max_resident_bytes = 274877906944
-target_resident_bytes = 257698037760
+# On a dedicated quota-controlled filesystem, omit logical resident limits.
 max_evictions_per_pass = 32
 gc_batch = 1024
 ```
@@ -272,10 +271,12 @@ gc_batch = 1024
 
 The native store uses one transactional index, lease/GC implementation, and
 usage-aware eviction policy on scheduler, worker and local executor. The
-resident budget counts uncompressed live blobs and queued garbage conservatively;
-ZFS separately compresses them and the filesystem free-space watermarks still
-apply. For actual physical cache isolation, place each store on a quota-managed
-dataset. Worker replicas are persistent and reuse the same verified blobs and
+optional logical resident watermarks count uncompressed live blobs and queued
+garbage. For a quota-managed dataset, omit both logical watermarks and use the
+filesystem free-space watermarks to drive eviction against the actual allocated
+bytes, including compression, index, temporary files and scratch on that dataset.
+Keep logical limits only for a store sharing a filesystem without a dedicated quota.
+Reservations conservatively reserve worst-case incoming bytes. Worker replicas are persistent and reuse the same verified blobs and
 package trees, fetching missing inputs only. Access frequency and recency are
 buffered and checkpointed at most once per minute during maintenance,
 plus on orderly shutdown, without write I/O on cache hits. Staged files

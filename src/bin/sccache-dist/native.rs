@@ -66,12 +66,13 @@ impl NativeWorker {
             .managed_space_policy()
             .ok_or_else(|| anyhow::anyhow!("worker requires a managed store"))?;
         let grace_bytes = config.artifact_grace_bytes.unwrap_or_else(|| {
-            (space.max_resident_bytes / 4)
-                .max(config.max_result_bytes.saturating_mul(2))
-                .min(space.max_resident_bytes)
+            let default = config.max_result_bytes.saturating_mul(2);
+            space
+                .max_resident_bytes
+                .map_or(default, |limit| (limit / 4).max(default).min(limit))
         });
         ensure!(
-            (1..=space.max_resident_bytes).contains(&grace_bytes),
+            (1..=space.resident_limit()).contains(&grace_bytes),
             "artifact grace budget must fit the resident budget"
         );
         // A shared store must not publish a worker's grace result into the

@@ -262,8 +262,8 @@ fn competing_results_reserve_complete_missing_closures_and_retry() -> Result<()>
         crate::SpacePolicy {
             min_available_bytes: 1,
             target_available_bytes: 1,
-            max_resident_bytes: 20,
-            target_resident_bytes: 20,
+            max_resident_bytes: Some(20),
+            target_resident_bytes: Some(20),
             max_evictions_per_pass: 8,
             gc_batch: 8,
         },
@@ -341,8 +341,8 @@ fn transfer_larger_than_resident_budget_is_not_retryable() -> Result<()> {
         crate::SpacePolicy {
             min_available_bytes: 1,
             target_available_bytes: 1,
-            max_resident_bytes: 10,
-            target_resident_bytes: 10,
+            max_resident_bytes: Some(10),
+            target_resident_bytes: Some(10),
             max_evictions_per_pass: 8,
             gc_batch: 8,
         },
@@ -376,8 +376,8 @@ fn cancelled_transfer_retains_budget_until_active_upload_is_dropped() -> Result<
         crate::SpacePolicy {
             min_available_bytes: 1,
             target_available_bytes: 1,
-            max_resident_bytes: 12,
-            target_resident_bytes: 12,
+            max_resident_bytes: Some(12),
+            target_resident_bytes: Some(12),
             max_evictions_per_pass: 8,
             gc_batch: 8,
         },

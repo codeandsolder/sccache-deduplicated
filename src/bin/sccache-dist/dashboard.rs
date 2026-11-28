@@ -92,7 +92,7 @@ fn timestamp_ms(instant: Instant) -> u64 {
 
 fn worker(id: ServerId, details: &ServerDetails, scheduler: &Scheduler, draining: bool) -> Worker {
     let identity = id.to_string();
-    let max_jobs = scheduler.job_slack.max_jobs(details.cpu_capacity);
+    let max_jobs = details.max_jobs(scheduler.job_slack);
     let demand = details.compiler_demand();
     let native = details
         .capabilities
@@ -149,15 +149,20 @@ fn worker(id: ServerId, details: &ServerDetails, scheduler: &Scheduler, draining
                 residency_reported: placement.residency.is_some(),
             }
         });
-    let slots = if draining {
-        0
-    } else {
-        max_jobs.saturating_sub(demand)
-    };
-    let archive_available = details.capabilities.archive.then_some(slots);
-    let native_available = native
-        .as_ref()
-        .map(|_| slots.min(details.native_headroom()));
+    let archive_available = details.capabilities.archive.then(|| {
+        if draining {
+            0
+        } else {
+            details.archive_slots(scheduler.job_slack)
+        }
+    });
+    let native_available = native.as_ref().map(|_| {
+        if draining {
+            0
+        } else {
+            details.native_headroom()
+        }
+    });
     Worker {
         name: details
             .worker_name
@@ -171,7 +176,9 @@ fn worker(id: ServerId, details: &ServerDetails, scheduler: &Scheduler, draining
         assigning: details.jobs_assigning.len(),
         compiler_demand: demand,
         max_jobs,
-        available: archive_available.unwrap_or_else(|| native_available.unwrap_or(0)),
+        available: archive_available
+            .unwrap_or(0)
+            .max(native_available.unwrap_or(0)),
         archive_available,
         native_available,
         native,

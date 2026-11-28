@@ -1366,7 +1366,7 @@ impl NativeStore {
                         // A small managed worker must be able to stage a
                         // small object even with a budget below one chunk.
                         let reservation = self.inner.space_policy.map_or(reservation, |policy| {
-                            reservation.min(policy.max_resident_bytes)
+                            reservation.min(policy.resident_limit())
                         });
                         ensure!(
                             size <= reservation,

@@ -156,7 +156,7 @@ impl NativeStore {
                     let maximum_bytes = store
                         .inner
                         .space_policy
-                        .map(|policy| policy.max_resident_bytes);
+                        .and_then(|policy| policy.max_resident_bytes);
                     let (report, error) = match store.cache_distribution() {
                         Ok(report) => (Some(report), None),
                         Err(error) => {
