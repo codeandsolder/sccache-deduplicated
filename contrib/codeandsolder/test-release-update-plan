@@ -104,7 +104,7 @@ if rg -Fq 'trap rollback EXIT ERR' "$updater"; then
 fi
 publisher="$(dirname -- "$updater")/../../.github/workflows/publish-ci-client.yml"
 protocol="$(dirname -- "$updater")/release-protocol.env"
-for literal in 'dist_protocol=7' 'rollout_epoch=8' 'glibc_abi_max=2.39'; do
+for literal in 'dist_protocol=8' 'rollout_epoch=9' 'glibc_abi_max=2.39'; do
     rg -Fxq -- "$literal" "$protocol"
 done
 for literal in 'source contrib/codeandsolder/release-protocol.env' 'direct-metrics' \

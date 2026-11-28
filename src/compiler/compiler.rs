@@ -1361,8 +1361,8 @@ where
 
     /// Compiler-specific result identity policy for the native CAS.
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
-    fn native_result_policy(&self) -> super::ResultIdentityPolicy {
-        super::ResultIdentityPolicy::Exact
+    fn native_packaging_policy(&self) -> super::CompilerPackagingPolicy {
+        super::CompilerPackagingPolicy::Default
     }
 
     /// The native compiler produces an independent object at a fixed

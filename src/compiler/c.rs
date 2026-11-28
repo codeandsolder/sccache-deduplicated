@@ -377,13 +377,13 @@ where
         })
         .context("compiler did not expose a native CPU frontend expansion")?;
     let flags = native_driver_replacement(driver_line, kind, &native_args)?;
-    // Preserve the requesting compiler's full observed frontend state in the
-    // native-only cache supplement. The working directory can affect emitted
-    // debug metadata without changing preprocessed bytes (notably Clang -g),
-    // so hashing only the CPU switches could alias materially different objects.
+    // The resolved effective CPU switches are the input. Driver transcript
+    // paths, including -fdebug-compilation-dir, are not CPU information.
     let mut digest = Digest::new();
-    digest.update(b"sccache-native-target-resolution-v4\0");
-    digest.update(driver_line.as_bytes());
+    digest.update(b"sccache-native-target-resolution-v5\0");
+    for flag in &flags {
+        digest.delimiter(flag.as_encoded_bytes());
+    }
     #[cfg(not(feature = "dist-client"))]
     let _ = flags;
     Ok(Some(NativeCodegenResolution {
@@ -691,7 +691,12 @@ where
         context: GenerateHashKeyContext<'_, T>,
     ) -> Result<HashResult<T>> {
         #[cfg(all(feature = "dist-client", target_os = "linux"))]
-        let native_identity = context.native.is_some();
+        let native_digests = context
+            .native
+            .as_ref()
+            .map(|client| client.toolchain_digests());
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        let native_identity = native_digests.is_some();
         #[cfg(not(all(feature = "dist-client", target_os = "linux")))]
         let native_identity = false;
         let GenerateHashKeyContext {
@@ -725,6 +730,60 @@ where
         }
 
         let mut extra_hashes = hash_all(&parsed_args.extra_hash_files, &pool.clone()).await?;
+        #[cfg(all(
+            feature = "dist-client",
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if let Some(digests) = native_digests
+            && self.compiler.kind() == CCompilerKind::Gcc
+        {
+            let packager = CToolchainPackager {
+                executable: self.executable.clone(),
+                kind: self.compiler.kind(),
+                cwd: cwd.clone(),
+                env_vars: env_vars.clone(),
+                driver_args: parsed_args
+                    .common_args
+                    .iter()
+                    .chain(&parsed_args.arch_args)
+                    .cloned()
+                    .collect(),
+            };
+            let language = parsed_args.language;
+            let selected = pool
+                .spawn_blocking(move || -> Result<Vec<String>> {
+                    let frontend = match language {
+                        Language::Assembler | Language::AssemblerToPreprocess => None,
+                        Language::Cxx
+                        | Language::CxxHeader
+                        | Language::CxxPreprocessed
+                        | Language::CxxModule => Some("cc1plus"),
+                        Language::ObjectiveC
+                        | Language::ObjectiveCHeader
+                        | Language::ObjectiveCPreprocessed => Some("cc1obj"),
+                        Language::ObjectiveCxx
+                        | Language::ObjectiveCxxHeader
+                        | Language::ObjectiveCxxPreprocessed => Some("cc1objplus"),
+                        _ => Some("cc1"),
+                    };
+                    let mut selected = Vec::new();
+                    if let Some(name) = frontend {
+                        let path = packager
+                            .named_tool("prog", name, pkg::ToolchainScope::PreprocessedC)?
+                            .context("GCC selected frontend unavailable")?;
+                        selected.push(crate::util::hex(&digests.file_digest(&path)?.id.0));
+                    }
+                    if let Some(path) =
+                        packager.named_tool("file", "specs", pkg::ToolchainScope::PreprocessedC)?
+                    {
+                        selected.push(crate::util::hex(&digests.file_digest(&path)?.id.0));
+                    }
+                    Ok(selected)
+                })
+                .await??;
+            extra_hashes.extend(selected);
+        }
         let native_resolution = native_codegen_resolution(
             creator,
             &self.executable,
@@ -1028,32 +1087,73 @@ where
         // use in creating a hash key
         let mut common_and_arch_args = self.parsed_args.common_args.clone();
         common_and_arch_args.extend(self.parsed_args.arch_args.clone());
+        if native_identity {
+            // Debug path flags and prefix-map operands are delivery metadata.
+            // Any actual preprocessor macro effect is already in its output.
+            common_and_arch_args.retain(|arg| {
+                let bytes = arg.as_encoded_bytes();
+                ![
+                    b"-fdebug-prefix-map=".as_slice(),
+                    b"-ffile-prefix-map=",
+                    b"-fmacro-prefix-map=",
+                    b"-fdebug-compilation-dir=",
+                    b"-Wa,--debug-prefix-map=",
+                    b"--debug-prefix-map=",
+                ]
+                .iter()
+                .any(|prefix| bytes.starts_with(prefix))
+            });
+        }
 
         // Hash the same remapped filename identity that the compiler uses for
         // debug information. Do not strip arbitrary source literals or flags.
-        let relocate_native_object = canonical_native.is_some()
-            && native_identity
+        let relocate_native_object = native_identity
             && matches!(
                 self.compiler.kind(),
                 CCompilerKind::Gcc | CCompilerKind::Clang
             )
             && relocatable_object(&parsed_args);
-        let key_input = if let Some(paths) = &canonical_native {
-            let normalized = paths.preprocessed_key_bytes(&preprocessor_output);
-            extra_hashes.push(paths.context_digest(
-                &self.parsed_args,
-                &cwd,
-                &normalized,
-                native_identity
-                    && matches!(
-                        self.compiler.kind(),
-                        CCompilerKind::Gcc | CCompilerKind::Clang
-                    )
-                    && relocatable_object(&parsed_args),
-            ));
-            normalized
+        let mapped_input = canonical_native.as_ref().map_or_else(
+            || Cow::Borrowed(preprocessor_output.as_slice()),
+            |paths| paths.preprocessed_key_bytes(&preprocessor_output),
+        );
+        let key_input = if native_identity {
+            if relocate_native_object {
+                extra_hashes.push("native-relocatable-object-v2".into());
+            } else {
+                // Some outputs reference a companion by name, or encode the
+                // runtime profiling destination. Preserve only that actual
+                // relationship, never arbitrary source/debug directories.
+                let mut digest = Digest::new();
+                digest.delimiter(b"native-output-relationships-v1");
+                let mut outputs = parsed_args
+                    .outputs
+                    .iter()
+                    .filter(|(name, _)| **name != "d")
+                    .collect::<Vec<_>>();
+                outputs.sort_unstable_by_key(|(name, _)| *name);
+                for (name, output) in outputs {
+                    digest.delimiter(name.as_bytes());
+                    let path = if parsed_args.profile_generate {
+                        cwd.join(&output.path)
+                    } else {
+                        PathBuf::from(output.path.file_name().unwrap_or_default())
+                    };
+                    digest.delimiter(path.as_os_str().as_encoded_bytes());
+                }
+                extra_hashes.push(digest.finish());
+            }
+            NativeCargoPaths::native_line_marker_identity(&mapped_input)
         } else {
-            Cow::Borrowed(preprocessor_output.as_slice())
+            if let Some(paths) = &canonical_native {
+                extra_hashes.push(paths.context_digest(
+                    &self.parsed_args,
+                    &cwd,
+                    &mapped_input,
+                    false,
+                ));
+            }
+            Cow::Borrowed(mapped_input.as_ref())
         };
         let basedirs = if canonical_native.is_some() || native_identity {
             &[][..]
@@ -1091,7 +1191,11 @@ where
             self.parsed_args.language,
             &self.parsed_args.input,
         ))
-        .with_debug_compilation_dir(debug_compilation_dir.as_deref())
+        .with_debug_compilation_dir(if native_identity {
+            None
+        } else {
+            debug_compilation_dir.as_deref()
+        })
         .compute();
 
         // Cache the preprocessing step
@@ -2172,17 +2276,17 @@ const PREPROCESSING_SKIPPED_COMPILE_POISON: &[u8] = b"([{SCCACHE -*-* INVALID_C_
 
 impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I> {
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
-    fn native_result_policy(&self) -> super::native::ResultIdentityPolicy {
-        use super::native::ResultIdentityPolicy;
+    fn native_packaging_policy(&self) -> super::native::CompilerPackagingPolicy {
+        use super::native::CompilerPackagingPolicy;
         if matches!(
             self.compiler.kind(),
             CCompilerKind::Gcc | CCompilerKind::Clang
         ) && !self.parsed_args.profile_generate
             && !self.parsed_args.language.is_c_like_header()
         {
-            ResultIdentityPolicy::PreprocessedC
+            CompilerPackagingPolicy::PreprocessedC
         } else {
-            ResultIdentityPolicy::Exact
+            CompilerPackagingPolicy::Default
         }
     }
 
@@ -2311,7 +2415,7 @@ impl pkg::InputsPackager for CInputsPackager {
 
     #[cfg(target_os = "linux")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        (*self).discover()?.into_native_mapping(|_| false)
+        (*self).discover()?.into_native_mapping(|_| true)
     }
 }
 
@@ -3703,12 +3807,11 @@ mod test {
 
         assert_eq!(znver2, znver2_again);
         assert_ne!(znver2, skylake);
-        // Debug compilation directories can affect emitted DW_AT_comp_dir even
-        // when preprocessing output and CPU ISA are otherwise identical.
-        assert_ne!(
+        // A debug directory or compiler installation alias is not a CPU.
+        assert_eq!(
             znver2,
             fingerprint(
-                "/usr/lib/gcc/cc1 -march=znver2 -mtune=znver2 -fdebug-compilation-dir=/other/worktree"
+                "/other/gcc/cc1 -march=znver2 -mtune=znver2 -fdebug-compilation-dir=/other/worktree"
             )
         );
         // Conversely, an effective ISA change must never alias the cache.
