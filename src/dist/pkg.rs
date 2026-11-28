@@ -14,7 +14,6 @@
 
 use fs_err as fs;
 use std::path::{Component, Path, PathBuf};
-use std::str;
 
 use crate::errors::{Context, Result, anyhow, bail};
 

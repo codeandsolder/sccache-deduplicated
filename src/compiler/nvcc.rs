@@ -36,7 +36,6 @@ use crate::util::{resolve_compiler_avoiding_wrapper, run_input_output};
 use async_trait::async_trait;
 #[cfg(test)]
 use fs_err as fs;
-#[cfg(test)]
 use itertools::Itertools;
 use log::Level::Trace;
 #[cfg(test)]
