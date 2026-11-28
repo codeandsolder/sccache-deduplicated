@@ -353,7 +353,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"12";
+const CACHE_VERSION: &[u8] = b"13";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -1283,6 +1283,31 @@ fn hash_rust_argument_pairs<'a>(
     }
 }
 
+/// Reuse the compiler-discovered digest for an explicit extern. An empty
+/// digest denotes an operand whose contents were not selected by rustc.
+fn selected_extern_hashes(
+    externs: &[PathBuf],
+    sources: &[PathBuf],
+    hashes: &[String],
+) -> Vec<String> {
+    let selected = sources.iter().zip(hashes).collect::<HashMap<_, _>>();
+    externs
+        .iter()
+        .map(|path| {
+            selected
+                .get(path)
+                .copied()
+                .or_else(|| {
+                    path.canonicalize()
+                        .ok()
+                        .and_then(|path| selected.get(&path).copied())
+                })
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 /// Bind each explicit extern name (including modifiers) to its content.
 fn rust_extern_bindings(
     args: &[Argument<ArgData>],
@@ -1304,7 +1329,18 @@ fn rust_extern_bindings(
             Ok((name.clone(), (*hash).clone()))
         })
         .collect::<Result<Vec<_>>>()?;
-    bindings.sort_by(|a, b| a.0.cmp(&b.0));
+    // A name can have multiple candidate files (Cargo commonly provides
+    // both .rmeta and .rlib). Once a candidate was selected, the unselected
+    // operands do not add another semantic binding. Keep a name-only entry
+    // for an entirely unused extern: it can still affect diagnostics.
+    let selected_names = bindings
+        .iter()
+        .filter(|(_, digest)| !digest.is_empty())
+        .map(|(name, _)| name.clone())
+        .collect::<HashSet<_>>();
+    bindings.retain(|(name, digest)| !digest.is_empty() || !selected_names.contains(name));
+    bindings.sort_unstable();
+    bindings.dedup();
     Ok(bindings)
 }
 
@@ -3385,6 +3421,15 @@ where
             .any(|path| path.extension().is_some_and(|ext| ext == DLL_EXTENSION));
         let precise_dependencies = native_discovery;
         let binary_dependencies = native_discovery && self.version.contains("-nightly");
+        // rustc's crate locator sets only_needs_metadata for rlib-only
+        // output as well as metadata-only invocations. Its binary dep-info
+        // is authoritative for these cases, including executed proc macros.
+        let metadata_inputs_only = self.parsed_args.metadata_only_output.is_some()
+            || (self.parsed_args.crate_types.rlib
+                && !self.parsed_args.crate_types.staticlib
+                && !self.parsed_args.crate_types.cdylib
+                && !self.parsed_args.split_link);
+        let selected_externs_only = binary_dependencies && metadata_inputs_only;
         let source_hashes_pool = pool.clone();
         let source_files_and_hashes_and_env_deps = async {
             let discover = async |environment: &[(OsString, OsString)], trace_reads| {
@@ -3444,7 +3489,7 @@ where
                 source_files.extend(rust_selected_binary_companions(
                     &source_files,
                     &self.parsed_args.crate_link_paths,
-                    self.parsed_args.metadata_only_output.is_none(),
+                    !metadata_inputs_only,
                 )?);
             }
             if let Some(config_dir) = clippy_config_dir(&self.executable, &env_vars, &cwd) {
@@ -3503,7 +3548,9 @@ where
             .collect::<Vec<_>>();
         #[cfg(all(feature = "dist-client", target_os = "linux"))]
         let extern_hashes = async {
-            if let Some(native) = &native {
+            if selected_externs_only {
+                Ok(Vec::new())
+            } else if let Some(native) = &native {
                 native.hash_files(&abs_externs, pool).await
             } else {
                 hash_all(&abs_externs, pool).await
@@ -3571,6 +3618,12 @@ where
             target_json_hash,
             outputs
         )?;
+
+        let extern_hashes = if selected_externs_only {
+            selected_extern_hashes(&abs_externs, &source_files, &source_hashes)
+        } else {
+            extern_hashes
+        };
 
         if let Some(canonical) = canonical_paths.as_ref()
             && let Some(path) = source_files
@@ -9803,6 +9856,45 @@ version='2.0.0'
             key(&["--extern", "a=z.rlib", "--extern", "b=b.rlib"]),
             "renaming an extern must not change its position in the result key"
         );
+    }
+
+    #[test]
+    fn rust_selected_externs_key_only_selected_contents_and_keep_names() -> Result<()> {
+        let root = Path::new("/work");
+        let paths = ["libdep.rlib", "libdep.rmeta", "libunused.rlib"].map(|path| root.join(path));
+        let args = [
+            ("dep", "libdep.rlib"),
+            ("dep", "libdep.rmeta"),
+            ("unused", "libunused.rlib"),
+        ]
+        .map(|(name, path)| {
+            Argument::WithValue(
+                "--extern",
+                ArgData::Extern(ArgExtern {
+                    name: name.into(),
+                    path: path.into(),
+                }),
+                ArgDisposition::Separated,
+            )
+        });
+        let hashes = selected_extern_hashes(&paths, &paths[1..2], &["metadata".into()]);
+        assert_eq!(hashes, ["", "metadata", ""]);
+        let bindings = rust_extern_bindings(&args, root, &paths, &hashes)?;
+        assert_eq!(
+            bindings,
+            [
+                ("dep".to_owned(), "metadata".to_owned()),
+                ("unused".to_owned(), String::new())
+            ]
+        );
+        let without_sibling = rust_extern_bindings(&args[1..], root, &paths[1..], &hashes[1..])?;
+        assert_eq!(bindings, without_sibling);
+        let changed = selected_extern_hashes(&paths, &paths[1..2], &["new-metadata".into()]);
+        assert_ne!(
+            bindings,
+            rust_extern_bindings(&args, root, &paths, &changed)?
+        );
+        Ok(())
     }
 
     #[test]

@@ -18,8 +18,8 @@ dynamic-library exception that switches compiler results to exact identity.
 Hash the compiler, language/driver mode, semantic options, preprocessed program
 (including expanded macros), selected auxiliary inputs and assembler. For GCC,
 hash the actual selected frontend and specs file, not its installation tree.
-Native CPU identity uses the resolved target flags instead of the full driver
-transcript. Source basenames remain where they identify object contents.
+Native CPU identity uses the actual lowered target flags in the worker argument
+list, without a separate expansion fingerprint or original native request. Source basenames remain where they identify object contents.
 Hash declared environment dependencies as effective name/value assignments;
 ordering and overridden assignments are not semantic inputs.
 
@@ -49,8 +49,12 @@ and content, independently of filename ordering or repeated discovery.
 An originating CPU profile is only hashed if the effective invocation still
 requests native CPU or tuning; successfully lowered explicit target arguments
 already identify the worker compilation.
-Metadata-only results do not depend on unselected linkable siblings of rmeta
-inputs; the execution packager can still deliver those siblings.
+Native nightly metadata-only and rlib-only results key the binary operands
+selected by rustc, not all explicit extern candidate files. A separate rlib
+supplied alongside selected rmeta contributes no digest; an entirely unused
+extern contributes its name and modifiers, not file contents. Reuse the
+already-computed selected dependency digests. Native-linking results retain
+linkable inputs, and the execution packager can still deliver siblings.
 Bundled native archives are resolved per library request using the compiler-reported
 target filename convention and ordered native search directories. Shadowed
 archives, unrelated filename conventions, and archives not used by metadata-only

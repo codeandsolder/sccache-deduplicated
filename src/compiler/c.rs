@@ -795,7 +795,9 @@ where
         .await;
         let mut cache_control = cache_control;
         if let Ok(Some(resolution)) = &native_resolution {
-            extra_hashes.push(resolution.fingerprint.clone());
+            if !native_identity {
+                extra_hashes.push(resolution.fingerprint.clone());
+            }
         } else if let Err(error) = &native_resolution {
             warn!(
                 "Failed to resolve native C/C++ codegen identity; bypassing cache for this compile: {error:#}"
@@ -1086,6 +1088,13 @@ where
         // Create an argument vector containing both common and arch args, to
         // use in creating a hash key
         let mut common_and_arch_args = self.parsed_args.common_args.clone();
+        // Native workers execute the lowered target arguments. Key that
+        // exact representation instead of both the request and a separate
+        // fingerprint of its expansion.
+        #[cfg(feature = "dist-client")]
+        if native_identity && let Some(resolution) = &native_resolution {
+            common_and_arch_args = resolution.rewrite_arguments(common_and_arch_args);
+        }
         common_and_arch_args.extend(self.parsed_args.arch_args.clone());
         if native_identity {
             // Debug path flags and prefix-map operands are delivery metadata.
@@ -2933,7 +2942,7 @@ pub(super) fn hashed_input_file_name(language: Language, input: &Path) -> Option
 }
 
 /// The cache is versioned by the inputs to `HashKeyParams::compute`.
-pub const CACHE_VERSION: &[u8] = b"16";
+pub const CACHE_VERSION: &[u8] = b"17";
 
 /// Environment variables that are factored into the cache key.
 static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
@@ -3689,6 +3698,20 @@ mod test {
             ["-march=znver2", "-mno-avx2", "-mno-xsaves", "-mtune=znver2"]
         );
         assert!(!remote_args.iter().any(|arg| arg.ends_with("=native")));
+        let lowered = resolution.rewrite_arguments(parsed_args.common_args);
+        let explicit = ovec![
+            "-mno-avx2",
+            "-march=znver2",
+            "-mno-avx2",
+            "-mno-xsaves",
+            "-mtune=znver2"
+        ];
+        let key =
+            |args: &[OsString]| HashKeyParams::new("gcc", Language::C, args, b"input").compute();
+        assert_eq!(key(&lowered), key(&explicit));
+        let mut different = explicit;
+        different.push("-mavx2".into());
+        assert_ne!(key(&lowered), key(&different));
         Ok(())
     }
 
