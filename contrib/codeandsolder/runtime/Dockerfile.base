@@ -5,7 +5,7 @@ FROM ${BASE}
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     ca-certificates build-essential clang lld cmake ninja-build pkg-config git \
-    bubblewrap fuse3 rustup \
+    bubblewrap fuse3 rustup strace \
  && mkdir -p /usr/share/sccache-runtime \
  && dpkg-query -W -f='${binary:Package}=${Version}\n' | sort > /usr/share/sccache-runtime/packages.txt \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*

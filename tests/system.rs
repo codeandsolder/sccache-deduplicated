@@ -1,3 +1,4 @@
+#![cfg(all(target_os = "linux", feature = "dist-client", feature = "dist-server"))]
 // System tests for compiling C code.
 //
 // Copyright 2016 Mozilla Foundation
@@ -13,7 +14,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 #![deny(rust_2018_idioms)]
 
 #[macro_use]
@@ -27,7 +27,6 @@ use fs::File;
 use fs_err as fs;
 use predicates::prelude::*;
 use regex::Regex;
-use sccache::lru_disk_cache::CACHEDIR_TAG_FILE_NAME;
 use serial_test::serial;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -38,7 +37,6 @@ use std::path::Path;
 use std::process::Command;
 use std::str;
 use std::time::{Duration, SystemTime};
-use test_case::test_case;
 use which::{which, which_in};
 
 pub mod harness;
@@ -713,7 +711,7 @@ fn test_gcc_clang_depfile(compiler: Compiler, tempdir: &Path) {
     assert_ne!(first, second);
 }
 
-fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path, preprocessor_cache_mode: bool) {
+fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path) {
     if compiler.name != "clang++" {
         test_basic_compile(compiler.clone(), tempdir);
         test_basic_compile_into_null(compiler.clone(), tempdir);
@@ -759,19 +757,9 @@ fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path, preprocessor_ca
             ),
             None => panic!("Version info not found in --version output: {version_output}"),
         };
-        test_clang_cache_whitespace_normalization(
-            compiler,
-            tempdir,
-            !is_appleclang && major >= 14,
-            preprocessor_cache_mode,
-        );
+        test_clang_cache_whitespace_normalization(compiler, tempdir, !is_appleclang && major >= 14);
     } else {
-        test_clang_cache_whitespace_normalization(
-            compiler,
-            tempdir,
-            false,
-            preprocessor_cache_mode,
-        );
+        test_clang_cache_whitespace_normalization(compiler, tempdir, false);
     }
 }
 
@@ -1738,12 +1726,7 @@ fn test_clang_multicall(compiler: Compiler, tempdir: &Path) {
         .success();
 }
 
-fn test_clang_cache_whitespace_normalization(
-    compiler: Compiler,
-    tempdir: &Path,
-    hit: bool,
-    preprocessor_cache_mode: bool,
-) {
+fn test_clang_cache_whitespace_normalization(compiler: Compiler, tempdir: &Path, hit: bool) {
     let Compiler {
         name,
         exe,
@@ -1800,15 +1783,8 @@ fn test_clang_cache_whitespace_normalization(
         get_stats(move |info| {
             assert_eq!(2, info.stats.compile_requests);
             assert_eq!(2, info.stats.requests_executed);
-            if preprocessor_cache_mode {
-                // Preprocessor cache mode hashes the input file, so whitespace
-                // normalization does not work.
-                assert_eq!(0, info.stats.cache_hits.all());
-                assert_eq!(2, info.stats.cache_misses.all());
-            } else {
-                assert_eq!(1, info.stats.cache_hits.all());
-                assert_eq!(1, info.stats.cache_misses.all());
-            }
+            assert_eq!(1, info.stats.cache_hits.all());
+            assert_eq!(1, info.stats.cache_misses.all());
         });
     } else {
         get_stats(|info| {
@@ -1930,11 +1906,10 @@ fn find_hip_compiler() -> Option<Compiler> {
 // split up to run them individually. In the current form, it is hard to see
 // which sub test cases are executed, and if one fails, the remaining tests
 // are not run.
-#[test_case(true ; "with preprocessor cache")]
-#[test_case(false ; "without preprocessor cache")]
+#[test]
 #[serial]
 #[cfg(any(unix, target_env = "msvc"))]
-fn test_sccache_command(preprocessor_cache_mode: bool) {
+fn test_sccache_command() {
     let _ = env_logger::try_init();
     let tempdir = tempfile::Builder::new()
         .prefix("sccache_system_test")
@@ -1947,7 +1922,11 @@ fn test_sccache_command(preprocessor_cache_mode: bool) {
         // Ensure there's no existing sccache server running.
         let _ = stop_local_daemon();
         // Create the configurations
-        let sccache_cfg = sccache_client_cfg(tempdir.path(), preprocessor_cache_mode);
+        let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), tempdir.path());
+        system.add_scheduler();
+        system.add_server(&[]);
+        let mut sccache_cfg = sccache_client_cfg();
+        system.configure_client(&mut sccache_cfg);
         write_json_cfg(tempdir.path(), "sccache-cfg.json", &sccache_cfg);
         let sccache_cached_cfg_path = tempdir.path().join("sccache-cached-cfg");
         // Start a server.
@@ -1957,7 +1936,7 @@ fn test_sccache_command(preprocessor_cache_mode: bool) {
             &sccache_cached_cfg_path,
         );
         for compiler in compilers {
-            run_sccache_command_tests(compiler, tempdir.path(), preprocessor_cache_mode);
+            run_sccache_command_tests(compiler, tempdir.path());
             zero_stats();
         }
         let _ = stop_local_daemon();
@@ -1969,11 +1948,10 @@ fn test_sccache_command(preprocessor_cache_mode: bool) {
 /// Preprocessor cache mode is the interesting half of this: a hit there hands
 /// back the object cache key stored with the entry, so the assembler has to be
 /// part of that key too.
-#[test_case(true ; "with preprocessor cache")]
-#[test_case(false ; "without preprocessor cache")]
+#[test]
 #[serial]
 #[cfg(all(unix, not(target_os = "macos")))]
-fn test_assembler_affects_cache(preprocessor_cache_mode: bool) {
+fn test_assembler_affects_cache() {
     use fs_err::os::unix::fs::OpenOptionsExt;
 
     let _ = env_logger::try_init();
@@ -2034,7 +2012,11 @@ fn test_assembler_affects_cache(preprocessor_cache_mode: bool) {
     );
 
     copy_to_tempdir(&[INPUT], tempdir.path());
-    let sccache_cfg = sccache_client_cfg(tempdir.path(), preprocessor_cache_mode);
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), tempdir.path());
+    system.add_scheduler();
+    system.add_server(&[]);
+    let mut sccache_cfg = sccache_client_cfg();
+    system.configure_client(&mut sccache_cfg);
     write_json_cfg(tempdir.path(), "sccache-cfg.json", &sccache_cfg);
     let cached_cfg = tempdir.path().join("sccache-cached-cfg");
 
@@ -2078,108 +2060,21 @@ fn test_assembler_affects_cache(preprocessor_cache_mode: bool) {
     let _ = stop_local_daemon();
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-fn find_gcc_or_clang() -> Option<Compiler> {
-    let compiler = find_compilers()
-        .into_iter()
-        .find(|c| c.name == "gcc" || c.name == "clang");
-    if compiler.is_none() {
-        warn!("No gcc or clang found, skipping test");
-    }
-    compiler
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn restart_local_daemon_with(dir: &Path, cfg: &sccache::config::FileConfig) {
-    write_json_cfg(dir, "sccache-cfg.json", cfg);
-    let _ = stop_local_daemon();
-    start_local_daemon(
-        &dir.join("sccache-cfg.json"),
-        &dir.join("sccache-cached-cfg"),
-    );
-}
-
-/// A preprocessor cache entry sccache cannot read, whether truncated or in a
-/// format it does not know, must not fail the compilation.
-#[test]
-#[serial]
-#[cfg(all(unix, not(target_os = "macos")))]
-fn test_unreadable_preprocessor_cache_entry_is_a_miss() {
-    let _ = env_logger::try_init();
-    let tempdir = tempfile::Builder::new()
-        .prefix("sccache_system_test")
-        .tempdir()
-        .unwrap();
-
-    let Some(compiler) = find_gcc_or_clang() else {
-        return;
-    };
-
-    copy_to_tempdir(&[INPUT], tempdir.path());
-    let sccache_cfg = sccache_client_cfg(tempdir.path(), true);
-    restart_local_daemon_with(tempdir.path(), &sccache_cfg);
-
-    let compile = |expected_hits: u64| {
-        zero_stats();
-        fs::remove_file(tempdir.path().join(OUTPUT)).ok();
-        sccache_command()
-            .args(compile_cmdline(
-                compiler.name,
-                &compiler.exe,
-                INPUT,
-                OUTPUT,
-                Vec::new(),
-            ))
-            .current_dir(tempdir.path())
-            .envs(compiler.env_vars.clone())
-            .assert()
-            .success();
-        get_stats(move |info| {
-            assert_eq!(expected_hits, info.stats.cache_hits.all());
-            assert_eq!(1 - expected_hits, info.stats.cache_misses.all());
-        });
-    };
-
-    compile(0);
-
-    let entries: Vec<_> =
-        walkdir::WalkDir::new(sccache_cfg.cache.disk.unwrap().dir.join("preprocessor"))
-            .into_iter()
-            .map(|entry| entry.unwrap())
-            .filter(|entry| {
-                entry.file_type().is_file() && entry.file_name() != CACHEDIR_TAG_FILE_NAME
-            })
-            .collect();
-    assert!(
-        !entries.is_empty(),
-        "no preprocessor cache entry was stored"
-    );
-    for entry in entries {
-        fs::write(entry.path(), [0xff]).unwrap();
-    }
-
-    // The object is still cached; only the preprocessor cache is unusable.
-    compile(1);
-    assert!(stop_local_daemon());
-}
-
 #[test]
 #[serial]
 fn test_stats_no_server() {
-    // Ensure there's no existing sccache server running.
     let _ = stop_local_daemon();
-    get_stats(|_| {});
+    sccache_command().arg("--show-stats").assert().failure();
     assert!(
         !stop_local_daemon(),
-        "Server shouldn't be running after --show-stats"
+        "stats must not start an unmanaged daemon"
     );
 }
 
-#[test_case(true ; "with preprocessor cache")]
-#[test_case(false ; "without preprocessor cache")]
+#[test]
 #[serial]
 #[cfg(any(unix, target_env = "msvc"))]
-fn test_cuda_sccache_command(preprocessor_cache_mode: bool) {
+fn test_cuda_sccache_command() {
     let _ = env_logger::try_init();
     let tempdir = tempfile::Builder::new()
         .prefix("sccache_system_test")
@@ -2199,7 +2094,11 @@ fn test_cuda_sccache_command(preprocessor_cache_mode: bool) {
         // Ensure there's no existing sccache server running.
         let _ = stop_local_daemon();
         // Create the configurations
-        let sccache_cfg = sccache_client_cfg(tempdir.path(), preprocessor_cache_mode);
+        let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), tempdir.path());
+        system.add_scheduler();
+        system.add_server(&[]);
+        let mut sccache_cfg = sccache_client_cfg();
+        system.configure_client(&mut sccache_cfg);
         write_json_cfg(tempdir.path(), "sccache-cfg.json", &sccache_cfg);
         let sccache_cached_cfg_path = tempdir.path().join("sccache-cached-cfg");
         // Start a server.
@@ -2220,11 +2119,10 @@ fn test_cuda_sccache_command(preprocessor_cache_mode: bool) {
     }
 }
 
-#[test_case(true ; "with preprocessor cache")]
-#[test_case(false ; "without preprocessor cache")]
+#[test]
 #[serial]
 #[cfg(any(unix, target_env = "msvc"))]
-fn test_hip_sccache_command(preprocessor_cache_mode: bool) {
+fn test_hip_sccache_command() {
     let _ = env_logger::try_init();
     let tempdir = tempfile::Builder::new()
         .prefix("sccache_system_test")
@@ -2234,7 +2132,11 @@ fn test_hip_sccache_command(preprocessor_cache_mode: bool) {
     if let Some(compiler) = find_hip_compiler() {
         let _ = stop_local_daemon();
         // Create the configurations
-        let sccache_cfg = sccache_client_cfg(tempdir.path(), preprocessor_cache_mode);
+        let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), tempdir.path());
+        system.add_scheduler();
+        system.add_server(&[]);
+        let mut sccache_cfg = sccache_client_cfg();
+        system.configure_client(&mut sccache_cfg);
         write_json_cfg(tempdir.path(), "sccache-cfg.json", &sccache_cfg);
         let sccache_cached_cfg_path = tempdir.path().join("sccache-cached-cfg");
         // Start a server.
@@ -2312,7 +2214,11 @@ fn test_cargo_native_relocated_objects_and_depfiles() -> anyhow::Result<()> {
     let tempdir = tempfile::tempdir()?;
     let root = tempdir.path();
     let _ = stop_local_daemon();
-    let cfg = sccache_client_cfg(root, true);
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
+    system.add_scheduler();
+    system.add_server(&[]);
+    let mut cfg = sccache_client_cfg();
+    system.configure_client(&mut cfg);
     write_json_cfg(root, "sccache-cfg.json", &cfg);
     start_local_daemon(
         &root.join("sccache-cfg.json"),

@@ -116,7 +116,7 @@ jobs:
           target_dir="$("${release_cargo[@]}" metadata --locked --no-deps --format-version 1 | jq -r .target_directory)"
           "${release_cargo[@]}" build --release --locked \
             --no-default-features \
-            --features s3,gha,dist-client,dist-server,direct-metrics \
+            --features dist-client,dist-server,direct-metrics \
             --bin sccache --bin sccache-dist
 
           install -D -m 0755 "$target_dir/release/sccache" dist/sccache-linux-x86_64-v2
@@ -131,7 +131,7 @@ jobs:
             echo "source_sha=${{ steps.rev.outputs.sha }}"
             echo "rust_toolchain=${{ steps.protocol.outputs.rust_toolchain }}"
             echo "rustflags=-C target-cpu=x86-64-v2"
-            echo "features=s3,gha,dist-client,dist-server,direct-metrics"
+            echo "features=dist-client,dist-server,direct-metrics"
             echo "dist_protocol=${{ steps.protocol.outputs.dist_protocol }}"
             echo "rollout_epoch=${{ steps.protocol.outputs.rollout_epoch }}"
             echo "glibc_abi_max=${{ steps.protocol.outputs.glibc_abi_max }}"
@@ -154,7 +154,7 @@ jobs:
           env -u RUSTFLAGS scripts/build-scheduler-dashboard.sh "$target_dir/dashboard-tools/wasm-bindgen" "$target_dir/dashboard-tools/stylance"
           "${release_cargo[@]}" build --release --locked \
             --no-default-features \
-            --features s3,gha,dist-client,dist-server,direct-metrics,scheduler-dashboard \
+            --features dist-client,dist-server,direct-metrics,scheduler-dashboard \
             --bin sccache-dist
           install -D -m 0755 "$target_dir/release/sccache-dist" dist/sccache-scheduler-dashboard-linux-x86_64-v2
           scripts/package-scheduler-dashboard.sh \

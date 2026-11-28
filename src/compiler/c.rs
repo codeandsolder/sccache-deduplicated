@@ -15,31 +15,24 @@
 use crate::cache::FileObjectSource;
 #[cfg(feature = "dist-client")]
 use crate::compiler::DistPackagers;
-use crate::compiler::preprocessor_cache::{
-    PreprocessorCacheKey, preprocessor_cache_entry_hash_key,
-};
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, CompileCommandImpl,
     CompileTransport, Compiler, CompilerArguments, CompilerDiscovery, CompilerHasher, CompilerKind,
     GenerateHashKeyContext, HashResult, Language, SingleCompileCommand,
 };
-use crate::config::PreprocessorCacheModeConfig;
 use crate::dist;
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{
-    Digest, MetadataCtimeExt, TimeMacroFinder, Timestamp, decode_path, encode_path, hash_all,
-    run_input_output, strip_basedirs, strip_basedirs_from_arg,
+    Digest, decode_path, hash_all, run_input_output, strip_basedirs, strip_basedirs_from_arg,
 };
 use async_trait::async_trait;
 use fs_err as fs;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io;
-use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::LazyLock;
@@ -48,8 +41,7 @@ use crate::errors::{Context, ProcessError, Result, bail};
 use anyhow::ensure;
 
 use super::CacheControl;
-use super::canonical_native::NativeCargoPaths;
-use super::preprocessor_cache::PreprocessorCacheEntry;
+use super::canonical_native::{NativeCargoPaths, relocatable_object};
 
 /// A generic implementation of the `Compiler` trait for C/C++ compilers.
 #[derive(Clone)]
@@ -128,8 +120,6 @@ pub struct ParsedArguments {
     pub color_mode: ColorMode,
     /// arguments are incompatible with `rewrite_includes_only`
     pub suppress_rewrite_includes_only: bool,
-    /// Arguments are incompatible with preprocessor cache mode
-    pub too_hard_for_preprocessor_cache_mode: Option<OsString>,
 }
 
 #[cfg(test)]
@@ -161,7 +151,6 @@ impl ParsedArguments {
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
         }
     }
 }
@@ -377,13 +366,13 @@ where
         })
         .context("compiler did not expose a native CPU frontend expansion")?;
     let flags = native_driver_replacement(driver_line, kind, &native_args)?;
-    // Preserve the requesting compiler's full observed frontend state in the
-    // native-only cache supplement. The working directory can affect emitted
-    // debug metadata without changing preprocessed bytes (notably Clang -g),
-    // so hashing only the CPU switches could alias materially different objects.
+    // The resolved effective CPU switches are the input. Driver transcript
+    // paths, including -fdebug-compilation-dir, are not CPU information.
     let mut digest = Digest::new();
-    digest.update(b"sccache-native-target-resolution-v4\0");
-    digest.update(driver_line.as_bytes());
+    digest.update(b"sccache-native-target-resolution-v5\0");
+    for flag in &flags {
+        digest.delimiter(flag.as_encoded_bytes());
+    }
     #[cfg(not(feature = "dist-client"))]
     let _ = flags;
     Ok(Some(NativeCodegenResolution {
@@ -405,9 +394,10 @@ impl ParsedArguments {
 /// A generic implementation of the `Compilation` trait for C/C++ compilers.
 struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
-    is_locally_preprocessed: bool,
     allow_dist: bool,
     native_resolution: Option<NativeCodegenResolution>,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    relocate_native_object: bool,
     #[cfg(feature = "dist-client")]
     preprocessed_input: Vec<u8>,
     executable: PathBuf,
@@ -449,7 +439,6 @@ pub struct CPreprocessContext<'a, T> {
     pub env_vars: &'a [(OsString, OsString)],
     pub may_dist: bool,
     pub rewrite_includes_only: bool,
-    pub preprocessor_cache_mode: bool,
 }
 
 pub struct CCompileContext<'a> {
@@ -469,7 +458,6 @@ impl CCompileContext<'_> {
             arguments,
             env_vars: self.env_vars.to_owned(),
             cwd: self.cwd.to_owned(),
-            share_jobserver: false,
         }
     }
 }
@@ -613,15 +601,6 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
     fn kind(&self) -> CompilerKind {
         CompilerKind::C(self.compiler.kind())
     }
-    #[cfg(feature = "dist-client")]
-    fn get_toolchain_packager(&self) -> Box<dyn pkg::ToolchainPackager> {
-        Box::new(CToolchainPackager {
-            executable: self.executable.clone(),
-            kind: self.compiler.kind(),
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-            env_vars: Vec::new(),
-        })
-    }
     fn parse_arguments(
         &self,
         arguments: &[OsString],
@@ -688,7 +667,12 @@ where
         context: GenerateHashKeyContext<'_, T>,
     ) -> Result<HashResult<T>> {
         #[cfg(all(feature = "dist-client", target_os = "linux"))]
-        let native_identity = context.native.is_some();
+        let native_digests = context
+            .native
+            .as_ref()
+            .map(|client| client.toolchain_digests());
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        let native_identity = native_digests.is_some();
         #[cfg(not(all(feature = "dist-client", target_os = "linux")))]
         let native_identity = false;
         let GenerateHashKeyContext {
@@ -702,7 +686,19 @@ where
             cache_control,
             ..
         } = context;
-        let start_of_compilation = std::time::SystemTime::now();
+        let env_vars = if native_identity {
+            super::c_driver_environment::normalize(
+                creator,
+                &self.executable,
+                self.compiler.kind(),
+                &self.parsed_args,
+                &cwd,
+                env_vars,
+            )
+            .await?
+        } else {
+            env_vars
+        };
         let mut parsed_args = self.parsed_args.clone();
         if native_identity {
             parsed_args.suppress_rewrite_includes_only = true;
@@ -722,6 +718,60 @@ where
         }
 
         let mut extra_hashes = hash_all(&parsed_args.extra_hash_files, &pool.clone()).await?;
+        #[cfg(all(
+            feature = "dist-client",
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let native_toolchain = if let Some(digests) = native_digests
+            && matches!(
+                self.compiler.kind(),
+                CCompilerKind::Gcc | CCompilerKind::Clang
+            ) {
+            let packager = CToolchainPackager {
+                executable: self.executable.clone(),
+                kind: self.compiler.kind(),
+                cwd: cwd.clone(),
+                env_vars: env_vars.clone(),
+                driver_args: parsed_args
+                    .common_args
+                    .iter()
+                    .chain(&parsed_args.arch_args)
+                    .cloned()
+                    .collect(),
+            };
+            let language = parsed_args.language;
+            let external_assembler = parsed_args.uses_external_assembler;
+            Some(
+                pool.spawn_blocking(move || {
+                    packager.compiler_identity(language, external_assembler, &digests)
+                })
+                .await??,
+            )
+        } else {
+            None
+        };
+        #[cfg(not(all(
+            feature = "dist-client",
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        let native_toolchain: Option<CCompilerIdentity> = None;
+        let (compiler_digest, assembler_digest) = native_toolchain.map_or_else(
+            || {
+                (
+                    Cow::Borrowed(self.executable_digest.as_str()),
+                    parsed_args
+                        .uses_external_assembler
+                        .then(|| self.compiler.assembler_digest())
+                        .flatten(),
+                )
+            },
+            |identity| {
+                extra_hashes.extend(identity.implementation);
+                (Cow::Owned(identity.driver), identity.assembler)
+            },
+        );
         let native_resolution = native_codegen_resolution(
             creator,
             &self.executable,
@@ -733,150 +783,23 @@ where
         .await;
         let mut cache_control = cache_control;
         if let Ok(Some(resolution)) = &native_resolution {
-            extra_hashes.push(resolution.fingerprint.clone());
+            if !native_identity {
+                extra_hashes.push(resolution.fingerprint.clone());
+            }
         } else if let Err(error) = &native_resolution {
             warn!(
-                "Failed to resolve native C/C++ codegen identity; bypassing cache for this compile: {error:#}"
+                "Failed to resolve native C/C++ codegen identity; native action cannot be prepared: {error:#}"
             );
             cache_control = CacheControl::ForceNoCache;
         }
         let native_resolution = native_resolution.ok().flatten();
-        // The assembler that turns the compiler's output into the object file is
-        // as much a part of the result as the compiler itself.
-        let assembler_digest = if parsed_args.uses_external_assembler {
-            self.compiler.assembler_digest()
-        } else {
-            None
-        };
-        // Create an argument vector containing both preprocessor and arch args, to
-        // use in creating a hash key
-        let mut preprocessor_and_arch_args = parsed_args.preprocessor_args.clone();
-        preprocessor_and_arch_args.extend(parsed_args.arch_args.clone());
-        // common_args is used in preprocessing too
-        preprocessor_and_arch_args.extend(parsed_args.common_args.clone());
-
         let absolute_input_path: Cow<'_, _> = if parsed_args.input.is_absolute() {
             Cow::Borrowed(&parsed_args.input)
         } else {
             Cow::Owned(cwd.join(&parsed_args.input))
         };
 
-        // Try to look for a cached preprocessing step for this compilation
-        // request.
-        let preprocessor_cache_mode_config = storage.preprocessor_cache_mode_config();
-        let too_hard_for_preprocessor_cache_mode =
-            parsed_args.too_hard_for_preprocessor_cache_mode.is_some();
-        if let Some(arg) = &parsed_args.too_hard_for_preprocessor_cache_mode {
-            debug!(
-                "generate_hash_key: Cannot use preprocessor cache because of {}",
-                crate::util::debug_display(arg)
-            );
-        }
-
-        let needs_preprocessing = parsed_args.language.needs_c_preprocessing();
-
-        let use_preprocessor_cache_mode = if needs_preprocessing {
-            let can_use_preprocessor_cache_mode = preprocessor_cache_mode_config
-                .use_preprocessor_cache_mode
-                && !too_hard_for_preprocessor_cache_mode
-                && canonical_native.is_none()
-                && !native_identity;
-
-            let mut use_preprocessor_cache_mode = can_use_preprocessor_cache_mode;
-
-            // Allow overrides from the env
-            for (key, val) in &env_vars {
-                if key == "SCCACHE_DIRECT" {
-                    if let Some(val) = val.to_str() {
-                        use_preprocessor_cache_mode = match val.to_lowercase().as_str() {
-                            "false" | "off" | "0" => false,
-                            _ => can_use_preprocessor_cache_mode,
-                        };
-                    }
-                    break;
-                }
-            }
-
-            if can_use_preprocessor_cache_mode && !use_preprocessor_cache_mode {
-                debug!(
-                    "generate_hash_key: Disabling preprocessor cache because SCCACHE_DIRECT=false"
-                );
-            }
-
-            use_preprocessor_cache_mode
-        } else {
-            debug!(
-                "generate_hash_key: Disabling preprocessor cache because {} language doesn't need C preprocessing",
-                parsed_args.language.as_str()
-            );
-            false
-        };
-
-        let mut preprocessor_key = if use_preprocessor_cache_mode {
-            preprocessor_cache_entry_hash_key(PreprocessorCacheKey {
-                compiler_digest: &self.executable_digest,
-                language: parsed_args.language,
-                arguments: &preprocessor_and_arch_args,
-                extra_hashes: &extra_hashes,
-                assembler_digest: assembler_digest.as_deref(),
-                env_vars: &env_vars,
-                input_file: &absolute_input_path,
-                plusplus: self.compiler.plusplus(),
-                config: preprocessor_cache_mode_config,
-                basedirs: storage.basedirs(),
-            })?
-        } else {
-            None
-        };
-
-        let (preprocessor_output, include_files) = if needs_preprocessing {
-            if let Some(preprocessor_key) = &preprocessor_key
-                && cache_control == CacheControl::Default
-                && let Some(mut seekable) = storage
-                    .get_preprocessor_cache_entry(preprocessor_key)
-                    .await
-                    .unwrap_or_else(|error| {
-                        debug!("Preprocessor cache lookup failed for {preprocessor_key}: {error}");
-                        None
-                    })
-                && let Some(preprocessor_cache_entry) =
-                    read_preprocessor_cache_entry(&mut seekable, preprocessor_key)
-            {
-                if let Some(key) =
-                    preprocessor_cache_entry.lookup_result_digest(preprocessor_cache_mode_config)
-                {
-                    debug!("Preprocessor cache hit: {preprocessor_key}");
-                    // A compiler binary may be a symlink to another and
-                    // so has the same digest, but that means
-                    // the toolchain will not contain the correct path
-                    // to invoke the compiler! Add the compiler
-                    // executable path to try and prevent this
-                    let weak_toolchain_key = format!(
-                        "{}-{}",
-                        self.executable.to_string_lossy(),
-                        self.executable_digest
-                    );
-                    return Ok(HashResult {
-                        key,
-                        compilation: Box::new(CCompilation {
-                            parsed_args: parsed_args.clone(),
-                            is_locally_preprocessed: false,
-                            allow_dist: true,
-                            native_resolution: native_resolution.clone(),
-                            #[cfg(feature = "dist-client")]
-                            preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON.to_vec(),
-                            executable: self.executable.clone(),
-                            compiler: self.compiler.to_owned(),
-                            cwd: cwd.clone(),
-                            env_vars: env_vars.clone(),
-                        }),
-                        weak_toolchain_key,
-                        cache_control,
-                    });
-                }
-                debug!("Preprocessor cache miss: {preprocessor_key}");
-            }
-
+        let preprocessor_output = if parsed_args.language.needs_c_preprocessing() {
             let result = self
                 .compiler
                 .preprocess(CPreprocessContext {
@@ -887,7 +810,6 @@ where
                     env_vars: &env_vars,
                     may_dist: may_dist || canonical_native.is_some(),
                     rewrite_includes_only,
-                    preprocessor_cache_mode: use_preprocessor_cache_mode,
                 })
                 .await;
             let out_pretty = parsed_args.output_pretty().into_owned();
@@ -899,7 +821,7 @@ where
             let outputs = parsed_args.outputs.clone();
             let args_cwd = cwd.clone();
 
-            let mut preprocessor_result = result.or_else(move |err| {
+            let preprocessor_result = result.or_else(move |err| {
                 // Errors remove all traces of potential output.
                 debug!("removing files {outputs:?}");
 
@@ -934,37 +856,16 @@ where
                 }
             })?;
 
-            // Remember include files needed in this preprocessing step
-            let mut include_files = HashMap::new();
-            if preprocessor_key.is_some() {
-                // TODO how to propagate stats and which stats?
-                if !process_preprocessed_file(
-                    &absolute_input_path,
-                    &cwd,
-                    &mut preprocessor_result.stdout,
-                    &mut include_files,
-                    preprocessor_cache_mode_config,
-                    start_of_compilation,
-                    &StandardFsAbstraction,
-                )? {
-                    debug!("Disabling preprocessor cache mode");
-                    preprocessor_key = None;
-                }
-            }
-
             trace!(
                 "[{}]: Preprocessor output is {} bytes",
                 parsed_args.output_pretty(),
                 preprocessor_result.stdout.len()
             );
 
-            (preprocessor_result.stdout, include_files)
+            preprocessor_result.stdout
         } else {
             // No preprocessing is supported - input is already preprocessed
-            (
-                std::fs::read(absolute_input_path.as_path())?,
-                HashMap::new(),
-            )
+            std::fs::read(absolute_input_path.as_path())?
         };
 
         let mut allow_dist = true;
@@ -1014,24 +915,87 @@ where
                 cache_control = CacheControl::ForceNoCache;
                 allow_dist = false;
             }
-            // Assembler-owned files are invisible to the C preprocessor. Never
-            // store a preprocessor-cache result that could bypass this scan.
-            preprocessor_key = None;
         }
 
         // Create an argument vector containing both common and arch args, to
         // use in creating a hash key
         let mut common_and_arch_args = self.parsed_args.common_args.clone();
+        // Native workers execute the lowered target arguments. Key that
+        // exact representation instead of both the request and a separate
+        // fingerprint of its expansion.
+        #[cfg(feature = "dist-client")]
+        if native_identity && let Some(resolution) = &native_resolution {
+            common_and_arch_args = resolution.rewrite_arguments(common_and_arch_args);
+        }
         common_and_arch_args.extend(self.parsed_args.arch_args.clone());
+        if native_identity {
+            // Debug path flags and prefix-map operands are delivery metadata.
+            // Any actual preprocessor macro effect is already in its output.
+            common_and_arch_args.retain(|arg| {
+                let bytes = arg.as_encoded_bytes();
+                ![
+                    b"-fdebug-prefix-map=".as_slice(),
+                    b"-ffile-prefix-map=",
+                    b"-fmacro-prefix-map=",
+                    b"-fdebug-compilation-dir=",
+                    b"-Wa,--debug-prefix-map=",
+                    b"--debug-prefix-map=",
+                ]
+                .iter()
+                .any(|prefix| bytes.starts_with(prefix))
+            });
+        }
 
         // Hash the same remapped filename identity that the compiler uses for
         // debug information. Do not strip arbitrary source literals or flags.
-        let key_input = if let Some(paths) = &canonical_native {
-            let normalized = paths.preprocessed_key_bytes(&preprocessor_output);
-            extra_hashes.push(paths.context_digest(&self.parsed_args, &cwd, &normalized));
-            normalized
+        let relocate_native_object = native_identity
+            && matches!(
+                self.compiler.kind(),
+                CCompilerKind::Gcc | CCompilerKind::Clang
+            )
+            && relocatable_object(&parsed_args);
+        let mapped_input = canonical_native
+            .as_ref()
+            .map_or(Cow::Borrowed(preprocessor_output.as_slice()), |paths| {
+                paths.preprocessed_key_bytes(&preprocessor_output)
+            });
+        let key_input = if native_identity {
+            if relocate_native_object {
+                extra_hashes.push("native-relocatable-object-v2".into());
+            } else {
+                // Some outputs reference a companion by name, or encode the
+                // runtime profiling destination. Preserve only that actual
+                // relationship, never arbitrary source/debug directories.
+                let mut digest = Digest::new();
+                digest.delimiter(b"native-output-relationships-v1");
+                let mut outputs = parsed_args
+                    .outputs
+                    .iter()
+                    .filter(|(name, _)| **name != "d")
+                    .collect::<Vec<_>>();
+                outputs.sort_unstable_by_key(|(name, _)| *name);
+                for (name, output) in outputs {
+                    digest.delimiter(name.as_bytes());
+                    let path = if parsed_args.profile_generate {
+                        cwd.join(&output.path)
+                    } else {
+                        PathBuf::from(output.path.file_name().unwrap_or_default())
+                    };
+                    digest.delimiter(path.as_os_str().as_encoded_bytes());
+                }
+                extra_hashes.push(digest.finish());
+            }
+            NativeCargoPaths::native_line_marker_identity(&mapped_input)
         } else {
-            Cow::Borrowed(preprocessor_output.as_slice())
+            if let Some(paths) = &canonical_native {
+                extra_hashes.push(paths.context_digest(
+                    &self.parsed_args,
+                    &cwd,
+                    &mapped_input,
+                    false,
+                ));
+            }
+            Cow::Borrowed(mapped_input.as_ref())
         };
         let basedirs = if canonical_native.is_some() || native_identity {
             &[][..]
@@ -1055,7 +1019,7 @@ where
             )
         });
         let key = HashKeyParams::new(
-            &self.executable_digest,
+            &compiler_digest,
             parsed_args.language,
             &common_and_arch_args,
             &key_input,
@@ -1069,28 +1033,12 @@ where
             self.parsed_args.language,
             &self.parsed_args.input,
         ))
-        .with_debug_compilation_dir(debug_compilation_dir.as_deref())
+        .with_debug_compilation_dir(if native_identity {
+            None
+        } else {
+            debug_compilation_dir.as_deref()
+        })
         .compute();
-
-        // Cache the preprocessing step
-        if let Some(preprocessor_key) = preprocessor_key
-            && !include_files.is_empty()
-        {
-            let mut preprocessor_cache_entry = PreprocessorCacheEntry::new();
-            let mut files: Vec<_> = include_files
-                .into_iter()
-                .map(|(path, digest)| (digest, path))
-                .collect();
-            files.sort_unstable_by(|a, b| a.1.cmp(&b.1));
-            preprocessor_cache_entry.add_result(start_of_compilation, &key, files);
-
-            if let Err(e) = storage
-                .put_preprocessor_cache_entry(&preprocessor_key, preprocessor_cache_entry)
-                .await
-            {
-                debug!("Failed to update preprocessor cache: {e}");
-            }
-        }
 
         // A compiler binary may be a symlink to another and so has the same digest, but that means
         // the toolchain will not contain the correct path to invoke the compiler! Add the compiler
@@ -1104,9 +1052,10 @@ where
             key,
             compilation: Box::new(CCompilation {
                 parsed_args,
-                is_locally_preprocessed: true,
                 allow_dist,
                 native_resolution,
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                relocate_native_object,
                 #[cfg(feature = "dist-client")]
                 preprocessed_input: preprocessor_output,
                 executable: self.executable.clone(),
@@ -1619,547 +1568,28 @@ fn assembler_file_dependencies(
     AssemblerDependencyScan::Complete(dependencies)
 }
 
-const PRAGMA_GCC_PCH_PREPROCESS: &[u8] = b"pragma GCC pch_preprocess";
-const HASH_31_COMMAND_LINE_NEWLINE: &[u8] = b"# 31 \"<command-line>\"\n";
-const HASH_32_COMMAND_LINE_2_NEWLINE: &[u8] = b"# 32 \"<command-line>\" 2\n";
 const INCBIN_DIRECTIVE: &[u8] = b".incbin";
 const INCLUDE_DIRECTIVE: &[u8] = b".include";
-const COMPRESSED_CLANG_OFFLOAD_BUNDLE_MAGIC: &[u8] = b"CCOB";
-
-/// An entry that cannot be read, such as one truncated by a crash, is a miss
-/// rather than a failed compilation: the miss path overwrites it.
-fn read_preprocessor_cache_entry(
-    mut entry: impl io::Read,
-    key: &str,
-) -> Option<PreprocessorCacheEntry> {
-    let mut buf = vec![];
-    let result = entry
-        .read_to_end(&mut buf)
-        .map_err(Into::into)
-        .and_then(|_| PreprocessorCacheEntry::read(&buf));
-    match result {
-        Ok(entry) => Some(entry),
-        Err(e) => {
-            debug!("Ignoring unreadable preprocessor cache entry {key}: {e}");
-            None
-        }
-    }
-}
-
-/// Remember the include files in the preprocessor output if it can be cached.
-/// Returns `false` if preprocessor cache mode should be disabled.
-fn process_preprocessed_file(
-    input_file: &Path,
-    cwd: &Path,
-    bytes: &mut [u8],
-    included_files: &mut HashMap<PathBuf, String>,
-    config: PreprocessorCacheModeConfig,
-    time_of_compilation: std::time::SystemTime,
-    fs_impl: &impl PreprocessorFSAbstraction,
-) -> Result<bool> {
-    if bytes.starts_with(COMPRESSED_CLANG_OFFLOAD_BUNDLE_MAGIC) {
-        debug!("Found compressed Clang offload bundle in preprocessor output");
-        return Ok(false);
-    }
-
-    let mut start = 0;
-    let mut hash_start = 0;
-    let total_len = bytes.len();
-    let mut digest = Digest::new();
-    let mut normalized_include_paths: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
-    // There must be at least 7 characters (# 1 "x") left to potentially find an
-    // include file path.
-    while start < total_len.saturating_sub(7) {
-        let mut slice = &bytes[start..];
-        // Check if we look at a line containing the file name of an included file.
-        // At least the following formats exist (where N is a positive integer):
-        //
-        // GCC:
-        //
-        //   # N "file"
-        //   # N "file" N
-        //   #pragma GCC pch_preprocess "file"
-        //
-        // HP's compiler:
-        //
-        //   #line N "file"
-        //
-        // AIX's compiler:
-        //
-        //   #line N "file"
-        //   #line N
-        //
-        // Note that there may be other lines starting with '#' left after
-        // preprocessing as well, for instance "#    pragma".
-        if slice[0] == b'#'
-        // GCC:
-        && ((slice[1] == b' ' && slice[2] >= b'0' && slice[2] <= b'9')
-            // GCC precompiled header:
-            || slice[1..].starts_with(PRAGMA_GCC_PCH_PREPROCESS)
-            // HP/AIX:
-            || slice[1..].starts_with(b"line "))
-        && (start == 0 || bytes[start - 1] == b'\n')
-        {
-            match process_preprocessor_line(
-                PreprocessorLineContext {
-                    input_file,
-                    cwd,
-                    included_files,
-                    config,
-                    time_of_compilation,
-                    bytes,
-                    digest: &mut digest,
-                    normalized_include_paths: &mut normalized_include_paths,
-                    fs_impl,
-                },
-                start,
-                hash_start,
-            )? {
-                ControlFlow::Continue((s, h)) => {
-                    start = s;
-                    hash_start = h;
-                }
-                ControlFlow::Break((s, h, continue_preprocessor_cache_mode)) => {
-                    if !continue_preprocessor_cache_mode {
-                        return Ok(false);
-                    }
-                    start = s;
-                    hash_start = h;
-                }
-            }
-        } else if slice.starts_with(b"___________") && (start == 0 || bytes[start - 1] == b'\n') {
-            // Unfortunately the distcc-pump wrapper outputs standard output lines:
-            // __________Using distcc-pump from /usr/bin
-            // __________Using # distcc servers in pump mode
-            // __________Shutting down distcc-pump include server
-            digest.update(&bytes[hash_start..start]);
-            while start < total_len && slice[0] != b'\n' {
-                start += 1;
-                if start < total_len {
-                    slice = &bytes[start..];
-                }
-            }
-            slice = &bytes[start..];
-            if slice[0] == b'\n' {
-                start += 1;
-            }
-            hash_start = start;
-        } else {
-            start += 1;
-        }
-    }
-    digest.update(&bytes[hash_start..]);
-
-    Ok(true)
-}
-
-/// What to do after handling a preprocessor number line.
-/// The `Break` variant is `(start, hash_start, continue_preprocessor_cache_mode)`.
-/// The `Continue` variant is `(start, hash_start)`.
-type PreprocessedLineAction = ControlFlow<(usize, usize, bool), (usize, usize)>;
-
-struct PreprocessorLineContext<'a, F> {
-    input_file: &'a Path,
-    cwd: &'a Path,
-    included_files: &'a mut HashMap<PathBuf, String>,
-    config: PreprocessorCacheModeConfig,
-    time_of_compilation: std::time::SystemTime,
-    bytes: &'a mut [u8],
-    digest: &'a mut Digest,
-    normalized_include_paths: &'a mut HashMap<Vec<u8>, Option<Vec<u8>>>,
-    fs_impl: &'a F,
-}
-
-fn process_preprocessor_line<F>(
-    context: PreprocessorLineContext<'_, F>,
-    mut start: usize,
-    mut hash_start: usize,
-) -> Result<PreprocessedLineAction>
-where
-    F: PreprocessorFSAbstraction,
-{
-    let PreprocessorLineContext {
-        input_file,
-        cwd,
-        included_files,
-        config,
-        time_of_compilation,
-        bytes,
-        digest,
-        normalized_include_paths,
-        fs_impl,
-    } = context;
-    let total_len = bytes.len();
-    let mut slice = &bytes[start..];
-    // Workarounds for preprocessor linemarker bugs in GCC version 6.
-    if slice.get(2) == Some(&b'3') {
-        if slice.starts_with(HASH_31_COMMAND_LINE_NEWLINE) {
-            // Bogus extra line with #31, after the regular #1:
-            // Ignore the whole line, and continue parsing.
-            digest.update(&bytes[hash_start..start]);
-            while start < hash_start && slice[0] != b'\n' {
-                start += 1;
-            }
-            start += 1;
-            hash_start = start;
-            return Ok(ControlFlow::Break((start, hash_start, true)));
-        } else if slice.starts_with(HASH_32_COMMAND_LINE_2_NEWLINE) {
-            // Bogus wrong line with #32, instead of regular #1:
-            // Replace the line number with the usual one.
-            digest.update(&bytes[hash_start..start]);
-            start += 1;
-            bytes[start..=start + 2].copy_from_slice(b"# 1");
-            hash_start = start;
-            slice = &bytes[start..];
-        }
-    }
-    while start < total_len && slice[0] != b'"' && slice[0] != b'\n' {
-        start += 1;
-        if start < total_len {
-            slice = &bytes[start..];
-        }
-    }
-    slice = &bytes[start..];
-    if start < total_len && slice[0] == b'\n' {
-        // a newline before the quotation mark -> no match
-        return Ok(ControlFlow::Break((start, hash_start, true)));
-    }
-    start += 1;
-    if start >= total_len {
-        bail!("Failed to parse included file path");
-    }
-    // `start` points to the beginning of an include file path
-    digest.update(&bytes[hash_start..start]);
-    hash_start = start;
-    slice = &bytes[start..];
-    while start < total_len && slice[0] != b'"' {
-        start += 1;
-        if start < total_len {
-            slice = &bytes[start..];
-        }
-    }
-    if start == hash_start {
-        // Skip empty file name.
-        return Ok(ControlFlow::Break((start, hash_start, true)));
-    }
-    // Look for preprocessor flags, after the "filename".
-    let mut system = false;
-    let mut pointer = start + 1;
-    while pointer < total_len && bytes[pointer] != b'\n' {
-        if bytes[pointer] == b'3' {
-            // System header.
-            system = true;
-        }
-        pointer += 1;
-    }
-
-    // `hash_start` and `start` span the include file path.
-    let include_path = &bytes[hash_start..start];
-    // We need to normalize the path now since it's part of the
-    // hash and since we need to deduplicate the include files.
-    // We cache the results since they are often quite a bit repeated.
-    let include_path: &[u8] = if let Some(opt) = normalized_include_paths.get(include_path) {
-        opt.as_ref().map_or(include_path, |normalized| normalized)
-    } else {
-        let path_buf = decode_path(include_path)?;
-        let normalized = normalize_path(&path_buf);
-        if normalized == path_buf {
-            // `None` is a marker that the normalization is the same
-            normalized_include_paths.insert(include_path.to_owned(), None);
-            include_path
-        } else {
-            let mut encoded = Vec::with_capacity(include_path.len());
-            encode_path(&mut encoded, &normalized)?;
-            let normalized = normalized_include_paths
-                .entry(include_path.to_owned())
-                .or_insert_with(|| Some(encoded));
-            normalized.as_deref().unwrap_or(include_path)
-        }
-    };
-
-    if !remember_include_file(RememberIncludeContext {
-        path: include_path,
-        input_file,
-        cwd,
-        included_files,
-        digest,
-        system,
-        config,
-        time_of_compilation,
-        fs_impl,
-    })? {
-        return Ok(ControlFlow::Break((start, hash_start, false)));
-    }
-    // Everything of interest between hash_start and start has been hashed now.
-    hash_start = start;
-    Ok(ControlFlow::Continue((start, hash_start)))
-}
-
-/// Copied from cargo.
-///
-/// Normalize a path, removing things like `.` and `..`.
-///
-/// CAUTION: This does not resolve symlinks (unlike
-/// [`std::fs::canonicalize`]).
-pub fn normalize_path(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut components = path.components().peekable();
-    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().copied() {
-        components.next();
-        PathBuf::from(c.as_os_str())
-    } else {
-        PathBuf::new()
-    };
-
-    for component in components {
-        match component {
-            Component::Prefix(prefix) => ret.push(prefix.as_os_str()),
-            Component::RootDir => {
-                ret.push(component.as_os_str());
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                ret.pop();
-            }
-            Component::Normal(c) => {
-                ret.push(c);
-            }
-        }
-    }
-    ret
-}
-
-/// Limited abstraction of `std::fs::Metadata`, allowing us to create fake
-/// values during testing.
-#[derive(Debug, Eq, PartialEq, Clone)]
-struct PreprocessorFileMetadata {
-    is_dir: bool,
-    is_file: bool,
-    modified: Option<Timestamp>,
-    ctime_or_creation: Option<Timestamp>,
-}
-
-impl From<std::fs::Metadata> for PreprocessorFileMetadata {
-    fn from(meta: std::fs::Metadata) -> Self {
-        Self {
-            is_dir: meta.is_dir(),
-            is_file: meta.is_file(),
-            modified: meta.modified().ok().map(Into::into),
-            ctime_or_creation: meta.ctime_or_creation().ok(),
-        }
-    }
-}
-
-/// An abstraction to filesystem access for use during the preprocessor
-/// caching phase, to make testing easier.
-///
-/// This may help non-local preprocessor caching in the future, if it ends up
-/// being viable.
-trait PreprocessorFSAbstraction {
-    fn metadata(&self, path: impl AsRef<Path>) -> io::Result<PreprocessorFileMetadata> {
-        std::fs::metadata(path).map(Into::into)
-    }
-
-    fn open(&self, path: impl AsRef<Path>) -> io::Result<Box<dyn std::io::Read>> {
-        Ok(Box::new(std::fs::File::open(path)?))
-    }
-}
-
-/// Provides filesystem access with the expected standard library functions.
-struct StandardFsAbstraction;
-
-impl PreprocessorFSAbstraction for StandardFsAbstraction {}
-
-struct RememberIncludeContext<'a, F> {
-    path: &'a [u8],
-    input_file: &'a Path,
-    cwd: &'a Path,
-    included_files: &'a mut HashMap<PathBuf, String>,
-    digest: &'a mut Digest,
-    system: bool,
-    config: PreprocessorCacheModeConfig,
-    time_of_compilation: std::time::SystemTime,
-    fs_impl: &'a F,
-}
-
-// Returns false if the include file was "too new" (meaning modified during or
-// after the start of the compilation) and therefore should disable
-// the preprocessor cache mode, otherwise true.
-fn remember_include_file<F>(context: RememberIncludeContext<'_, F>) -> Result<bool>
-where
-    F: PreprocessorFSAbstraction,
-{
-    let RememberIncludeContext {
-        mut path,
-        input_file,
-        cwd,
-        included_files,
-        digest,
-        system,
-        config,
-        time_of_compilation,
-        fs_impl,
-    } = context;
-    // TODO if precompiled header.
-    if path.len() >= 2 && path[0] == b'<' && path[path.len() - 1] == b'>' {
-        // Typically <built-in> or <command-line>.
-        digest.update(path);
-        return Ok(true);
-    }
-
-    if system && config.skip_system_headers {
-        // Don't remember this system header, only hash its path.
-        digest.update(path);
-        return Ok(true);
-    }
-
-    let original_path = path;
-    // Canonicalize path for comparison; Clang uses ./header.h.
-    #[cfg(windows)]
-    {
-        if path.starts_with(br".\") || path.starts_with(b"./") {
-            path = &path[2..];
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        if path.starts_with(b"./") {
-            path = &path[2..];
-        }
-    }
-    let mut path = decode_path(path).context("failed to decode path")?;
-    if path.is_relative() {
-        path = cwd.join(path);
-    }
-    if path != cwd || config.hash_working_directory {
-        digest.update(original_path);
-    }
-
-    if included_files.contains_key(&path) {
-        // Already known include file
-        return Ok(true);
-    }
-
-    if path == input_file {
-        // Don't remember the input file.
-        return Ok(true);
-    }
-    let meta = match fs_impl.metadata(&path) {
-        Ok(meta) => meta,
-        Err(e) => {
-            debug!("Failed to stat include file {}: {e}", path.display());
-            return Ok(false);
-        }
-    };
-    if meta.is_dir {
-        // Ignore directory, typically $PWD.
-        return Ok(true);
-    }
-    if !meta.is_file {
-        // Device, pipe, socket or other strange creature.
-        debug!("Non-regular include file {}", path.display());
-        return Ok(false);
-    }
-
-    // TODO add an option to ignore some header files?
-    if include_is_too_new(&path, &meta, time_of_compilation) {
-        return Ok(false);
-    }
-
-    // Let's hash the include file content.
-    let file = match fs_impl.open(&path) {
-        Ok(file) => file,
-        Err(e) => {
-            debug!("Failed to open header file {}: {e}", path.display());
-            return Ok(false);
-        }
-    };
-
-    let (file_digest, finder) = if config.ignore_time_macros {
-        match Digest::reader_sync(file) {
-            Ok(file_digest) => (file_digest, TimeMacroFinder::new()),
-            Err(e) => {
-                debug!("Failed to read header file {}: {e}", path.display());
-                return Ok(false);
-            }
-        }
-    } else {
-        match Digest::reader_sync_time_macros(file) {
-            Ok((file_digest, finder)) => (file_digest, finder),
-            Err(e) => {
-                debug!("Failed to read header file {}: {e}", path.display());
-                return Ok(false);
-            }
-        }
-    };
-
-    if finder.found_time_macros() {
-        debug!("Time macro in header file {}", path.display());
-        return Ok(false);
-    }
-
-    included_files.insert(path, file_digest);
-
-    Ok(true)
-}
-
-/// Opt out of preprocessor cache mode because of a race condition.
-///
-/// The race condition consists of these events:
-///
-/// - the preprocessor is run
-/// - an include file is modified by someone
-/// - the new include file is hashed by sccache
-/// - the real compiler is run on the preprocessor's output, which contains
-///   data from the old header file
-/// - the wrong object file is stored in the cache.
-fn include_is_too_new(
-    path: &Path,
-    meta: &PreprocessorFileMetadata,
-    time_of_compilation: std::time::SystemTime,
-) -> bool {
-    // The comparison using >= is intentional, due to a possible race between
-    // starting compilation and writing the include file.
-    if let Some(mtime) = meta.modified
-        && mtime >= time_of_compilation.into()
-    {
-        debug!("Include file {} is too new", path.display());
-        return true;
-    }
-
-    // The same >= logic as above applies to the change time of the file.
-    if let Some(ctime) = meta.ctime_or_creation
-        && ctime >= time_of_compilation.into()
-    {
-        debug!("Include file {} is too new", path.display());
-        return true;
-    }
-
-    false
-}
-
-// Used as "preprocessed code" when no preprocessing was done so that compilation fails. That should never
-// happen though because, where necessary, the situation is detected and preprocessing is *then* done to
-// salvage the situation. Previously, an empty u8 vector was used, which is unfortunately a valid C and C++
-// compilation unit and caused errors that only surfaced when linking: the symbols expected from the
-// compilation unit were of course not produced.
-#[cfg(feature = "dist-client")]
-const PREPROCESSING_SKIPPED_COMPILE_POISON: &[u8] = b"([{SCCACHE -*-* INVALID_C_CPP_CODE([{\"";
 
 impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I> {
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
-    fn native_result_policy(&self) -> super::native::ResultIdentityPolicy {
-        use super::native::ResultIdentityPolicy;
+    fn native_packaging_policy(&self) -> super::native::CompilerPackagingPolicy {
+        use super::native::CompilerPackagingPolicy;
         if matches!(
             self.compiler.kind(),
             CCompilerKind::Gcc | CCompilerKind::Clang
         ) && !self.parsed_args.profile_generate
             && !self.parsed_args.language.is_c_like_header()
         {
-            ResultIdentityPolicy::PreprocessedC
+            CompilerPackagingPolicy::PreprocessedC
         } else {
-            ResultIdentityPolicy::Exact
+            CompilerPackagingPolicy::Default
         }
+    }
+
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    fn native_relocatable_output(&self) -> bool {
+        self.relocate_native_object
     }
 
     fn generate_compile_commands(
@@ -2191,6 +1621,11 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
     fn automatic_dist_toolchain_is_ready(&self) -> bool {
         use std::io::Read as _;
 
+        if self.env_vars.iter().any(|(name, value)| {
+            matches!(name.to_str(), Some("LD_PRELOAD" | "LD_AUDIT")) && !value.is_empty()
+        }) {
+            return false;
+        }
         // A script's transitive execution environment is not automatically
         // discoverable by ELF dependency analysis. A custom archive may
         // still explicitly provide the wrapper and its dependencies.
@@ -2227,17 +1662,19 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
             extra_dist_files: parsed_args.extra_dist_files,
             extra_hash_files: parsed_args.extra_hash_files,
         });
+        let driver_args = parsed_args
+            .common_args
+            .into_iter()
+            .chain(parsed_args.arch_args)
+            .collect();
         let toolchain_packager = Box::new(CToolchainPackager {
             executable,
             kind: compiler.kind(),
             cwd,
             env_vars,
+            driver_args,
         });
         Ok((inputs_packager, toolchain_packager))
-    }
-
-    fn is_locally_preprocessed(&self) -> bool {
-        self.is_locally_preprocessed
     }
 
     fn outputs<'a>(&'a self) -> Box<dyn Iterator<Item = FileObjectSource> + 'a> {
@@ -2265,13 +1702,9 @@ struct CInputsPackager {
 
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for CInputsPackager {
-    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<()> {
-        (*self).discover()?.write_archive(wtr, |_, _| Ok(None))
-    }
-
     #[cfg(target_os = "linux")]
-    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        (*self).discover()?.into_native_mapping(|_| false)
+    fn native_mapping(self: Box<Self>) -> Result<pkg::NativeInputPlan> {
+        (*self).discover()?.into_native_input_plan(|_| true)
     }
 }
 
@@ -2301,146 +1734,21 @@ impl CInputsPackager {
     }
 }
 
+/// Content of the actual driver, selected compilation implementation and
+/// external assembler. The version banner is not another compiler input.
+struct CCompilerIdentity {
+    driver: String,
+    implementation: Vec<String>,
+    assembler: Option<String>,
+}
+
 #[cfg(feature = "dist-client")]
 struct CToolchainPackager {
     executable: PathBuf,
     kind: CCompilerKind,
     cwd: PathBuf,
     env_vars: Vec<(OsString, OsString)>,
-}
-
-#[cfg(all(
-    feature = "dist-client",
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-fn gcc_program_search_fingerprint(
-    search_output: &[u8],
-    cwd: &Path,
-    path_env: Option<&OsStr>,
-) -> Result<String> {
-    use std::os::unix::ffi::OsStrExt;
-
-    fn record_path(digest: &mut Digest, path: &Path) -> Result<bool> {
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::MetadataExt;
-
-        digest.delimiter(path.as_os_str().as_bytes());
-        let metadata = match fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                digest.update(b"absent");
-                return Ok(false);
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("Could not inspect GCC helper {}", path.display()));
-            }
-        };
-        digest.update(b"present");
-        for field in [
-            metadata.dev(),
-            metadata.ino(),
-            metadata.len(),
-            metadata.mode().into(),
-            metadata.mtime().cast_unsigned(),
-            metadata.mtime_nsec().cast_unsigned(),
-            metadata.ctime().cast_unsigned(),
-            metadata.ctime_nsec().cast_unsigned(),
-        ] {
-            digest.update(&field.to_le_bytes());
-        }
-        Ok(metadata.is_dir())
-    }
-
-    let program_line = search_output
-        .split(|&byte| byte == b'\n')
-        .find_map(|line| line.strip_prefix(b"programs: "))
-        .context("GCC -print-search-dirs omitted program search paths")?;
-    let installation_directory = search_output
-        .split(|&byte| byte == b'\n')
-        .find_map(|line| line.strip_prefix(b"install: "));
-    let mut digest = Digest::new();
-    digest.delimiter(b"gcc-toolchain-helper-search-v2");
-    for bytes in program_line
-        .split(|&byte| byte == b':')
-        .chain(installation_directory)
-    {
-        let bytes = bytes.strip_prefix(b"=").unwrap_or(bytes);
-        if bytes.is_empty() {
-            continue;
-        }
-        let directory = PathBuf::from(OsStr::from_bytes(bytes));
-        let directory = if directory.is_absolute() {
-            directory
-        } else {
-            cwd.join(directory)
-        };
-        if !record_path(&mut digest, &directory)? {
-            continue;
-        }
-        let mut entries = fs::read_dir(&directory)?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<io::Result<Vec<_>>>()?;
-        entries.sort_unstable();
-        for entry in entries {
-            record_path(&mut digest, &entry)?;
-        }
-    }
-    // GCC may fall back to PATH after its own program search directories.
-    // Include all known helper names without enumerating an entire /usr/bin.
-    if let Some(path_env) = path_env {
-        for dir in std::env::split_paths(path_env) {
-            let dir = if dir.is_absolute() {
-                dir
-            } else {
-                cwd.join(dir)
-            };
-            for helper in [
-                "as",
-                "objcopy",
-                "ld",
-                "cc1",
-                "cc1plus",
-                "collect2",
-                "lto-wrapper",
-                "lto1",
-            ] {
-                record_path(&mut digest, &dir.join(helper))?;
-            }
-        }
-    }
-    Ok(digest.finish())
-}
-
-#[cfg(all(
-    test,
-    feature = "dist-client",
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-#[test]
-fn gcc_program_search_fingerprint_tracks_helper_changes() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let dir = temp.path().join("gcc-tools");
-    fs::create_dir(&dir)?;
-    let search = format!(
-        "install: ignored\nprograms: ={}\nlibraries: ignored\n",
-        dir.display()
-    );
-    let fingerprint = || gcc_program_search_fingerprint(search.as_bytes(), temp.path(), None);
-
-    let initial = fingerprint()?;
-    assert_eq!(initial, fingerprint()?);
-    fs::write(dir.join("as"), b"assembler version 1")?;
-    let with_assembler = fingerprint()?;
-    assert_ne!(initial, with_assembler);
-    fs::write(dir.join("as"), b"assembler version 2 with new size")?;
-    let with_new_assembler = fingerprint()?;
-    assert_ne!(with_assembler, with_new_assembler);
-    fs::write(dir.join("ld"), b"linker")?;
-    assert_ne!(with_new_assembler, fingerprint()?);
-    Ok(())
+    driver_args: Vec<OsString>,
 }
 
 #[cfg(all(
@@ -2467,28 +1775,170 @@ fn real_cross_gcc_package_preserves_executable_helper_search_path() -> Result<()
     assert!(assembler.is_absolute() && assembler.is_file());
 
     let temp = tempfile::tempdir()?;
-    let archive_path = temp.path().join("toolchain.tar.gz");
     let packager = CToolchainPackager {
         executable,
         kind: CCompilerKind::Gcc,
         cwd: temp.path().to_owned(),
         env_vars: Vec::new(),
+        driver_args: Vec::new(),
     };
-    let cache_key = pkg::ToolchainPackager::cache_key_extension(&packager)?;
-    assert_eq!(
-        cache_key,
-        pkg::ToolchainPackager::cache_key_extension(&packager)?,
-        "unchanged GCC helper dependencies must have a stable cache key"
-    );
-    pkg::ToolchainPackager::write_pkg(Box::new(packager), fs::File::create(&archive_path)?)?;
-
-    let root = temp.path().join("unpacked");
-    crate::compression::deflate::unpack_gzip(fs::File::open(archive_path)?, &root)?;
+    let store = crate::build_runtime::NativeStore::open(&temp.path().join("store"))?;
+    let tree =
+        pkg::ToolchainPackager::native_mapping(Box::new(packager), pkg::ToolchainScope::Default)?
+            .mapping
+            .prepare()?
+            .import(&store)?;
+    let view = tree.materialize(temp.path())?;
+    let root = view.root();
     assert!(
         root.join(assembler.strip_prefix("/")?).is_file(),
         "packaged GCC assembler must resolve using the driver's original path"
     );
     Ok(())
+}
+
+#[cfg(all(
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl CToolchainPackager {
+    fn compiler_identity(
+        &self,
+        language: Language,
+        external_assembler: bool,
+        digests: &crate::build_runtime::SourceDigestCache,
+    ) -> Result<CCompilerIdentity> {
+        let hash_file = |path: &Path| -> Result<String> {
+            Ok(crate::util::hex(&digests.file_digest(path)?.id.0))
+        };
+        let driver = hash_file(&self.executable)?;
+        let mut files = super::c_toolchain::selected_compiler_libraries(
+            &self.executable,
+            &self.env_vars,
+            &self.cwd,
+            None,
+        )?;
+        if self.kind == CCompilerKind::Gcc {
+            let frontend = match language {
+                Language::Assembler | Language::AssemblerToPreprocess => None,
+                Language::Cxx
+                | Language::CxxHeader
+                | Language::CxxPreprocessed
+                | Language::CxxModule => Some("cc1plus"),
+                Language::ObjectiveC
+                | Language::ObjectiveCHeader
+                | Language::ObjectiveCPreprocessed => Some("cc1obj"),
+                Language::ObjectiveCxx
+                | Language::ObjectiveCxxHeader
+                | Language::ObjectiveCxxPreprocessed => Some("cc1objplus"),
+                _ => Some("cc1"),
+            };
+            if let Some(name) = frontend {
+                let path = self
+                    .named_tool("prog", name, pkg::ToolchainScope::PreprocessedC)?
+                    .context("GCC selected frontend unavailable")?;
+                files.extend(super::c_toolchain::selected_compiler_libraries(
+                    &path,
+                    &self.env_vars,
+                    &self.cwd,
+                    None,
+                )?);
+                files.push(path);
+            }
+            if let Some(path) =
+                self.named_tool("file", "specs", pkg::ToolchainScope::PreprocessedC)?
+            {
+                files.push(path);
+            }
+        }
+        let mut seen = HashSet::new();
+        // Preserve selection order, not installation pathname order. A path
+        // alias for the same selected implementation is not another input.
+        let mut implementation = Vec::new();
+        for path in files {
+            if seen.insert(path.canonicalize()?) {
+                implementation.push(hash_file(&path)?);
+            }
+        }
+        let assembler = if external_assembler {
+            let path = self
+                .named_tool("prog", "as", pkg::ToolchainScope::PreprocessedC)?
+                .context("selected assembler unavailable")?;
+            let mut identity = Digest::new();
+            identity.delimiter(b"c-selected-assembler-v1");
+            identity.update(hash_file(&path)?.as_bytes());
+            for library in super::c_toolchain::selected_compiler_libraries(
+                &path,
+                &self.env_vars,
+                &self.cwd,
+                None,
+            )? {
+                identity.update(hash_file(&library)?.as_bytes());
+            }
+            Some(identity.finish())
+        } else {
+            None
+        };
+        Ok(CCompilerIdentity {
+            driver,
+            implementation,
+            assembler,
+        })
+    }
+
+    fn named_tool(
+        &self,
+        kind: &str,
+        name: &str,
+        scope: pkg::ToolchainScope,
+    ) -> Result<Option<PathBuf>> {
+        use std::os::unix::ffi::OsStringExt;
+        let output = process::Command::new(&self.executable)
+            .args(&self.driver_args)
+            .arg(format!("-print-{kind}-name={name}"))
+            .current_dir(&self.cwd)
+            .env_clear()
+            .envs(self.env_vars.iter().cloned())
+            .output()?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let mut bytes = output.stdout;
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
+        let path = PathBuf::from(OsString::from_vec(bytes));
+        if path.is_absolute() {
+            return Ok(path.is_file().then_some(path));
+        }
+        if path.components().count() > 1 {
+            let path = self.cwd.join(path);
+            return Ok(path.is_file().then_some(path));
+        }
+        if kind != "prog" {
+            return Ok(None);
+        }
+        let search = self
+            .env_vars
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "PATH")
+            .map_or_else(
+                || OsString::from("/bin:/usr/bin"),
+                |(_, value)| value.clone(),
+            );
+        let Some(path) = which::which_in(path, Some(search), &self.cwd).ok() else {
+            return Ok(None);
+        };
+        // PATH aliases are not execution inputs. Package the selected
+        // executable, rather than the spelling of the caller's search dir.
+        if scope == pkg::ToolchainScope::PreprocessedC {
+            Ok(Some(path.canonicalize()?))
+        } else {
+            Ok(Some(path))
+        }
+    }
 }
 
 #[cfg(feature = "dist-client")]
@@ -2497,105 +1947,33 @@ fn real_cross_gcc_package_preserves_executable_helper_search_path() -> Result<()
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 impl pkg::DiscoverToolchain for CToolchainPackager {
-    fn key_extension(&self) -> Result<Option<String>> {
-        // The compiler binary can be unchanged while its assembler, linker,
-        // internal phases or search directories are being installed or updated.
-        // One GCC driver query and metadata checks are cheaper than repackaging
-        // on every distributed compile.
-        if self.kind != CCompilerKind::Gcc {
-            return Ok(Some("c-toolchain-lexical-paths-v2".to_owned()));
-        }
-        let output = process::Command::new(&self.executable)
-            .arg("-print-search-dirs")
-            .current_dir(&self.cwd)
-            .envs(self.env_vars.iter().cloned())
-            .output()
-            .with_context(|| format!("Could not inspect GCC {}", self.executable.display()))?;
-        if !output.status.success() {
-            bail!("GCC failed while reporting toolchain search directories");
-        }
-        let path_env = self
-            .env_vars
-            .iter()
-            .find(|(key, _)| key.as_os_str() == OsStr::new("PATH"))
-            .map(|(_, value)| value.clone())
-            .or_else(|| std::env::var_os("PATH"));
-        Ok(Some(gcc_program_search_fingerprint(
-            &output.stdout,
-            &self.cwd,
-            path_env.as_deref(),
-        )?))
-    }
-
-    fn package_builder(self, _scope: pkg::ToolchainScope) -> Result<pkg::ToolchainPackageBuilder> {
-        use std::os::unix::ffi::OsStringExt;
-
+    fn package_builder(self, scope: pkg::ToolchainScope) -> Result<pkg::ToolchainPackageBuilder> {
         info!("Generating toolchain {}", self.executable.display());
         let mut package_builder = pkg::ToolchainPackageBuilder::new();
         package_builder.add_common()?;
-        package_builder.add_executable_and_deps(self.executable.clone())?;
+        let mut executables = vec![self.executable.clone()];
+        let mut helpers = Vec::new();
 
-        // Helper to use -print-file-name and -print-prog-name to look up
-        // files by path.
-        let named_file = |kind: &str, name: &str| -> Option<PathBuf> {
-            let mut output = process::Command::new(&self.executable)
-                .arg(format!("-print-{kind}-name={name}"))
-                .current_dir(&self.cwd)
-                .envs(self.env_vars.iter().cloned())
-                .output()
-                .ok()?;
-            debug!(
-                "find named {kind} {name} output:\n{}\n===\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-            if !output.status.success() {
-                debug!("exit failure");
-                return None;
-            }
-
-            // Remove the trailing newline (if present)
-            if output.stdout.last() == Some(&b'\n') {
-                output.stdout.pop();
-            }
-
-            // Create our PathBuf from the raw bytes.  Assume that relative
-            // paths can be found via PATH.
-            let path: PathBuf = OsString::from_vec(output.stdout).into();
-            if path.is_absolute() {
-                Some(path)
-            } else {
-                let paths = self
-                    .env_vars
-                    .iter()
-                    .find(|(key, _)| key.as_os_str() == OsStr::new("PATH"))
-                    .map(|(_, value)| value.clone())
-                    .or_else(|| std::env::var_os("PATH"))
-                    .unwrap_or_default();
-                which::which_in(path, Some(paths), &self.cwd).ok()
-            }
-        };
-
-        // Helper to add a named file/program by to the package.
-        // We ignore the case where the file doesn't exist, as we don't need it.
-        let add_named_prog =
-            |builder: &mut pkg::ToolchainPackageBuilder, name: &str| -> Result<()> {
-                if let Some(path) = named_file("prog", name) {
-                    builder.add_executable_and_deps(path)?;
+        let mut add_named_prog = |name: &str| -> Result<()> {
+            if let Some(path) = self.named_tool("prog", name, scope)? {
+                if scope == pkg::ToolchainScope::PreprocessedC {
+                    helpers.push((OsString::from(name), path.clone()));
                 }
-                Ok(())
-            };
+                executables.push(path);
+            }
+            Ok(())
+        };
         let add_named_file =
             |builder: &mut pkg::ToolchainPackageBuilder, name: &str| -> Result<()> {
-                if let Some(path) = named_file("file", name) {
+                if let Some(path) = self.named_tool("file", name, scope)? {
                     builder.add_file(path)?;
                 }
                 Ok(())
             };
 
         // Add basic |as| and |objcopy| programs.
-        add_named_prog(&mut package_builder, "as")?;
-        add_named_prog(&mut package_builder, "objcopy")?;
+        add_named_prog("as")?;
+        add_named_prog("objcopy")?;
 
         // Linker configuration.
         if Path::new("/etc/ld.so.conf").is_file() {
@@ -2610,7 +1988,7 @@ impl pkg::DiscoverToolchain for CToolchainPackager {
         match self.kind {
             CCompilerKind::Clang => {
                 // Clang uses internal header files, so add them.
-                if let Some(limits_h) = named_file("file", "include/limits.h") {
+                if let Some(limits_h) = self.named_tool("file", "include/limits.h", scope)? {
                     info!("limits_h = {}", limits_h.display());
                     let include_dir = limits_h
                         .parent()
@@ -2621,12 +1999,12 @@ impl pkg::DiscoverToolchain for CToolchainPackager {
 
             CCompilerKind::Gcc => {
                 // Various external programs / files which may be needed by gcc
-                add_named_prog(&mut package_builder, "ld")?;
-                add_named_prog(&mut package_builder, "collect2")?;
-                add_named_prog(&mut package_builder, "lto-wrapper")?;
-                add_named_prog(&mut package_builder, "lto1")?;
-                add_named_prog(&mut package_builder, "cc1")?;
-                add_named_prog(&mut package_builder, "cc1plus")?;
+                add_named_prog("ld")?;
+                add_named_prog("collect2")?;
+                add_named_prog("lto-wrapper")?;
+                add_named_prog("lto1")?;
+                add_named_prog("cc1")?;
+                add_named_prog("cc1plus")?;
                 add_named_file(&mut package_builder, "specs")?;
                 add_named_file(&mut package_builder, "liblto_plugin.so")?;
             }
@@ -2641,8 +2019,8 @@ impl pkg::DiscoverToolchain for CToolchainPackager {
                 add_named_file(&mut package_builder, "cpp1")?;
                 add_named_file(&mut package_builder, "cpp2")?;
                 add_named_file(&mut package_builder, "opt")?;
-                add_named_prog(&mut package_builder, "llc")?;
-                add_named_prog(&mut package_builder, "acclnk")?;
+                add_named_prog("llc")?;
+                add_named_prog("acclnk")?;
             }
 
             CCompilerKind::Diab | CCompilerKind::Msvc | CCompilerKind::TaskingVX => {
@@ -2653,6 +2031,19 @@ impl pkg::DiscoverToolchain for CToolchainPackager {
             }
         }
 
+        if scope == pkg::ToolchainScope::PreprocessedC {
+            super::c_toolchain::prepare_search(
+                &mut package_builder,
+                &executables,
+                &helpers,
+                &self.env_vars,
+                &self.cwd,
+            )?;
+        } else {
+            for executable in executables {
+                package_builder.add_executable_and_deps(executable)?;
+            }
+        }
         // Bundle into a compressed tarfile.
         Ok(package_builder)
     }
@@ -2755,26 +2146,16 @@ pub(super) fn hashed_input_file_name(language: Language, input: &Path) -> Option
 }
 
 /// The cache is versioned by the inputs to `HashKeyParams::compute`.
-pub const CACHE_VERSION: &[u8] = b"15";
+pub const CACHE_VERSION: &[u8] = b"19";
 
 /// Environment variables that are factored into the cache key.
 static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
-    [
-        // SCCACHE_C_CUSTOM_CACHE_BUSTER has no particular meaning behind it,
-        // serving as a way for the user to factor custom data into the hash.
-        // One can set it to different values for different invocations
-        // to prevent cache reuse between them.
-        "SCCACHE_C_CUSTOM_CACHE_BUSTER",
-        "MACOSX_DEPLOYMENT_TARGET",
-        "IPHONEOS_DEPLOYMENT_TARGET",
-        "TVOS_DEPLOYMENT_TARGET",
-        "WATCHOS_DEPLOYMENT_TARGET",
-        "SDKROOT",
-        "CCC_OVERRIDE_OPTIONS",
-    ]
-    .iter()
-    .map(OsStr::new)
-    .collect()
+    super::c_driver_environment::DARWIN_ENVIRONMENT
+        .iter()
+        .copied()
+        .chain(std::iter::once("CCC_OVERRIDE_OPTIONS"))
+        .map(OsStr::new)
+        .collect()
 });
 
 /// Feed normalized compiler arguments into the digest with unambiguous boundaries.
@@ -2824,24 +2205,23 @@ pub(super) fn hash_input_file_name_marker(m: &mut Digest, present: bool) {
     m.update(&[u8::from(present)]);
 }
 
-/// Hash only the declared compiler environment dependencies, preserving
-/// ordering, duplicates, field boundaries and arbitrary OS string bytes.
+/// Hash the effective compiler environment dependencies, not the order
+/// of the caller's environment vector or superseded assignments.
 pub(super) fn hash_cached_env_vars(
     m: &mut Digest,
     env_vars: &[(OsString, OsString)],
     dependencies: &HashSet<&'static OsStr>,
 ) {
-    m.delimiter(b"c-cached-env-v1");
-    let count = env_vars
+    m.delimiter(b"c-cached-env-v2");
+    let effective = env_vars
         .iter()
         .filter(|(name, _)| dependencies.contains(name.as_os_str()))
-        .count();
-    m.update(&(count as u128).to_le_bytes());
-    for (name, value) in env_vars {
-        if dependencies.contains(name.as_os_str()) {
-            hash_length_prefixed(m, name.as_encoded_bytes());
-            hash_length_prefixed(m, value.as_encoded_bytes());
-        }
+        .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
+        .collect::<BTreeMap<_, _>>();
+    m.update(&(effective.len() as u128).to_le_bytes());
+    for (name, value) in effective {
+        hash_length_prefixed(m, name.as_encoded_bytes());
+        hash_length_prefixed(m, value.as_encoded_bytes());
     }
 }
 
@@ -2960,14 +2340,20 @@ impl<'a> HashKeyParams<'a> {
     /// # Note
     /// If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
     pub fn compute(&self) -> String {
-        let mut m = Digest::new();
+        let mut m = Digest::audited("c-frontend");
+        m.audit_field("sccache.key.compiler");
         m.update(self.compiler_digest.as_bytes());
         // clang and clang++ have different behavior despite being byte-for-byte identical binaries, so
         // we have to incorporate that into the hash as well.
+        m.audit_field("sccache.key.driver_mode");
         m.update(&[u8::from(self.plusplus)]);
+        m.audit_field("sccache.key.schema");
         m.update(CACHE_VERSION);
+        m.audit_field("sccache.key.language");
         m.update(self.language.as_str().as_bytes());
+        m.audit_field("sccache.key.arguments");
         hash_arguments(&mut m, self.arguments, self.basedirs);
+        m.audit_field("sccache.key.auxiliary");
         hash_auxiliary_inputs(&mut m, self.extra_hashes, self.assembler_digest);
         // The compiler writes the source's file name into the object (the
         // STT_FILE symbol on ELF), and -P leaves it out of the preprocessed
@@ -2975,16 +2361,19 @@ impl<'a> HashKeyParams<'a> {
         // object naming only one of them. The directory is left out: the
         // symbol does not record it, and keeping it would cost cache hits
         // across checkouts.
+        m.audit_field("sccache.key.input_basename");
         hash_input_file_name_marker(&mut m, self.input_file_name.is_some());
         if let Some(input_file_name) = self.input_file_name {
             hash_length_prefixed(&mut m, input_file_name.as_encoded_bytes());
         }
 
+        m.audit_field("sccache.key.environment");
         hash_cached_env_vars(&mut m, self.env_vars, &CACHED_ENV_VARS);
 
         // Version only the debug-dependent keys: objects without debug data
         // retain their existing cache identity, while old unsafe debug hits
         // cannot alias the additional domain and directory payload.
+        m.audit_field("sccache.key.debug_compdir");
         if let Some(dir) = self.debug_compilation_dir {
             m.delimiter(b"c-effective-debug-compdir-v1");
             hash_length_prefixed(&mut m, dir);
@@ -2993,6 +2382,7 @@ impl<'a> HashKeyParams<'a> {
         // Strip basedirs from preprocessor output if configured
         let preprocessor_output_to_hash = strip_basedirs(self.preprocessor_output, self.basedirs);
 
+        m.audit_field("sccache.key.preprocessed");
         m.update(&preprocessor_output_to_hash);
         m.finish()
     }
@@ -3000,8 +2390,6 @@ impl<'a> HashKeyParams<'a> {
 
 #[cfg(test)]
 mod test {
-    use std::{collections::VecDeque, sync::Mutex};
-
     use super::*;
     use crate::mock_command::*;
     use crate::test::utils::*;
@@ -3030,7 +2418,7 @@ mod test {
         let creator = <ProcessCommandCreator as CommandCreatorSync>::new(
             &crate::jobserver::Client::new_num(2),
         );
-        let storage = Arc::new(MockStorage::new(None, true));
+        let storage = Arc::new(MockStorage::new());
         let work = tempfile::tempdir()?;
 
         for (name, source) in [
@@ -3100,7 +2488,6 @@ mod test {
                         },
                     ),
                 )?;
-                assert!(hash.compilation.is_locally_preprocessed());
                 let deps = std::fs::read_to_string(&depfile)?;
                 assert!(deps.contains(input.to_str().context("UTF-8 input")?));
                 assert!(!deps.contains("/__sccache/"));
@@ -3151,7 +2538,6 @@ mod test {
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
         }
     }
 
@@ -3161,73 +2547,6 @@ mod test {
         args.common_args.clear();
         args.preprocessor_args = preprocessor_args;
         args
-    }
-
-    #[test]
-    #[cfg(feature = "dist-client")]
-    fn test_dist_input_packager_preserves_parent_path_resolution() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        std::fs::create_dir_all(root.join("arch/arm64/kvm")).unwrap();
-        std::fs::create_dir_all(root.join("virt/kvm")).unwrap();
-        std::fs::write(
-            root.join("virt/kvm/eventfd.c"),
-            b"int f(void) { return 0; }\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("asm/a/b")).unwrap();
-        std::fs::write(root.join("asm/blob.bin"), b"blob").unwrap();
-
-        let input_path = root.join("arch/arm64/kvm/../../../virt/kvm/eventfd.c");
-        let extra_input_path = root.join("asm/a/b/../../blob.bin");
-        let mut path_transformer = dist::PathTransformer::new();
-        path_transformer.add_root_mapping(root.to_owned(), "/work");
-        let packager = CInputsPackager {
-            input_path,
-            path_transformer,
-            preprocessed_input: b"int f(void) { return 0; }\n".to_vec(),
-            extra_dist_files: Vec::new(),
-            extra_hash_files: vec![extra_input_path],
-        };
-        let mut package = Vec::new();
-        pkg::InputsPackager::write_inputs(Box::new(packager), &mut package).unwrap();
-
-        let mut archive = tar::Archive::new(std::io::Cursor::new(&package));
-        let paths: std::collections::BTreeSet<_> = archive
-            .entries()
-            .unwrap()
-            .map(|entry| entry.unwrap().path().unwrap().into_owned())
-            .collect();
-        assert_eq!(
-            paths,
-            std::collections::BTreeSet::from([
-                PathBuf::from("work/arch"),
-                PathBuf::from("work/arch/arm64"),
-                PathBuf::from("work/arch/arm64/kvm"),
-                PathBuf::from("work/virt/kvm/eventfd.c"),
-                PathBuf::from("work/asm/a"),
-                PathBuf::from("work/asm/a/b"),
-                PathBuf::from("work/asm/blob.bin"),
-            ])
-        );
-        assert!(paths.iter().all(|path| {
-            !path
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-        }));
-
-        let worker_root = tempfile::tempdir().unwrap();
-        let mut archive = tar::Archive::new(std::io::Cursor::new(package));
-        archive.unpack(worker_root.path()).unwrap();
-        let worker_input = worker_root
-            .path()
-            .join("work/arch/arm64/kvm/../../../virt/kvm/eventfd.c");
-        assert_eq!(
-            std::fs::read(worker_input).unwrap(),
-            b"int f(void) { return 0; }\n"
-        );
-        let worker_extra = worker_root.path().join("work/asm/a/b/../../blob.bin");
-        assert_eq!(std::fs::read(worker_extra).unwrap(), b"blob");
     }
 
     #[cfg(all(feature = "dist-client", feature = "native-store", target_os = "linux"))]
@@ -3250,6 +2569,7 @@ mod test {
         };
         let store = NativeStore::open(&temp.path().join("store"))?;
         let tree = pkg::InputsPackager::native_mapping(Box::new(packager))?
+            .mapping
             .prepare()?
             .import(&store)?;
         let view = tree.materialize(temp.path())?;
@@ -3502,6 +2822,20 @@ mod test {
             ["-march=znver2", "-mno-avx2", "-mno-xsaves", "-mtune=znver2"]
         );
         assert!(!remote_args.iter().any(|arg| arg.ends_with("=native")));
+        let lowered = resolution.rewrite_arguments(parsed_args.common_args);
+        let explicit = ovec![
+            "-mno-avx2",
+            "-march=znver2",
+            "-mno-avx2",
+            "-mno-xsaves",
+            "-mtune=znver2"
+        ];
+        let key =
+            |args: &[OsString]| HashKeyParams::new("gcc", Language::C, args, b"input").compute();
+        assert_eq!(key(&lowered), key(&explicit));
+        let mut different = explicit;
+        different.push("-mavx2".into());
+        assert_ne!(key(&lowered), key(&different));
         Ok(())
     }
 
@@ -3620,12 +2954,11 @@ mod test {
 
         assert_eq!(znver2, znver2_again);
         assert_ne!(znver2, skylake);
-        // Debug compilation directories can affect emitted DW_AT_comp_dir even
-        // when preprocessing output and CPU ISA are otherwise identical.
-        assert_ne!(
+        // A debug directory or compiler installation alias is not a CPU.
+        assert_eq!(
             znver2,
             fingerprint(
-                "/usr/lib/gcc/cc1 -march=znver2 -mtune=znver2 -fdebug-compilation-dir=/other/worktree"
+                "/other/gcc/cc1 -march=znver2 -mtune=znver2 -fdebug-compilation-dir=/other/worktree"
             )
         );
         // Conversely, an effective ISA change must never alias the cache.
@@ -4029,7 +3362,7 @@ mod test {
     fn test_hash_key_environment_field_boundaries() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let name = OsString::from("SCCACHE_C_CUSTOM_CACHE_BUSTER");
+        let name = OsString::from("SDKROOT");
         let other = OsString::from("MACOSX_DEPLOYMENT_TARGET");
         let collapsed = [(
             name.clone(),
@@ -4043,6 +3376,42 @@ mod test {
                 .compute()
         };
         assert_ne!(key(&collapsed), key(&split));
+    }
+
+    #[test]
+    fn test_hash_key_environment_uses_effective_assignments() {
+        let base: [(OsString, OsString); 2] = [
+            ("SDKROOT".into(), "one".into()),
+            ("MACOSX_DEPLOYMENT_TARGET".into(), "two".into()),
+        ];
+        let reversed = [base[1].clone(), base[0].clone()];
+        let overwritten = [
+            ("SDKROOT".into(), "discarded".into()),
+            base[1].clone(),
+            base[0].clone(),
+        ];
+        let key = |env: &[(OsString, OsString)]| {
+            HashKeyParams::new("compiler", Language::C, &[], b"input")
+                .with_env_vars(env)
+                .compute()
+        };
+        assert_eq!(key(&base), key(&reversed));
+        assert_eq!(key(&base), key(&overwritten));
+        assert_ne!(key(&base), key(&overwritten[..2]));
+    }
+
+    #[test]
+    fn test_arbitrary_cache_buster_is_not_a_compiler_input() {
+        let env = [(
+            OsString::from("SCCACHE_C_CUSTOM_CACHE_BUSTER"),
+            OsString::from("arbitrary"),
+        )];
+        let key = |env: &[(OsString, OsString)]| {
+            HashKeyParams::new("compiler", Language::C, &[], b"input")
+                .with_env_vars(env)
+                .compute()
+        };
+        assert_eq!(key(&[]), key(&env));
     }
 
     #[test]
@@ -4253,445 +3622,5 @@ mod test {
         t("Hpp");
         t("Mm");
         t("Cu");
-    }
-
-    #[test]
-    fn test_process_preprocessed_file() {
-        env_logger::builder()
-            .is_test(true)
-            .filter_level(log::LevelFilter::Debug)
-            .try_init()
-            .ok();
-        let input_file = Path::new("tests/test.c");
-        let path = Path::new(file!())
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        // This should be portable since the only headers present in this
-        // output are system headers, which aren't interacted with
-        // on the filesystem if configured.
-        let path = path.join("tests/test.c.gcc-13.2.0-preproc");
-        let mut bytes = std::fs::read(path).unwrap();
-        let original_bytes = bytes.clone();
-        let mut include_files = HashMap::new();
-
-        let config = PreprocessorCacheModeConfig {
-            use_preprocessor_cache_mode: true,
-            skip_system_headers: true,
-            ..Default::default()
-        };
-        let success = process_preprocessed_file(
-            input_file,
-            Path::new(""),
-            &mut bytes,
-            &mut include_files,
-            config,
-            std::time::SystemTime::now(),
-            &StandardFsAbstraction,
-        )
-        .unwrap();
-        assert_eq!(&bytes, &original_bytes);
-        assert!(success);
-        assert_eq!(include_files.len(), 0);
-    }
-
-    #[test]
-    fn test_process_preprocessed_file_disables_cache_for_compressed_offload_bundle() {
-        let input_file = Path::new("tests/test.hip");
-        let mut bytes = b"CCOB\0\0\0\0\n# 1karg compressed payload".to_vec();
-        let original_bytes = bytes.clone();
-        let mut include_files = HashMap::new();
-
-        let config = PreprocessorCacheModeConfig {
-            use_preprocessor_cache_mode: true,
-            ..Default::default()
-        };
-        let success = process_preprocessed_file(
-            input_file,
-            Path::new(""),
-            &mut bytes,
-            &mut include_files,
-            config,
-            std::time::SystemTime::now(),
-            &PanicFs,
-        )
-        .unwrap();
-
-        assert_eq!(bytes, original_bytes);
-        assert!(!success);
-        assert!(include_files.is_empty());
-    }
-
-    #[test]
-    fn test_process_preprocessed_file_line_directive() {
-        let header = PathBuf::from("tests/test.h");
-        let fs_impl = TestFs {
-            metadata_results: Mutex::new(
-                [(
-                    header.clone(),
-                    PreprocessorFileMetadata {
-                        is_dir: false,
-                        is_file: true,
-                        modified: Some(Timestamp::new(12_341_234, 0)),
-                        ctime_or_creation: None,
-                    },
-                )]
-                .into_iter()
-                .collect(),
-            ),
-            open_results: Mutex::new(
-                [(
-                    header.clone(),
-                    Box::new(&b"contents"[..]) as Box<dyn std::io::Read>,
-                )]
-                .into_iter()
-                .collect(),
-            ),
-        };
-        let mut bytes = br#"#line 1 "tests/test.h"
-int value;
-"#
-        .to_vec();
-        let mut include_files = HashMap::new();
-
-        let success = process_preprocessed_file(
-            Path::new("tests/test.c"),
-            Path::new(""),
-            &mut bytes,
-            &mut include_files,
-            PreprocessorCacheModeConfig::activated(),
-            std::time::SystemTime::now(),
-            &fs_impl,
-        )
-        .unwrap();
-
-        assert!(success);
-        assert_eq!(
-            include_files.get(&header).map(String::as_str),
-            Some("a93900c371d997927c5bc568ea538bed59ae5c960021dcfe7b0b369da5267528")
-        );
-    }
-
-    /// A filesystem interface that only panics to test that we don't access it.
-    struct PanicFs;
-
-    impl PreprocessorFSAbstraction for PanicFs {
-        fn metadata(&self, path: impl AsRef<Path>) -> io::Result<PreprocessorFileMetadata> {
-            panic!("called metadata at {}", path.as_ref().display());
-        }
-
-        fn open(&self, path: impl AsRef<Path>) -> io::Result<Box<dyn std::io::Read>> {
-            panic!("called open at {}", path.as_ref().display());
-        }
-    }
-
-    /// A filesystem interface that gives back expected values.
-    struct TestFs {
-        metadata_results: Mutex<VecDeque<(PathBuf, PreprocessorFileMetadata)>>,
-        open_results: Mutex<VecDeque<(PathBuf, Box<dyn std::io::Read>)>>,
-    }
-
-    impl PreprocessorFSAbstraction for TestFs {
-        fn metadata(&self, path: impl AsRef<Path>) -> io::Result<PreprocessorFileMetadata> {
-            let (expected_path, meta) = self
-                .metadata_results
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("not enough 'metadata' results");
-            assert_eq!(expected_path, path.as_ref(), "{}", path.as_ref().display());
-            Ok(meta)
-        }
-
-        fn open(&self, path: impl AsRef<Path>) -> io::Result<Box<dyn std::io::Read>> {
-            let (expected_path, impls_read) = self
-                .open_results
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("not enough 'open' results");
-            assert_eq!(expected_path, path.as_ref(), "{}", path.as_ref().display());
-            Ok(impls_read)
-        }
-    }
-
-    // Short-circuit the parameters we don't need to change during tests
-    fn do_single_preprocessor_line_call(
-        line: &[u8],
-        include_files: &mut HashMap<PathBuf, String>,
-        fs_impl: &impl PreprocessorFSAbstraction,
-        skip_system_headers: bool,
-    ) -> PreprocessedLineAction {
-        let input_file = Path::new("tests/test.c");
-
-        let config = PreprocessorCacheModeConfig {
-            use_preprocessor_cache_mode: true,
-            skip_system_headers,
-            ..Default::default()
-        };
-
-        let mut bytes = line.to_vec();
-        let mut digest = Digest::new();
-        let mut normalized_include_paths = HashMap::new();
-        process_preprocessor_line(
-            PreprocessorLineContext {
-                input_file,
-                cwd: Path::new(""),
-                included_files: include_files,
-                config,
-                time_of_compilation: std::time::SystemTime::now(),
-                bytes: &mut bytes,
-                digest: &mut digest,
-                normalized_include_paths: &mut normalized_include_paths,
-                fs_impl,
-            },
-            0,
-            0,
-        )
-        .unwrap()
-    }
-
-    /// Test cases where we don't access the filesystem
-    #[test]
-    fn test_process_preprocessor_line_simple() {
-        env_logger::builder()
-            .is_test(true)
-            .filter_level(log::LevelFilter::Debug)
-            .try_init()
-            .ok();
-
-        let mut include_files = HashMap::new();
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 0 "tests/test.c""#,
-                &mut include_files,
-                &PanicFs,
-                true,
-            ),
-            ControlFlow::Continue((20, 20)),
-        );
-        assert_eq!(include_files.len(), 0);
-
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 0 "<built-in>""#,
-                &mut include_files,
-                &PanicFs,
-                true,
-            ),
-            ControlFlow::Continue((18, 18)),
-        );
-        assert_eq!(include_files.len(), 0);
-
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 0 "<command-line>""#,
-                &mut include_files,
-                &PanicFs,
-                true,
-            ),
-            ControlFlow::Continue((22, 22)),
-        );
-        assert_eq!(include_files.len(), 0);
-
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 0 "<command-line>" 2"#,
-                &mut include_files,
-                &PanicFs,
-                true,
-            ),
-            ControlFlow::Continue((22, 22)),
-        );
-        assert_eq!(include_files.len(), 0);
-
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 1 "tests/test.c""#,
-                &mut include_files,
-                &PanicFs,
-                true,
-            ),
-            ControlFlow::Continue((20, 20)),
-        );
-        assert_eq!(include_files.len(), 0);
-
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 1 "/usr/include/stdc-predef.h" 1 3 4"#,
-                &mut include_files,
-                &PanicFs,
-                true,
-            ),
-            ControlFlow::Continue((34, 34)),
-        );
-        assert_eq!(include_files.len(), 0);
-    }
-
-    /// Test cases where we test our tests...
-    #[test]
-    fn test_test_helpers() {
-        env_logger::builder()
-            .is_test(true)
-            .filter_level(log::LevelFilter::Debug)
-            .try_init()
-            .ok();
-
-        // Test PanicFs
-        let res = std::panic::catch_unwind(|| {
-            let mut include_files = HashMap::new();
-            assert_eq!(
-                do_single_preprocessor_line_call(
-                    br#"// # 1 "/usr/include/stdc-predef.h" 1 3 4"#,
-                    &mut include_files,
-                    &PanicFs,
-                    false,
-                ),
-                ControlFlow::Continue((34, 34)),
-            );
-        });
-        assert_eq!(
-            res.unwrap_err().downcast_ref::<String>().unwrap(),
-            "called metadata at /usr/include/stdc-predef.h"
-        );
-
-        // Test TestFs's safeguard
-        let res = std::panic::catch_unwind(|| {
-            let mut include_files = HashMap::new();
-            let fs_impl = TestFs {
-                metadata_results: Mutex::new(VecDeque::new()),
-                open_results: Mutex::new(VecDeque::new()),
-            };
-            assert_eq!(
-                do_single_preprocessor_line_call(
-                    br#"// # 33 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 3 4"#,
-                    &mut include_files,
-                    &fs_impl,
-                    false,
-                ),
-                ControlFlow::Continue((34, 34)),
-            );
-        });
-        assert_eq!(
-            res.unwrap_err().downcast_ref::<String>().unwrap(),
-            "not enough 'metadata' results"
-        );
-    }
-
-    /// Test cases where we test filesystem access
-    #[test]
-    fn test_process_preprocessor_line_fs_access() {
-        env_logger::builder()
-            .is_test(true)
-            .filter_level(log::LevelFilter::Debug)
-            .try_init()
-            .ok();
-
-        // Test "too new" include file
-        let mut include_files = HashMap::new();
-        let fs_impl = TestFs {
-            metadata_results: Mutex::new(
-                [(
-                    PathBuf::from("/usr/include/x86_64-linux-gnu/bits/libc-header-start.h"),
-                    PreprocessorFileMetadata {
-                        is_dir: false,
-                        is_file: true,
-                        modified: Some(Timestamp::new(i64::MAX - 1, 0)),
-                        ctime_or_creation: None,
-                    },
-                )]
-                .into_iter()
-                .collect(),
-            ),
-            open_results: Mutex::new(VecDeque::new()),
-        };
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 33 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 3 4"#,
-                &mut include_files,
-                &fs_impl,
-                false,
-            ),
-            // preprocessor cache mode is disabled
-            ControlFlow::Break((63, 9, false)),
-        );
-
-        // Test invalid include file is actually a dir
-        let mut include_files = HashMap::new();
-        let fs_impl = TestFs {
-            metadata_results: Mutex::new(
-                [(
-                    PathBuf::from("/usr/include/x86_64-linux-gnu/bits/libc-header-start.h"),
-                    PreprocessorFileMetadata {
-                        is_dir: true,
-                        is_file: false,
-                        modified: Some(Timestamp::new(12_341_234, 0)),
-                        ctime_or_creation: None,
-                    },
-                )]
-                .into_iter()
-                .collect(),
-            ),
-            open_results: Mutex::new(VecDeque::new()),
-        };
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 33 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 3 4"#,
-                &mut include_files,
-                &fs_impl,
-                false,
-            ),
-            // preprocessor cache mode is *not* disabled,
-            ControlFlow::Continue((63, 63)),
-        );
-        assert_eq!(include_files.len(), 0);
-
-        // Test correct include file
-        let mut include_files = HashMap::new();
-        let fs_impl = TestFs {
-            metadata_results: Mutex::new(
-                [(
-                    PathBuf::from("/usr/include/x86_64-linux-gnu/bits/libc-header-start.h"),
-                    PreprocessorFileMetadata {
-                        is_dir: false,
-                        is_file: true,
-                        modified: Some(Timestamp::new(12_341_234, 0)),
-                        ctime_or_creation: None,
-                    },
-                )]
-                .into_iter()
-                .collect(),
-            ),
-            open_results: Mutex::new(
-                [(
-                    PathBuf::from("/usr/include/x86_64-linux-gnu/bits/libc-header-start.h"),
-                    Box::new(&b"contents"[..]) as Box<dyn std::io::Read>,
-                )]
-                .into_iter()
-                .collect(),
-            ),
-        };
-        assert_eq!(
-            do_single_preprocessor_line_call(
-                br#"// # 33 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 3 4"#,
-                &mut include_files,
-                &fs_impl,
-                false,
-            ),
-            ControlFlow::Continue((63, 63)),
-        );
-        assert_eq!(include_files.len(), 1);
-        assert_eq!(
-            include_files
-                .get(Path::new(
-                    "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h",
-                ))
-                .unwrap(),
-            // hash of `b"contents"`
-            "a93900c371d997927c5bc568ea538bed59ae5c960021dcfe7b0b369da5267528",
-        );
     }
 }

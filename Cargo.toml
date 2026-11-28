@@ -72,11 +72,8 @@ mime = "0.3"
 opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"], optional = true }
 prost = { version = "0.14", optional = true }
 object = { version = "0.41", default-features = false, features = ["read", "std"] }
-opendal = { version = "0.59.0", optional = true, default-features = false }
-http-body = { version = "1", optional = true }
-http-body-util = { version = "0.1", optional = true }
 wreq = { workspace = true, optional = true }
-opendal-layer-logging = { version = "0.59.0", optional = true }
+proc-macro2 = "1"
 rand = "0.10.0"
 rayon-core = { version = "1.13", optional = true }
 regex = "1.10.3"
@@ -92,6 +89,7 @@ serde_json = ">=1.0, <1.0.155" # zmij (used in 1.0.147+) requires Rust 1.84+
 sha2 = { version = "0.11.0", optional = true }
 shlex = "2.0.1"
 strip-ansi-escapes = "0.2"
+syn = { version = "3", default-features = false, features = ["parsing"] }
 tar = "0.4.40"
 tempfile = "3"
 tokio = { version = "1", features = [
@@ -111,8 +109,6 @@ uuid = { version = "1.9", features = ["v4"] }
 walkdir = "2"
 # by default which pulls in an outdated failure version
 which = { version = "8", default-features = false, features = ["real-sys"] }
-zip = { version = "9", default-features = false }
-zstd = "0.14"
 zlib-rs-fast = { package = "zlib-rs", version = "=0.6.8", optional = true, default-features = false, features = ["std"] }
 
 # dist-server only
@@ -123,6 +119,7 @@ syslog = { version = "7", optional = true }
 sha2 = "0.11"
 
 [dev-dependencies]
+zstd = "0.14"
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["test-util"] }
 assert_cmd = "2.0.13"
@@ -167,87 +164,10 @@ features = [
 version = "0.61"
 
 [features]
-all = [
-  "dist-client",
-  "redis",
-  "s3",
-  "memcached",
-  "gcs",
-  "azure",
-  "gha",
-  "webdav",
-  "oss",
-  "cos",
-]
-azure = [
-  "opendal/services-azblob",
-  "opendal-layer-logging",
-  "dep:wreq",
-  "dep:http-body",
-  "dep:http-body-util",
-  "dep:url",
-  "http-client",
-]
-cos = [
-  "opendal/services-cos",
-  "opendal-layer-logging",
-  "dep:wreq",
-  "dep:http-body",
-  "dep:http-body-util",
-  "dep:url",
-  "http-client",
-]
-default = ["all"]
+default = ["dist-client"]
 direct-metrics = ["dep:hostname", "dep:lurkmoar"]
-gcs = [
-  "opendal/services-gcs",
-  "opendal-layer-logging",
-  "dep:wreq",
-  "dep:http-body",
-  "dep:http-body-util",
-  "dep:url",
-  "http-client",
-]
-gha = [
-  "opendal/services-ghac",
-  "opendal-layer-logging",
-  "dep:wreq",
-  "dep:http-body",
-  "dep:http-body-util",
-  "dep:url",
-  "http-client",
-]
-memcached = ["opendal/services-memcached", "opendal-layer-logging"]
 native-store = ["sccache-build/async-io", "dep:rayon-core", "tokio-util/io-util"]
-oss = [
-  "opendal/services-oss",
-  "opendal-layer-logging",
-  "dep:wreq",
-  "dep:http-body",
-  "dep:http-body-util",
-  "dep:url",
-  "http-client",
-]
-redis = ["dep:url", "opendal/services-redis", "opendal-layer-logging"]
 http-client = ["dep:wreq", "dep:url", "dep:opentelemetry-proto", "dep:prost"]
-s3 = [
-  "opendal/services-s3",
-  "opendal-layer-logging",
-  "dep:wreq",
-  "dep:http-body",
-  "dep:http-body-util",
-  "dep:url",
-  "http-client",
-]
-webdav = [
-  "opendal/services-webdav",
-  "opendal-layer-logging",
-  "dep:wreq",
-  "dep:http-body",
-  "dep:http-body-util",
-  "dep:url",
-  "http-client",
-]
 # Enable features that require unstable features of Nightly Rust.
 unstable = []
 # Enables distributed support in the sccache client
@@ -293,15 +213,6 @@ btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "53c46285
 tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "53c46285a85742dc8c3ab48fbb66613da6b4a297" }
 wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "7c0668c3b3e137f233c0aaee132028ab39572dbd", default-features = false, features = ["tokio-rt", "native-roots", "webpki-roots", "stream", "json", "form", "query", "system-proxy", "http2"] }
 
-[[bench]]
-harness = false
-name = "sccache_bench"
-test = false
-
-[[bench]]
-harness = false
-name = "preprocessor_cache_bench"
-test = false
 
 [lints]
 workspace = true
@@ -320,6 +231,3 @@ unnecessary_semicolon = "warn"
 # One source identity for direct streams and all Flate2 consumers.
 [patch.crates-io]
 zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "98f76b3a242099f2229b048360eeb4707246a68f" }
-reqsign-core = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "8480e6c3e8fe8b965a8acd7bcb53741079149006" }
-reqsign-azure-storage = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "8480e6c3e8fe8b965a8acd7bcb53741079149006" }
-reqsign-google = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "8480e6c3e8fe8b965a8acd7bcb53741079149006" }

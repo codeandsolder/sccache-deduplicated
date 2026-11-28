@@ -11,7 +11,7 @@ use anyhow::{Result, ensure};
 use sccache::{
     build_runtime::{
         BlobResidency, CapturedExecution, ContentId, ExecutionPolicy, NativeStore,
-        PackageImportLimits, PackageTransferCost, ResidentInputs, wire::WorkerTiming,
+        PackageImportLimits, PackageTransferCost, ResidentInputs, SpaceReport, wire::WorkerTiming,
     },
     config::server::NativeWorkerConfig,
     dist::{
@@ -25,6 +25,7 @@ use sccache::{
 
 pub struct NativeWorker {
     store: NativeStore,
+    _scratch_lock: std::fs::File,
     client: NativeCacheClient,
     pub(super) policy: ExecutionPolicy,
     renewal_interval: Duration,
@@ -55,10 +56,17 @@ impl NativeWorker {
         );
 
         let shared = shared_store.is_some();
-        let store = match (shared_store, config.directory, config.space) {
-            (Some(store), None, None) => store,
-            (None, Some(directory), Some(space)) if directory.is_absolute() => {
-                NativeStore::open_managed(&directory, space)?
+        let store = match (
+            shared_store,
+            config.directory,
+            config.index_directory,
+            config.space,
+        ) {
+            (Some(store), None, None, None) => store,
+            (None, Some(directory), Some(index), Some(space))
+                if directory.is_absolute() && index.is_absolute() =>
+            {
+                NativeStore::open_managed(&directory, &index, space)?
             }
             _ => anyhow::bail!("invalid standalone or shared native store configuration"),
         };
@@ -66,12 +74,13 @@ impl NativeWorker {
             .managed_space_policy()
             .ok_or_else(|| anyhow::anyhow!("worker requires a managed store"))?;
         let grace_bytes = config.artifact_grace_bytes.unwrap_or_else(|| {
-            (space.max_resident_bytes / 4)
-                .max(config.max_result_bytes.saturating_mul(2))
-                .min(space.max_resident_bytes)
+            let default = config.max_result_bytes.saturating_mul(2);
+            space
+                .max_resident_bytes
+                .map_or(default, |limit| (limit / 4).max(default).min(limit))
         });
         ensure!(
-            (1..=space.max_resident_bytes).contains(&grace_bytes),
+            (1..=space.resident_limit()).contains(&grace_bytes),
             "artifact grace budget must fit the resident budget"
         );
         // A shared store must not publish a worker's grace result into the
@@ -92,7 +101,7 @@ impl NativeWorker {
                 "workers do not retain compressed original archives"
             );
         }
-        std::fs::create_dir_all(&config.scratch)?;
+        let scratch_lock = store.claim_execution_scratch(&config.scratch)?;
         let scope = ContentId::of(
             format!(
                 "{}\n{}",
@@ -111,7 +120,6 @@ impl NativeWorker {
             placement.analytics = Some(store.analytics_sampler()?);
         }
         let package_transfer = PackageTransportTracker::new(timing)?;
-        let _ = store.can_clone_into(&config.scratch)?;
         let client = NativeCacheClient::new(
             &config.cache_url.to_url(),
             peer,
@@ -120,6 +128,7 @@ impl NativeWorker {
         )?;
         Ok(Self {
             store,
+            _scratch_lock: scratch_lock,
             client,
             policy: ExecutionPolicy {
                 platform: ContentId::of(config.platform_contract.as_bytes()),
@@ -143,16 +152,34 @@ impl NativeWorker {
         self.artifact_grace.is_some()
     }
 
-    pub(super) fn maintain_local_store(&self) -> Result<()> {
-        if let Some(grace) = &self.artifact_grace {
-            grace.reap();
-            if let Some(report) = self.store.maintain_space()?
-                && !report.minimum_satisfied
-            {
-                debug!("native worker cache space pressure: {report:?}");
+    pub(super) async fn wait_for_local_maintenance(&self, previous: Option<SpaceReport>) {
+        self.store.wait_for_space_maintenance(previous).await;
+    }
+
+    pub(super) fn maintain_local_store(&self) -> Result<Option<SpaceReport>> {
+        let Some(grace) = &self.artifact_grace else {
+            return Ok(None);
+        };
+        grace.reap();
+        match self.store.maintain_space() {
+            Ok(report) => {
+                if let Some(report) = report
+                    && !report.minimum_satisfied
+                {
+                    debug!("native worker cache space pressure: {report:?}");
+                }
+                Ok(report)
+            }
+            Err(error) => {
+                if self.store.index_requires_restart() {
+                    error!(
+                        "native worker index requires reopening; terminating for supervised recovery: {error:#}"
+                    );
+                    std::process::exit(1);
+                }
+                Err(error)
             }
         }
-        Ok(())
     }
 
     pub(super) fn pin_resident_inputs(

@@ -171,16 +171,14 @@ async fn compile(
         activity_id: _,
         mut compile,
         aliases,
-        toolchains,
         catalogs,
     } = job;
     // Use the attested real executable for both cacheable work and the
-    // daemon-owned fallback; a strict launcher must not resubmit the job.
+    // daemon-owned compiler query; a strict launcher must not resubmit the job.
     compile.exe = aliases.resolve(compile.exe.into())?.into_os_string();
     let storage = IpcStorage::connect(ServerConnection::new(Box::new(broker))?).await?;
     let conn = storage.conn();
     let config = DistConfig {
-        toolchains: serde_json::from_slice(&toolchains)?,
         native_installation_catalogs: catalogs,
         ..DistConfig::default()
     };
@@ -210,10 +208,12 @@ async fn compile(
         CompileResponse::UnsupportedCompiler(exe) => {
             bail!("Compiler not supported: {}", exe.to_string_lossy())
         }
-        CompileResponse::UnhandledCompile => {
-            // The client must never execute this fallback. It runs here, in
-            // the exact same credential and filesystem context as cache hits.
-            activity::phase(activity::Phase::LocalCompile);
+        CompileResponse::RejectedCompilation(reason) => {
+            bail!("Remote compilation rejected: {reason}")
+        }
+        CompileResponse::CompilerQuery => {
+            // Compiler queries run with the request's credentials and paths.
+            activity::phase(activity::Phase::CompilerQuery);
             let mut child = activity::ChildActivity::waiting();
             let _token = jobserver.acquire().await?;
             child.started();
@@ -321,7 +321,7 @@ async fn report_compile(
         tokio::select! {
             biased;
             result = &mut work => {
-                output.write_all(&frame(&ExecutorEvent::Progress(activity.snapshot()))?)?;
+                output.write_all(&frame(&ExecutorEvent::Progress(Box::new(activity.snapshot())))?)?;
                 output.write_all(&frame(&ExecutorEvent::Finished(
                     result.map_err(|error| format!("{error:#}")),
                 ))?)?;
@@ -329,7 +329,7 @@ async fn report_compile(
                 return Ok(());
             }
             _ = ticker.tick() => {
-                output.write_all(&frame(&ExecutorEvent::Progress(activity.snapshot()))?)?;
+                output.write_all(&frame(&ExecutorEvent::Progress(Box::new(activity.snapshot())))?)?;
                 output.flush()?;
             }
         }

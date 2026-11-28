@@ -23,6 +23,8 @@ fn action(root: &TreeManifest) -> Result<ExecutionSpec> {
     let id = root.id()?;
     Ok(ExecutionSpec {
         compiler_result: None,
+        working_inputs: Default::default(),
+        scratch: Default::default(),
         platform: ContentId::of(b"test-platform"),
         root: ExecutionRoot::resolve(
             TreeRecipe::union(
@@ -293,6 +295,56 @@ fn with_native_service(
         .join()
         .map_err(|_| anyhow::anyhow!("native HTTPS test server panicked"))??;
     outcome
+}
+
+#[test]
+fn renewal_replies_advertise_lifetime_and_distinguish_lease_rejection() -> Result<()> {
+    use crate::build_runtime::wire::{LeaseRenewal, Ticket};
+    with_native_service(|endpoint, _, _, _| {
+        let client = make_client(endpoint, "client-token")?;
+        let group = client.open_retention()?;
+        let (http, url) = endpoint.raw(&endpoint.client)?;
+        let runtime = crate::http_client::io_runtime()?;
+        let renew = |operation: &str, ticket: Ticket| -> Result<wreq::Response> {
+            Ok(runtime.block_on(
+                http.post(
+                    url.join(&format!("/api/v5/native/client/{operation}"))?
+                        .as_str(),
+                )
+                .header("Content-Type", "application/octet-stream")
+                .body(codec().serialize(&ticket)?)
+                .timeout(Duration::from_secs(5))
+                .send(),
+            )?)
+        };
+        let response = renew("retain_renew", group)?;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let reply: LeaseRenewal = codec().deserialize(&runtime.block_on(response.bytes())?)?;
+        assert_eq!(reply.valid_for, limits().idle_timeout);
+        client.close_retention(group)?;
+        assert_eq!(
+            renew("retain_renew", group)?.status(),
+            http::StatusCode::GONE
+        );
+        assert_eq!(
+            renew("renew", Ticket([0; 32]))?.status(),
+            http::StatusCode::GONE
+        );
+        Ok(())
+    })?;
+    assert_eq!(
+        native_response("renew", Err(NativeLeaseRejected::Unauthorized.into())).status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        native_response("renew", Err(NativeServiceBusy.into())).status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        native_response("retain_renew", Err(anyhow::anyhow!("internal failure"))).status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    Ok(())
 }
 
 fn verify_compressed_download(
@@ -669,15 +721,25 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         let allocation = client.schedule(ticket, spec.clone())?;
         assert!(matches!(allocation, ScheduleReply::Assigned(_)));
         assert_eq!(client.schedule(ticket, spec.clone())?, allocation);
-        worker_client.renew(ticket)?;
+        assert_eq!(
+            worker_client.renew(ticket)?.valid_for,
+            limits().idle_timeout
+        );
         worker_client.verify_execution(ticket, spec.clone())?;
         let mut wrong = spec.clone();
         wrong.command.arguments.push(b"changed".to_vec());
         assert!(worker_client.verify_execution(ticket, wrong).is_err());
         assert!(wrong_job.verify_execution(ticket, spec.clone()).is_err());
         client.close(offer.ticket)?;
-        assert!(client.renew(ticket).is_err());
-        assert!(wrong_job.renew(ticket).is_err());
+        for rejected in [client.renew(ticket), wrong_job.renew(ticket)] {
+            let error = rejected.unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<wreq::Error>()
+                    .and_then(wreq::Error::status),
+                Some(http::StatusCode::FORBIDDEN)
+            );
+        }
 
         let bytes = vec![0x5a; 2 * 1024 * 1024];
         let blob = BlobRef {

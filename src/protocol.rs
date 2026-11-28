@@ -1,9 +1,4 @@
-use crate::cache::CacheMode;
 use crate::compiler::ColorMode;
-use crate::config::PreprocessorCacheModeConfig;
-use crate::dist::{
-    CompileCommand, JobId, SchedulerStatusResult, ServerId, SubmitToolchainResult, Toolchain,
-};
 use crate::server::{DistInfo, ServerInfo, ServerStats};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -81,48 +76,10 @@ pub enum Response {
 /// Maximum application payload in a transfer frame. The framing envelope
 /// stays well below the default 8 MiB IPC frame limit.
 pub const TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
-pub const NAMESPACE_PROTOCOL_VERSION: u32 = 8;
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub enum StorageBlob {
-    Cache,
-    Preprocessor,
-}
+pub const NAMESPACE_PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Serialize, Deserialize)]
 pub enum TransferRequest {
-    Read {
-        kind: StorageBlob,
-        key: String,
-    },
-    BeginWrite {
-        kind: StorageBlob,
-        key: String,
-        len: u64,
-    },
-    LookupToolchain {
-        compiler: std::path::PathBuf,
-        key: String,
-    },
-    BeginToolchain {
-        compiler: std::path::PathBuf,
-        key: String,
-        len: u64,
-    },
-    Allocate {
-        toolchain: Toolchain,
-    },
-    SubmitToolchain {
-        job: JobId,
-    },
-    BeginRun {
-        job: JobId,
-        len: u64,
-    },
-    Status,
-    WorkerLabel {
-        server: ServerId,
-    },
     // Native action stream: only a connection that completed the native
     // handshake can start one. No scheduler tickets or credentials cross IPC.
     NativeStart,
@@ -139,27 +96,13 @@ pub enum TransferRequest {
         blob: crate::build_runtime::BlobRef,
     },
     IntermediateChunk,
-    WriteChunk(#[serde(with = "serde_bytes")] Vec<u8>),
-    FinishWrite,
-    ReadChunk,
     Abort,
 }
 
 #[derive(Serialize, Deserialize)]
 pub enum TransferReply {
     ReadStarted(Option<u64>),
-    WriteStarted,
     Chunk(#[serde(with = "serde_bytes")] Vec<u8>),
-    Toolchain(Option<Toolchain>),
-    Allocation {
-        server: ServerId,
-        job: JobId,
-        need_toolchain: bool,
-    },
-    AllocationFailed(String),
-    Submitted(SubmitToolchainResult),
-    Status(SchedulerStatusResult),
-    WorkerLabel(String),
     Ack,
     IntermediateOpened(crate::build_runtime::wire::Ticket),
 }
@@ -181,15 +124,6 @@ impl TransferRequest {
 impl std::fmt::Debug for TransferRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
-            Self::Read { .. } => "Read",
-            Self::BeginWrite { .. } => "BeginWrite",
-            Self::LookupToolchain { .. } => "LookupToolchain",
-            Self::BeginToolchain { .. } => "BeginToolchain",
-            Self::Allocate { .. } => "Allocate",
-            Self::SubmitToolchain { .. } => "SubmitToolchain",
-            Self::BeginRun { .. } => "BeginRun",
-            Self::Status => "Status",
-            Self::WorkerLabel { .. } => "WorkerLabel",
             Self::NativeStart => "NativeStart",
             Self::NativeRead => "NativeRead",
             Self::NativeWrite(_) => "NativeWrite",
@@ -198,9 +132,6 @@ impl std::fmt::Debug for TransferRequest {
             Self::IntermediateAuthorize { .. } => "IntermediateAuthorize",
             Self::IntermediateRead { .. } => "IntermediateRead",
             Self::IntermediateChunk => "IntermediateChunk",
-            Self::WriteChunk(_) => "WriteChunk",
-            Self::FinishWrite => "FinishWrite",
-            Self::ReadChunk => "ReadChunk",
             Self::Abort => "Abort",
         };
         f.write_str(name)
@@ -211,26 +142,11 @@ impl std::fmt::Debug for TransferReply {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ReadStarted(len) => f.debug_tuple("ReadStarted").field(len).finish(),
-            Self::WriteStarted => f.write_str("WriteStarted"),
             Self::Chunk(bytes) => f.debug_tuple("Chunk").field(&bytes.len()).finish(),
-            Self::Toolchain(_) => f.write_str("Toolchain"),
-            Self::Allocation { .. } => f.write_str("Allocation"),
-            Self::AllocationFailed(_) => f.write_str("AllocationFailed"),
-            Self::Submitted(_) => f.write_str("Submitted"),
-            Self::Status(_) => f.write_str("Status"),
-            Self::WorkerLabel(_) => f.write_str("WorkerLabel"),
             Self::Ack => f.write_str("Ack"),
             Self::IntermediateOpened(_) => f.write_str("IntermediateOpened"),
         }
     }
-}
-
-/// Serialized at the start of the input stream, followed by the raw input
-/// archive. All of it is chunked, including unusually large argument vectors.
-#[derive(Serialize, Deserialize)]
-pub struct NamespaceRunSpec {
-    pub command: CompileCommand,
-    pub outputs: Vec<String>,
 }
 
 /// Possible responses from the server for a `Compile` request.
@@ -238,8 +154,10 @@ pub struct NamespaceRunSpec {
 pub enum CompileResponse {
     /// The compilation was started.
     CompileStarted,
-    /// The server could not handle this compilation request.
-    UnhandledCompile,
+    /// A verified non-compilation compiler query.
+    CompilerQuery,
+    /// A compilation cannot be executed under the remote action contract.
+    RejectedCompilation(String),
     /// The compiler was not supported.
     UnsupportedCompiler(OsString),
 }
@@ -250,16 +168,26 @@ pub struct NativeCompileReport {
     pub key: crate::build_runtime::ActionKey,
     pub mode: crate::build_runtime::ActionMode,
     pub source: NativeBuildSource,
+    pub stage: NativeStage,
+    pub successful: bool,
+    pub duration: std::time::Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeStage {
+    Compile,
+    Codegen,
+    LinkPlan,
+    Link,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeBuildSource {
     Hit,
-    Local,
     Worker(crate::build_runtime::PeerId),
 }
 
-/// Information about a finished compile, either from cache or executed locally.
+/// Information about a finished scheduler-owned compiler request.
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct CompileFinished {
     /// The return code of the compile process, if available.
@@ -272,8 +200,8 @@ pub struct CompileFinished {
     pub stderr: Vec<u8>,
     /// The state of any compiler options passed to control color output.
     pub color_mode: ColorMode,
-    /// Exact native action identity and outcome, absent for uncached work.
-    pub native: Option<NativeCompileReport>,
+    /// Native actions and outcomes, in dependency order.
+    pub native: Vec<NativeCompileReport>,
 }
 
 /// The contents of a compile request from a client.
@@ -316,12 +244,9 @@ pub struct StorageHandshakeInfo {
     pub location: String,
     pub cache_type_name: String,
     pub basedirs: Vec<Vec<u8>>,
-    pub preprocessor_cache_mode_config: PreprocessorCacheModeConfig,
-    pub cache_mode: CacheMode,
     pub max_size: Option<u64>,
     pub namespace_protocol: u32,
     pub transfer_chunk_bytes: usize,
-    pub dist_rewrite_includes_only: Option<bool>,
     pub native: Option<NativeNamespacePolicy>,
 }
 
@@ -346,16 +271,14 @@ mod tests {
         let payload = (0..TRANSFER_CHUNK_BYTES)
             .map(|index| index.to_le_bytes()[0])
             .collect::<Vec<_>>();
-        for request in [
-            TransferRequest::NativeWrite(payload.clone()),
-            TransferRequest::WriteChunk(payload.clone()),
-        ] {
+        {
+            let request = TransferRequest::NativeWrite(payload.clone());
             let bytes = bincode::serialize(&Request::Transfer(request))?;
             assert!(bytes.len() <= payload.len() + 32);
             match bincode::deserialize(&bytes)? {
-                Request::Transfer(
-                    TransferRequest::NativeWrite(decoded) | TransferRequest::WriteChunk(decoded),
-                ) => assert_eq!(decoded, payload),
+                Request::Transfer(TransferRequest::NativeWrite(decoded)) => {
+                    assert_eq!(decoded, payload)
+                }
                 _ => anyhow::bail!("unexpected decoded transfer request"),
             }
         }

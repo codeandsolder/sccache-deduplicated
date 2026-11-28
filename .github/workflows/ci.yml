@@ -64,7 +64,7 @@ jobs:
       RUSTFLAGS: ${{ startsWith(github.ref, 'refs/tags/') && '' || '-C target-cpu=x86-64-v2' }}
     strategy:
       matrix:
-        feature: [ azure, direct-metrics, gcs, gha, memcached, redis, s3, webdav, dist-server, "dist-client,s3" ]
+        feature: [ direct-metrics, dist-client, dist-server, "dist-client,dist-server" ]
     steps:
       - name: Clone repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -101,14 +101,12 @@ jobs:
       - name: Install host validation dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ripgrep socat bubblewrap binutils
+          sudo apt-get install -y --no-install-recommends ripgrep socat bubblewrap binutils zstd
 
       - name: Validate managed host scripts
         run: |
           bash -n contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers
           shellcheck -x contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers contrib/codeandsolder/build-host-native contrib/codeandsolder/host-native-metadata contrib/codeandsolder/test-host-native-metadata contrib/codeandsolder/test-release-update-plan contrib/codeandsolder/test-release-update-transaction
-          shellcheck -x contrib/codeandsolder/sccache-dist-client-preflight contrib/codeandsolder/test-dist-client-preflight
-          contrib/codeandsolder/test-dist-client-preflight
           contrib/codeandsolder/test-release-update-plan
           shellcheck -x contrib/codeandsolder/verify-release-native-abi.sh contrib/codeandsolder/test-release-native-abi
           contrib/codeandsolder/test-release-native-abi
@@ -121,9 +119,11 @@ jobs:
           contrib/codeandsolder/fleet/test-native-only-config
           contrib/codeandsolder/test-native-cache-reuse --self-test
           sudo contrib/codeandsolder/fleet/test-activate-host
-          shellcheck -x contrib/codeandsolder/runtime/{build-image,run,test-run,test-runtime}
+          shellcheck -x contrib/codeandsolder/runtime/{build-image,run,install-profile-broker,sccache-runtime-profile,sccache-runtime-profile-service,test-run,test-runtime,test-profile,test-profile-service}
           shellcheck -x scripts/ci-{prepare-linux-tests,linux-test-shard,build-dist-tests,dist-test-shard}.sh
           contrib/codeandsolder/runtime/test-run
+          contrib/codeandsolder/runtime/test-profile
+          contrib/codeandsolder/runtime/test-profile-service
 
   toml_format:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
@@ -349,8 +349,8 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
         with:
           rust-toolchain: ${{ steps.rust.outputs.name }}
-      - name: Verify long Rust compiler arguments with actual rustc
-        run: cargo +${{ steps.rust.outputs.name }} test --locked --no-default-features --test sccache_cargo test_rust_response_file_long_command -- --test-threads 1
+      - name: Verify long Rust response-file encoding
+        run: cargo +${{ steps.rust.outputs.name }} test --locked --no-default-features --lib compiler::rust_response::tests -- --test-threads 1
       - name: Finalize mandatory sccache
         if: always()
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
@@ -403,7 +403,7 @@ jobs:
         run: |
           set -euo pipefail
           env -u RUSTC -u RUSTDOC cargo +${{ steps.compiler.outputs.channel }} build --release --locked --no-default-features \
-            --features s3,gha,dist-client,dist-server,direct-metrics \
+            --features dist-client,dist-server,direct-metrics \
             --bin sccache --bin sccache-dist --message-format=json > "$RUNNER_TEMP/release-binaries.jsonl"
           mapfile -t binaries < <(jq -r 'select(.reason=="compiler-artifact" and .executable!=null and (.target.name=="sccache" or .target.name=="sccache-dist")) | .executable' "$RUNNER_TEMP/release-binaries.jsonl")
           [[ ${#binaries[@]} == 2 ]]
@@ -414,7 +414,7 @@ jobs:
         run: |
           set -euo pipefail
           packages="$(env -u RUSTC -u RUSTDOC cargo +${{ steps.compiler.outputs.channel }} tree --locked --no-default-features \
-            --features s3,gha,dist-client,dist-server,direct-metrics,scheduler-dashboard \
+            --features dist-client,dist-server,direct-metrics,scheduler-dashboard \
             --edges normal --prefix none --format '{p}')"
           # These alternate application stacks were deliberately removed.
           printf '%s\n' "$packages" | awk '
@@ -433,7 +433,7 @@ jobs:
             --all-features --filter-platform x86_64-unknown-linux-gnu --format-version 1 \
             | jq -e -f contrib/codeandsolder/verify-native-dependency-identities.jq
           features="$(env -u RUSTC -u RUSTDOC cargo +${{ steps.compiler.outputs.channel }} tree --locked --target x86_64-unknown-linux-gnu \
-            --no-default-features --features s3,gha,dist-client,dist-server,direct-metrics,scheduler-dashboard \
+            --no-default-features --features dist-client,dist-server,direct-metrics,scheduler-dashboard \
             --edges features -i btls-sys)"
           rg -q 'btls-sys feature "static-cxx-runtime"' <<<"$features"
       - name: Link and verify exact scheduler release feature profile
@@ -442,7 +442,7 @@ jobs:
         run: |
           set -euo pipefail
           env -u RUSTC -u RUSTDOC cargo +${{ steps.compiler.outputs.channel }} build --release --locked --no-default-features \
-            --features s3,gha,dist-client,dist-server,direct-metrics,scheduler-dashboard \
+            --features dist-client,dist-server,direct-metrics,scheduler-dashboard \
             --bin sccache-dist --message-format=json > "$RUNNER_TEMP/release-dashboard.jsonl"
           mapfile -t binaries < <(jq -r 'select(.reason=="compiler-artifact" and .executable!=null and .target.name=="sccache-dist") | .executable' "$RUNNER_TEMP/release-dashboard.jsonl")
           [[ ${#binaries[@]} == 1 ]]

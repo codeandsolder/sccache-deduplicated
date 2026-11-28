@@ -60,9 +60,9 @@ mod session;
 #[cfg(all(unix, feature = "store"))]
 pub use session::{
     AdmissionStats, DeliveryReceipt, ManifestStatus, NativeContentPending, NativeDownload,
-    NativeInputRejected, NativeServiceBusy, NativeSessions, NativeUpload, PeerInputClaim,
-    RecoveryStatus, SchedulePreparation, ScheduleReservation, SessionLimits, SessionStatus,
-    TicketStatus,
+    NativeInputRejected, NativeLeaseRejected, NativeServiceBusy, NativeSessions, NativeUpload,
+    PeerInputClaim, RecoveryStatus, SchedulePreparation, ScheduleReservation, SessionLimits,
+    SessionStatus, TicketStatus,
 };
 #[cfg(all(unix, feature = "store"))]
 mod store;
@@ -73,8 +73,9 @@ pub use store::{
     CacheAnalyticsSampler, CacheStats, ComponentAudit, Eviction, GarbageCollected,
     NativeIndexAudit, NativeStore, PackageArchiveLease, PackageDecoder, PackageImport,
     PackageImportLimits, PackagePolicy, PackagePreparation, PackageSlot, PhysicalStager, Published,
-    ResultLease, SchemaInventory, SpaceReport, SpaceStatus, StageBudget, StagedBlob, TreeLease,
-    UploadReservation, VerifiedPackage, decode_package_process,
+    ResultLease, SchemaInventory, SpaceReport, SpaceStatus, StageBudget, StageSpaceExhausted,
+    StageSpaceTooLarge, StagedBlob, TreeLease, UploadReservation, VerifiedPackage,
+    decode_package_process,
 };
 
 #[cfg(all(target_os = "linux", feature = "store"))]
@@ -102,7 +103,7 @@ mod source;
 pub use mapped::{
     DescriptorDigestProvider, DescriptorMemo, InstallationCatalog, InstallationReport,
     MappedMetadata, MappedTree, PreparedTree, ReferenceBlobProvider, ReferenceResolver,
-    SourceDigestCache, hash_descriptor,
+    SourceDigestCache, hash_descriptor, open_input_data, open_input_descriptor,
 };
 
 // Cluster principals are independent of socket endpoints and TLS implementation.

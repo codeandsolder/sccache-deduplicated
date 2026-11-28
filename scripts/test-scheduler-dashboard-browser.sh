@@ -238,6 +238,11 @@ await_js 'return document.querySelector("#trace-completed:not([hidden]) tbody tr
 
 control phase 6
 select_tab "Cache hits"
+await_js 'return [...document.querySelectorAll("#duplicate-misses strong")].map(x=>x.textContent).join(",")==="14,11,26"'
+js 'window.duplicateCounter=document.querySelector("#duplicate-misses strong"); return true' >/dev/null
+control phase 7
+await_js 'return duplicateCounter===document.querySelector("#duplicate-misses strong") && [...document.querySelectorAll("#duplicate-misses strong")].map(x=>x.textContent).join(",")==="15,12,27"'
+control phase 6
 await_js 'return document.querySelector("#admission")?.innerText.includes("80.0%") && document.querySelectorAll("#metrics article").length===20 && [...document.querySelectorAll("#metrics article")].some(a=>a.querySelector("h3").textContent==="Cache hit rate (rolling)"&&a.innerText.includes("80.0%"))'
 await_js 'return [...document.querySelectorAll("#metrics select")[1].options].some(o=>o.value==="fixture-client")'
 js 'const e=document.querySelectorAll("#metrics select")[1]; e.value="fixture-client"; e.dispatchEvent(new Event("change",{bubbles:true})); return true' >/dev/null

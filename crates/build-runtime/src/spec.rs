@@ -156,16 +156,11 @@ impl ExecutionRoot {
 
 /// Compiler-front-end identity of a reusable result.
 ///
-/// The authenticated client supplies the compiler's semantic input digest; the exact execution plan
-/// remains independently verified. The packaged toolchain is also an input
-/// because an identical driver may load different auxiliary programs/libraries.
+/// The frontend owns semantic identity. The independently verified execution
+/// declaration describes delivery and sandbox construction, not result reuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompilerResultIdentity {
     pub semantic: ContentId,
-    pub toolchain: TreeId,
-    /// Additional compiler-visible inputs not covered by the front-end digest.
-    pub input_closure: Option<TreeId>,
-    pub environment: ContentId,
 }
 
 /// All declared inputs to a Linux native build.
@@ -178,6 +173,11 @@ pub struct CompilerResultIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionSpec {
     pub compiler_result: Option<CompilerResultIdentity>,
+    /// Root-relative destinations of recipe layers whose files belong to this
+    /// action's generated output tree. Other input files remain immutable.
+    pub working_inputs: BTreeSet<TreePath>,
+    /// Existing directories made privately writable but never captured as results.
+    pub scratch: BTreeSet<BuildPath>,
     pub platform: ContentId,
     pub root: ExecutionRoot,
     pub mounts: BTreeMap<BuildPath, TreeId>,
@@ -210,6 +210,20 @@ impl ExecutionSpec {
                 "overlapping build mounts"
             );
         }
+        for path in &self.scratch {
+            path.validate()?;
+            ensure!(
+                path.as_bytes() != b"/"
+                    && ![b"/proc".as_slice(), b"/dev"]
+                        .iter().any(|reserved| path.within(reserved))
+                    && !self.mounts.keys().any(|mount| path.within(mount.as_bytes()) || mount.within(path.as_bytes())),
+                "scratch directory conflicts with reserved or mounted path"
+            );
+        }
+        ensure!(
+            self.scratch.is_empty() || self.compiler_result.is_none(),
+            "private scratch requires exact action identity"
+        );
         let mut paths = BTreeSet::new();
         for (name, output) in &self.outputs {
             ensure!(
@@ -239,6 +253,53 @@ impl ExecutionSpec {
                 ensure!(!paths.contains(&path[..index]), "overlapping output paths");
             }
         }
+        if !self.working_inputs.is_empty() {
+            ensure!(
+                self.compiler_result.is_none(),
+                "working inputs require exact action identity"
+            );
+            for path in &self.working_inputs {
+                let mut absolute = vec![b'/'];
+                absolute.extend_from_slice(path.as_bytes());
+                let absolute = BuildPath::new(absolute)?;
+                ensure!(
+                    self.root
+                        .recipe
+                        .layers
+                        .iter()
+                        .filter(|layer| layer.destination.as_ref() == Some(path))
+                        .count()
+                        == 1,
+                    "working input must name exactly one root recipe layer"
+                );
+                ensure!(
+                    self.outputs
+                        .values()
+                        .any(|output| output.kind == OutputKind::GeneratedTree
+                            && absolute.within(output.path.as_bytes()))
+                        || self
+                            .scratch
+                            .iter()
+                            .any(|path| absolute.within(path.as_bytes())),
+                    "working input must lie in a generated output tree or private scratch"
+                );
+                ensure!(
+                    !self
+                        .mounts
+                        .keys()
+                        .any(|mount| absolute.within(mount.as_bytes())
+                            || mount.within(absolute.as_bytes())),
+                    "working input conflicts with a mounted tree"
+                );
+            }
+            ensure!(
+                self.root.recipe.layers.iter().any(|layer| !layer
+                    .destination
+                    .as_ref()
+                    .is_some_and(|path| self.working_inputs.contains(path))),
+                "working inputs require an immutable root"
+            );
+        }
         Ok(())
     }
 
@@ -250,6 +311,30 @@ impl ExecutionSpec {
         self.validate()?;
         let mut components = self.command.input_components()?;
         components.insert("platform".into(), self.platform);
+        if !self.scratch.is_empty() {
+            components.insert(
+                "output/private-scratch".into(),
+                ContentId(typed_digest(b"native-private-scratch-v1\0", &self.scratch)?),
+            );
+        }
+        if !self.working_inputs.is_empty() {
+            let layers = self
+                .working_inputs
+                .iter()
+                .map(|path| {
+                    self.root
+                        .recipe
+                        .layers
+                        .iter()
+                        .find(|layer| layer.destination.as_ref() == Some(path))
+                        .ok_or_else(|| anyhow::anyhow!("missing working layer"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            components.insert(
+                "output/working-inputs".into(),
+                ContentId(typed_digest(b"native-working-inputs-v1\0", &layers)?),
+            );
+        }
         let mut trees: BTreeSet<_> = self
             .root
             .recipe
@@ -278,22 +363,9 @@ impl ExecutionSpec {
             }
         }
         let result_fingerprint = self.compiler_result.map(|identity| {
-            let mut components = BTreeMap::from([
-                ("compiler/semantic".into(), identity.semantic),
-                ("compiler/toolchain".into(), ContentId(identity.toolchain.0)),
-                ("compiler/environment".into(), identity.environment),
-                ("platform".into(), self.platform),
-                (
-                    "command/umask".into(),
-                    ContentId::of(&self.command.umask.to_le_bytes()),
-                ),
-            ]);
-            if let Some(tree) = identity.input_closure {
-                components.insert("compiler/input-closure".into(), ContentId(tree.0));
-            }
-            // Generated trees may contain embedded paths (e.g. Rust rlink).
-            // Preserve their logical output root even when file output names
-            // are relocatable according to the compiler frontend.
+            let mut components = BTreeMap::from([("compiler/semantic".into(), identity.semantic)]);
+            // A generated tree is not an independent relocatable file:
+            // rustc's rlink contains logical paths to its generated objects.
             for (name, output) in &self.outputs {
                 if output.kind == OutputKind::GeneratedTree {
                     components.insert(
@@ -303,24 +375,10 @@ impl ExecutionSpec {
                 }
             }
             ActionFingerprint {
-                schema: "native-compiler-result-v1".into(),
+                schema: "native-compiler-result-v2".into(),
                 components,
             }
         });
-        if let Some(identity) = self.compiler_result {
-            ensure!(
-                self.mounts.is_empty(),
-                "compiler identity does not describe additional mounts"
-            );
-            ensure!(
-                self.root
-                    .recipe
-                    .layers
-                    .iter()
-                    .any(|layer| layer.tree == identity.toolchain),
-                "compiler result identity references an undeclared toolchain"
-            );
-        }
         Ok(ActionRequest {
             result_fingerprint,
             fingerprint: ActionFingerprint {
@@ -344,6 +402,8 @@ mod tests {
     fn spec() -> Result<ExecutionSpec> {
         Ok(ExecutionSpec {
             compiler_result: None,
+            working_inputs: Default::default(),
+            scratch: Default::default(),
             platform: ContentId::of(b"platform"),
             root: ExecutionRoot {
                 id: TreeId([1; 32]),
@@ -375,6 +435,29 @@ mod tests {
                 },
             )]),
         })
+    }
+
+    #[test]
+    fn private_scratch_is_keyed_and_not_an_output() -> Result<()> {
+        let base = spec()?;
+        let mut scratch = base.clone();
+        scratch
+            .scratch
+            .insert(BuildPath::new(b"/tmp/build".to_vec())?);
+        let request = scratch.action_request()?;
+        assert_eq!(
+            request.required_outputs,
+            base.action_request()?.required_outputs
+        );
+        assert_ne!(
+            request.action_fingerprint()?.key()?,
+            base.action_request()?.action_fingerprint()?.key()?
+        );
+        scratch
+            .scratch
+            .insert(BuildPath::new(b"/src/nested".to_vec())?);
+        assert!(scratch.validate().is_err());
+        Ok(())
     }
 
     #[test]
@@ -437,12 +520,8 @@ mod tests {
     fn compiler_result_identity_is_independent_of_exact_execution() -> Result<()> {
         let mut original = spec()?;
         original.mounts.clear();
-        let toolchain = original.root.recipe.layers[0].tree;
         let identity = CompilerResultIdentity {
             semantic: ContentId::of(b"compiler semantic inputs"),
-            toolchain,
-            input_closure: Some(TreeId([8; 32])),
-            environment: ContentId::of(b"compiler environment"),
         };
         original.compiler_result = Some(identity);
         let request = original.action_request()?;
@@ -453,46 +532,55 @@ mod tests {
             .environment
             .insert(b"CI_RUN_ID".to_vec(), b"new".to_vec());
         changed.command.cwd = BuildPath::new(b"/different-checkout".to_vec())?;
+        changed.command.umask = 0o077;
+        changed.platform = ContentId::of(b"different execution platform");
         changed.root.id = TreeId([9; 32]);
+        changed.root.recipe.layers[0].tree = TreeId([12; 32]);
+        changed
+            .outputs
+            .get_mut("object")
+            .context("test output")?
+            .path = BuildPath::new(b"/different/output".to_vec())?;
         let changed_request = changed.action_request()?;
         assert_ne!(request, changed_request);
         assert_eq!(key, changed_request.action_fingerprint()?.key()?);
-
-        for different in [
-            CompilerResultIdentity {
-                semantic: ContentId::of(b"changed input"),
-                ..identity
-            },
-            CompilerResultIdentity {
-                input_closure: Some(TreeId([10; 32])),
-                ..identity
-            },
-            CompilerResultIdentity {
-                environment: ContentId::of(b"changed compiler environment"),
-                ..identity
-            },
-        ] {
-            changed.compiler_result = Some(different);
-            assert_ne!(key, changed.action_request()?.action_fingerprint()?.key()?);
-        }
+        assert_eq!(
+            request
+                .action_fingerprint()?
+                .components
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["compiler/semantic", "native/output-contract"]
+        );
+        // A generated tree may embed its logical output directory.
+        let mut generated = original.clone();
+        generated
+            .outputs
+            .get_mut("object")
+            .context("test output")?
+            .kind = OutputKind::GeneratedTree;
+        let generated_key = generated.action_request()?.action_fingerprint()?.key()?;
+        generated
+            .outputs
+            .get_mut("object")
+            .context("test output")?
+            .path = BuildPath::new(b"/different/generated".to_vec())?;
+        assert_ne!(
+            generated_key,
+            generated.action_request()?.action_fingerprint()?.key()?
+        );
+        changed.compiler_result = Some(CompilerResultIdentity {
+            semantic: ContentId::of(b"changed input"),
+        });
+        assert_ne!(key, changed.action_request()?.action_fingerprint()?.key()?);
         changed.compiler_result = Some(identity);
-        changed.command.umask = 0o077;
-        assert_ne!(key, changed.action_request()?.action_fingerprint()?.key()?);
-        changed.command.umask = original.command.umask;
-        changed.platform = ContentId::of(b"changed platform");
-        assert_ne!(key, changed.action_request()?.action_fingerprint()?.key()?);
-        changed.platform = original.platform;
         changed
             .outputs
             .get_mut("object")
             .context("test output")?
             .required = false;
         assert_ne!(key, changed.action_request()?.action_fingerprint()?.key()?);
-        changed.compiler_result = Some(CompilerResultIdentity {
-            toolchain: TreeId([12; 32]),
-            ..identity
-        });
-        assert!(changed.action_request().is_err());
         Ok(())
     }
 

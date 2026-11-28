@@ -92,7 +92,8 @@ impl PartialEq for ReferenceBlobProvider {
 }
 impl Eq for ReferenceBlobProvider {}
 
-/// A descriptor-based resolver for explicitly authorized immutable references.
+/// An identity-only descriptor resolver for explicitly authorized immutable
+/// references. The descriptor pins the inode but cannot be used to read bytes.
 /// Returning None selects ordinary verified file capture.
 pub type ReferenceResolver<'a> =
     dyn Fn(&File, &Path) -> Result<Option<(BlobRef, ReferenceBlobProvider)>> + 'a;
@@ -295,7 +296,13 @@ impl MappedTree {
                     path,
                     metadata: policy,
                 } => {
-                    let (file, stat) = open_source(&path)?;
+                    let (file, stat) = if resolver.is_some() {
+                        let file = open_input_descriptor(&path, false)?;
+                        let stat = regular_source_stat(&file)?;
+                        (file, stat)
+                    } else {
+                        open_source(&path)?
+                    };
                     let reference = resolver.map_or(Ok(None), |resolve| resolve(&file, &path))?;
                     let blob = if let Some((blob, provider)) = &reference {
                         ensure!(
@@ -306,6 +313,13 @@ impl MappedTree {
                         add_reference(&mut references, *blob, provider.clone())?;
                         *blob
                     } else {
+                        let file = if resolver.is_some() {
+                            let data = open_input_data(&file)?;
+                            unchanged(&stat, &fstat(&data)?)?;
+                            data
+                        } else {
+                            file
+                        };
                         match cache {
                             Some(cache) => cache.digest(&path, &file, &stat)?,
                             None => hash_open_source(&file, &stat)?,
@@ -345,9 +359,9 @@ impl MappedTree {
         let id = manifest.id()?;
         Ok(PreparedTree {
             id,
-            manifest,
-            sources,
-            references,
+            manifest: Arc::new(manifest),
+            sources: Arc::new(sources),
+            references: Arc::new(references),
         })
     }
 }
@@ -387,6 +401,43 @@ fn mapped_file_metadata(stat: &Stat, policy: MappedMetadata) -> Result<TreeMetad
     })
 }
 
+fn regular_source_stat(file: &File) -> Result<Stat> {
+    let stat = fstat(file)?;
+    ensure!(
+        FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile,
+        "capture source is not a regular file"
+    );
+    Ok(stat)
+}
+
+/// Pin a regular input inode for reference discovery without opening its data.
+/// # Errors
+/// Returns an error for an inaccessible path or a non-regular file.
+pub fn open_input_descriptor(path: &Path, follow_symlinks: bool) -> Result<File> {
+    let mut flags = OFlags::PATH | OFlags::CLOEXEC;
+    if !follow_symlinks {
+        flags |= OFlags::NOFOLLOW;
+    }
+    let file = File::from(openat(CWD, path, flags, Mode::empty())?);
+    regular_source_stat(&file)?;
+    Ok(file)
+}
+
+/// Open the bytes of a previously pinned regular inode, not its original path.
+/// # Errors
+/// Returns an error for inaccessible data or a changed inode.
+pub fn open_input_data(identity: &File) -> Result<File> {
+    let before = regular_source_stat(identity)?;
+    let file = File::from(openat(
+        CWD,
+        crate::source::descriptor_path(identity),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?);
+    unchanged(&before, &regular_source_stat(&file)?)?;
+    Ok(file)
+}
+
 fn open_source(path: &Path) -> Result<(File, Stat)> {
     let file = File::from(openat(
         CWD,
@@ -394,11 +445,7 @@ fn open_source(path: &Path) -> Result<(File, Stat)> {
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )?);
-    let stat = fstat(&file)?;
-    ensure!(
-        FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile,
-        "capture source is not a regular file"
-    );
+    let stat = regular_source_stat(&file)?;
     Ok((file, stat))
 }
 
@@ -415,6 +462,7 @@ fn hash_open_source(file: &File, stat: &Stat) -> Result<BlobRef> {
     })
 }
 
+#[derive(Clone)]
 struct PreparedFile {
     path: PathBuf,
     stat: Stat,
@@ -428,6 +476,7 @@ impl PreparedFile {
     }
 }
 
+#[derive(Clone)]
 enum PreparedSource {
     File {
         primary: PreparedFile,
@@ -438,11 +487,12 @@ enum PreparedSource {
 
 /// A validated mapped manifest and direct readers for its unique content.
 /// No local CAS, temporary archive, or persistent staging is needed.
+#[derive(Clone)]
 pub struct PreparedTree {
     id: TreeId,
-    manifest: TreeManifest,
-    sources: BTreeMap<ContentId, PreparedSource>,
-    references: References,
+    manifest: Arc<TreeManifest>,
+    sources: Arc<BTreeMap<ContentId, PreparedSource>>,
+    references: Arc<References>,
 }
 
 impl PreparedTree {
@@ -461,9 +511,9 @@ impl PreparedTree {
             .collect();
         Ok(Self {
             id,
-            manifest,
-            sources: BTreeMap::new(),
-            references,
+            manifest: Arc::new(manifest),
+            sources: Arc::new(BTreeMap::new()),
+            references: Arc::new(references),
         })
     }
 
@@ -473,8 +523,67 @@ impl PreparedTree {
     }
 
     #[must_use = "the manifest describes the selected build inputs"]
-    pub const fn manifest(&self) -> &TreeManifest {
+    pub fn manifest(&self) -> &TreeManifest {
         &self.manifest
+    }
+
+    /// Select only the requested paths and their directory ancestors without
+    /// reopening any content. Selected hardlinks retain their inode topology;
+    /// a hardlink whose original file is not selected becomes a regular file
+    /// backed by the same blob. No unselected content is exposed by the result.
+    ///
+    /// # Errors
+    /// Returns an error for an undeclared path or invalid projected topology.
+    pub fn select_paths(&self, paths: impl IntoIterator<Item = TreePath>) -> Result<Self> {
+        let mut selected = BTreeSet::new();
+        for path in paths {
+            let mut current = Some(path);
+            while let Some(path) = current {
+                ensure!(
+                    self.manifest.entries.contains_key(&path),
+                    "selected input path is not declared: {path:?}"
+                );
+                current = path.parent();
+                if !selected.insert(path) {
+                    break;
+                }
+            }
+        }
+        let mapping = selected.iter().map(|path| (path, path.clone())).collect();
+        let mut manifest = TreeManifest {
+            root: self.manifest.root,
+            entries: BTreeMap::new(),
+        };
+        crate::recipe::project_entries(&self.manifest, &mapping, &mut manifest)?;
+        // Projection does not normalize existing directory metadata. Unlike
+        // a recipe union, this is a selection of one original tree.
+        for path in &selected {
+            if let Some(TreeEntry::Directory(metadata)) = self.manifest.entries.get(path) {
+                manifest
+                    .entries
+                    .insert(path.clone(), TreeEntry::Directory(*metadata));
+            }
+        }
+        let id = manifest.id()?;
+        let blobs = manifest.blobs()?;
+        let sources = self
+            .sources
+            .iter()
+            .filter(|(id, _)| blobs.contains_key(id))
+            .map(|(id, source)| (*id, source.clone()))
+            .collect();
+        let references = self
+            .references
+            .iter()
+            .filter(|(id, _)| blobs.contains_key(id))
+            .map(|(id, source)| (*id, source.clone()))
+            .collect();
+        Ok(Self {
+            id,
+            manifest: Arc::new(manifest),
+            sources: Arc::new(sources),
+            references: Arc::new(references),
+        })
     }
 
     /// Reopen only an advertised source blob. The receiver must verify the
@@ -550,6 +659,102 @@ mod tests {
         io::Read,
         os::unix::fs::{PermissionsExt, symlink},
     };
+
+    #[test]
+    fn input_descriptor_keeps_identity_after_path_replacement() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("input");
+        fs::write(&path, b"original")?;
+        let identity = open_input_descriptor(&path, false)?;
+        fs::rename(&path, dir.path().join("old"))?;
+        fs::write(&path, b"replacement")?;
+        let mut contents = Vec::new();
+        open_input_data(&identity)?.read_to_end(&mut contents)?;
+        assert_eq!(contents, b"original");
+        let alias = dir.path().join("alias");
+        symlink(&path, &alias)?;
+        assert!(open_input_descriptor(&alias, false).is_err());
+        let identity = open_input_descriptor(&alias, true)?;
+        assert_eq!(
+            hash_descriptor(&open_input_data(&identity)?)?.id,
+            ContentId::of(b"replacement")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_tree_retains_only_selected_content_and_ancestors() -> Result<()> {
+        let metadata = TreeMetadata {
+            mode: 0o755,
+            modified: TreeTimestamp {
+                seconds: 123,
+                nanoseconds: 0,
+            },
+        };
+        let mut mapping = MappedTree::new(metadata);
+        let selected = TreePath::new(b"lib/needed.a".to_vec())?;
+        let other = TreePath::new(b"lib/other.a".to_vec())?;
+        mapping.add_bytes(selected.clone(), b"needed".to_vec(), metadata)?;
+        mapping.add_bytes(other, b"unrelated".to_vec(), metadata)?;
+        let prepared = mapping.prepare()?;
+        let projected = prepared.select_paths([selected.clone()])?;
+        assert_ne!(projected.id(), prepared.id());
+        assert_eq!(projected.manifest().entries.len(), 2);
+        assert!(projected.manifest().entries.contains_key(&selected));
+        assert!(projected.manifest().entries.contains_key(b"lib".as_slice()));
+        assert!(projected.open_blob(ContentId::of(b"unrelated")).is_err());
+        let mut bytes = Vec::new();
+        projected
+            .open_blob(ContentId::of(b"needed"))?
+            .read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"needed");
+        assert!(
+            prepared
+                .select_paths([TreePath::new(b"missing".to_vec())?])
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_reference_tree_rehomes_hardlinks_without_opening_blobs() -> Result<()> {
+        let metadata = TreeMetadata {
+            mode: 0o755,
+            modified: TreeTimestamp {
+                seconds: 123,
+                nanoseconds: 0,
+            },
+        };
+        let blob = BlobRef {
+            id: ContentId::of(b"leased"),
+            size: 6,
+        };
+        let original = TreePath::new(b"original".to_vec())?;
+        let alias = TreePath::new(b"alias".to_vec())?;
+        let second = TreePath::new(b"second".to_vec())?;
+        let manifest = TreeManifest {
+            root: metadata,
+            entries: BTreeMap::from([
+                (original.clone(), TreeEntry::File { blob, metadata }),
+                (alias.clone(), TreeEntry::Hardlink(original.clone())),
+                (second.clone(), TreeEntry::Hardlink(original.clone())),
+            ]),
+        };
+        let provider =
+            ReferenceBlobProvider::new(|_| anyhow::bail!("projection must not open blobs"));
+        let prepared = PreparedTree::from_references(manifest, &provider)?;
+        let projected = prepared.select_paths([alias.clone(), second.clone()])?;
+        assert_eq!(
+            projected.manifest().entries[&alias],
+            TreeEntry::File { blob, metadata }
+        );
+        assert_eq!(
+            projected.manifest().entries[&second],
+            TreeEntry::Hardlink(alias)
+        );
+        assert!(!projected.manifest().entries.contains_key(&original));
+        Ok(())
+    }
 
     #[test]
     fn mapped_paths_normalize_metadata_and_deduplicate_content() -> Result<()> {

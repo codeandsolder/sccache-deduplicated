@@ -23,6 +23,6 @@ jobs:
         [
           {"name":"workspace","allow-test-panics":true},
           {"name":"cpu-target-profile","directory":"tools/cpu-target-profile"},
-          {"name":"dashboard-ssr","cargo":["--locked","-p","sccache","-p","sccache-dashboard","--no-default-features","--features","sccache/s3,sccache/gha,sccache/dist-client,sccache/dist-server,sccache/direct-metrics,sccache/scheduler-dashboard,sccache-dashboard/ssr","--lib","--bins","--examples"],"allow-test-panics":true},
+          {"name":"dashboard-ssr","cargo":["--locked","-p","sccache","-p","sccache-dashboard","--no-default-features","--features","sccache/dist-client,sccache/dist-server,sccache/direct-metrics,sccache/scheduler-dashboard,sccache-dashboard/ssr","--lib","--bins","--examples"],"allow-test-panics":true},
           {"name":"dashboard-wasm","cargo":["--locked","-p","sccache-dashboard","--no-default-features","--features","hydrate","--target","wasm32-unknown-unknown","--lib"]}
         ]

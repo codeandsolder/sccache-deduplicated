@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cache::{IpcStorage, storage_from_config};
+use crate::cache::IpcStorage;
 use crate::client::{ServerConnection, connect_to_server, connect_with_retry};
 use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::ColorMode;
-use crate::config::{Config, default_disk_cache_dir};
+use crate::config::Config;
 use crate::jobserver::Client;
-use crate::lru_disk_cache::CACHEDIR_TAG_FILE_NAME;
 use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
 use crate::protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
 use crate::server::{self, DistInfo, ServerInfo, ServerStartup, ServerStats};
@@ -37,15 +36,12 @@ use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
-#[cfg(feature = "dist-client")]
-use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 use strip_ansi_escapes::Writer;
 use tokio::io::AsyncReadExt;
 use tokio::runtime::{Builder, Runtime};
-use walkdir::WalkDir;
 use which::which_in;
 
 use crate::errors::{Context, Result, anyhow, bail};
@@ -568,19 +564,19 @@ fn handle_compile_finished(
     }
 
     trace!("handle_compile_finished");
-    if let Some(report) = response.native {
+    for report in &response.native {
         use crate::protocol::NativeBuildSource;
         let source = match report.source {
             NativeBuildSource::Hit => "hit",
-            NativeBuildSource::Local => "local",
             NativeBuildSource::Worker(_) => "worker",
         };
         let mode = match report.mode {
             crate::build_runtime::ActionMode::Reuse => "reuse",
             crate::build_runtime::ActionMode::Refresh => "refresh",
         };
-        log::info!(target: "sccache::native_action", "native_action {} {source} {mode}",
-            blake3::Hash::from_bytes(report.key.0).to_hex());
+        log::info!(target: "sccache::native_action", "native_action {} {source} {mode} {:?} {}",
+            blake3::Hash::from_bytes(report.key.0).to_hex(), report.stage,
+            if report.successful { "success" } else { "failed" });
     }
     // It might be nice if the server sent stdout/stderr as the process
     // ran, but then it would have to also save them in the cache as
@@ -629,7 +625,7 @@ pub struct CompileInvocation<'a> {
 ///
 /// If the server returned `CompileStarted`, read its terminal result.
 /// An ambiguous disconnect must not launch another compiler against the
-/// same outputs. Only an explicit unhandled response permits local execution.
+/// same outputs. Only a verified compiler query permits local execution.
 fn handle_compile_response<T>(
     creator: T,
     runtime: &Runtime,
@@ -705,12 +701,15 @@ where
             );
             bail!("Compiler not supported: {}", crate::util::debug_display(&s));
         }
-        CompileResponse::UnhandledCompile => {
-            debug!("Server sent UnhandledCompile");
+        CompileResponse::RejectedCompilation(reason) => {
+            bail!("Remote compilation rejected: {reason}")
+        }
+        CompileResponse::CompilerQuery => {
+            debug!("Server accepted compiler query");
         }
     }
 
-    // Only an explicit UnhandledCompile reaches this point. Preserve the
+    // Only a verified compiler query reaches this point. Preserve the
     // original path and environment rather than inventing a canonical layout.
     let mut cmd = creator.new_command_sync(invocation.exe);
     cmd.args(&invocation.cmdline)
@@ -721,7 +720,7 @@ where
         trace!("running command: {cmd:?}");
     }
 
-    server::activity::phase(server::activity::Phase::LocalCompile);
+    server::activity::phase(server::activity::Phase::CompilerQuery);
     let status = cmd
         .spawn()
         .await?
@@ -784,8 +783,8 @@ where
 /// Run a compile in client-side mode: the compile pipeline executes in this
 /// process, and only cache I/O is forwarded to the daemon via `conn`.
 ///
-/// Shares `resolve_compile_result` with the daemon-IPC path so local-fallback
-/// execution is not duplicated.
+/// Shares `resolve_compile_result` with the daemon-IPC path so compiler query
+/// execution has a single policy.
 pub fn do_compile_client_side<C>(
     jobserver: &Client,
     runtime: &Runtime,
@@ -875,41 +874,13 @@ fn cancel_compile(id: String) -> Result<()> {
     Ok(())
 }
 
-fn show_stats(config: &Config, fmt: StatsFormat, advanced: bool) -> Result<()> {
+fn show_stats(_config: &Config, fmt: StatsFormat, advanced: bool) -> Result<()> {
     trace!("Command::ShowStats({fmt:?})");
-    let stats = match connect_to_server(&get_addr()) {
-        Ok(srv) => request_stats(srv).context("failed to get stats from server")?,
-        Err(error) if !auto_start_server_enabled() => {
-            return Err(error).context("managed sccache endpoint is unavailable");
-        }
-        Err(_) => {
-            let runtime = new_client_runtime()?;
-            let storage = storage_from_config(config, runtime.handle()).ok();
-            runtime.block_on(ServerInfo::new(ServerStats::default(), storage.as_deref()))?
-        }
-    };
+    let stats =
+        request_stats(connect_to_server(&get_addr()).context("native daemon unavailable")?)?;
     match fmt {
         StatsFormat::Text => stats.print(advanced),
         StatsFormat::Json => serde_json::to_writer(&mut io::stdout(), &stats)?,
-    }
-    Ok(())
-}
-
-fn debug_preprocessor_cache_entries() -> Result<()> {
-    trace!("Command::DebugPreprocessorCacheEntries");
-    let entries_dir = default_disk_cache_dir().join("preprocessor");
-    for entry in WalkDir::new(entries_dir).sort_by_file_name() {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() || entry.file_name() == CACHEDIR_TAG_FILE_NAME {
-            continue;
-        }
-        println!("=========================");
-        println!("Showing preprocessor entry file {}", path.display());
-        let contents = std::fs::read(path)?;
-        let entry = crate::compiler::PreprocessorCacheEntry::read(&contents)?;
-        println!("{entry:#?}");
-        println!("=========================");
     }
     Ok(())
 }
@@ -998,35 +969,6 @@ fn show_dist_status(startup_timeout: Option<Duration>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "dist-client")]
-fn package_toolchain(executable: PathBuf, out: PathBuf) -> Result<()> {
-    use crate::compiler;
-
-    trace!("Command::PackageToolchain({})", executable.display());
-    let runtime = new_client_runtime()?;
-    let jobserver = Client::new();
-    let creator = ProcessCommandCreator::new(&jobserver);
-    let args: Vec<_> = env::args_os().collect();
-    let env: Vec<_> = env::vars_os().collect();
-    let out_file = File::create(out)?;
-    let cwd = env::current_dir().context("failed to determine current directory")?;
-    let pool = runtime.handle().clone();
-    runtime.block_on(async move {
-        compiler::get_compiler_info(
-            creator,
-            &executable,
-            &cwd,
-            &args,
-            &env,
-            &pool,
-            compiler::CompilerDiscovery::default(),
-        )
-        .await
-        .map(|compiler| compiler.0.get_toolchain_packager())
-        .and_then(|packager| packager.write_pkg(out_file))
-    })
-}
-
 fn run_compile_command(
     config: &Config,
     startup_timeout: Option<Duration>,
@@ -1110,7 +1052,6 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         Command::ShowStats(fmt, advanced) => show_stats(config, fmt, advanced)?,
         Command::ActiveCompiles => show_active_compiles()?,
         Command::CancelCompile(id) => cancel_compile(id)?,
-        Command::DebugPreprocessorCacheEntries => debug_preprocessor_cache_entries()?,
         Command::InternalStartServer => start_internal_server(config)?,
         Command::StartServer => start_server_command(startup_timeout)?,
         Command::StopServer => {
@@ -1133,12 +1074,6 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             "Distributed compilation not compiled in, please rebuild with the dist-client feature"
         ),
         Command::DistStatus => show_dist_status(startup_timeout)?,
-        #[cfg(feature = "dist-client")]
-        Command::PackageToolchain(executable, out) => package_toolchain(executable, out)?,
-        #[cfg(not(feature = "dist-client"))]
-        Command::PackageToolchain(_executable, _out) => bail!(
-            "Toolchain packaging not compiled in, please rebuild with the dist-client feature"
-        ),
         Command::Compile {
             exe,
             cmdline,
@@ -1163,7 +1098,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
 mod test {
     use super::*;
     use crate::jobserver::Client;
-    use crate::mock_command::{CommandCreator, MockChild, MockCommandCreator, exit_status};
+    use crate::mock_command::{CommandCreator, MockCommandCreator};
     use crate::net::Connection;
     use std::sync::{Arc, Mutex};
 
@@ -1253,60 +1188,23 @@ mod test {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn test_unhandled_rust_compile_falls_back_with_physical_arguments() -> Result<()> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
+    fn test_rejected_compilation_never_starts_local_compiler() -> Result<()> {
+        let runtime = make_runtime();
         let client = Client::new_num(1);
         let creator = Arc::new(Mutex::new(MockCommandCreator::new(&client)));
-        let cmdline = vec![
-            OsString::from("--crate-name"),
-            OsString::from("build_script_build"),
-            OsString::from("build.rs"),
-            OsString::from("--emit=dep-info,link"),
-        ];
-        let expected = cmdline.clone();
-
-        creator
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .next_command_calls(move |args| {
-                assert_eq!(args, expected.as_slice());
-                Ok(MockChild::new(exit_status(0), "", ""))
-            });
-
         let invocation = CompileInvocation {
             exe: Path::new("/rust/bin/rustc"),
-            cmdline,
+            cmdline: vec!["build.rs".into(), "--emit=link".into()],
             cwd: Path::new("/work/project"),
-            env_vars: vec![
-                (
-                    OsString::from("SCCACHE_EXPERIMENTAL_CANONICAL_RUST"),
-                    OsString::from("1"),
-                ),
-                (
-                    OsString::from("SCCACHE_CANONICAL_BUILD_ROOT"),
-                    OsString::from("/work/project"),
-                ),
-                (
-                    OsString::from("SCCACHE_CANONICAL_TARGET_ROOT"),
-                    OsString::from("/work/project/target"),
-                ),
-            ],
+            env_vars: vec![],
         };
-        let mut stdout = vec![];
-        let mut stderr = vec![];
-
-        let code = runtime
-            .block_on(resolve_compile_result(
-                creator,
-                CompileResponse::UnhandledCompile,
-                None,
-                &invocation,
-            ))?
-            .finish(&mut stdout, &mut stderr)?;
-
-        assert_eq!(code, 0);
+        let result = runtime.block_on(resolve_compile_result(
+            creator,
+            CompileResponse::RejectedCompilation("unsupported invocation".into()),
+            None,
+            &invocation,
+        ));
+        assert!(result.is_err());
         Ok(())
     }
 

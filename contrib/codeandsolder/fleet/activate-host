@@ -37,7 +37,8 @@ fi
 guard="$stage/updaters-paused"
 client_guard=/etc/systemd/system/sccache-fleet-rollout-drain
 guard_name=zz-sccache-fleet-rollout-guard.conf
-units=("${clients[@]}" "${workers[@]}" "${scheduler[@]}" "${timers[@]}" "$watchdog_timer")
+profile_socket=sccache-runtime-profile.socket
+units=("${clients[@]}" "${workers[@]}" "${scheduler[@]}" "${timers[@]}" "$watchdog_timer" "$profile_socket")
 exec 9>"$stage/activation.lock"
 flock -x 9
 active_before() { rg -xq -- "$1" "$rollback/active-units"; }
@@ -128,6 +129,28 @@ install_atomic() {
   install -o "$owner" -g "$group" -m "$mode" "$from" "$tmp"
   mv -Tf -- "$tmp" "$to"
 }
+verify_index_location() {
+  local store="$1" index="$2"
+  if [[ -e "$store/index.redb" || -L "$store/index.redb" ]]; then
+    printf 'Relocate the stopped store index before activation: %s -> %s\n' "$store" "$index" >&2
+    return 1
+  fi
+  if [[ -d "$store" && -n $(find "$store" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+    [[ -f "$index/index.redb" && ! -L "$index/index.redb" ]] || {
+      printf 'Existing CAS requires its relocated index: %s\n' "$index" >&2
+      return 1
+    }
+  fi
+  # Resolve the filesystem of the nearest existing parent for new stores.
+  # Creating a directory cannot move it to another capacity domain.
+  local store_parent="$store" index_parent="$index"
+  while [[ ! -d "$store_parent" ]]; do store_parent=$(dirname -- "$store_parent"); done
+  while [[ ! -d "$index_parent" ]]; do index_parent=$(dirname -- "$index_parent"); done
+  [[ $(stat -c %d "$store_parent") != $(stat -c %d "$index_parent") ]] || {
+    printf 'CAS and index must occupy different capacity domains: %s %s\n' "$store" "$index" >&2
+    return 1
+  }
+}
 assert_stopped() {
   local u state
   for u in "${clients[@]}" "${workers[@]}" "${scheduler[@]}"; do
@@ -190,8 +213,12 @@ case "$phase" in
     [[ ! -f scheduler.conf ]] || files+=(/etc/sccache-dist/scheduler.conf "$dashboard_link")
     [[ ! -f 90-real-binary.conf ]] || files+=(/etc/systemd/system/sccache-strict-local.service.d/90-real-binary.conf)
     [[ ! -f cargo-wrapper ]] || files+=(/usr/local/bin/cargo)
+    [[ ! -f runtime-run ]] || files+=(/usr/local/bin/sccache-runtime)
+    [[ ! -f runtime-profile ]] || files+=(/usr/local/bin/sccache-runtime-profile)
+    if [[ -f runtime-profile-service ]]; then
+      files+=(/usr/local/libexec/sccache-runtime-profile-service /usr/local/share/sccache-runtime/Dockerfile.profile "/etc/systemd/system/$profile_socket" /etc/systemd/system/sccache-runtime-profile@.service)
+    fi
     [[ ! -f sccache-cmake-launcher ]] || files+=(/usr/local/libexec/sccache-cmake-launcher)
-    [[ ! -f sccache-dist-client-preflight ]] || files+=(/usr/local/libexec/sccache-dist-client-preflight)
     for f in "${state_files[@]}"; do files+=("$state/$f"); done
     files+=("$state/release.json")
     for f in "${files[@]}"; do snapshot_file "$f"; done
@@ -228,6 +255,12 @@ case "$phase" in
     [[ $(cat "$rollback/release-sha") == "$sha" && -e "$drain" ]]
     assert_prepared
     assert_stopped
+    if [[ -f server.conf ]]; then
+      verify_index_location /var/cache/sccache-native/worker /var/lib/sccache-native-index/worker
+    fi
+    if [[ -f scheduler.conf ]]; then
+      verify_index_location /var/cache/sccache-native/scheduler /var/lib/sccache-native-index/scheduler
+    fi
     assert_updaters_paused
     install_atomic "$bundle/sccache" "$live" 0755
     install_atomic "$bundle/sccache-dist" "$dist" 0755
@@ -235,9 +268,16 @@ case "$phase" in
     install_atomic sccache-client /usr/local/libexec/sccache-client 0755
     install_atomic sccache-release-update /usr/local/libexec/sccache-release-update 0755
     install_atomic host-native-metadata /usr/local/libexec/host-native-metadata 0755
+    if [[ -f runtime-run ]]; then install_atomic runtime-run /usr/local/bin/sccache-runtime 0755; fi
+    if [[ -f runtime-profile-service ]]; then
+      install_atomic runtime-profile-service /usr/local/libexec/sccache-runtime-profile-service 0755
+      install_atomic runtime-profile-dockerfile /usr/local/share/sccache-runtime/Dockerfile.profile 0644
+      install_atomic runtime-profile.socket "/etc/systemd/system/$profile_socket" 0644
+      install_atomic runtime-profile@.service /etc/systemd/system/sccache-runtime-profile@.service 0644
+    fi
+    if [[ -f runtime-profile ]]; then install_atomic runtime-profile /usr/local/bin/sccache-runtime-profile 0755; fi
     if [[ -f cargo-wrapper ]]; then install_atomic cargo-wrapper /usr/local/bin/cargo 0755; fi
     if [[ -f sccache-cmake-launcher ]]; then install_atomic sccache-cmake-launcher /usr/local/libexec/sccache-cmake-launcher 0755; fi
-    if [[ -f sccache-dist-client-preflight ]]; then install_atomic sccache-dist-client-preflight /usr/local/libexec/sccache-dist-client-preflight 0755; fi
     install_atomic client-shared.toml /etc/sccache/client-shared.toml 0600
     install_atomic cluster-ca.pem /etc/sccache/cluster-ca.pem 0644
     install -d -m 0700 /var/lib/sccache-cluster/client
@@ -252,16 +292,22 @@ case "$phase" in
       install_atomic server.conf /etc/sccache-dist/server.conf 0600
       install -d -m 0755 /var/cache/sccache-native
       install -d -m 0700 /var/cache/sccache-native/worker /var/cache/sccache-native/scratch
+      install -d -m 0700 /var/lib/sccache-native-index/worker
       [[ $(stat -c %d /var/cache/sccache-native/worker) == $(stat -c %d /var/cache/sccache-native/scratch) ]]
     fi
     if [[ -f scheduler.conf ]]; then
       install_atomic scheduler.conf /etc/sccache-dist/scheduler.conf 0640 root sccache-scheduler
       /usr/local/libexec/host-native-metadata dashboard-select "$bundle" "$dashboard_link"
       runuser -u sccache-scheduler -- test -r "$dashboard_link/sccache-dashboard_bg.wasm"
-      install -d -o sccache-scheduler -g sccache-scheduler -m 0700 /var/cache/sccache-native/scheduler
+      install -d -o sccache-scheduler -g sccache-scheduler -m 0700 /var/cache/sccache-native/scheduler /var/lib/sccache-native-index/scheduler
     fi
     systemctl daemon-reload
     [[ $(systemctl show sccache-local.service -p User --value) == root ]]
+    if [[ -f runtime-profile-service ]]; then
+      systemctl enable "$profile_socket"
+      systemctl start "$profile_socket"
+      systemctl is-active --quiet "$profile_socket"
+    fi
     echo "installed $role $sha"
     ;;
   start-scheduler)
@@ -385,6 +431,10 @@ case "$phase" in
     ;;
   rollback-restore)
     assert_stopped
+    if [[ -f runtime-profile-service ]]; then
+      stop_if_active "$profile_socket"
+      if ! rg -xq "$profile_socket" "$rollback/enabled-units"; then systemctl disable "$profile_socket"; fi
+    fi
     while IFS= read -r f; do
       if [[ -e "$rollback/files$f" || -L "$rollback/files$f" ]]; then
         [[ -d "$(dirname -- "$f")" ]] || install -d -m 0755 "$(dirname -- "$f")"
@@ -395,6 +445,7 @@ case "$phase" in
     done < "$rollback/paths"
     systemctl daemon-reload
     if rg -xq sccache-local-root.service "$rollback/enabled-units"; then systemctl enable sccache-local-root.service; fi
+    if [[ -f runtime-profile-service ]]; then start_if_previous "$profile_socket"; fi
     ;;
   rollback-start-scheduler)
     start_if_previous sccache-dist-scheduler.service

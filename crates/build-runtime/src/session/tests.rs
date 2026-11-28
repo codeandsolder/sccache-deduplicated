@@ -50,7 +50,10 @@ async fn cancelled_async_commit_finishes_session_and_can_be_replayed() -> Result
 }
 
 fn service(dir: &std::path::Path) -> Result<NativeSessions> {
-    let store = NativeStore::open(dir)?;
+    service_with_store(NativeStore::open(dir)?)
+}
+
+fn service_with_store(store: NativeStore) -> Result<NativeSessions> {
     store.publish_tree(&empty_root(), vec![])?;
     NativeSessions::new(
         store,
@@ -248,6 +251,161 @@ fn result_upload_saturation_is_retryable_and_does_not_consume_admission() -> Res
     upload_encoded(&service, ticket, worker, stdout, b"stdout")?;
     upload_encoded(&service, ticket, worker, object, b"object")?;
     assert_eq!(service.commit(ticket, worker)?, output);
+    Ok(())
+}
+
+#[test]
+fn competing_results_reserve_complete_missing_closures_and_retry() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open_managed(
+        dir.path(),
+        dir.path(),
+        crate::SpacePolicy {
+            min_available_bytes: 1,
+            target_available_bytes: 1,
+            max_resident_bytes: Some(20),
+            target_resident_bytes: Some(20),
+            max_evictions_per_pass: 8,
+            gc_batch: 8,
+        },
+    )?;
+    let service = service_with_store(store)?;
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
+    let NativeAdmission::Compile { ticket: first } =
+        service.admit(None, request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("expected first compilation")
+    };
+    let mut second_request = request()?;
+    second_request
+        .fingerprint
+        .components
+        .insert("source".into(), ContentId::of(b"other"));
+    let NativeAdmission::Compile { ticket: second } = service.admit(
+        None,
+        second_request,
+        worker,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
+    else {
+        bail!("expected second compilation")
+    };
+    let mut first_manifest = manifest(b"object");
+    let stdout = BlobRef {
+        id: ContentId::of(b"stdout"),
+        size: 6,
+    };
+    first_manifest.stdout = Some(stdout);
+    let mut second_manifest = manifest(b"second");
+    let stderr = BlobRef {
+        id: ContentId::of(b"stderr"),
+        size: 6,
+    };
+    second_manifest.stderr = Some(stderr);
+    service.begin(first, worker, first_manifest.clone())?;
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(12));
+    let refused = service.begin(second, worker, second_manifest.clone());
+    assert!(matches!(refused, Err(error) if error.is::<crate::StageSpaceExhausted>()));
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(12));
+    let object = first_manifest.outputs["obj"].test_file_blob();
+    drop(service.prepare_upload(first, worker, object, BlobEncoding::Raw)?);
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(12));
+    upload_encoded(&service, first, worker, object, b"object")?;
+    upload_encoded(&service, first, worker, stdout, b"stdout")?;
+    assert_eq!(service.commit(first, worker)?, first_manifest);
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(0));
+    service.close(first, Publisher::Client)?;
+    service.store().maintain_space()?;
+    service.begin(second, worker, second_manifest.clone())?;
+    upload_encoded(
+        &service,
+        second,
+        worker,
+        second_manifest.outputs["obj"].test_file_blob(),
+        b"second",
+    )?;
+    upload_encoded(&service, second, worker, stderr, b"stderr")?;
+    assert_eq!(service.commit(second, worker)?, second_manifest);
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(0));
+    Ok(())
+}
+
+#[test]
+fn transfer_larger_than_resident_budget_is_not_retryable() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service_with_store(NativeStore::open_managed(
+        dir.path(),
+        dir.path(),
+        crate::SpacePolicy {
+            min_available_bytes: 1,
+            target_available_bytes: 1,
+            max_resident_bytes: Some(10),
+            target_resident_bytes: Some(10),
+            max_evictions_per_pass: 8,
+            gc_batch: 8,
+        },
+    )?)?;
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
+    let NativeAdmission::Compile { ticket } =
+        service.admit(None, request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("expected compilation")
+    };
+    let mut output = manifest(b"object");
+    output.stdout = Some(BlobRef {
+        id: ContentId::of(b"stdout"),
+        size: 6,
+    });
+    assert!(
+        matches!(service.begin(ticket, worker, output), Err(error) if error.is::<crate::StageSpaceTooLarge>())
+    );
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(0));
+    Ok(())
+}
+
+#[test]
+fn cancelled_transfer_retains_budget_until_active_upload_is_dropped() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service_with_store(NativeStore::open_managed(
+        dir.path(),
+        dir.path(),
+        crate::SpacePolicy {
+            min_available_bytes: 1,
+            target_available_bytes: 1,
+            max_resident_bytes: Some(12),
+            target_resident_bytes: Some(12),
+            max_evictions_per_pass: 8,
+            gc_batch: 8,
+        },
+    )?)?;
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
+    let NativeAdmission::Compile { ticket } =
+        service.admit(None, request()?, worker, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("expected compilation")
+    };
+    let output = manifest(b"object");
+    service.begin(ticket, worker, output.clone())?;
+    let upload = service.prepare_upload(
+        ticket,
+        worker,
+        output.outputs["obj"].test_file_blob(),
+        BlobEncoding::Raw,
+    )?;
+    service.close(ticket, Publisher::Client)?;
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(6));
+    drop(upload);
+    assert_eq!(service.store().space_status()?.reserved_bytes, Some(0));
     Ok(())
 }
 
@@ -454,10 +612,14 @@ fn abandoned_and_failed_sessions_release_exclusive_compilation() -> Result<()> {
 fn result_contract_and_limits_control_publication() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
     let NativeAdmission::Compile { ticket } = service.admit(
         None,
         request()?,
-        Publisher::Client,
+        worker,
         ActionMode::Reuse,
         std::collections::BTreeMap::new(),
     )?
@@ -466,16 +628,12 @@ fn result_contract_and_limits_control_publication() -> Result<()> {
     };
     let mut invalid = manifest(b"data");
     invalid.outputs.clear();
-    assert!(service.begin(ticket, Publisher::Client, invalid).is_err());
+    assert!(service.begin(ticket, worker, invalid).is_err());
     let too_large = manifest(&[0; 1025]);
-    assert!(service.begin(ticket, Publisher::Client, too_large).is_err());
+    assert!(service.begin(ticket, worker, too_large).is_err());
     let first = manifest(b"first");
-    service.begin(ticket, Publisher::Client, first)?;
-    assert!(
-        service
-            .begin(ticket, Publisher::Client, manifest(b"second"))
-            .is_err()
-    );
+    service.begin(ticket, worker, first)?;
+    assert!(service.begin(ticket, worker, manifest(b"second")).is_err());
     service.close(ticket, Publisher::Client)?;
     assert!(matches!(
         service.admit(
@@ -511,6 +669,49 @@ impl NativeSessions {
             }
         }
     }
+}
+
+#[test]
+fn unassigned_origin_cannot_execute_or_publish_an_action() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let request = request()?;
+    let NativeAdmission::Compile { ticket } = service.admit(
+        None,
+        request.clone(),
+        Publisher::Client,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
+    else {
+        bail!("expected compilation")
+    };
+    let output = manifest(b"object");
+    let blob = output.outputs["obj"].test_file_blob();
+    assert!(
+        service
+            .verify_execution(ticket, Publisher::Client, &request)
+            .is_err()
+    );
+    assert!(service.inputs_staged(ticket, Publisher::Client).is_err());
+    assert!(
+        service
+            .open_tree(
+                *request.input_trees.iter().next().context("missing tree")?,
+                Publisher::Client,
+                ticket
+            )
+            .is_err()
+    );
+    assert!(service.begin(ticket, Publisher::Client, output).is_err());
+    assert!(
+        service
+            .prepare_upload(ticket, Publisher::Client, blob, BlobEncoding::Raw)
+            .is_err()
+    );
+    assert!(service.commit(ticket, Publisher::Client).is_err());
+    service.close(ticket, Publisher::Client)?;
+    Ok(())
 }
 
 #[test]
@@ -1210,6 +1411,10 @@ fn tree_result_contract_rejects_wrong_kinds_and_duplicate_logical_overflow() -> 
     use crate::{OutputKind, TreeEntry, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
     let mut request = request()?;
     request
         .required_outputs
@@ -1217,7 +1422,7 @@ fn tree_result_contract_rejects_wrong_kinds_and_duplicate_logical_overflow() -> 
     let NativeAdmission::Compile { ticket } = service.admit(
         None,
         request.clone(),
-        Publisher::Client,
+        worker,
         ActionMode::Reuse,
         BTreeMap::new(),
     )?
@@ -1226,7 +1431,7 @@ fn tree_result_contract_rejects_wrong_kinds_and_duplicate_logical_overflow() -> 
     };
     assert!(
         service
-            .begin(ticket, Publisher::Client, manifest(b"wrong kind"))
+            .begin(ticket, worker, manifest(b"wrong kind"))
             .is_err()
     );
     let metadata = TreeMetadata {
@@ -1261,23 +1466,17 @@ fn tree_result_contract_rejects_wrong_kinds_and_duplicate_logical_overflow() -> 
     };
     assert_eq!(result.blobs()?.len(), 1);
     assert_eq!(result.logical_bytes()?, 1200);
-    assert!(
-        service
-            .begin(ticket, Publisher::Client, result.clone())
-            .is_err()
-    );
+    assert!(service.begin(ticket, worker, result.clone()).is_err());
     let Artifact::Tree(tree) = result.outputs.get_mut("obj").context("missing tree")? else {
         bail!("expected tree");
     };
     tree.entries.remove(&TreePath::new(b"two".to_vec())?);
     assert_eq!(
-        service
-            .begin(ticket, Publisher::Client, result.clone())?
-            .missing,
+        service.begin(ticket, worker, result.clone())?.missing,
         vec![blob]
     );
-    upload_encoded(&service, ticket, Publisher::Client, blob, data.as_slice())?;
-    assert_eq!(service.commit(ticket, Publisher::Client)?, result);
+    upload_encoded(&service, ticket, worker, blob, data.as_slice())?;
+    assert_eq!(service.commit(ticket, worker)?, result);
     service.close(ticket, Publisher::Client)?;
     let NativeAdmission::Hit { ticket, manifest } = service.admit(
         None,
@@ -1390,10 +1589,14 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
     let client = Publisher::Client;
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
     let NativeAdmission::Compile { ticket: first } = service.admit(
         None,
         request()?,
-        client,
+        worker,
         ActionMode::Reuse,
         std::collections::BTreeMap::new(),
     )?
@@ -1402,14 +1605,14 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
     };
     let old = manifest(b"old");
     let old_blob = old.outputs["obj"].test_file_blob();
-    service.begin(first, client, old.clone())?;
-    upload_encoded(&service, first, client, old_blob, b"old")?;
-    service.commit(first, client)?;
+    service.begin(first, worker, old.clone())?;
+    upload_encoded(&service, first, worker, old_blob, b"old")?;
+    service.commit(first, worker)?;
 
     let NativeAdmission::Compile { ticket: failed } = service.admit(
         None,
         request()?,
-        client,
+        worker,
         ActionMode::Refresh,
         std::collections::BTreeMap::new(),
     )?
@@ -1440,13 +1643,13 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
         bail!("expected old hit during refresh");
     };
     assert_eq!(current, old);
-    service.fail(failed, client)?;
+    service.fail(failed, worker)?;
     service.close(failed, client)?;
 
     let NativeAdmission::Compile { ticket: next } = service.admit(
         None,
         request()?,
-        client,
+        worker,
         ActionMode::Refresh,
         std::collections::BTreeMap::new(),
     )?
@@ -1455,11 +1658,11 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
     };
     let new = manifest(b"new");
     let new_blob = new.outputs["obj"].test_file_blob();
-    service.begin(next, client, new.clone())?;
-    assert!(service.commit(next, client).is_err());
+    service.begin(next, worker, new.clone())?;
+    assert!(service.commit(next, worker).is_err());
     assert_eq!(service.status(reader)?, NativeStatus::Ready(old));
-    upload_encoded(&service, next, client, new_blob, b"new")?;
-    assert_eq!(service.commit(next, client)?, new);
+    upload_encoded(&service, next, worker, new_blob, b"new")?;
+    assert_eq!(service.commit(next, worker)?, new);
     let NativeAdmission::Hit {
         ticket: latest,
         manifest: current,
@@ -2189,6 +2392,10 @@ fn session_telemetry_reports_contended_tickets_without_waiting() -> Result<()> {
 fn retention_group_survives_action_close_refresh_and_exceeds_action_slots() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
+    let worker = Publisher::Worker {
+        peer: test_peer(1),
+        job: 42,
+    };
     let owner = test_peer(1);
     let other = test_peer(2);
     let group = service.open_retention(owner)?;
@@ -2204,7 +2411,7 @@ fn retention_group_survives_action_close_refresh_and_exceeds_action_slots() -> R
         let NativeAdmission::Compile { ticket } = service.admit(
             None,
             request()?,
-            Publisher::Client,
+            worker,
             ActionMode::Refresh,
             BTreeMap::new(),
         )?
@@ -2216,9 +2423,9 @@ fn retention_group_survives_action_close_refresh_and_exceeds_action_slots() -> R
                 .retain_result(group, ticket, result.id()?, owner)
                 .is_err()
         );
-        service.begin(ticket, Publisher::Client, result.clone())?;
-        upload_encoded(&service, ticket, Publisher::Client, blob, &bytes)?;
-        service.commit(ticket, Publisher::Client)?;
+        service.begin(ticket, worker, result.clone())?;
+        upload_encoded(&service, ticket, worker, blob, &bytes)?;
+        service.commit(ticket, worker)?;
         assert!(
             service
                 .retain_result(group, ticket, result.id()?, other)

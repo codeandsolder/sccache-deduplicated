@@ -10,12 +10,9 @@ use sccache::config::{
     server as server_config,
 };
 use sccache::dist::{
-    self, AllocJobResult, AssignJobResult, BuilderIncoming, CompileCommand, HeartbeatServerResult,
-    InputsReader, JobAlloc, JobAssignment, JobAuthorizer, JobComplete, JobId, JobState,
-    NativeAssignment, OutputRequest, RunJobResult, SchedulerIncoming, SchedulerOutgoing,
-    SchedulerStatusResult, ServerId, ServerIncoming, ServerNonce, ServerOutgoing,
-    StagedToolchainArchive, SubmitToolchainResult, TcCache, Toolchain, ToolchainReader,
-    UpdateJobStateResult,
+    self, AllocJobResult, AssignJobResult, HeartbeatServerResult, JobAlloc, JobAuthorizer, JobId,
+    JobState, NativeAssignment, SchedulerIncoming, SchedulerOutgoing, SchedulerStatusResult,
+    ServerId, ServerIncoming, ServerNonce, ServerOutgoing, UpdateJobStateResult,
 };
 use sccache::util::BASE64_URL_SAFE_ENGINE;
 use sccache::util::daemonize;
@@ -27,14 +24,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-#[cfg_attr(target_os = "freebsd", path = "build_freebsd.rs")]
-mod build;
-
 mod cmdline;
-mod command_helpers;
 #[cfg(feature = "scheduler-dashboard")]
 mod dashboard;
-mod job_telemetry;
 mod placement;
 use placement::{Exploration, NativeTransferPlan, choose_worker, native_estimate};
 #[cfg(target_os = "linux")]
@@ -289,14 +281,17 @@ fn package_report(
     }))
 }
 
+#[cfg(feature = "scheduler-dashboard")]
+fn verify_dashboard(assets: &Path, source: Option<&Path>) -> Result<i32> {
+    sccache_dashboard::server::verify_assets(assets, source)?;
+    println!("{}", sccache_dashboard::GENERATION);
+    Ok(0)
+}
+
 fn run(command: Command) -> Result<i32> {
     match command {
         #[cfg(feature = "scheduler-dashboard")]
-        Command::VerifyDashboard { assets, source } => {
-            sccache_dashboard::server::verify_assets(&assets, source.as_deref())?;
-            println!("{}", sccache_dashboard::GENERATION);
-            Ok(0)
-        }
+        Command::VerifyDashboard { assets, source } => verify_dashboard(&assets, source.as_deref()),
         Command::NativeDecodePackage {
             compression,
             max_tar_bytes,
@@ -381,7 +376,8 @@ fn run(command: Command) -> Result<i32> {
             index,
             schema,
             without,
-        } => audit_index(&index, schema.as_deref(), &without),
+            action_key,
+        } => audit_index(&index, schema.as_deref(), &without, action_key.as_deref()),
         Command::ClusterInit { directory } => cluster_init(&directory),
         Command::ClusterId { directory } => cluster_id(&directory),
         Command::ClusterRevoke { directory, peer } => cluster_revoke(&directory, peer),
@@ -557,9 +553,24 @@ fn attest_installation(
     Ok(0)
 }
 
-fn audit_index(index: &Path, schema: Option<&str>, without: &[String]) -> Result<i32> {
+fn audit_index(
+    index: &Path,
+    schema: Option<&str>,
+    without: &[String],
+    action_key: Option<&str>,
+) -> Result<i32> {
     let audit = sccache::build_runtime::NativeIndexAudit::open(index)?;
-    if let Some(schema) = schema {
+    if let Some(key) = action_key {
+        let digest = blake3::Hash::from_hex(key)?;
+        let result = audit.action_result(sccache::build_runtime::ActionKey(*digest.as_bytes()))?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "action_key": key,
+                "result": result.map(|id| blake3::Hash::from_bytes(id.0).to_hex().to_string()),
+            })
+        );
+    } else if let Some(schema) = schema {
         let comparison = audit.compare(schema, without)?;
         println!(
             "{}",
@@ -777,68 +788,20 @@ fn start_worker(
     let server_config::Config {
         cluster,
         builder,
-        cache_dir,
         public_addr,
         bind_address,
         scheduler_url,
         scheduler_auth,
-        toolchain_cache_size,
-        toolchain_archive_sources,
         native_worker,
         traces,
     } = config;
     sccache::latency_trace::configure(traces.as_ref())?;
 
-    let builder: Option<Box<dyn dist::BuilderIncoming>> = match builder {
-        server_config::BuilderType::Native => None,
-        #[cfg(not(target_os = "freebsd"))]
-        server_config::BuilderType::Docker => Some(Box::new(
-            build::DockerBuilder::new().context("Docker builder failed to start")?,
-        )),
-        #[cfg(not(target_os = "freebsd"))]
-        server_config::BuilderType::Overlay {
-            bwrap_path,
-            build_dir,
-            extracted_toolchain_cache_size,
-        } => Some(Box::new(
-            build::OverlayBuilder::new(bwrap_path, build_dir, extracted_toolchain_cache_size)
-                .context("Overlay builder failed to start")?,
-        )),
-        #[cfg(target_os = "freebsd")]
-        server_config::BuilderType::Pot {
-            pot_fs_root,
-            clone_from,
-            pot_cmd,
-            pot_clone_args,
-        } => Some(Box::new(
-            build::PotBuilder::new(pot_fs_root, clone_from, pot_cmd, pot_clone_args)
-                .context("Pot builder failed to start")?,
-        )),
-        _ => bail!("Builder type not supported on this platform: {builder:?}"),
-    };
-    if builder.is_none() {
-        anyhow::ensure!(
-            native_worker.is_some(),
-            "native builder requires native_worker configuration"
-        );
-        anyhow::ensure!(
-            cache_dir.is_none() && toolchain_archive_sources.is_empty(),
-            "native-only worker cannot configure archive cache paths"
-        );
-    }
-    let archive = builder
-        .map(|builder| {
-            ArchiveWorker::new(
-                builder,
-                cache_dir
-                    .as_deref()
-                    .context("archive builder requires cache_dir")?,
-                toolchain_cache_size,
-                toolchain_archive_sources,
-            )
-        })
-        .transpose()?;
-
+    anyhow::ensure!(
+        native_worker.is_some(),
+        "native_worker configuration required"
+    );
+    let _ = builder;
     let server_id = sccache_cluster_identity::open_identity(&cluster)?.id()?;
 
     let peer = dist::cluster::open_peer(
@@ -855,7 +818,7 @@ fn start_worker(
     if native_worker.is_some() || shared_store.is_some() {
         bail!("native worker requires Linux");
     }
-    let server = Server::new(archive);
+    let server = Server::new();
     #[cfg(target_os = "linux")]
     let server = Server {
         native_worker: native_worker
@@ -1013,6 +976,7 @@ pub struct Scheduler {
         Mutex<BTreeMap<ServerId, (Instant, sccache::build_runtime::wire::ClientDeliveryRates)>>,
     job_slack: JobSlackConfig,
     maintenance_drain_file: Option<PathBuf>,
+    queue_changed: tokio::sync::Notify,
 
     // Currently running jobs, can never be Complete
     jobs: Mutex<BTreeMap<JobId, JobDetail>>,
@@ -1091,10 +1055,15 @@ impl ServerDetails {
             })
     }
 
-    fn admission_slots(&self, job_slack: JobSlackConfig) -> usize {
-        job_slack
-            .max_jobs(self.cpu_capacity)
-            .saturating_sub(self.compiler_demand())
+    fn max_jobs(&self, _job_slack: JobSlackConfig) -> usize {
+        self.capabilities
+            .native_placement
+            .as_ref()
+            .map_or(0, |placement| placement.queue.capacity as usize)
+    }
+
+    fn available_jobs(&self, _job_slack: JobSlackConfig) -> usize {
+        self.native_headroom()
     }
 
     fn native_headroom(&self) -> usize {
@@ -1165,6 +1134,7 @@ impl Scheduler {
             dashboard_clients: Mutex::default(),
             job_slack,
             maintenance_drain_file,
+            queue_changed: tokio::sync::Notify::new(),
             jobs: Mutex::new(BTreeMap::new()),
             servers: Mutex::new(HashMap::new()),
             completed_acks: Mutex::new(CompletedJobAcks::default()),
@@ -1232,33 +1202,6 @@ impl Default for Scheduler {
     }
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "Worker admission weights are approximate floating-point CPU capacity estimates"
-)]
-fn admission_weight(job_count: usize, cpu_capacity: f64, job_slack: JobSlackConfig) -> Option<f64> {
-    (job_count < job_slack.max_jobs(cpu_capacity))
-        .then_some((cpu_capacity - job_count as f64).max(0.0) + 0.5)
-}
-
-fn weighted_server(candidates: &[(ServerId, f64)], draw: f64) -> Option<ServerId> {
-    let total: f64 = candidates.iter().map(|(_, weight)| weight).sum();
-    let mut ticket = draw * total;
-    for &(server_id, weight) in candidates {
-        if weight > 0.0 {
-            if ticket < weight {
-                return Some(server_id);
-            }
-            ticket -= weight;
-        }
-    }
-    candidates
-        .iter()
-        .rev()
-        .find(|(_, weight)| *weight > 0.0)
-        .map(|(id, _)| *id)
-}
-
 struct Reservation {
     #[cfg(feature = "scheduler-dashboard")]
     trace: Option<sccache::latency_trace::TraceContext>,
@@ -1286,6 +1229,7 @@ impl Drop for AssignmentGuard {
             entry.jobs_assigned.remove(&self.job_id);
             entry.last_error = Some(Instant::now());
         }
+        self.scheduler.queue_changed.notify_waiters();
         #[cfg(feature = "scheduler-dashboard")]
         self.scheduler.dashboard_changed();
     }
@@ -1294,6 +1238,51 @@ impl Drop for AssignmentGuard {
 struct NoCapacity {
     servers: usize,
     saturated_native: bool,
+}
+
+/// Native admission distinguishes incompatible platforms from a compatible
+/// fleet with no free queue headroom. Called while holding the servers lock.
+fn native_capacity_failure(
+    servers: &HashMap<ServerId, ServerDetails>,
+    platform: sccache::build_runtime::ContentId,
+) -> Option<NoCapacity> {
+    let mut compatible = false;
+    for details in servers.values() {
+        if details.capabilities.native_platform == Some(platform) {
+            compatible = true;
+            if details.native_headroom() != 0 {
+                return None;
+            }
+        }
+    }
+    Some(NoCapacity {
+        servers: servers.len(),
+        saturated_native: compatible,
+    })
+}
+
+fn native_transfer_plan<'a>(
+    native: &'a NativeAssignment,
+    network: &'a NetworkSnapshot,
+    servers: &HashMap<ServerId, ServerDetails>,
+    packages: &'a sccache::build_runtime::PackageCatalog,
+    cost_book: &placement::CostBook,
+    assigned_at: Instant,
+) -> NativeTransferPlan<'a> {
+    let receiver = native.receiver.as_ref();
+    let remote_fraction = receiver
+        .zip(native.delivery_profile)
+        .map_or(1_000_000, |((requester, _), profile)| {
+            cost_book.delivery_fraction(*requester, profile, assigned_at)
+        });
+    NativeTransferPlan::new(
+        network,
+        servers,
+        Some(packages),
+        Some(&native.input_blobs),
+        receiver,
+    )
+    .with_remote_fraction(remote_fraction)
 }
 
 struct CandidateSet {
@@ -1333,69 +1322,49 @@ impl CandidateSet {
 
 fn collect_candidates(
     servers: &mut HashMap<ServerId, ServerDetails>,
-    native: Option<&NativeAssignment>,
-    class: Option<placement::ActionClass>,
-    transfer_plan: Option<&NativeTransferPlan<'_>>,
+    native: &NativeAssignment,
+    class: placement::ActionClass,
+    transfer_plan: &NativeTransferPlan<'_>,
     cost_book: &placement::CostBook,
-    job_slack: JobSlackConfig,
+    _job_slack: JobSlackConfig,
     now: Instant,
 ) -> CandidateSet {
-    let native_platform = native.map(|assignment| assignment.spec.platform);
-    let native_inputs = native.map(|assignment| &assignment.input_blobs);
+    let platform = native.spec.platform;
     let mut healthy = Vec::new();
     let mut retry = Vec::new();
     let mut predictions = BTreeMap::new();
     let mut saturated_native = false;
     for (&server_id, details) in servers {
-        let compatible = match native_platform {
-            Some(platform) => details.capabilities.native_platform == Some(platform),
-            None => details.capabilities.archive,
-        };
-        if !compatible {
+        if details.capabilities.native_platform != Some(platform) {
             continue;
         }
-        let native_worker = native.is_some()
-            && details.cpu_capacity > 0.0
-            && details.capabilities.native_placement.is_some();
-        let Some(weight) =
-            admission_weight(details.compiler_demand(), details.cpu_capacity, job_slack)
-        else {
-            saturated_native |= native_worker;
+        let Some(placement) = details.capabilities.native_placement.as_ref() else {
             continue;
         };
-        let weight = if let (Some(inputs), Some(plan)) = (native_inputs, transfer_plan) {
-            let Some(placement) = details.capabilities.native_placement.as_ref() else {
-                continue;
-            };
-            if !placement.queue.has_capacity(
-                details
-                    .jobs_assigned
-                    .iter()
-                    .filter_map(|(&id, inputs)| inputs.is_some().then_some(id)),
-            ) {
-                saturated_native |= native_worker;
-                continue;
-            }
-            let learned = class.zip(native_platform).map(|(class, platform)| {
-                cost_book.predict(
-                    placement::WorkerScope {
-                        peer: server_id,
-                        platform,
-                    },
-                    class,
-                    placement,
-                    now,
-                )
-            });
-            let Some(forecast) = placement::WorkerForecast::new(details, learned) else {
-                continue;
-            };
-            let estimate = native_estimate(forecast, inputs, Peer::Worker(server_id), plan);
-            predictions.insert(server_id, estimate);
-            estimate.seconds
-        } else {
-            weight
+        if details.native_headroom() == 0 {
+            saturated_native = true;
+            continue;
+        }
+        let learned = cost_book.predict(
+            placement::WorkerScope {
+                peer: server_id,
+                platform,
+            },
+            class,
+            placement,
+            now,
+        );
+        let Some(forecast) = placement::WorkerForecast::new(details, Some(learned)) else {
+            continue;
         };
+        let estimate = native_estimate(
+            forecast,
+            &native.input_blobs,
+            Peer::Worker(server_id),
+            transfer_plan,
+        );
+        predictions.insert(server_id, estimate);
+        let weight = estimate.seconds;
         if details
             .last_error
             .is_some_and(|when| now.duration_since(when) > SERVER_REMEMBER_ERROR_TIMEOUT)
@@ -1420,8 +1389,8 @@ fn collect_candidates(
 impl Scheduler {
     fn select_candidate(
         &self,
-        native_inputs: Option<&dist::NativeInputBlobs>,
-        transfer_plan: Option<&NativeTransferPlan<'_>>,
+        native_inputs: &dist::NativeInputBlobs,
+        transfer_plan: &NativeTransferPlan<'_>,
         servers: &HashMap<ServerId, ServerDetails>,
         candidates: &CandidateSet,
         now: Instant,
@@ -1429,93 +1398,69 @@ impl Scheduler {
         [&candidates.healthy, &candidates.retry]
             .into_iter()
             .find_map(|group| {
-                if let (Some(inputs), Some(plan)) = (native_inputs, transfer_plan) {
-                    let mut history = self
-                        .exploration
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    choose_worker(
-                        group,
-                        servers,
-                        inputs,
-                        &candidates.predictions,
-                        plan,
-                        &mut history,
-                        now,
-                    )
-                } else {
-                    weighted_server(group, rand::random::<f64>())
-                }
+                let mut history = self
+                    .exploration
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                choose_worker(
+                    group,
+                    servers,
+                    native_inputs,
+                    &candidates.predictions,
+                    transfer_plan,
+                    &mut history,
+                    now,
+                )
             })
     }
 
     fn reserve_job(
         &self,
-        assignment: &JobAssignment,
+        assignment: &NativeAssignment,
         network: &NetworkSnapshot,
         packages: &std::sync::Arc<sccache::build_runtime::PackageCatalog>,
         assigned_at: Instant,
     ) -> Result<std::result::Result<Reservation, NoCapacity>> {
-        let native = match assignment {
-            JobAssignment::Archive(_) => None,
-            JobAssignment::Native(native) => Some(native.as_ref()),
-        };
-        let native_platform = native.map(|assignment| assignment.spec.platform);
-        let native_inputs = native.map(|assignment| &assignment.input_blobs);
-        let class = native
-            .map(|assignment| placement::ActionClass::from_spec(&assignment.spec))
-            .transpose()?;
+        let platform = assignment.spec.platform;
+        let inputs = &assignment.input_blobs;
+        let class = placement::ActionClass::from_spec(&assignment.spec)?;
         #[cfg(feature = "scheduler-dashboard")]
-        let description = native.map(dashboard::describe_native);
+        let description = Some(dashboard::describe_native(assignment));
         // LOCKS
         let mut servers = self
             .servers
             .lock()
             .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
+        if let Some(failure) = native_capacity_failure(&servers, platform) {
+            return Ok(Err(failure));
+        }
+
         let cost_book = self
             .cost_book
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transfer_plan = native_inputs.map(|inputs| {
-            NativeTransferPlan::new(
-                network,
-                &servers,
-                Some(packages),
-                Some(inputs),
-                native.and_then(|assignment| assignment.receiver.as_ref()),
-            )
-            .with_remote_fraction(
-                native
-                    .and_then(|assignment| {
-                        let (requester, _) = assignment.receiver.as_ref()?;
-                        let profile = assignment.delivery_profile?;
-                        Some(cost_book.delivery_fraction(*requester, profile, assigned_at))
-                    })
-                    .unwrap_or(1_000_000),
-            )
-        });
+        let transfer_plan = native_transfer_plan(
+            assignment,
+            network,
+            &servers,
+            packages,
+            &cost_book,
+            assigned_at,
+        );
         let now = Instant::now();
         let candidates = collect_candidates(
             &mut servers,
-            native,
+            assignment,
             class,
-            transfer_plan.as_ref(),
+            &transfer_plan,
             &cost_book,
             self.job_slack,
             now,
         );
-        let estimated_result_bytes = class
-            .zip(native_platform)
-            .and_then(|(class, platform)| cost_book.result_reservation(platform, class, now));
+        let estimated_result_bytes = cost_book.result_reservation(platform, class, now);
         drop(cost_book);
-        let selected = self.select_candidate(
-            native_inputs,
-            transfer_plan.as_ref(),
-            &servers,
-            &candidates,
-            now,
-        );
+        let selected = self.select_candidate(inputs, &transfer_plan, &servers, &candidates, now);
         let Some(server_id) = selected else {
             return Ok(Err(candidates.no_capacity(servers.len())));
         };
@@ -1535,17 +1480,17 @@ impl Scheduler {
         trace_native_assignment(
             job_id,
             server_id,
-            class,
+            Some(class),
             &candidates,
             estimated_result_bytes,
             server_details,
         );
-        let assigned = native_inputs.map(|inputs| placement::AssignedNative {
+        let assigned = Some(placement::AssignedNative {
             #[cfg(feature = "scheduler-dashboard")]
             dashboard: description,
             packages: std::sync::Arc::clone(packages),
             inputs: inputs.clone(),
-            class,
+            class: Some(class),
             cost: prediction.map(|estimate| estimate.cost),
             milestone: None,
         });
@@ -1554,7 +1499,7 @@ impl Scheduler {
         info!("Job {job_id} created and will be assigned to server {server_id:?}");
         Ok(Ok(Reservation {
             #[cfg(feature = "scheduler-dashboard")]
-            trace: native.and_then(|assignment| assignment.trace),
+            trace: assignment.trace,
             job_id,
             server_id,
             auth,
@@ -1568,54 +1513,66 @@ impl Scheduler {
     async fn allocate_job(
         self: Arc<Self>,
         requester: &dyn SchedulerOutgoing,
-        mut assignment: JobAssignment,
+        mut assignment: NativeAssignment,
         network: &NetworkSnapshot,
         packages: &Arc<sccache::build_runtime::PackageCatalog>,
     ) -> Result<AllocJobResult> {
-        let scheduler = Arc::clone(&self);
-        let network = network.clone();
-        let packages = Arc::clone(packages);
-        let prepared = tokio::task::spawn_blocking(move || -> Result<_> {
-            if scheduler.is_draining() {
-                return Ok(Err(AllocJobResult::Fail {
+        let (assignment, reservation, _guard, assigned_at) = loop {
+            // Register before observing capacity to avoid losing a heartbeat
+            // or completion between the failed reservation and the wait.
+            let changed = self.queue_changed.notified();
+            tokio::pin!(changed);
+            let _ = changed.as_mut().enable();
+            if self.is_draining() {
+                return Ok(AllocJobResult::Fail {
                     msg: "scheduler is draining for maintenance".to_owned(),
-                }));
+                });
             }
-            let assigned_at = Instant::now();
-            let reservation =
+            let scheduler = Arc::clone(&self);
+            let network = network.clone();
+            let packages = Arc::clone(packages);
+            let prepared = tokio::task::spawn_blocking(move || -> Result<_> {
+                let assigned_at = Instant::now();
                 match scheduler.reserve_job(&assignment, &network, &packages, assigned_at)? {
-                    Ok(reservation) => reservation,
-                    Err(NoCapacity {
+                    Ok(reservation) => {
+                        let guard = AssignmentGuard {
+                            scheduler: Arc::clone(&scheduler),
+                            server_id: reservation.server_id,
+                            job_id: reservation.job_id,
+                        };
+                        #[cfg(feature = "scheduler-dashboard")]
+                        scheduler.dashboard_changed();
+                        assignment.estimated_result_bytes = reservation.estimated_result_bytes;
+                        Ok(Ok((assignment, reservation, guard, assigned_at)))
+                    }
+                    Err(reason) => Ok(Err((assignment, reason))),
+                }
+            })
+            .await??;
+            match prepared {
+                Ok(reservation) => break reservation,
+                Err((
+                    pending,
+                    NoCapacity {
                         saturated_native: true,
                         ..
-                    }) => {
-                        // This ticket remains unassigned. The native HTTP
-                        // service returns 503 and the origin retries within
-                        // its existing allocation deadline.
-                        return Err(sccache::build_runtime::NativeServiceBusy.into());
-                    }
-                    Err(NoCapacity { servers: count, .. }) => {
-                        return Ok(Err(AllocJobResult::Fail {
-                            msg: format!("Insufficient capacity across {count} available servers"),
-                        }));
-                    }
-                };
-            let guard = AssignmentGuard {
-                scheduler: Arc::clone(&scheduler),
-                server_id: reservation.server_id,
-                job_id: reservation.job_id,
-            };
-            #[cfg(feature = "scheduler-dashboard")]
-            scheduler.dashboard_changed();
-            if let JobAssignment::Native(native) = &mut assignment {
-                native.estimated_result_bytes = reservation.estimated_result_bytes;
+                    },
+                )) => {
+                    // The admitted session owns the queued request. Do not
+                    // reject work merely because the bounded worker queues
+                    // are full. Wake on a released reservation or heartbeat;
+                    // a short timer also observes the maintenance drain.
+                    assignment = pending;
+                    let _ = tokio::time::timeout(Duration::from_secs(1), changed).await;
+                }
+                Err((_, NoCapacity { servers: count, .. })) => {
+                    return Ok(AllocJobResult::Fail {
+                        msg: format!(
+                            "No available capacity on compatible workers across {count} servers"
+                        ),
+                    });
+                }
             }
-            Ok(Ok((assignment, reservation, guard, assigned_at)))
-        })
-        .await??;
-        let (assignment, reservation, _guard, assigned_at) = match prepared {
-            Ok(prepared) => prepared,
-            Err(response) => return Ok(response),
         };
         let result = requester
             .do_assign_job(
@@ -1644,10 +1601,7 @@ impl Scheduler {
             prediction,
             ..
         } = reservation;
-        let AssignJobResult {
-            state,
-            need_toolchain,
-        } = *result;
+        let AssignJobResult { state } = *result;
         {
             // LOCKS
             let mut jobs = self
@@ -1705,10 +1659,7 @@ impl Scheduler {
             job_id,
             server_id,
         };
-        Ok(AllocJobResult::Success {
-            job_alloc,
-            need_toolchain,
-        })
+        Ok(AllocJobResult::Success { job_alloc })
     }
 }
 
@@ -1867,7 +1818,7 @@ fn validate_heartbeat(
         bail!("invalid worker CPU capacity {cpu_capacity}");
     }
     anyhow::ensure!(
-        capabilities.archive || capabilities.native_platform.is_some(),
+        capabilities.native_platform.is_some(),
         "worker advertises no build engine"
     );
     anyhow::ensure!(
@@ -1905,20 +1856,6 @@ fn validate_heartbeat(
 
 #[async_trait::async_trait]
 impl SchedulerIncoming for Scheduler {
-    async fn handle_alloc_job(
-        self: Arc<Self>,
-        requester: &dyn SchedulerOutgoing,
-        tc: Toolchain,
-    ) -> Result<AllocJobResult> {
-        self.allocate_job(
-            requester,
-            JobAssignment::Archive(tc),
-            &NetworkSnapshot::default(),
-            &std::sync::Arc::default(),
-        )
-        .await
-    }
-
     async fn handle_alloc_native_job(
         self: Arc<Self>,
         requester: &dyn SchedulerOutgoing,
@@ -1942,13 +1879,8 @@ impl SchedulerIncoming for Scheduler {
         }
 
         assignment.spec.validate()?;
-        self.allocate_job(
-            requester,
-            JobAssignment::Native(Box::new(assignment)),
-            network,
-            &packages,
-        )
-        .await
+        self.allocate_job(requester, assignment, network, &packages)
+            .await
     }
 
     fn observe_native_lifecycle(
@@ -2182,6 +2114,7 @@ impl SchedulerIncoming for Scheduler {
                 reconcile_stale_assignments(details, &mut jobs, server_id, active_job_ids, now);
                 let mut assigned_job_ids: Vec<_> = details.jobs_assigned.keys().copied().collect();
                 assigned_job_ids.sort_unstable();
+                self.queue_changed.notify_waiters();
                 return Ok(HeartbeatServerResult {
                     is_new: false,
                     assigned_job_ids,
@@ -2215,6 +2148,7 @@ impl SchedulerIncoming for Scheduler {
         );
         drop(servers);
         drop(jobs);
+        self.queue_changed.notify_waiters();
         Ok(HeartbeatServerResult {
             is_new: true,
             assigned_job_ids: Vec::new(),
@@ -2367,6 +2301,7 @@ impl SchedulerIncoming for Scheduler {
         }
         drop(servers);
         drop(jobs);
+        self.queue_changed.notify_waiters();
         Ok(UpdateJobStateResult::Success)
     }
 
@@ -2420,182 +2355,36 @@ impl SchedulerIncoming for Scheduler {
             in_progress: servers.values().map(|v| v.jobs_assigned.len()).sum(),
             max_jobs: servers
                 .values()
-                .map(|v| self.job_slack.max_jobs(v.cpu_capacity))
+                .map(|v| v.max_jobs(self.job_slack))
                 .fold(0, usize::saturating_add),
             available_jobs: if self.is_draining() {
                 0
             } else {
                 servers
                     .values()
-                    .map(|v| {
-                        let slots = v.admission_slots(self.job_slack);
-                        if v.capabilities.archive {
-                            slots
-                        } else {
-                            slots.min(v.native_headroom())
-                        }
-                    })
+                    .map(|v| v.available_jobs(self.job_slack))
                     .fold(0, usize::saturating_add)
             },
         })
     }
 }
 
-struct LocalAssignment {
-    assignment: JobAssignment,
-    // Local time of receipt, not the scheduler's assignment timestamp.
-    accepted_at: Instant,
-}
-
-struct ArchiveWorker {
-    builder: Box<dyn BuilderIncoming>,
-    cache: Mutex<TcCache>,
-    staging_dir: PathBuf,
-    toolchain_cache_size: u64,
-    #[cfg(target_os = "linux")]
-    toolchain_archive_sources: Vec<PathBuf>,
-}
-
-impl ArchiveWorker {
-    fn new(
-        builder: Box<dyn BuilderIncoming>,
-        cache_dir: &Path,
-        toolchain_cache_size: u64,
-        toolchain_archive_sources: Vec<PathBuf>,
-    ) -> Result<Self> {
-        if toolchain_archive_sources
-            .iter()
-            .any(|path| !path.is_absolute())
-        {
-            bail!("toolchain archive sources must be absolute paths");
-        }
-        #[cfg(not(target_os = "linux"))]
-        if !toolchain_archive_sources.is_empty() {
-            bail!("local toolchain archive reflinks require Linux");
-        }
-        let cache = TcCache::new(&cache_dir.join("tc"), toolchain_cache_size)
-            .context("Failed to create toolchain cache")?;
-        Ok(Self {
-            builder,
-            cache: Mutex::new(cache),
-            staging_dir: cache_dir.join("tc"),
-            toolchain_cache_size,
-            #[cfg(target_os = "linux")]
-            toolchain_archive_sources,
-        })
-    }
-
-    fn has_cached_toolchain(&self, tc: &Toolchain) -> Result<bool> {
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
-        match cache.get_file(tc) {
-            Ok(_) => Ok(true),
-            Err(sccache::lru_disk_cache::Error::FileNotInCache) => Ok(false),
-            Err(error) => Err(error).context("checking worker toolchain cache"),
-        }
-    }
-
-    /// Try local archive sources before asking the client to upload. The
-    /// cache mutex is not held while cloning or verifying archive contents.
-    fn has_or_reuse_toolchain(&self, tc: &Toolchain) -> Result<bool> {
-        if self.has_cached_toolchain(tc)? {
-            return Ok(true);
-        }
-        #[cfg(target_os = "linux")]
-        for source in &self.toolchain_archive_sources {
-            match StagedToolchainArchive::clone_verified(
-                &self.staging_dir,
-                source,
-                tc.clone(),
-                self.toolchain_cache_size,
-            ) {
-                Ok(staged) => {
-                    let mut cache = self
-                        .cache
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
-                    match cache.insert_staged(staged) {
-                        Ok(()) => {
-                            debug!("Reused local toolchain archive {}", tc.archive_id);
-                            return Ok(true);
-                        }
-                        Err(error) => debug!("Could not install cloned archive: {error:#}"),
-                    }
-                }
-                Err(error) => trace!(
-                    "Local archive source {} unavailable: {error:#}",
-                    source.display()
-                ),
-            }
-        }
-        self.has_cached_toolchain(tc)
-    }
-}
-
 pub struct Server {
-    archive: Option<ArchiveWorker>,
     execution_queue: std::sync::Arc<dist::execution_queue::ExecutionQueue>,
-    job_toolchains: Mutex<HashMap<JobId, LocalAssignment>>,
     #[cfg(target_os = "linux")]
     native_worker: Option<NativeDispatcher>,
 }
 
 impl Server {
-    fn new(archive: Option<ArchiveWorker>) -> Self {
+    fn new() -> Self {
         Self {
-            archive,
             execution_queue: std::sync::Arc::new(dist::execution_queue::ExecutionQueue::new(
                 std::num::NonZeroUsize::new(sccache::util::num_cpus())
                     .unwrap_or(std::num::NonZeroUsize::MIN),
             )),
-            job_toolchains: Mutex::new(HashMap::new()),
             #[cfg(target_os = "linux")]
             native_worker: None,
         }
-    }
-}
-
-impl Server {
-    fn begin_execution(
-        &self,
-        requester: &dyn ServerOutgoing,
-        job_id: JobId,
-    ) -> Result<Option<LocalAssignment>> {
-        let assigned = {
-            let mut jobs = self
-                .job_toolchains
-                .lock()
-                .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
-            match jobs.entry(job_id) {
-                std::collections::hash_map::Entry::Occupied(entry) => Some(entry.remove()),
-                std::collections::hash_map::Entry::Vacant(_) => None,
-            }
-        };
-        let Some(assigned) = assigned else {
-            return Ok(None);
-        };
-        let transition = sccache::http_client::io_runtime()?
-            .block_on(requester.do_update_job_state(job_id, JobState::Started))
-            .and_then(|reply| match reply {
-                UpdateJobStateResult::Success => Ok(()),
-                UpdateJobStateResult::Fail { msg } => {
-                    Err(anyhow::anyhow!("scheduler rejected start: {msg}"))
-                }
-            });
-        if let Err(error) = transition {
-            let mut jobs = self
-                .job_toolchains
-                .lock()
-                .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
-            if jobs.insert(job_id, assigned).is_some() {
-                bail!("job {job_id} reappeared while restoring failed start transition");
-            }
-            drop(jobs);
-            return Err(error).context("Updating job state failed");
-        }
-        Ok(Some(assigned))
     }
 }
 
@@ -2610,23 +2399,15 @@ impl ServerIncoming for Server {
         heartbeat_started_at: Instant,
     ) -> Result<usize> {
         let known: HashSet<_> = assigned_job_ids.iter().copied().collect();
-        let mut local = self
-            .job_toolchains
-            .lock()
-            .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
-        let before = local.len();
-        local.retain(|id, assignment| {
-            // A scheduler reservation precedes receipt by the worker. Do not
-            // prune assignments received after the heartbeat request began.
-            assignment.accepted_at >= heartbeat_started_at || known.contains(id)
-        });
-        let removed = before - local.len();
-        drop(local);
         #[cfg(target_os = "linux")]
-        let removed = removed
-            + self.native_worker.as_ref().map_or(0, |dispatcher| {
-                dispatcher.reconcile(&known, heartbeat_started_at)
-            });
+        let removed = self.native_worker.as_ref().map_or(0, |dispatcher| {
+            dispatcher.reconcile(&known, heartbeat_started_at)
+        });
+        #[cfg(not(target_os = "linux"))]
+        let removed = {
+            let _ = (known, heartbeat_started_at);
+            0
+        };
         Ok(removed)
     }
 
@@ -2643,7 +2424,6 @@ impl ServerIncoming for Server {
         #[cfg(not(target_os = "linux"))]
         let native_placement = None;
         dist::WorkerCapabilities {
-            archive: self.archive.is_some(),
             native_platform,
             native_placement,
         }
@@ -2695,7 +2475,6 @@ impl ServerIncoming for Server {
                 .assign(job_id, assignment, requester)?;
             Ok(AssignJobResult {
                 state: JobState::Ready,
-                need_toolchain: false,
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -2723,166 +2502,36 @@ impl ServerIncoming for Server {
             bail!("native worker requires Linux")
         }
     }
-
-    fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> Result<AssignJobResult> {
-        let need_toolchain = !self
-            .archive
-            .as_ref()
-            .context("archive worker disabled")?
-            .has_or_reuse_toolchain(&tc)?;
-        let mut assignments = self
-            .job_toolchains
-            .lock()
-            .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
-        match assignments.entry(job_id) {
-            std::collections::hash_map::Entry::Occupied(_) => {
-                bail!("duplicate assignment for job {job_id}")
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(LocalAssignment {
-                    assignment: JobAssignment::Archive(tc),
-                    accepted_at: Instant::now(),
-                });
-            }
-        }
-        drop(assignments);
-        let state = if need_toolchain {
-            JobState::Pending
-        } else {
-            // TODO: can start prepping the build environment now
-            JobState::Ready
-        };
-        Ok(AssignJobResult {
-            state,
-            need_toolchain,
-        })
-    }
-    fn handle_submit_toolchain(
-        &self,
-        requester: &dyn ServerOutgoing,
-        job_id: JobId,
-        tc_rdr: ToolchainReader,
-    ) -> Result<SubmitToolchainResult> {
-        let archive = self.archive.as_ref().context("archive worker disabled")?;
-        let tc = match self
-            .job_toolchains
-            .lock()
-            .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?
-            .get(&job_id)
-        {
-            Some(LocalAssignment {
-                assignment: JobAssignment::Archive(tc),
-                ..
-            }) => tc.clone(),
-            Some(_) | None => return Ok(SubmitToolchainResult::JobNotFound),
-        };
-        // Streaming and hashing large archives must not hold the cache mutex:
-        // other toolchains still need to be assigned while uploads are slow.
-        let staged = match StagedToolchainArchive::receive(
-            &archive.staging_dir,
-            tc,
-            tc_rdr,
-            archive.toolchain_cache_size,
-        ) {
-            Ok(staged) => staged,
-            Err(error) => {
-                warn!("Could not receive or verify toolchain archive: {error:#}");
-                return Ok(SubmitToolchainResult::CannotCache);
-            }
-        };
-        let inserted = archive
-            .cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?
-            .insert_staged(staged);
-        if let Err(error) = inserted {
-            warn!("Could not install verified toolchain archive: {error:#}");
-            return Ok(SubmitToolchainResult::CannotCache);
-        }
-        // Uploads can outlive a scheduler-side timeout. Never publish Ready
-        // for a job that has since been removed by heartbeat reconciliation.
-        if !self
-            .job_toolchains
-            .lock()
-            .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?
-            .contains_key(&job_id)
-        {
-            return Ok(SubmitToolchainResult::JobNotFound);
-        }
-        sccache::http_client::io_runtime()?
-            .block_on(requester.do_update_job_state(job_id, JobState::Ready))
-            .context("Updating job state failed")?;
-        Ok(SubmitToolchainResult::Success)
-    }
-    fn handle_run_job(
-        &self,
-        requester: &dyn ServerOutgoing,
-        job_id: JobId,
-        command: CompileCommand,
-        outputs: OutputRequest,
-        inputs_rdr: InputsReader,
-    ) -> Result<RunJobResult> {
-        let Some(assigned) = self.begin_execution(requester, job_id)? else {
-            return Ok(RunJobResult::JobNotFound);
-        };
-        let JobAssignment::Archive(toolchain) = assigned.assignment else {
-            bail!("archive job assignment type changed");
-        };
-
-        let (crate_name, command_fingerprint) = job_telemetry::identity(&command);
-        info!(
-            "dist_job_start job_id={job_id} compiler={:?} crate_name={crate_name:?} command_fingerprint={command_fingerprint:016x} argument_count={}",
-            command.executable,
-            command.arguments.len()
-        );
-        let started = Instant::now();
-        let archive = self.archive.as_ref().context("archive worker disabled")?;
-        // Receiving input must not depend on toolchain extraction or compiler
-        // admission. In particular, a cold extraction can keep a TCP receive
-        // window closed long enough for the client to abandon a healthy upload.
-        let res = inputs_rdr
-            .stage(&archive.staging_dir)
-            .context("Receiving compiler inputs failed")
-            .and_then(|inputs| {
-                let _permit = self.execution_queue.acquire(|| Ok(()))?;
-                archive
-                    .builder
-                    .run_build(job_id, toolchain, command, outputs, inputs, &archive.cache)
-            })
-            .map(|res| {
-                info!(
-                    "dist_job_result job_id={job_id} result=complete exit_code={} output_count={} elapsed_ms={}",
-                    res.output.code,
-                    res.outputs.len(),
-                    started.elapsed().as_millis()
-                );
-                RunJobResult::Complete(JobComplete {
-                    output: res.output,
-                    outputs: res.outputs,
-                })
-            })
-            .map_err(|error| {
-                warn!(
-                    "dist_job_result job_id={job_id} result=error elapsed_ms={} error={error:#}",
-                    started.elapsed().as_millis()
-                );
-                error.context("run build failed")
-            });
-        sccache::http_client::io_runtime()?
-            .block_on(requester.do_update_job_state(job_id, JobState::Complete))
-            .context("Updating job state failed")?;
-        res
-    }
 }
 
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
 
-    fn test_toolchain(marker: char) -> Toolchain {
-        Toolchain {
-            archive_id: sccache::dist::ArchiveId::try_from(marker.to_string().repeat(64)).unwrap(),
+    fn test_platform() -> sccache::build_runtime::ContentId {
+        sccache::build_runtime::ContentId::of(b"scheduler-lifecycle-test")
+    }
+
+    fn test_capabilities() -> dist::WorkerCapabilities {
+        dist::WorkerCapabilities {
+            native_platform: Some(test_platform()),
+            native_placement: Some(dist::NativePlacement::default()),
         }
+    }
+
+    async fn test_allocate(
+        scheduler: Arc<Scheduler>,
+        requester: &dyn SchedulerOutgoing,
+        _marker: char,
+    ) -> Result<AllocJobResult> {
+        scheduler
+            .handle_alloc_native_job(
+                requester,
+                native_test_assignment(test_platform(), BTreeMap::new())?,
+                &NetworkSnapshot::default(),
+                Default::default(),
+            )
+            .await
     }
 
     #[test]
@@ -2902,8 +2551,6 @@ mod scheduler_tests {
         for cores in [1, 2, 7, 8, 12, 16, 64] {
             assert_eq!(slack.max_jobs(cores as f64), cores + 1 + cores / 8);
         }
-        assert!(admission_weight(13, 12.0, slack).is_some());
-        assert!(admission_weight(14, 12.0, slack).is_none());
     }
 
     #[test]
@@ -2914,35 +2561,8 @@ mod scheduler_tests {
         };
 
         assert_eq!(slack.max_jobs(12.0), 36);
-        assert!(admission_weight(35, 12.0, slack).is_some());
-        assert!(admission_weight(36, 12.0, slack).is_none());
         assert_eq!(slack.max_jobs(0.0), 1);
         assert_eq!(JobSlackConfig::default().max_jobs(0.0), 2);
-    }
-
-    #[test]
-    fn free_cpu_weight_accounts_for_reservations_and_capacity_changes() {
-        let slack = JobSlackConfig {
-            static_jobs: 0,
-            percent: 400.0,
-        };
-        assert_eq!(admission_weight(0, 2.5, slack), Some(3.0));
-        assert_eq!(admission_weight(0, 0.01, slack), Some(0.51));
-        assert_eq!(admission_weight(1, 2.5, slack), Some(2.0));
-        assert_eq!(admission_weight(2, 2.5, slack), Some(1.0));
-        assert_eq!(admission_weight(3, 2.5, slack), Some(0.5));
-        assert_eq!(admission_weight(0, 0.0, slack), Some(0.5));
-        assert!(admission_weight(1, 0.0, slack).is_none());
-        assert!(admission_weight(0, f64::NAN, slack).is_none());
-        let a: ServerId = ServerId::from_digest([1; 32]);
-        let b: ServerId = ServerId::from_digest([2; 32]);
-        let c: ServerId = ServerId::from_digest([3; 32]);
-        let choices = [(a, 1.5), (b, 3.5), (c, 0.5)];
-        assert_eq!(weighted_server(&choices, 0.0), Some(a));
-        assert_eq!(weighted_server(&choices, 0.27), Some(a));
-        assert_eq!(weighted_server(&choices, 0.28), Some(b));
-        assert_eq!(weighted_server(&choices, 0.999), Some(c));
-        assert_eq!(weighted_server(&[(c, 0.0)], 0.0), None);
     }
 
     pub(super) struct TestJobAuthorizer;
@@ -2982,7 +2602,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )
             .unwrap();
     }
@@ -3003,12 +2623,11 @@ mod scheduler_tests {
             &self,
             _server_id: ServerId,
             _job_id: JobId,
-            _assignment: JobAssignment,
+            _assignment: NativeAssignment,
             _auth: String,
         ) -> Result<AssignJobResult> {
             Ok(AssignJobResult {
                 state: JobState::Pending,
-                need_toolchain: false,
             })
         }
     }
@@ -3105,7 +2724,6 @@ mod scheduler_tests {
                 &[],
                 Box::new(TestJobAuthorizer),
                 dist::WorkerCapabilities {
-                    archive: false,
                     native_platform: Some(ContentId::of(server.to_string().as_bytes())),
                     native_placement: Some(placement),
                 },
@@ -3191,6 +2809,8 @@ mod scheduler_tests {
             delivery_profile: None,
             spec: ExecutionSpec {
                 compiler_result: None,
+                working_inputs: Default::default(),
+                scratch: Default::default(),
                 platform,
                 root: ExecutionRoot {
                     id: TreeId([0; 32]),
@@ -3227,7 +2847,6 @@ mod scheduler_tests {
         let platform = ContentId::of(b"native-staging-test");
         let nonce = ServerNonce::new();
         let capabilities = dist::WorkerCapabilities {
-            archive: false,
             native_platform: Some(platform),
             native_placement: Some(dist::NativePlacement::default()),
         };
@@ -3381,7 +3000,6 @@ mod scheduler_tests {
         let platform = ContentId::of(b"timing-platform");
         let nonce = ServerNonce::new();
         let capabilities = dist::WorkerCapabilities {
-            archive: false,
             native_platform: Some(platform),
             native_placement: Some(dist::NativePlacement::default()),
         };
@@ -3481,7 +3099,6 @@ mod scheduler_tests {
                 &[],
                 Box::new(TestJobAuthorizer),
                 dist::WorkerCapabilities {
-                    archive: false,
                     native_platform: Some(platform),
                     native_placement: Some(dist::NativePlacement {
                         timing: sccache::build_runtime::wire::WorkerTiming {
@@ -3603,7 +3220,7 @@ mod scheduler_tests {
     }
 
     #[tokio::test]
-    async fn native_jobs_select_compatible_workers_using_shared_capacity() -> Result<()> {
+    async fn native_jobs_queue_at_zero_cpu_and_wait_for_real_reservation_capacity() -> Result<()> {
         use sccache::build_runtime::ContentId;
         let scheduler = Arc::new(Scheduler::new_with_job_slack(JobSlackConfig {
             static_jobs: 0,
@@ -3616,14 +3233,22 @@ mod scheduler_tests {
         let platform = ContentId::of(b"native-test");
         scheduler.handle_heartbeat_server(
             a,
-            nonce_a,
-            1.0,
+            nonce_a.clone(),
+            0.0,
             &[],
             Box::new(TestJobAuthorizer),
             dist::WorkerCapabilities {
-                archive: false,
                 native_platform: Some(platform),
-                native_placement: Some(dist::NativePlacement::default()),
+                native_placement: Some(dist::NativePlacement {
+                    queue: dist::NativeQueueSnapshot {
+                        capacity: 2,
+                        compiler_slots: 1,
+                        staging_slots: 2,
+                        publication_slots: 2,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
             },
         )?;
         scheduler.handle_heartbeat_server(
@@ -3633,7 +3258,6 @@ mod scheduler_tests {
             &[],
             Box::new(TestJobAuthorizer),
             dist::WorkerCapabilities {
-                archive: true,
                 native_platform: Some(ContentId::of(b"other")),
                 native_placement: Some(dist::NativePlacement::default()),
             },
@@ -3680,16 +3304,38 @@ mod scheduler_tests {
             assert_eq!(description.input_bytes, 10);
             assert_eq!(description.input_blobs, 1);
         }
-        let saturated = Arc::clone(&scheduler)
+        let AllocJobResult::Success {
+            job_alloc: second, ..
+        } = Arc::clone(&scheduler)
             .handle_alloc_native_job(
                 &AcceptAssign,
                 assignment.clone(),
                 &NetworkSnapshot::default(),
                 Default::default(),
             )
-            .await;
+            .await?
+        else {
+            bail!("second reservation unavailable at zero CPU")
+        };
+        assert_eq!(second.server_id, a);
+        {
+            let servers = scheduler.servers.lock().unwrap();
+            let worker = &servers[&a];
+            assert_eq!(worker.max_jobs(scheduler.job_slack), 2);
+            assert_eq!(worker.available_jobs(scheduler.job_slack), 0);
+        }
+        let network = NetworkSnapshot::default();
+        let waiting = Arc::clone(&scheduler).handle_alloc_native_job(
+            &AcceptAssign,
+            assignment.clone(),
+            &network,
+            Default::default(),
+        );
+        tokio::pin!(waiting);
         assert!(
-            matches!(saturated, Err(error) if error.is::<sccache::build_runtime::NativeServiceBusy>())
+            tokio::time::timeout(Duration::from_millis(50), waiting.as_mut())
+                .await
+                .is_err()
         );
         // Incompatible platforms are not temporary queue pressure.
         let missing =
@@ -3706,25 +3352,33 @@ mod scheduler_tests {
             AllocJobResult::Fail { .. }
         ));
         scheduler.handle_update_job_state(job_alloc.job_id, a, JobState::Complete)?;
-        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
-            .handle_alloc_native_job(
-                &AcceptAssign,
-                assignment,
-                &NetworkSnapshot::default(),
-                Default::default(),
-            )
-            .await?
+        // The terminal result occupies a reservation until the worker acknowledges it.
+        scheduler.handle_heartbeat_server(
+            a,
+            nonce_a,
+            0.0,
+            &[second.job_id],
+            Box::new(TestJobAuthorizer),
+            dist::WorkerCapabilities {
+                native_platform: Some(platform),
+                native_placement: Some(dist::NativePlacement {
+                    queue: dist::NativeQueueSnapshot {
+                        capacity: 2,
+                        compiler_slots: 1,
+                        staging_slots: 2,
+                        publication_slots: 2,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            },
+        )?;
+        let AllocJobResult::Success { job_alloc, .. } =
+            tokio::time::timeout(Duration::from_secs(5), waiting).await??
         else {
-            bail!("native worker did not become available after completion");
+            bail!("queued work did not become available after completion");
         };
         assert_eq!(job_alloc.server_id, a);
-        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
-            .handle_alloc_job(&AcceptAssign, test_toolchain('a'))
-            .await?
-        else {
-            bail!("archive worker unavailable");
-        };
-        assert_eq!(job_alloc.server_id, b);
         Ok(())
     }
 
@@ -3748,91 +3402,88 @@ mod scheduler_tests {
     }
 
     #[tokio::test]
-    async fn scheduler_status_tracks_per_worker_admission_and_capacity_changes() {
-        let scheduler = Arc::new(Scheduler::new_with_job_slack(JobSlackConfig {
-            static_jobs: 0,
-            percent: 200.0,
-        }));
-        let ids: [ServerId; 3] = [
+    async fn scheduler_status_tracks_per_worker_admission_and_capacity_changes() -> Result<()> {
+        let scheduler = Arc::new(Scheduler::new());
+        let ids = [
             ServerId::from_digest([1; 32]),
             ServerId::from_digest([2; 32]),
-            ServerId::from_digest([3; 32]),
         ];
         let nonce = ServerNonce::new();
-        for (id, cpus) in ids.into_iter().zip([1.0, 3.0, 0.0]) {
-            scheduler
-                .handle_heartbeat_server(
-                    id,
-                    nonce.clone(),
-                    cpus,
-                    &[],
-                    Box::new(TestJobAuthorizer),
-                    dist::WorkerCapabilities::ARCHIVE,
-                )
-                .unwrap();
-        }
-        let status = scheduler.handle_status().unwrap();
-        assert_eq!(
-            (status.num_cpus, status.max_jobs, status.available_jobs),
-            (4, 13, 13)
-        );
-        #[cfg(feature = "scheduler-dashboard")]
-        {
-            let snapshot = scheduler.handle_dashboard_snapshot().unwrap();
-            assert_eq!(snapshot.totals.workers, 3);
-            assert_eq!(snapshot.totals.available, status.available_jobs);
-            assert_eq!(snapshot.totals.max_jobs, status.max_jobs);
-            assert_eq!(snapshot.totals.cpu_capacity, 4.0);
-            assert_eq!(snapshot.workers.len(), 3);
-        }
-        for _ in 0..13 {
-            assert!(matches!(
-                Arc::clone(&scheduler)
-                    .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
-                    .await
-                    .unwrap(),
-                AllocJobResult::Success { .. }
-            ));
-        }
-        assert!(matches!(
-            Arc::clone(&scheduler)
-                .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
-                .await
-                .unwrap(),
-            AllocJobResult::Fail { .. }
-        ));
-        let status = scheduler.handle_status().unwrap();
-        assert_eq!(
-            (status.in_progress, status.max_jobs, status.available_jobs),
-            (13, 13, 0)
-        );
-        scheduler
-            .handle_heartbeat_server(
-                ids[0],
+        let capabilities = |capacity| dist::WorkerCapabilities {
+            native_platform: Some(test_platform()),
+            native_placement: Some(dist::NativePlacement {
+                queue: dist::NativeQueueSnapshot {
+                    capacity,
+                    compiler_slots: 1,
+                    staging_slots: 1,
+                    publication_slots: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        };
+        for (id, capacity) in ids.into_iter().zip([2, 3]) {
+            scheduler.handle_heartbeat_server(
+                id,
                 nonce.clone(),
                 0.0,
                 &[],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
-            )
-            .unwrap();
-        scheduler
-            .handle_heartbeat_server(
-                ids[1],
-                nonce,
-                4.0,
-                &[],
-                Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
-            )
-            .unwrap();
-        let status = scheduler.handle_status().unwrap();
-        // Three jobs remain assigned to the now-busy worker; the other worker
-        // can admit three more despite the fleet's nominal capacity being full.
+                capabilities(capacity),
+            )?;
+        }
+        let status = scheduler.handle_status()?;
+        assert_eq!(
+            (status.num_cpus, status.max_jobs, status.available_jobs),
+            (0, 5, 5)
+        );
+        for _ in 0..5 {
+            assert!(matches!(
+                test_allocate(Arc::clone(&scheduler), &AcceptAssign, 'c').await?,
+                AllocJobResult::Success { .. }
+            ));
+        }
+        let status = scheduler.handle_status()?;
         assert_eq!(
             (status.in_progress, status.max_jobs, status.available_jobs),
-            (13, 14, 3)
+            (5, 5, 0)
         );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                test_allocate(Arc::clone(&scheduler), &AcceptAssign, 'c')
+            )
+            .await
+            .is_err()
+        );
+        let assigned = {
+            let servers = scheduler.servers.lock().unwrap();
+            servers[&ids[1]]
+                .jobs_assigned
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        scheduler.handle_heartbeat_server(
+            ids[1],
+            nonce,
+            0.0,
+            &assigned,
+            Box::new(TestJobAuthorizer),
+            capabilities(4),
+        )?;
+        let status = scheduler.handle_status()?;
+        assert_eq!(
+            (status.in_progress, status.max_jobs, status.available_jobs),
+            (5, 6, 1)
+        );
+        #[cfg(feature = "scheduler-dashboard")]
+        {
+            let snapshot = scheduler.handle_dashboard_snapshot()?;
+            assert_eq!(snapshot.totals.available, status.available_jobs);
+            assert_eq!(snapshot.totals.max_jobs, status.max_jobs);
+        }
+        Ok(())
     }
 
     struct StatusDuringAssign<'a>(&'a Scheduler);
@@ -3843,7 +3494,7 @@ mod scheduler_tests {
             &self,
             _server_id: ServerId,
             job_id: JobId,
-            _assignment: JobAssignment,
+            _assignment: NativeAssignment,
             _auth: String,
         ) -> Result<AssignJobResult> {
             let _ = job_id;
@@ -3862,7 +3513,6 @@ mod scheduler_tests {
             }
             Ok(AssignJobResult {
                 state: JobState::Pending,
-                need_toolchain: false,
             })
         }
     }
@@ -3878,7 +3528,7 @@ mod scheduler_tests {
             &self,
             server_id: ServerId,
             job_id: JobId,
-            _assignment: JobAssignment,
+            _assignment: NativeAssignment,
             _auth: String,
         ) -> Result<AssignJobResult> {
             let snapshot = self.scheduler.handle_heartbeat_server(
@@ -3887,12 +3537,11 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )?;
             assert_eq!(snapshot.assigned_job_ids, vec![job_id]);
             Ok(AssignJobResult {
                 state: JobState::Pending,
-                need_toolchain: false,
             })
         }
     }
@@ -3903,15 +3552,15 @@ mod scheduler_tests {
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
-        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
-            .handle_alloc_job(
-                &SnapshotDuringAssign {
-                    scheduler: &scheduler,
-                    nonce: nonce.clone(),
-                },
-                test_toolchain('c'),
-            )
-            .await?
+        let AllocJobResult::Success { job_alloc, .. } = test_allocate(
+            Arc::clone(&scheduler),
+            &SnapshotDuringAssign {
+                scheduler: &scheduler,
+                nonce: nonce.clone(),
+            },
+            'c',
+        )
+        .await?
         else {
             panic!("expected job allocation");
         };
@@ -3921,7 +3570,7 @@ mod scheduler_tests {
             1.0,
             &[],
             Box::new(TestJobAuthorizer),
-            dist::WorkerCapabilities::ARCHIVE,
+            test_capabilities(),
         )?;
         assert_eq!(snapshot.assigned_job_ids, vec![job_alloc.job_id]);
         for state in [JobState::Ready, JobState::Started, JobState::Complete] {
@@ -3933,7 +3582,7 @@ mod scheduler_tests {
             1.0,
             &[],
             Box::new(TestJobAuthorizer),
-            dist::WorkerCapabilities::ARCHIVE,
+            test_capabilities(),
         )?;
         assert!(snapshot.assigned_job_ids.is_empty());
         Ok(())
@@ -3944,10 +3593,10 @@ mod scheduler_tests {
         let scheduler = Arc::new(Scheduler::new());
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         register_test_server(&scheduler, server_id, ServerNonce::new());
-        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
-            .handle_alloc_job(&StatusDuringAssign(&scheduler), test_toolchain('c'))
-            .await
-            .unwrap()
+        let AllocJobResult::Success { job_alloc, .. } =
+            test_allocate(Arc::clone(&scheduler), &StatusDuringAssign(&scheduler), 'c')
+                .await
+                .unwrap()
         else {
             panic!("worker should accept job");
         };
@@ -3968,7 +3617,7 @@ mod scheduler_tests {
             &self,
             _server_id: ServerId,
             _job_id: JobId,
-            _assignment: JobAssignment,
+            _assignment: NativeAssignment,
             _auth: String,
         ) -> Result<AssignJobResult> {
             self.0.notify_one();
@@ -3985,11 +3634,7 @@ mod scheduler_tests {
         let task = tokio::spawn({
             let scheduler = Arc::clone(&scheduler);
             let requester = Arc::clone(&requester);
-            async move {
-                scheduler
-                    .handle_alloc_job(requester.as_ref(), test_toolchain('c'))
-                    .await
-            }
+            async move { test_allocate(scheduler, requester.as_ref(), 'c').await }
         });
         tokio::time::timeout(Duration::from_secs(5), requester.0.notified()).await?;
         assert_eq!(scheduler.handle_status()?.in_progress, 1);
@@ -3998,62 +3643,6 @@ mod scheduler_tests {
         assert_no_assigned_jobs(&scheduler, &worker);
         assert_eq!(scheduler.handle_status()?.in_progress, 0);
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn idle_workers_receive_jobs_proportional_to_cpu_capacity() {
-        let scheduler = Arc::new(Scheduler::new());
-        let ids: Vec<ServerId> = [1, 2, 3]
-            .into_iter()
-            .map(|i| ServerId::from_digest([i; 32]))
-            .collect();
-
-        for (&id, capacity) in ids.iter().zip([1.0, 3.0, 0.0]) {
-            scheduler
-                .handle_heartbeat_server(
-                    id,
-                    ServerNonce::new(),
-                    capacity,
-                    &[],
-                    Box::new(TestJobAuthorizer),
-                    dist::WorkerCapabilities::ARCHIVE,
-                )
-                .unwrap();
-        }
-
-        let mut observed = Vec::new();
-        for _ in 0..1024 {
-            let result = Arc::clone(&scheduler)
-                .handle_alloc_job(&AcceptAssign, test_toolchain('b'))
-                .await
-                .unwrap();
-            let AllocJobResult::Success { job_alloc, .. } = result else {
-                panic!("eligible idle workers must accept a job");
-            };
-            observed.push(job_alloc.server_id);
-            for state in [JobState::Ready, JobState::Started, JobState::Complete] {
-                scheduler
-                    .handle_update_job_state(job_alloc.job_id, job_alloc.server_id, state)
-                    .unwrap();
-            }
-        }
-
-        let first = observed
-            .iter()
-            .filter(|&&selected| selected == ids[0])
-            .count();
-        assert!(
-            (210..=350).contains(&first),
-            "first worker received {first} jobs"
-        );
-        let busy = observed
-            .iter()
-            .filter(|&&selected| selected == ids[2])
-            .count();
-        assert!(
-            (40..=150).contains(&busy),
-            "busy worker received {busy} jobs"
-        );
     }
 
     #[tokio::test]
@@ -4070,8 +3659,7 @@ mod scheduler_tests {
         std::fs::write(&drain, b"drain").unwrap();
         assert!(scheduler.handle_is_draining());
         assert_eq!(scheduler.handle_status().unwrap().available_jobs, 0);
-        let allocation = Arc::clone(&scheduler)
-            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+        let allocation = test_allocate(Arc::clone(&scheduler), &AcceptAssign, 'c')
             .await
             .unwrap();
         assert!(matches!(allocation, AllocJobResult::Fail { .. }));
@@ -4079,8 +3667,7 @@ mod scheduler_tests {
 
         std::fs::remove_file(&drain).unwrap();
         assert!(!scheduler.handle_is_draining());
-        let allocation = Arc::clone(&scheduler)
-            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+        let allocation = test_allocate(Arc::clone(&scheduler), &AcceptAssign, 'c')
             .await
             .unwrap();
         assert!(matches!(allocation, AllocJobResult::Success { .. }));
@@ -4111,7 +3698,7 @@ mod scheduler_tests {
             &self,
             server_id: ServerId,
             job_id: JobId,
-            _assignment: JobAssignment,
+            _assignment: NativeAssignment,
             _auth: String,
         ) -> Result<AssignJobResult> {
             assert_eq!(server_id, self.server_id);
@@ -4130,13 +3717,12 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )?;
             assert!(!heartbeat.is_new);
 
             Ok(AssignJobResult {
                 state: JobState::Pending,
-                need_toolchain: false,
             })
         }
     }
@@ -4148,10 +3734,10 @@ mod scheduler_tests {
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
 
-        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
-            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
-            .await
-            .unwrap()
+        let AllocJobResult::Success { job_alloc, .. } =
+            test_allocate(Arc::clone(&scheduler), &AcceptAssign, 'c')
+                .await
+                .unwrap()
         else {
             panic!("worker should accept job");
         };
@@ -4173,7 +3759,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )
             .unwrap();
         assert_eq!(
@@ -4193,7 +3779,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )
             .unwrap();
         assert_no_assigned_jobs(&scheduler, &server_id);
@@ -4205,9 +3791,8 @@ mod scheduler_tests {
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
-        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
-            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
-            .await?
+        let AllocJobResult::Success { job_alloc, .. } =
+            test_allocate(Arc::clone(&scheduler), &AcceptAssign, 'c').await?
         else {
             bail!("worker should accept job");
         };
@@ -4230,7 +3815,7 @@ mod scheduler_tests {
             1.0,
             &[job_id],
             Box::new(TestJobAuthorizer),
-            dist::WorkerCapabilities::ARCHIVE,
+            test_capabilities(),
         )?;
         assert!(
             !scheduler
@@ -4249,7 +3834,7 @@ mod scheduler_tests {
             1.0,
             &[],
             Box::new(TestJobAuthorizer),
-            dist::WorkerCapabilities::ARCHIVE,
+            test_capabilities(),
         )?;
         assert_no_assigned_jobs(&scheduler, &server_id);
         Ok(())
@@ -4262,10 +3847,10 @@ mod scheduler_tests {
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
 
-        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
-            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
-            .await
-            .unwrap()
+        let AllocJobResult::Success { job_alloc, .. } =
+            test_allocate(Arc::clone(&scheduler), &AcceptAssign, 'c')
+                .await
+                .unwrap()
         else {
             panic!("worker should accept job");
         };
@@ -4282,15 +3867,15 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )
             .unwrap();
         assert_no_assigned_jobs(&scheduler, &server_id);
 
-        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
-            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
-            .await
-            .unwrap()
+        let AllocJobResult::Success { job_alloc, .. } =
+            test_allocate(Arc::clone(&scheduler), &AcceptAssign, 'c')
+                .await
+                .unwrap()
         else {
             panic!("worker should accept another job");
         };
@@ -4312,7 +3897,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )
             .unwrap();
         assert_eq!(
@@ -4371,12 +3956,11 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(RejectToken),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )
             .unwrap();
         assert!(
-            Arc::clone(&scheduler)
-                .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+            test_allocate(Arc::clone(&scheduler), &AcceptAssign, 'c')
                 .await
                 .is_err()
         );
@@ -4388,10 +3972,10 @@ mod scheduler_tests {
         let scheduler = Arc::new(Scheduler::new());
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         register_test_server(&scheduler, server_id, ServerNonce::new());
-        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
-            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
-            .await
-            .unwrap()
+        let AllocJobResult::Success { job_alloc, .. } =
+            test_allocate(Arc::clone(&scheduler), &AcceptAssign, 'c')
+                .await
+                .unwrap()
         else {
             panic!("worker should accept job");
         };
@@ -4443,10 +4027,10 @@ mod scheduler_tests {
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
-        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
-            .handle_alloc_job(&AcceptAssign, test_toolchain('d'))
-            .await
-            .unwrap()
+        let AllocJobResult::Success { job_alloc, .. } =
+            test_allocate(Arc::clone(&scheduler), &AcceptAssign, 'd')
+                .await
+                .unwrap()
         else {
             panic!("expected scheduler job allocation");
         };
@@ -4470,7 +4054,7 @@ mod scheduler_tests {
                 1.0,
                 &[job_id],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )
             .unwrap();
         assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
@@ -4483,7 +4067,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )
             .unwrap();
         assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
@@ -4502,7 +4086,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )
             .unwrap();
         assert_no_assigned_jobs(&scheduler, &server_id);
@@ -4521,9 +4105,8 @@ mod scheduler_tests {
         let owner: ServerId = ServerId::from_digest([1; 32]);
         let other: ServerId = ServerId::from_digest([2; 32]);
         register_test_server(&scheduler, owner, ServerNonce::new());
-        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
-            .handle_alloc_job(&AcceptAssign, test_toolchain('f'))
-            .await?
+        let AllocJobResult::Success { job_alloc, .. } =
+            test_allocate(Arc::clone(&scheduler), &AcceptAssign, 'f').await?
         else {
             panic!("expected job");
         };
@@ -4581,10 +4164,10 @@ mod scheduler_tests {
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
-        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
-            .handle_alloc_job(&AcceptAssign, test_toolchain('d'))
-            .await
-            .unwrap()
+        let AllocJobResult::Success { job_alloc, .. } =
+            test_allocate(Arc::clone(&scheduler), &AcceptAssign, 'd')
+                .await
+                .unwrap()
         else {
             panic!("expected scheduler job allocation");
         };
@@ -4601,7 +4184,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )
             .unwrap();
         assert!(
@@ -4621,7 +4204,7 @@ mod scheduler_tests {
                 1.0,
                 &[job_id],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )
             .unwrap();
         assert!(
@@ -4641,7 +4224,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )
             .unwrap();
         assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
@@ -4656,10 +4239,10 @@ mod scheduler_tests {
         let scheduler = Arc::new(Scheduler::new());
         let server_id: ServerId = ServerId::from_digest([1; 32]);
         register_test_server(&scheduler, server_id, ServerNonce::new());
-        let AllocJobResult::Success { job_alloc, .. } = Arc::clone(&scheduler)
-            .handle_alloc_job(&AcceptAssign, test_toolchain('d'))
-            .await
-            .unwrap()
+        let AllocJobResult::Success { job_alloc, .. } =
+            test_allocate(Arc::clone(&scheduler), &AcceptAssign, 'd')
+                .await
+                .unwrap()
         else {
             panic!("expected scheduler job allocation");
         };
@@ -4693,7 +4276,7 @@ mod scheduler_tests {
                 8.0,
                 &[],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )
             .unwrap();
         assert_eq!(scheduler.handle_get_worker_name(server_id).unwrap(), None);
@@ -4720,7 +4303,7 @@ mod scheduler_tests {
                 8.0,
                 &[],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )
             .unwrap();
         assert!(heartbeat.is_new);
@@ -4742,7 +4325,7 @@ mod scheduler_tests {
                     8.0,
                     &[],
                     Box::new(TestJobAuthorizer),
-                    dist::WorkerCapabilities::ARCHIVE,
+                    test_capabilities(),
                 )
                 .unwrap();
         }
@@ -4767,7 +4350,7 @@ mod scheduler_tests {
                 8.0,
                 &[],
                 Box::new(TestJobAuthorizer),
-                dist::WorkerCapabilities::ARCHIVE,
+                test_capabilities(),
             )
             .unwrap();
         scheduler
@@ -4792,414 +4375,11 @@ mod scheduler_tests {
             server_id,
             server_nonce,
         };
-        let allocation = Arc::clone(&scheduler)
-            .handle_alloc_job(&requester, test_toolchain('c'))
+        let allocation = test_allocate(Arc::clone(&scheduler), &requester, 'c')
             .await
             .unwrap();
 
         assert!(matches!(allocation, AllocJobResult::Fail { .. }));
         assert_no_assigned_jobs(&scheduler, &server_id);
-    }
-}
-
-#[cfg(test)]
-mod server_upload_tests {
-    use super::*;
-    use sccache::util::Digest;
-    use std::io::{self, Cursor, Read};
-    use std::sync::{Arc, mpsc};
-    use std::thread;
-
-    struct NoopBuilder;
-
-    impl BuilderIncoming for NoopBuilder {
-        fn run_build(
-            &self,
-            _job_id: JobId,
-            _toolchain: Toolchain,
-            _command: CompileCommand,
-            _outputs: OutputRequest,
-            _inputs_rdr: InputsReader<'_>,
-            _cache: &Mutex<TcCache>,
-        ) -> Result<sccache::dist::BuildResult> {
-            unreachable!("upload tests must never execute a compile");
-        }
-    }
-
-    struct RecordingRequester(Mutex<Vec<JobState>>);
-
-    #[async_trait::async_trait]
-    impl ServerOutgoing for RecordingRequester {
-        async fn do_update_job_state(
-            &self,
-            _job_id: JobId,
-            state: JobState,
-        ) -> Result<UpdateJobStateResult> {
-            self.0.lock().unwrap().push(state);
-            Ok(UpdateJobStateResult::Success)
-        }
-    }
-
-    fn test_server() -> Result<(tempfile::TempDir, Arc<Server>)> {
-        let dir = tempfile::tempdir()?;
-        let server = Server::new(Some(ArchiveWorker::new(
-            Box::new(NoopBuilder),
-            dir.path(),
-            1024 * 1024,
-            vec![],
-        )?));
-        Ok((dir, Arc::new(server)))
-    }
-
-    fn tc(contents: &[u8]) -> Result<Toolchain> {
-        Ok(Toolchain {
-            archive_id: sccache::dist::ArchiveId::try_from(Digest::reader_sync(contents)?)?,
-        })
-    }
-
-    struct PausingReader {
-        sent: bool,
-        started: mpsc::Sender<()>,
-        resume: mpsc::Receiver<()>,
-        inner: Cursor<Vec<u8>>,
-    }
-
-    impl Read for PausingReader {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            if !self.sent {
-                self.sent = true;
-                self.started.send(()).unwrap();
-                self.resume.recv().unwrap();
-            }
-            self.inner.read(buf)
-        }
-    }
-
-    #[test]
-    fn reconcile_removes_only_stale_unclaimed_assignments() -> Result<()> {
-        let (_dir, server) = test_server()?;
-        for id in [JobId(41), JobId(42)] {
-            server.handle_assign_job(id, tc(b"older toolchain")?)?;
-        }
-        let heartbeat_started_at = Instant::now();
-        // This assignment arrived after the heartbeat began and may be
-        // legitimately absent from the scheduler's earlier snapshot.
-        server.handle_assign_job(JobId(43), tc(b"new toolchain")?)?;
-
-        assert_eq!(
-            server.handle_reconcile_assignments(&[JobId(42)], heartbeat_started_at)?,
-            1
-        );
-        {
-            let jobs = server.job_toolchains.lock().unwrap();
-            assert!(!jobs.contains_key(&JobId(41)));
-            assert!(jobs.contains_key(&JobId(42)));
-            assert!(jobs.contains_key(&JobId(43)));
-        }
-        let next_heartbeat = Instant::now();
-        assert_eq!(
-            server.handle_reconcile_assignments(&[JobId(43)], next_heartbeat)?,
-            1
-        );
-        let jobs = server.job_toolchains.lock().unwrap();
-        assert!(!jobs.contains_key(&JobId(42)));
-        assert!(jobs.contains_key(&JobId(43)));
-        Ok(())
-    }
-
-    #[test]
-    fn removed_job_does_not_publish_ready_after_upload_finishes() -> Result<()> {
-        let (_dir, server) = test_server()?;
-        let job_id = JobId(71);
-        let bytes = b"toolchain still uploading";
-        server.handle_assign_job(job_id, tc(bytes)?)?;
-
-        let (started_tx, started_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel();
-        let uploader = Arc::clone(&server);
-        let upload = thread::spawn(move || {
-            let requester = RecordingRequester(Mutex::new(Vec::new()));
-            let reader = PausingReader {
-                sent: false,
-                started: started_tx,
-                resume: resume_rx,
-                inner: Cursor::new(bytes.to_vec()),
-            };
-            let outcome = uploader.handle_submit_toolchain(
-                &requester,
-                job_id,
-                ToolchainReader::new(Box::new(reader)),
-            );
-            (outcome, requester.0.lock().unwrap().clone())
-        });
-        started_rx.recv_timeout(Duration::from_secs(5))?;
-
-        let removed = server.handle_reconcile_assignments(&[], Instant::now())?;
-        // Always release the upload, even if the expected cleanup failed.
-        resume_tx.send(())?;
-        let (outcome, published) = upload.join().unwrap();
-        assert_eq!(removed, 1);
-        assert!(matches!(outcome?, SubmitToolchainResult::JobNotFound));
-        assert!(published.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn unknown_run_does_not_publish_any_job_state() -> Result<()> {
-        let (_dir, server) = test_server()?;
-        let requester = RecordingRequester(Mutex::new(Vec::new()));
-        let result = server.handle_run_job(
-            &requester,
-            JobId(999),
-            CompileCommand {
-                umask: Some(0o022),
-                executable: "cc".to_owned(),
-                arguments: Vec::new(),
-                env_vars: Vec::new(),
-                cwd: "/tmp".to_owned(),
-            },
-            OutputRequest {
-                paths: Vec::new(),
-                compression_level: 3,
-            },
-            InputsReader::new(Box::new(Cursor::new(Vec::new()))),
-        )?;
-        assert!(matches!(result, RunJobResult::JobNotFound));
-        assert!(requester.0.lock().unwrap().is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn archive_input_failure_finishes_without_waiting_for_execution_capacity() -> Result<()> {
-        struct FailedUpload;
-
-        impl Read for FailedUpload {
-            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-                Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    "input disconnected",
-                ))
-            }
-        }
-
-        let (_dir, server) = test_server()?;
-        let job_id = JobId(81);
-        server.handle_assign_job(job_id, tc(b"cold toolchain")?)?;
-        // Saturate the shared execution queue without any build running. The
-        // upload must still be consumed and failed, without entering the builder.
-        let permits = (0..server.execution_queue.width().get())
-            .map(|_| server.execution_queue.acquire(|| Ok(())))
-            .collect::<Result<Vec<_>>>()?;
-        let uploader = Arc::clone(&server);
-        let (finished_tx, finished_rx) = mpsc::channel();
-        let upload = thread::spawn(move || {
-            let requester = RecordingRequester(Mutex::new(Vec::new()));
-            let result = uploader.handle_run_job(
-                &requester,
-                job_id,
-                CompileCommand {
-                    umask: Some(0o022),
-                    executable: "cc".to_owned(),
-                    arguments: Vec::new(),
-                    env_vars: Vec::new(),
-                    cwd: "/tmp".to_owned(),
-                },
-                OutputRequest {
-                    paths: Vec::new(),
-                    compression_level: 3,
-                },
-                InputsReader::new(Box::new(FailedUpload)),
-            );
-            let states = requester.0.lock().unwrap().clone();
-            finished_tx.send((result, states)).unwrap();
-        });
-        let finished = finished_rx.recv_timeout(Duration::from_secs(5));
-        drop(permits);
-        upload.join().unwrap();
-        let (result, states) = finished.context("upload was blocked by compiler admission")?;
-        let error = result.err().context("disconnected input must fail")?;
-        assert!(format!("{error:#}").contains("input disconnected"));
-        assert_eq!(states, vec![JobState::Started, JobState::Complete]);
-        assert_eq!(server.execution_queue.active(), 0);
-        Ok(())
-    }
-
-    struct RejectStartRequester;
-    #[async_trait::async_trait]
-    impl ServerOutgoing for RejectStartRequester {
-        async fn do_update_job_state(
-            &self,
-            _job_id: JobId,
-            _state: JobState,
-        ) -> Result<UpdateJobStateResult> {
-            bail!("synthetic failure to acknowledge Started")
-        }
-    }
-
-    #[test]
-    fn failed_started_ack_restores_unclaimed_local_job() -> Result<()> {
-        let (_dir, server) = test_server()?;
-        let job_id = JobId(42);
-        let toolchain = tc(b"custom toolchain")?;
-        server.handle_assign_job(job_id, toolchain.clone())?;
-        let failed = server.handle_run_job(
-            &RejectStartRequester,
-            job_id,
-            CompileCommand {
-                umask: Some(0o022),
-                executable: "cc".to_owned(),
-                arguments: Vec::new(),
-                env_vars: Vec::new(),
-                cwd: "/tmp".to_owned(),
-            },
-            OutputRequest {
-                paths: Vec::new(),
-                compression_level: 3,
-            },
-            InputsReader::new(Box::new(Cursor::new(Vec::new()))),
-        );
-        assert!(failed.is_err());
-        assert_eq!(
-            server
-                .job_toolchains
-                .lock()
-                .unwrap()
-                .get(&job_id)
-                .and_then(|assigned| match &assigned.assignment {
-                    JobAssignment::Archive(toolchain) => Some(toolchain),
-                    JobAssignment::Native(_) => None,
-                }),
-            Some(&toolchain)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn assignments_are_not_blocked_by_in_progress_toolchain_uploads() -> Result<()> {
-        let (_dir, server) = test_server()?;
-        let first = b"first valid toolchain archive";
-        server.handle_assign_job(JobId(41), tc(first)?)?;
-        let (started_tx, started_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel();
-        let uploader = Arc::clone(&server);
-        let upload = thread::spawn(move || {
-            let requester = RecordingRequester(Mutex::new(Vec::new()));
-            let reader = PausingReader {
-                sent: false,
-                started: started_tx,
-                resume: resume_rx,
-                inner: Cursor::new(first.to_vec()),
-            };
-            let outcome = uploader.handle_submit_toolchain(
-                &requester,
-                JobId(41),
-                ToolchainReader::new(Box::new(reader)),
-            );
-            (outcome, requester.0.lock().unwrap().clone())
-        });
-        started_rx.recv_timeout(Duration::from_secs(5))?;
-
-        let second_server = Arc::clone(&server);
-        let (assignment_tx, assignment_rx) = mpsc::channel();
-        let assignment = thread::spawn(move || {
-            let result =
-                second_server.handle_assign_job(JobId(42), tc(b"second toolchain").unwrap());
-            assignment_tx.send(result).unwrap();
-        });
-        // Release the upload after checking the other assignment, even when
-        // the assertion fails, so the test never leaves a blocked thread.
-        let not_blocked = assignment_rx.recv_timeout(Duration::from_secs(2));
-        resume_tx.send(())?;
-        assignment.join().unwrap();
-        let (upload_result, states) = upload.join().unwrap();
-        assert!(
-            not_blocked.is_ok(),
-            "assignment was blocked by another toolchain's upload"
-        );
-        assert!(matches!(upload_result?, SubmitToolchainResult::Success));
-        assert_eq!(states, vec![JobState::Ready]);
-        Ok(())
-    }
-
-    #[test]
-    fn missing_cached_archive_requires_fresh_upload_on_assignment() -> Result<()> {
-        let (dir, server) = test_server()?;
-        let contents = b"verified archive removed after publication";
-        let toolchain = tc(contents)?;
-        let root = dir.path().join("tc");
-        let staged = StagedToolchainArchive::receive(
-            &root,
-            toolchain.clone(),
-            contents.as_slice(),
-            1024 * 1024,
-        )?;
-        let archive = server.archive.as_ref().context("archive worker disabled")?;
-        archive.cache.lock().unwrap().insert_staged(staged)?;
-
-        let first = server.handle_assign_job(JobId(45), toolchain.clone())?;
-        assert!(!first.need_toolchain);
-        assert!(matches!(first.state, JobState::Ready));
-
-        let key = toolchain.archive_id.as_str();
-        std::fs::remove_file(root.join(&key[..1]).join(&key[1..2]).join(key))?;
-
-        let next = server.handle_assign_job(JobId(46), toolchain.clone())?;
-        assert!(next.need_toolchain);
-        assert!(matches!(next.state, JobState::Pending));
-        assert!(!archive.has_cached_toolchain(&toolchain)?);
-        Ok(())
-    }
-
-    #[test]
-    fn corrupt_toolchain_is_not_published_as_ready_or_cached() -> Result<()> {
-        let (_dir, server) = test_server()?;
-        let expected = tc(b"expected")?;
-        server.handle_assign_job(JobId(43), expected.clone())?;
-        let requester = RecordingRequester(Mutex::new(Vec::new()));
-        let result = server.handle_submit_toolchain(
-            &requester,
-            JobId(43),
-            ToolchainReader::new(Box::new(Cursor::new(b"wrong".to_vec()))),
-        )?;
-        assert!(matches!(result, SubmitToolchainResult::CannotCache));
-        assert!(requester.0.lock().unwrap().is_empty());
-        assert!(
-            !server
-                .archive
-                .as_ref()
-                .unwrap()
-                .cache
-                .lock()
-                .unwrap()
-                .contains_toolchain(&expected)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn oversized_archive_is_rejected_without_publishing_ready() -> Result<()> {
-        let (_dir, server) = test_server()?;
-        let bytes = vec![7; 1024 * 1024 + 1];
-        let expected = tc(&bytes)?;
-        server.handle_assign_job(JobId(44), expected.clone())?;
-        let requester = RecordingRequester(Mutex::new(Vec::new()));
-        let result = server.handle_submit_toolchain(
-            &requester,
-            JobId(44),
-            ToolchainReader::new(Box::new(Cursor::new(bytes))),
-        )?;
-        assert!(matches!(result, SubmitToolchainResult::CannotCache));
-        assert!(requester.0.lock().unwrap().is_empty());
-        assert!(
-            !server
-                .archive
-                .as_ref()
-                .unwrap()
-                .cache
-                .lock()
-                .unwrap()
-                .contains_toolchain(&expected)
-        );
-        Ok(())
     }
 }

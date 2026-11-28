@@ -142,7 +142,6 @@ fn snapshot(phase: u64) -> Snapshot {
         compiler_demand: jobs.len(),
         max_jobs: 12,
         available: 12 - jobs.len(),
-        archive_available: None,
         native_available: Some(12 - jobs.len()),
         native: Some(NativeWorker {
             cache_analytics: Some(analytics().site_summary()),
@@ -264,6 +263,11 @@ fn telemetry(phase: u64) -> NativeTelemetry {
             misses: 20 + phase,
             refreshes: 1,
             ..Default::default()
+        }),
+        duplicate_misses: Some(sccache_build::analytics::DuplicateMisses {
+            new_keys: 20 + phase,
+            identical_outputs: 8 + phase,
+            identical_results: 5 + phase,
         }),
         analytics: Some(analytics()),
         cache: Some(Cache {

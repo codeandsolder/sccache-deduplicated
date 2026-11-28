@@ -964,7 +964,6 @@ pub fn parse_arguments(
         // FIXME: implement color_mode for msvc.
         color_mode: ColorMode::Auto,
         suppress_rewrite_includes_only: false,
-        too_hard_for_preprocessor_cache_mode: None,
     })
 }
 
@@ -2899,7 +2898,7 @@ mod test {
         assert!(dist_command.is_some());
         #[cfg(not(feature = "dist-client"))]
         assert!(dist_command.is_none());
-        assert_compile_command_executes(&command)?;
+        assert_compile_command_declared(&command)?;
         assert_eq!(
             if existing_pdb {
                 Cacheable::No

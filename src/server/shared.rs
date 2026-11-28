@@ -52,15 +52,12 @@ struct Job {
     activity_id: String,
     compile: Compile,
     aliases: CompilerAliases,
-    // Tagged serde enums are not supported by bincode. These contain
-    // administrator-approved toolchain mappings only, never scheduler auth.
-    toolchains: Vec<u8>,
     catalogs: Vec<std::path::PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
 enum ExecutorEvent {
-    Progress(activity::CompileActivity),
+    Progress(Box<activity::CompileActivity>),
     Finished(std::result::Result<CompileFinished, String>),
 }
 
@@ -69,7 +66,6 @@ pub(super) struct SharedExecutor {
     jobserver: Client,
     executors: tokio::sync::Semaphore,
     aliases: CompilerAliases,
-    toolchains: Vec<u8>,
     catalogs: Vec<std::path::PathBuf>,
     #[cfg(feature = "dist-client")]
     digest_memo: Arc<crate::build_runtime::DescriptorMemo>,
@@ -206,7 +202,7 @@ async fn read_result(
         let mut bytes = vec![0; len];
         reader.read_exact(&mut bytes).await?;
         match decode_frame(&bytes)? {
-            ExecutorEvent::Progress(sample) => activity.observe_executor(sample)?,
+            ExecutorEvent::Progress(sample) => activity.observe_executor(*sample)?,
             ExecutorEvent::Finished(result) => return result.map_err(anyhow::Error::msg),
         }
     }
@@ -232,12 +228,7 @@ impl SharedExecutor {
         jobserver: Client,
     ) -> Result<Self> {
         ensure!(
-            !config.client_side_mode
-                && config
-                    .dist
-                    .native
-                    .as_ref()
-                    .is_none_or(|native| native.local_execution.is_none()),
+            !config.client_side_mode,
             "shared daemon requires credential-isolated execution"
         );
         let capacity = policy.max_executors.map_or_else(
@@ -253,7 +244,6 @@ impl SharedExecutor {
             jobserver,
             executors: tokio::sync::Semaphore::new(capacity),
             aliases: config.compiler_aliases.clone(),
-            toolchains: serde_json::to_vec(&config.dist.toolchains)?,
             catalogs: config.dist.native_installation_catalogs.clone(),
             #[cfg(feature = "dist-client")]
             digest_memo: Arc::default(),
@@ -359,7 +349,6 @@ impl SharedExecutor {
             activity_id: activity.snapshot().id,
             compile,
             aliases: self.aliases.clone(),
-            toolchains: self.toolchains.clone(),
             catalogs: self.catalogs.clone(),
         };
         input.write_all(&frame(&peer.credentials)?).await?;

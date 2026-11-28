@@ -2,8 +2,8 @@
 //! before its delivery ticket is released, so GC never observes a pin gap.
 use super::{
     Arc, BTreeMap, BlobRef, ContentId, Context, HashMap, Instant, Mutex, MutexGuard,
-    NativeDownload, NativeSessions, Phase, Publisher, Ready, Result, ResultLease, Ticket, anyhow,
-    bail, ensure,
+    NativeDownload, NativeLeaseRejected, NativeSessions, Phase, Publisher, Ready, Result,
+    ResultLease, Ticket, anyhow, bail, ensure,
 };
 use crate::ResultId;
 
@@ -43,10 +43,12 @@ impl RetentionGroups {
 
 impl Group {
     fn touch(&mut self, peer: crate::PeerId, deadline: Instant) -> Result<()> {
-        ensure!(
-            self.owner == peer && self.expires > Instant::now(),
-            "unknown or expired native retention group"
-        );
+        if self.owner != peer {
+            return Err(NativeLeaseRejected::Unauthorized.into());
+        }
+        if self.expires <= Instant::now() {
+            return Err(NativeLeaseRejected::Expired.into());
+        }
         self.expires = deadline;
         Ok(())
     }
@@ -188,12 +190,19 @@ impl NativeSessions {
     /// Renew a build-wide lease, independent of the number of retained results.
     /// # Errors
     /// Returns an error for an expired or unauthorized group.
-    pub fn renew_retention(&self, group: Ticket, owner: crate::PeerId) -> Result<()> {
+    pub fn renew_retention(
+        &self,
+        group: Ticket,
+        owner: crate::PeerId,
+    ) -> Result<crate::wire::LeaseRenewal> {
         self.retained
             .lock()?
             .get_mut(&group)
-            .context("unknown or expired native retention group")?
-            .touch(owner, self.deadline())
+            .ok_or(NativeLeaseRejected::Expired)?
+            .touch(owner, self.deadline())?;
+        Ok(crate::wire::LeaseRenewal {
+            valid_for: self.limits.idle_timeout,
+        })
     }
 
     /// Authorize exact retained content for direct worker delivery.

@@ -64,105 +64,19 @@ For deliberate builds targeting another machine, use the explicit destination
 CPU profile exporter in `tools/cpu-target-profile`; this is distinct from
 the implicit `native` CPU at the compilation request's origin.
 
-## Distributed compression backend
+## Execution and communication
 
-Input transport uses the direct fallible zlib-rs-fast streaming API.
-Toolchains use standard multi-member gzip with fixed-size members and the
-fork's bounded parallel batch compressor. Decoders are created on the
-consuming thread, and cached archives can be read in either single-member or
-multi-member gzip form. No flate2 compatibility adapter is required. Compiler output is Zstandard, as described below.
+Distributed compilation uses the native scheduler-owned content store.
+The Linux client declares immutable inputs and executable identity, the
+scheduler selects a compatible Linux worker, and the worker executes the
+declared task in a bubblewrap namespace. Code generation and linking are
+separately scheduled and cacheable. There is no local compilation or
+archive execution fallback.
 
-For host-local builds use `contrib/codeandsolder/build-host-native`;
-it compiles the client and worker specifically for the executing CPU.
-Both builds use the pinned nightly Rust toolchain required by zlib-rs-fast's portable SIMD implementation. Published shared fleet bundles retain their portable x86-64-v2 ABI.
-
-## Distributed output transport and cache storage
-
-Protocol 3 / rollout epoch 4 sends each compiler output as a checksummed
-Zstandard frame and its original byte length. The client supplies its cache
-compression level in the run-job request. The frame is validated during
-the single decompression needed to materialize the output file. The same
-compressed bytes are inserted verbatim into the cache ZIP's stored entry,
-rather than reading the output file and compressing it again. Local outputs
-such as preprocessor dependency files still use ordinary cache compression.
-If another output has overwritten or replaced a materialized file, only
-that file is compressed again. Local and remote cache entries use the same
-checksummed Zstandard encoder.
-The cache entry format is unchanged, including support for reading already
-stored Zstandard entries. The run-job endpoint is versioned separately to
-reject the old wire format; upgrade clients and workers together.
-
-## Overview
-
-Distributed sccache consists of three parts:
-
- - the client, an sccache binary that wishes to perform a compilation on
-   remote machines
- - the scheduler (`sccache-dist` binary), responsible for deciding where
-   a compilation job should run
- - the server (`sccache-dist` binary), responsible for actually executing
-   a build
-
-All servers are required to be a 64-bit Linux or a FreeBSD install. Clients
-may request compilation from Linux, Windows or macOS. Linux compilations will
-attempt to automatically package the compiler in use, while Windows and macOS
-users will need to specify a toolchain for cross-compilation ahead of time.
-
-## Communication
-
-The HTTP implementation of sccache has the following API, where all HTTP body content is encoded using [`bincode`](http://docs.rs/bincode):
-
- - scheduler
-   - `POST /api/v1/scheduler/alloc_job`
-      - Called by a client to submit a compilation request.
-      - Returns information on where the job is allocated it should run.
-   - `GET /api/v1/scheduler/worker_route/{peer_id}`
-      - Returns the configured worker endpoint and bounded alternative interface
-        addresses. All routes must authenticate the same enrolled public key.
-   - `GET /api/v1/scheduler/native_routes`
-      - Returns the native CAS listener's candidate addresses.
-   - `POST /api/v4/scheduler/heartbeat_server`
-      - Called (repeatedly) by servers to register as available for jobs.
-      - Every five seconds, advertises fractional effective CPU capacity from
-        host idle CPU time plus the worker's currently executing jobs (capped
-        at the available CPU count). Admission counts assignments still
-        requiring compiler capacity, including newly reserved jobs not yet
-        visible in the heartbeat; native publication and terminal replies
-        use separate bounded dispatcher capacity. Legacy selection weights
-        healthy workers by remaining compiler capacity. Native selection
-        predicts staging, execution and publication completion from the
-        queue snapshot and measured transfer costs (see NativeCache.md).
-      - Includes active legacy `run_job` IDs and native dispatcher phases. A `Started` job absent for a full
-        heartbeat timeout is released, while long compilations remain
-        assigned as long as the worker reports them running.
-      - The response includes the scheduler's assigned-job IDs, including
-        in-flight assignment reservations. Workers discard obsolete local
-        Pending/Ready assignments while retaining jobs received after the
-        heartbeat request started.
-   - `POST /api/v1/scheduler/job_state`
-      - Called by servers to inform the scheduler of the state of the job.
-      - Repeated state updates are idempotent. A terminal completion may be
-        acknowledged again for the same worker if the scheduler already
-        completed that job, within its bounded acknowledgment retry window.
-   - `GET /api/v1/scheduler/status`
-      - Returns information about the scheduler, including total outstanding-job
-        capacity and currently available admission slots. Capacity is computed
-        per worker from its current advertised CPU count and the scheduler's
-        `[job_slack]` configuration; a fully busy worker retains a minimum
-        admission slot.
-      - Protocol 4 / rollout epoch 5 adds these fields to the status wire format.
- - `server`
-   - `POST /api/v1/distserver/assign_job`
-      - Called by the scheduler to inform of a new job being assigned to this server.
-      - Returns whether the toolchain is already on the server or needs submitting.
-   - `POST /api/v1/distserver/submit_toolchain`
-      - Called by the client to submit a toolchain.
-   - `POST /api/v1/distserver/run_job`
-      - Called by the client to run a job.
-      - Returns the compilation stdout along with files created.
-
-The heartbeat body uses a binary protocol shared by schedulers and workers.
-Changes to the active-job inventory therefore require deploying compatible
+See [NativeCache.md](NativeCache.md) for the action, storage, transport,
+provisioning and placement contracts. The scheduler's control plane retains
+worker route discovery, status, job state updates and native allocation.
+Heartbeat protocol v5 advertises native execution capacity only. Deploy
 scheduler and worker binaries together while the cluster is drained.
 
 There are three axes of security in this setup:
@@ -526,79 +440,11 @@ type = "DANGEROUSLY_INSECURE"
 
 ### server.toml
 
-
-```toml
-# This is where client toolchains will be stored.
-cache_dir = "/tmp/toolchains"
-# Optional Linux same-filesystem archive sources (the source cache's tc/).
-# Archives are reflink-cloned and digest-verified before use; misses fall
-# back to an ordinary upload. Never share writable cache directories.
-# toolchain_archive_sources = ["/var/cache/sccache-client-dist/client/tc"]
-# The maximum size of the toolchain cache, in bytes.
-# If unspecified the default is 10GB.
-#toolchain_cache_size = 10737418240
-# A public IP address and port that clients will use to connect to this builder.
-public_addr = "192.168.1.1:10501"
-# The socket address the builder will listen on. Defaults to a wildcard for non-loopback endpoints.
-#bind_address = "0.0.0.0:10501"
-# The reliable native HTTPS scheduler endpoint.
-scheduler_url = "https://192.168.1.1:10600"
-
-[cluster]
-directory = "/var/lib/sccache-cluster/worker"
-ca_certificate = "/etc/sccache/cluster-ca.pem"
-scheduler_id = "<64-digit scheduler peer ID>"
-
-[builder]
-type = "overlay"
-# The directory under which a sandboxed filesystem will be created for builds.
-build_dir = "/tmp/build"
-# The path to the bubblewrap version 0.3.0+ `bwrap` binary.
-bwrap_path = "/usr/bin/bwrap"
-# Maximum retained extracted-toolchain logical bytes (default 8 GiB).
-# Active builds may exceed the limit; idle extractions are reclaimed in
-# LRU order, while compressed archives remain cached.
-# extracted_toolchain_cache_size = 8589934592
-
-[scheduler_auth]
-type = "jwt_token"
-# This will be generated by the `generate-jwt-hs256-server-token` command or
-# provided by an administrator of the sccache cluster.
-token = "my server's token"
-```
-
-
-#### [builder]
-
-The `[builder]` section can be can be one of:
-```toml
-[builder]
-type = "docker"
-
-[builder]
-type = "overlay"
-# The directory under which a sandboxed filesystem will be created for builds.
-build_dir = "/tmp/build"
-# The path to the bubblewrap version 0.3.0+ `bwrap` binary.
-bwrap_path = "/usr/bin/bwrap"
-# Maximum retained extracted-toolchain logical bytes (default 8 GiB).
-# Active builds may exceed the limit; idle extractions are reclaimed in
-# LRU order, while compressed archives remain cached.
-# extracted_toolchain_cache_size = 8589934592
-
-[builder]
-type = "pot"
-# Pot filesystem root
-#pot_fs_root = "/opt/pot"
-# Reference pot cloned when creating containers
-#clone_from = "sccache-template"
-# Command to invoke when calling pot
-#pot_cmd = "pot"
-# Arguments passed to `pot clone` command
-#pot_clone_args = ["-i", "lo0|127.0.0.2"]
-
-```
-
+Use the native worker configuration in [NativeCache.md](NativeCache.md#configuration),
+with the cluster identity, public address, scheduler URL and scheduler
+authentication specified here. The only supported builder is native.
+Archive cache directories, archive sources and extracted-toolchain
+cache settings are rejected.
 
 #### [scheduler_auth]
 
@@ -734,11 +580,8 @@ CAS logical accounting, garbage collection and directional network estimates, in
 concurrent-capacity groups. CAS/network samples have their own cadence and
 are not recomputed in response to scheduler mutations.
 All scheduler-owned reservations, including assignment RPCs in flight, are
-available through a searchable, paginated table. Archive and native admission
-headroom are shown separately; they share compiler capacity and must not be added.
-Worker protocol labels distinguish CAS execution, legacy archive, both, or
-neither; CAS execution describes the transport/execution protocol, not the
-compiler's target architecture. Native job rows include the executable basename,
+available through a searchable, paginated table. Native admission headroom is shown directly. CAS execution describes the
+transport/execution protocol, not the compiler's target architecture. Native job rows include the executable basename,
 Rust crate name or declared output basename, explicit target when present,
 requester identity and total/remaining input bytes and blob counts. The Jobs
 tab supports multi-term search, a phase filter, sorting by age, input backlog,
@@ -746,8 +589,7 @@ worker or phase, and a declared-input availability bar (not network transfer
 progress). Unknown ages and backlog sizes are sorted after known values. The dashboard
 does not retain full command lines, environment variables or authorization data.
 No thousand-job truncation. Expired workers are excluded without
-mutating scheduling state. Native compiler slots are not legacy allocations;
-logical CAS bytes are not physical filesystem usage; measured transport
+mutating scheduling state. logical CAS bytes are not physical filesystem usage; measured transport
 goodput is not physical link capacity.
 
 ### Cache hit statistics

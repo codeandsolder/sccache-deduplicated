@@ -31,10 +31,11 @@ use super::{SchedulerRequester, role_error};
 use crate::{
     build_runtime::{
         ActionMode, ArchiveLength, BlobEncoding, BlobRef, Direction, ExecutionSpec,
-        NativeContentPending, NativeInputRejected, NativeServiceBusy, NativeSessions, NativeStore,
-        NetworkMeter, NetworkSnapshot, PackageCatalog, PackageIdentity, PackageImportLimits,
-        PackagePreparation, PackageSource, Peer, SchedulePreparation, ScheduleReservation,
-        StagedBlob, TreeId, TreeManifest, VerifiedPackage,
+        NativeContentPending, NativeInputRejected, NativeLeaseRejected, NativeServiceBusy,
+        NativeSessions, NativeStore, NetworkMeter, NetworkSnapshot, PackageCatalog,
+        PackageIdentity, PackageImportLimits, PackagePreparation, PackageSource, Peer,
+        SchedulePreparation, ScheduleReservation, StagedBlob, TreeId, TreeManifest,
+        VerifiedPackage,
         wire::{BlobRecipient, BlobSource, BlobSourcePlan, Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
@@ -482,21 +483,37 @@ where
     thread::Builder::new()
         .name("native-cache-maintenance".into())
         .spawn(move || {
+            let mut previous = None;
+            let mut next_reap = Instant::now();
             loop {
-                thread::sleep(Duration::from_secs(1));
                 let Some(maintenance) = maintenance.upgrade() else {
                     break;
                 };
-                if let Err(error) = maintenance.reap() {
-                    error!("native cache session reap failed: {error:#}");
-                }
-                match maintenance.store().maintain_space() {
-                    Ok(Some(report)) if !report.minimum_satisfied => {
-                        warn!("native cache space pressure: {report:?}");
+                runtime.block_on(maintenance.store().wait_for_space_maintenance(previous));
+                if Instant::now() >= next_reap {
+                    if let Err(error) = maintenance.reap() {
+                        error!("native cache session reap failed: {error:#}");
                     }
-                    Ok(_) => {}
-                    Err(error) => error!("native cache space maintenance failed: {error:#}"),
+                    next_reap = Instant::now() + Duration::from_secs(1);
                 }
+                previous = match maintenance.store().maintain_space() {
+                    Ok(report) => {
+                        if let Some(report) = report
+                            && !report.minimum_satisfied
+                        {
+                            warn!("native cache space pressure: {report:?}");
+                        }
+                        report
+                    }
+                    Err(error) => {
+                        if maintenance.store().index_requires_restart() {
+                            error!("native cache index requires reopening; terminating for supervised recovery: {error:#}");
+                            std::process::exit(1);
+                        }
+                        error!("native cache space maintenance failed: {error:#}");
+                        None
+                    }
+                };
             }
         })?;
     thread::Builder::new()
@@ -602,7 +619,6 @@ where
             ),
         );
     for (path, role, operation) in [
-        ("/api/v5/native/client/commit", "client", "commit"),
         ("/api/v5/native/worker/commit", "worker", "commit"),
         ("/api/v5/native/client/tree_commit", "client", "tree_commit"),
     ] {
@@ -1022,8 +1038,30 @@ fn native_response(operation: &str, result: Result<Response>) -> Response {
             "native input bytes rejected",
         )
             .into_response(),
+        Err(error) if error.is::<crate::build_runtime::StageSpaceExhausted>() => {
+            debug!("Native cache {operation} waiting for storage: {error:#}");
+            (StatusCode::SERVICE_UNAVAILABLE, "native cache storage busy").into_response()
+        }
         Err(error) if error.is::<NativeServiceBusy>() => {
             (StatusCode::SERVICE_UNAVAILABLE, "native service busy").into_response()
+        }
+        Err(error) if matches!(operation, "renew" | "retain_renew") => {
+            match error.downcast_ref::<NativeLeaseRejected>() {
+                Some(NativeLeaseRejected::Expired) => {
+                    (StatusCode::GONE, "native lease lost").into_response()
+                }
+                Some(NativeLeaseRejected::Unauthorized) => {
+                    (StatusCode::FORBIDDEN, "native lease owner mismatch").into_response()
+                }
+                None => {
+                    error!("Native cache {operation} failed: {error:#}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "native renewal service failed",
+                    )
+                        .into_response()
+                }
+            }
         }
         Err(error) => {
             // Do not return host paths, auth tokens or raw internal metadata
@@ -1111,7 +1149,7 @@ fn dispatch(
         "poll_input" if publisher == Publisher::Client => {
             encode(&sessions.poll_input(metadata(request, limit)?)?, limit)
         }
-        "inputs_staged" => {
+        "inputs_staged" if matches!(publisher, Publisher::Worker { .. }) => {
             sessions.inputs_staged(metadata(request, limit)?, publisher)?;
             if let Publisher::Worker { peer, job } = publisher {
                 observe_result(
@@ -1172,10 +1210,6 @@ fn dispatch(
                 result,
             } = metadata(request, limit)?;
             sessions.retain_result(group, action, result, request.id())?;
-            encode(&(), limit)
-        }
-        "retain_renew" if publisher == Publisher::Client => {
-            sessions.renew_retention(metadata(request, limit)?, request.id())?;
             encode(&(), limit)
         }
         "retain_close" if publisher == Publisher::Client => {
@@ -1251,7 +1285,7 @@ fn dispatch(
         "tree_offer" if publisher == Publisher::Client => {
             encode(&sessions.offer_tree(metadata(request, limit)?)?, limit)
         }
-        "tree_open" => {
+        "tree_open" if matches!(publisher, Publisher::Worker { .. }) => {
             let OpenTreeRequest { action, tree } = metadata(request, limit)?;
             encode(&sessions.open_tree(tree, publisher, action)?, limit)
         }
@@ -1267,12 +1301,12 @@ fn dispatch(
                 limit,
             )
         }
-        "verify" => {
+        "verify" if matches!(publisher, Publisher::Worker { .. }) => {
             let ExecutionRequest { ticket, spec } = metadata(request, limit)?;
             sessions.verify_execution(ticket, publisher, &spec.action_request()?)?;
             encode(&(), limit)
         }
-        "begin" => {
+        "begin" if matches!(publisher, Publisher::Worker { .. }) => {
             let ManifestRequest { ticket, manifest } = metadata(request, limit)?;
             let reply = sessions.begin(ticket, publisher, manifest)?;
             if let Publisher::Worker { peer, job } = publisher {
@@ -1289,9 +1323,20 @@ fn dispatch(
             );
             Ok(response)
         }
-        "renew" => {
-            sessions.renew(metadata(request, limit)?, publisher)?;
-            encode(&(), limit)
+        "renew" | "retain_renew" if operation == "renew" || publisher == Publisher::Client => {
+            let ticket = match metadata(request, limit) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    debug!("invalid native renewal request: {error:#}");
+                    return Ok(StatusCode::BAD_REQUEST.into_response());
+                }
+            };
+            let reply = if operation == "renew" {
+                sessions.renew(ticket, publisher)?
+            } else {
+                sessions.renew_retention(ticket, request.id())?
+            };
+            encode(&reply, limit)
         }
         "fail" => {
             sessions.fail(metadata(request, limit)?, publisher)?;

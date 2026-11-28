@@ -1,3 +1,4 @@
+use crate::harness;
 use anyhow::{Context, Result};
 use assert_cmd::assert::OutputAssertExt;
 use chrono::Local;
@@ -23,20 +24,14 @@ pub static SCCACHE_BIN: LazyLock<&Path> =
 /// accidentally stop that externally managed compiler cache.
 #[must_use = "the returned command must be executed to invoke the test client"]
 pub fn test_sccache_command() -> Command {
-    let mut cmd = Command::new(SCCACHE_BIN.as_os_str());
-    cmd.env_remove("SCCACHE_SERVER_PORT")
-        .env_remove("SCCACHE_SERVER_UDS");
-    cmd
+    harness::sccache_command()
 }
 
 /// Test Cargo invocations compile through the test-built sccache binary,
 /// not an inherited CI compiler-cache endpoint.
 #[must_use = "the returned command must be executed to invoke Cargo"]
 pub fn test_cargo_command() -> Command {
-    let mut cmd = Command::new(CARGO.as_os_str());
-    cmd.env_remove("SCCACHE_SERVER_PORT")
-        .env_remove("SCCACHE_SERVER_UDS");
-    cmd
+    harness::prune_command(Command::new(CARGO.as_os_str()))
 }
 
 /// Ensures the logger is only initialized once. Panics if initialization fails.
@@ -61,6 +56,7 @@ static LOGGER: LazyLock<Result<(), Infallible>> = LazyLock::new(|| {
 pub struct SccacheTest<'a> {
     /// Tempdir used for Sccache cache and cargo output. It is kept in the struct only to have the
     /// destructor run when `SccacheTest` goes out of scope, but is never used otherwise.
+    _system: harness::DistSystem,
     pub tempdir: tempfile::TempDir,
     pub env: Vec<(&'a str, std::ffi::OsString)>,
 }
@@ -69,27 +65,24 @@ impl SccacheTest<'_> {
     pub fn new(additional_envs: Option<&[(&'static str, std::ffi::OsString)]>) -> Result<Self> {
         assert!(LOGGER.is_ok());
 
-        // Create a temp directory to use for the disk cache.
+        // Create an isolated native scheduler/worker fixture.
         let tempdir = tempfile::Builder::new()
             .prefix("sccache_test_rust_cargo")
             .tempdir()
             .context("Failed to create tempdir")?;
-        let cache_dir = tempdir.path().join("cache");
-        fs::create_dir(&cache_dir)?;
         let cargo_dir = tempdir.path().join("cargo");
         fs::create_dir(&cargo_dir)?;
 
-        // Ensure there's no existing sccache server running.
-        stop_sccache()?;
-
-        trace!("sccache --start-server");
-
-        test_sccache_command()
-            .arg("--start-server")
-            .env("SCCACHE_DIR", &cache_dir)
-            .assert()
-            .try_success()
-            .context("Failed to start sccache server")?;
+        let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), tempdir.path());
+        system.add_scheduler();
+        system.add_server(&[]);
+        let mut config = harness::sccache_client_cfg();
+        system.configure_client(&mut config);
+        harness::write_json_cfg(tempdir.path(), "sccache-cfg.json", &config);
+        harness::start_local_daemon(
+            &tempdir.path().join("sccache-cfg.json"),
+            &tempdir.path().join("cached-config"),
+        );
 
         let mut env = vec![
             ("CARGO_TARGET_DIR", cargo_dir.as_os_str().to_owned()),
@@ -105,6 +98,7 @@ impl SccacheTest<'_> {
         }
 
         Ok(SccacheTest {
+            _system: system,
             tempdir,
             env: env.clone(),
         })

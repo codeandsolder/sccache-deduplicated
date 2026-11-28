@@ -8,7 +8,10 @@ use std::{
     ffi::OsStr,
     fs::File,
     io::{Read, Seek, SeekFrom},
-    os::unix::{ffi::OsStrExt, fs::MetadataExt, process::ExitStatusExt},
+    os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, fs::MetadataExt, process::ExitStatusExt},
+    },
     path::{Path, PathBuf},
     process::{Child, ExitStatus, Stdio},
     sync::Arc,
@@ -141,13 +144,11 @@ impl CapturedExecution {
     /// # Errors
     /// Returns an error for undeclared content or descriptor failure.
     pub fn open_file(&self, id: ContentId) -> Result<File> {
-        let mut file = self
-            .files
-            .get(&id)
-            .context("uncaptured result blob")?
-            .try_clone()?;
-        file.rewind()?;
-        Ok(file)
+        let file = self.files.get(&id).context("uncaptured result blob")?;
+        // A dup shares the original open-file description and seek cursor.
+        // Reopening the pinned descriptor provides an independent cursor even
+        // after the captured file was unlinked from its temporary directory.
+        Ok(File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?)
     }
 
     /// Whether all captured content can be committed locally without copying.
@@ -238,9 +239,14 @@ struct GeneratedBaseline {
 }
 
 impl GeneratedBaseline {
-    fn capture(directory: &File, relative: &Path, input: &TreeManifest) -> Result<Self> {
+    fn capture(
+        directory: &File,
+        relative: &Path,
+        input: &TreeManifest,
+        immutable: &TreeManifest,
+    ) -> Result<Self> {
         let mut files = BTreeMap::new();
-        let tree = crate::source::capture_tree(directory, |path, _, stat| {
+        let mut tree = crate::source::capture_tree(directory, |path, _, stat| {
             let logical = relative.join(host_path(path.as_bytes()));
             let key = TreePath::new(logical.as_os_str().as_bytes().to_vec())?;
             let entry = input
@@ -262,9 +268,26 @@ impl GeneratedBaseline {
                 u64::try_from(stat.st_size)? == blob.size,
                 "materialized input size changed"
             );
-            files.insert(path.clone(), *stat);
+            if immutable.entries.contains_key(&key) {
+                files.insert(path.clone(), *stat);
+            }
             Ok(*blob)
         })?;
+        let owned = tree
+            .entries
+            .keys()
+            .filter_map(|path| {
+                let logical = relative.join(host_path(path.as_bytes()));
+                (!immutable
+                    .entries
+                    .contains_key(logical.as_os_str().as_bytes()))
+                .then_some(path.clone())
+            })
+            .collect::<Vec<_>>();
+        for path in owned {
+            tree.entries.remove(&path);
+        }
+        tree.validate()?;
         Ok(Self { tree, files })
     }
 
@@ -390,6 +413,11 @@ fn writable_locations(
 ) -> Result<BTreeSet<BuildPath>> {
     let tmp = BuildPath::new(b"/tmp".to_vec())?;
     let mut writable = BTreeSet::from([tmp]);
+    for path in &spec.scratch {
+        let (mount, tree) = backing(leases, path)?;
+        require_directory(tree, relative(path, mount)?)?;
+        writable.insert(path.clone());
+    }
     for output in spec.outputs.values() {
         let (mount, tree) = backing(leases, &output.path)?;
         let path = relative(&output.path, mount)?;
@@ -436,6 +464,7 @@ fn capture_locations(
     spec: &ExecutionSpec,
     views: &BTreeMap<BuildPath, MountedTree>,
     writable: &BTreeSet<BuildPath>,
+    immutable_root: Option<&TreeManifest>,
 ) -> Result<BTreeMap<String, OutputLocation>> {
     let mut outputs = BTreeMap::new();
     for (name, output) in &spec.outputs {
@@ -459,6 +488,11 @@ fn capture_locations(
                 &directory,
                 relative(&output.path, point)?,
                 view.manifest(),
+                if point.as_bytes() == b"/" {
+                    immutable_root.unwrap_or_else(|| view.manifest())
+                } else {
+                    view.manifest()
+                },
             )?);
         }
         outputs.insert(name.clone(), location);
@@ -630,7 +664,23 @@ impl PreparedBuild {
             )?;
         }
         bind_file_overlays(&mut plan, &views)?;
-        let outputs = capture_locations(spec, &views, &writable)?;
+        let immutable_root = if spec.working_inputs.is_empty() {
+            None
+        } else {
+            let mut recipe = spec.root.recipe.clone();
+            recipe.layers.retain(|layer| {
+                !layer
+                    .destination
+                    .as_ref()
+                    .is_some_and(|path| spec.working_inputs.contains(path))
+            });
+            let manifests = inputs
+                .iter()
+                .map(|(id, lease)| (*id, lease.manifest()))
+                .collect();
+            Some(recipe.compose(&manifests)?)
+        };
+        let outputs = capture_locations(spec, &views, &writable, immutable_root.as_ref())?;
         Ok(Self {
             plan,
             outputs,
@@ -770,11 +820,16 @@ pub fn execute(
         "invalid execution limits"
     );
     let started = Instant::now();
+    let mut progress = || {
+        progress()?;
+        store.check_execution_space()
+    };
     progress()?;
     let build = PreparedBuild::prepare(spec, store, &policy.scratch, inputs)?;
     let invocation = SandboxInvocation::from_spec(&spec.command)?;
     let stdout = tempfile::tempfile_in(&policy.scratch)?;
-    let stderr = tempfile::tempfile_in(&policy.scratch)?;
+    let mut stderr = tempfile::tempfile_in(&policy.scratch)?;
+    let mut sandbox_status = tempfile::tempfile_in(&policy.scratch)?;
     progress()?;
     let preparation = started.elapsed();
     ensure!(
@@ -786,7 +841,7 @@ pub fn execute(
     let mut child = RunningChild(
         build
             .plan
-            .command(&policy.bubblewrap, &invocation)?
+            .command(&policy.bubblewrap, &invocation, sandbox_status.try_clone()?)?
             .stdin(Stdio::null())
             .stdout(stdout.try_clone()?)
             .stderr(stderr.try_clone()?)
@@ -796,6 +851,16 @@ pub fn execute(
         policy.timeout.saturating_sub(started.elapsed()),
         &mut progress,
     )?;
+    sandbox_status.rewind()?;
+    if let Err(error) = crate::sandbox::verify_status(sandbox_status, status) {
+        stderr.rewind()?;
+        let mut diagnostic = Vec::new();
+        (&mut stderr).take(16 * 1024).read_to_end(&mut diagnostic)?;
+        return Err(error.context(format!(
+            "Bubblewrap did not complete compiler execution ({status}): {}",
+            String::from_utf8_lossy(&diagnostic)
+        )));
+    }
     let process = running.elapsed();
     phase(ExecutionPhase::Capture);
     progress()?;

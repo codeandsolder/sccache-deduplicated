@@ -341,7 +341,7 @@ tag_sha="${tag#"$TAG_PREFIX"}"
     echo "sccache-release-update: release is not x86-64-v2" >&2
     exit 1
 }
-[[ ",$features," == *",s3,"* && ",$features," == *",dist-client,"* && ",$features," == *",dist-server,"* ]] || {
+[[ ",$features," == *",dist-client,"* && ",$features," == *",dist-server,"* ]] || {
     echo "sccache-release-update: release is missing required features: $features" >&2
     exit 1
 }

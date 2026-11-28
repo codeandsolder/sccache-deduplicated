@@ -90,14 +90,33 @@ impl SessionLimits {
 /// One shared verified transfer state for result and input-tree publication.
 struct Transfer {
     reservation: UploadReservation,
+    budget: crate::store::StagingReservation,
     missing: BTreeMap<ContentId, BlobRef>,
     staged: BTreeMap<ContentId, StagedBlob>,
     active: BTreeSet<ContentId>,
 }
 
 impl Transfer {
-    fn new(reservation: UploadReservation) -> Self {
-        Self {
+    fn new(
+        store: &NativeStore,
+        reservation: UploadReservation,
+        closure: &BTreeMap<ContentId, u64>,
+    ) -> Result<Self> {
+        // Admit the actual missing closure atomically, before accepting any
+        // bytes. Partial uploads must not deadlock competing publications.
+        let bytes = reservation.missing().iter().try_fold(0_u64, |sum, blob| {
+            sum.checked_add(blob.size).context("transfer size overflow")
+        })?;
+        if bytes != 0 {
+            let total = closure.values().try_fold(0_u64, |sum, &size| {
+                sum.checked_add(size)
+                    .context("transfer closure size overflow")
+            })?;
+            store.check_transfer_capacity(total)?;
+        }
+        let budget = store.reserve_transfer(bytes)?;
+        Ok(Self {
+            budget,
             missing: reservation
                 .missing()
                 .iter()
@@ -106,7 +125,7 @@ impl Transfer {
             reservation,
             staged: BTreeMap::new(),
             active: BTreeSet::new(),
-        }
+        })
     }
 
     fn missing(&self) -> Vec<BlobRef> {
@@ -520,7 +539,7 @@ impl Session {
     }
 
     fn negotiated_result(&self) -> Option<&ResultManifest> {
-        // Local execution and trees keep their existing publication semantics.
+        // Only delegated worker actions have a negotiated result preview.
         self.allocation.as_ref()?;
         match &self.phase {
             Phase::Pending(pending) => match &**pending {
@@ -784,6 +803,24 @@ pub struct NativeSessions {
     live_traces: live::LiveTraces,
 }
 
+/// A definitive lease rejection, distinct from a busy or unavailable service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeLeaseRejected {
+    Expired,
+    Unauthorized,
+}
+
+impl std::fmt::Display for NativeLeaseRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Expired => "unknown or expired native lease",
+            Self::Unauthorized => "native lease owner mismatch",
+        })
+    }
+}
+
+impl std::error::Error for NativeLeaseRejected {}
+
 /// A bounded service slot is occupied. Clients can retry without changing
 /// identities or starting additional downloads.
 #[derive(Debug)]
@@ -916,7 +953,7 @@ impl NativeSessions {
         self.sessions()?
             .get(&ticket)
             .cloned()
-            .context("unknown or expired native ticket")
+            .ok_or_else(|| NativeLeaseRejected::Expired.into())
     }
 
     fn register(&self, kind: Kind, publisher: Publisher, phase: Phase) -> Result<Ticket> {
@@ -947,10 +984,9 @@ impl NativeSessions {
     }
 
     fn touch(&self, session: &mut Session) -> Result<()> {
-        ensure!(
-            session.allocating.is_some() || session.expires > Instant::now(),
-            "native ticket expired"
-        );
+        if session.allocating.is_none() && session.expires <= Instant::now() {
+            return Err(NativeLeaseRejected::Expired.into());
+        }
         session.expires = self.deadline();
         Ok(())
     }
@@ -959,10 +995,9 @@ impl NativeSessions {
         if session.allocating.is_some() {
             return Err(NativeServiceBusy.into());
         }
-        ensure!(
-            session.publisher == publisher,
-            "native publisher does not own ticket"
-        );
+        if session.publisher != publisher {
+            return Err(NativeLeaseRejected::Unauthorized.into());
+        }
         self.touch(session)
     }
 
@@ -971,7 +1006,9 @@ impl NativeSessions {
             Kind::Action => Publisher::Client,
             Kind::Tree => session.publisher,
         };
-        ensure!(reader == expected, "native reader does not own ticket");
+        if reader != expected {
+            return Err(NativeLeaseRejected::Unauthorized.into());
+        }
         self.touch(session)
     }
 
@@ -1309,6 +1346,10 @@ impl NativeSessions {
         publisher: Publisher,
         request: &ActionRequest,
     ) -> Result<()> {
+        ensure!(
+            matches!(publisher, Publisher::Worker { .. }),
+            "native action execution requires a scheduler-assigned worker"
+        );
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.authorize(&mut state, publisher)?;
@@ -1330,7 +1371,7 @@ impl NativeSessions {
     ///
     /// # Errors
     /// Returns an error if the ticket expired or belongs to another publisher.
-    pub fn renew(&self, ticket: Ticket, publisher: Publisher) -> Result<()> {
+    pub fn renew(&self, ticket: Ticket, publisher: Publisher) -> Result<crate::wire::LeaseRenewal> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         if publisher == Publisher::Client && state.allocating.is_some() {
@@ -1341,7 +1382,10 @@ impl NativeSessions {
             self.authorize_reader(&mut state, publisher)
         } else {
             self.authorize(&mut state, publisher)
-        }
+        }?;
+        Ok(crate::wire::LeaseRenewal {
+            valid_for: self.limits.idle_timeout,
+        })
     }
 
     fn upload_slot(&self, source: UploadSource) -> Result<UploadSlot> {
@@ -1393,6 +1437,10 @@ impl NativeSessions {
         publisher: Publisher,
         manifest: ResultManifest,
     ) -> Result<BeginResult> {
+        ensure!(
+            matches!(publisher, Publisher::Worker { .. }),
+            "native action execution requires a scheduler-assigned worker"
+        );
         let session = self.get(ticket)?;
         {
             let mut state = Self::lock(&session)?;
@@ -1410,7 +1458,7 @@ impl NativeSessions {
             manifest.logical_bytes()? <= self.limits.max_result_bytes,
             "native result logical byte limit exceeded"
         );
-        let transfer = Transfer::new(self.store().reserve_blobs(&blobs)?);
+        let transfer = Transfer::new(self.store(), self.store().reserve_blobs(&blobs)?, &blobs)?;
         let mut state = Self::lock(&session)?;
         self.authorize(&mut state, publisher)?;
         // Another identical begin may already have won, or the ticket may
@@ -1434,14 +1482,19 @@ impl NativeSessions {
     pub fn offer_tree(&self, manifest: TreeManifest) -> Result<TreeOffer> {
         self.reap()?;
         let id = manifest.id()?;
-        self.limits.check_blobs(Kind::Tree, &manifest.blobs()?)?;
+        let blobs = manifest.blobs()?;
+        self.limits.check_blobs(Kind::Tree, &blobs)?;
         let (phase, missing) = if let Some(lease) = self.store().lookup_tree(id)? {
             (
                 Phase::Ready(Ready::Tree(Box::new(TreeDelivery::new(lease)))),
                 Vec::new(),
             )
         } else {
-            let transfer = Transfer::new(self.store().reserve_tree_upload(&manifest)?);
+            let transfer = Transfer::new(
+                self.store(),
+                self.store().reserve_tree_upload(&manifest)?,
+                &blobs,
+            )?;
             let missing = transfer.missing();
             (
                 Phase::Pending(Box::new(Pending::Tree { manifest, transfer })),
@@ -1467,6 +1520,10 @@ impl NativeSessions {
         reader: Publisher,
         action_ticket: Ticket,
     ) -> Result<TreeRead> {
+        ensure!(
+            matches!(reader, Publisher::Worker { .. }),
+            "native action input delivery requires a scheduler-assigned worker"
+        );
         self.reap()?;
         let action = self.get(action_ticket)?;
         let mut state = Self::lock(&action)?;
@@ -1581,18 +1638,24 @@ impl NativeSessions {
     ) -> Result<NativeUpload> {
         let slot = self.upload_slot(UploadSource::Direct)?;
         let session = self.get(ticket)?;
-        {
+        let budget = {
             let mut state = Self::lock(&session)?;
+            ensure!(
+                state.kind != Kind::Action || matches!(publisher, Publisher::Worker { .. }),
+                "native action upload requires a scheduler-assigned worker"
+            );
             self.authorize(&mut state, publisher)?;
             let Phase::Pending(pending) = &mut state.phase else {
                 bail!("no active native upload");
             };
-            pending
+            let transfer = pending
                 .transfer_mut()
-                .context("no negotiated native upload")?
-                .start(blob, self.limits.max_concurrent_uploads)?;
+                .context("no negotiated native upload")?;
+            transfer.start(blob, self.limits.max_concurrent_uploads)?;
+            let budget = transfer.budget.clone();
             drop(state);
-        }
+            budget
+        };
         let guard = UploadGuard {
             session,
             publisher,
@@ -1600,7 +1663,9 @@ impl NativeSessions {
             active: true,
             _slot: slot,
         };
-        let stager = self.store().prepare_physical(blob, encoding)?;
+        let stager = self
+            .store()
+            .prepare_physical_reserved(blob, encoding, budget)?;
         Ok(NativeUpload {
             stager,
             publication: UploadPublication::Direct(guard),
@@ -1699,6 +1764,10 @@ impl NativeSessions {
         publisher: Publisher,
         kind: Kind,
     ) -> Result<CommitStart> {
+        ensure!(
+            kind != Kind::Action || matches!(publisher, Publisher::Worker { .. }),
+            "native action publication requires a scheduler-assigned worker"
+        );
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.authorize(&mut state, publisher)?;
@@ -2264,6 +2333,10 @@ impl NativeSessions {
     /// # Errors
     /// Returns an error for an invalid or unauthorized action ticket.
     pub fn inputs_staged(&self, ticket: Ticket, publisher: Publisher) -> Result<()> {
+        ensure!(
+            matches!(publisher, Publisher::Worker { .. }),
+            "native action execution requires a scheduler-assigned worker"
+        );
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.authorize(&mut state, publisher)?;

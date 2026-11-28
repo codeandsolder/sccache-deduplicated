@@ -17,10 +17,10 @@ if [[ "$role" == asus ]]; then
 fi
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 case "$role" in
-  acer) user=jan; source=/etc/sccache/client.conf; worker_gib=12; worker_target=10; minimum=16; target=24 ;;
-  asus) user=jan; source=/etc/sccache/client.conf; worker_gib=48; worker_target=36; minimum=32; target=48 ;;
+  acer) user=jan; source=/etc/sccache/client.conf; worker_gib=12; worker_target=8; minimum=16; target=20 ;;
+  asus) user=jan; source=/etc/sccache/client.conf; worker_gib=32; worker_target=28; minimum=32; target=36 ;;
   cold-storage) user=sentinelx; source=/etc/sccache/client.conf; worker_gib=0 ;;
-  wsl) user=jan; source=/etc/sccache/config; worker_gib=12; worker_target=10; minimum=32; target=48 ;;
+  wsl) user=jan; source=/etc/sccache/config; worker_gib=12; worker_target=8; minimum=32; target=36 ;;
   *) exit 2 ;;
 esac
 [[ "$(systemctl show sccache-local.service -p User --value)" == "$user" ]]
@@ -156,7 +156,7 @@ Environment=SCCACHE_CONF=/etc/sccache/client-shared.toml
 Environment=SCCACHE_SERVER_UDS=/run/sccache-shared/sccache.sock
 Environment=SCCACHE_START_SERVER=1
 Environment=SCCACHE_NO_DAEMON=1
-UnsetEnvironment=SCCACHE_SERVER_PORT SCCACHE_CLIENT_SIDE SCCACHE_DIST_CLIENT_CACHE_DIR
+UnsetEnvironment=SCCACHE_SERVER_PORT SCCACHE_CLIENT_SIDE
 UNIT
 cat > "$stage/wrapper.conf" <<'ROUTING'
 user_endpoint=unix:/run/sccache-shared/sccache.sock
@@ -172,13 +172,22 @@ install -m 0700 "$repo/host-native-metadata" "$stage/host-native-metadata"
 install -m 0700 "$repo/fleet/activate-host" "$stage/activate-host"
 install -m 0600 "$repo/native-action-report.awk" "$stage/native-action-report.awk"
 if [[ -x /usr/bin/rustup && -f /usr/local/bin/cargo ]]; then
+  [[ -r /etc/sccache/runtime-image ]] || { echo "Managed Cargo requires a provisioned common runtime image" >&2; exit 69; }
+  read -r runtime_image < /etc/sccache/runtime-image
+  [[ "$runtime_image" =~ ^sha256:[0-9a-f]{64}$ ]]
+  [[ "$(docker image inspect --format '{{.Id}}' "$runtime_image")" == "$runtime_image" ]]
   install -m 0700 "$repo/cargo-wrapper" "$stage/cargo-wrapper"
+  install -m 0700 "$repo/runtime/run" "$stage/runtime-run"
+  install -m 0700 "$repo/runtime/sccache-runtime-profile" "$stage/runtime-profile"
+  install -m 0700 "$repo/runtime/sccache-runtime-profile-service" "$stage/runtime-profile-service"
+  install -m 0600 "$repo/runtime/Dockerfile.profile" "$stage/runtime-profile-dockerfile"
+  install -m 0600 "$repo/runtime/sccache-runtime-profile.socket" "$stage/runtime-profile.socket"
+  install -m 0600 "$repo/runtime/sccache-runtime-profile@.service" "$stage/runtime-profile@.service"
+  [[ -r /etc/sccache/runtime-profile-authority ]] || { echo "Configure the fleet runtime profile authority before activation" >&2; exit 69; }
 fi
-for helper in sccache-cmake-launcher sccache-dist-client-preflight; do
-  if [[ -f "/usr/local/libexec/$helper" ]]; then
-    install -m 0700 "$repo/$helper" "$stage/$helper"
-  fi
-done
+if [[ -f /usr/local/libexec/sccache-cmake-launcher ]]; then
+  install -m 0700 "$repo/sccache-cmake-launcher" "$stage/sccache-cmake-launcher"
+fi
 case "$role" in
   wsl) sed -i 's| /usr/bin/rustup | /home/jan/.cargo/bin/rustup |' "$stage/sccache-client" ;;
   cold-storage) sed -i 's| /usr/bin/rustup | /var/lib/sccache-native-builder/cargo/bin/rustup |' "$stage/sccache-client" ;;
@@ -211,6 +220,7 @@ scheduler_id = "$scheduler_id"
 [native_worker]
 cache_url = "$cache_url"
 directory = "/var/cache/sccache-native/worker"
+index_directory = "/var/lib/sccache-native-index/worker"
 scratch = "/var/cache/sccache-native/scratch"
 bubblewrap = "/usr/bin/bwrap"
 platform_contract = "$platform"
@@ -271,6 +281,7 @@ percent = 200.0
 [native_cache]
 public_addr = "100.73.74.69:10602"
 directory = "/var/cache/sccache-native/scheduler"
+index_directory = "/var/lib/sccache-native-index/scheduler"
 idle_timeout_secs = 120
 max_sessions = 256
 max_result_bytes = 1073741824
@@ -284,9 +295,9 @@ max_metadata_bytes = 67108864
 
 [native_cache.space]
 min_available_bytes = $((32*gib))
-target_available_bytes = $((48*gib))
-max_resident_bytes = $((64*gib))
-target_resident_bytes = $((48*gib))
+target_available_bytes = $((36*gib))
+max_resident_bytes = $((32*gib))
+target_resident_bytes = $((28*gib))
 max_evictions_per_pass = 128
 gc_batch = 1024
 

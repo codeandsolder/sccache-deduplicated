@@ -60,7 +60,13 @@ pub(super) fn expand(arguments: &[OsString], cwd: &Path) -> Result<Vec<OsString>
 /// the entire compiler invocation, including its asynchronous wait.
 pub(super) struct PreparedArguments<'a> {
     pub(super) args: Cow<'a, [OsString]>,
-    _directory: Option<tempfile::TempDir>,
+    directory: Option<tempfile::TempDir>,
+}
+
+impl PreparedArguments<'_> {
+    pub(super) fn scratch_path(&self) -> Option<&Path> {
+        self.directory.as_ref().map(tempfile::TempDir::path)
+    }
 }
 
 fn windows_command_line_bound(executable: &Path, args: &[OsString]) -> usize {
@@ -100,7 +106,7 @@ fn prepare_for_platform<'a>(
     if !needs_file {
         return Ok(PreparedArguments {
             args: Cow::Borrowed(arguments),
-            _directory: None,
+            directory: None,
         });
     }
     let directory = tempfile::Builder::new()
@@ -145,7 +151,7 @@ fn prepare_for_platform<'a>(
     }
     Ok(PreparedArguments {
         args: Cow::Owned(prepared),
-        _directory: Some(directory),
+        directory: Some(directory),
     })
 }
 
@@ -167,7 +173,7 @@ mod tests {
         ];
         let prepared = prepare_for_platform(Path::new("rustc.exe"), &arguments, true)?;
         let directory = prepared
-            ._directory
+            .directory
             .as_ref()
             .context("missing argument directory")?
             .path()

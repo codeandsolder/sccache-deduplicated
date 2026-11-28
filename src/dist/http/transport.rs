@@ -1,8 +1,7 @@
 //! Distributed HTTP transport policy.
 //!
 //! Control-plane replies have bounded memory and strict request deadlines.
-//! Build results may contain arbitrarily large compressed artifacts and are
-//! intentionally not assigned an artificial size limit here.
+//! Build artifacts travel through the native content store.
 use crate::errors::{Context, Result, anyhow};
 use bincode::Options;
 #[cfg(all(test, feature = "dist-server"))]
@@ -13,44 +12,11 @@ use std::time::Duration;
 /// Maximum encoded control-plane response size.
 pub const CONTROL_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
 const ERROR_RESPONSE_LIMIT: usize = 64 * 1024;
-#[cfg(feature = "dist-client")]
-const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_mins(20);
-
-/// Decide whether the expected response is small protocol metadata or a
-/// compressed build result which may legitimately exceed ordinary limits.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RequestClass {
-    /// Scheduler and worker control messages, which must return promptly.
-    Control,
-    /// Optional display metadata: failure must not affect compilation.
-    WorkerName,
-    /// Toolchain uploads can actively stream for many minutes.
-    ToolchainUpload,
-    /// Large compressed build results must preserve existing size semantics.
-    BuildResult,
-}
-
-#[cfg(feature = "dist-client")]
-impl RequestClass {
-    const fn timeout(self) -> Duration {
-        match self {
-            Self::Control => Duration::from_secs(90),
-            Self::WorkerName => Duration::from_secs(1),
-            Self::ToolchainUpload | Self::BuildResult => HTTP_REQUEST_TIMEOUT,
-        }
-    }
-}
-
-const fn response_limit(success: bool, class: RequestClass) -> Option<usize> {
+const fn response_limit(success: bool) -> usize {
     if success {
-        match class {
-            RequestClass::Control | RequestClass::WorkerName | RequestClass::ToolchainUpload => {
-                Some(CONTROL_RESPONSE_LIMIT)
-            }
-            RequestClass::BuildResult => None,
-        }
+        CONTROL_RESPONSE_LIMIT
     } else {
-        Some(ERROR_RESPONSE_LIMIT)
+        ERROR_RESPONSE_LIMIT
     }
 }
 
@@ -105,29 +71,23 @@ fn check_advertised_length(length: Option<u64>, limit: usize) -> Result<()> {
 }
 
 #[cfg(feature = "dist-client")]
-pub async fn send_async<T: serde::de::DeserializeOwned>(
-    req: wreq::RequestBuilder,
-    class: RequestClass,
-) -> Result<T> {
-    send(req.timeout(class.timeout()), Some(class)).await
+pub async fn send_async<T: serde::de::DeserializeOwned>(req: wreq::RequestBuilder) -> Result<T> {
+    send(req.timeout(Duration::from_secs(90))).await
 }
 
 #[cfg(feature = "dist-server")]
 pub(super) async fn send_control<T: serde::de::DeserializeOwned>(
     req: wreq::RequestBuilder,
 ) -> Result<T> {
-    send(req, None).await
+    send(req).await
 }
 
-async fn send<T: serde::de::DeserializeOwned>(
-    req: wreq::RequestBuilder,
-    class: Option<RequestClass>,
-) -> Result<T> {
+async fn send<T: serde::de::DeserializeOwned>(req: wreq::RequestBuilder) -> Result<T> {
     use futures::StreamExt;
     let res = req.send().await?;
     let status = res.status();
-    let limit = response_limit(status.is_success(), class.unwrap_or(RequestClass::Control));
-    let bytes = if let Some(limit) = limit {
+    let limit = response_limit(status.is_success());
+    let bytes = {
         check_advertised_length(res.content_length(), limit)?;
         let mut body = Vec::new();
         let mut stream = std::pin::pin!(res.bytes_stream());
@@ -143,8 +103,6 @@ async fn send<T: serde::de::DeserializeOwned>(
             body.extend_from_slice(&chunk);
         }
         bytes::Bytes::from(body)
-    } else {
-        res.bytes().await?
     };
     if !status.is_success() {
         let message = format!(
@@ -224,26 +182,8 @@ mod tests {
             .timeout(Duration::from_secs(5))
             .build()
             .expect("test client");
-        let result = send_async::<Vec<u8>>(client.get(url.as_str()), RequestClass::Control).await;
+        let result = send_async::<Vec<u8>>(client.get(url.as_str())).await;
         assert!(result.unwrap_err().to_string().contains("exceeds"));
-        handler.join().expect("response server");
-    }
-
-    #[cfg(feature = "dist-client")]
-    #[tokio::test]
-    async fn async_build_result_accepts_payload_larger_than_control_limit() {
-        let payload = vec![123u8; CONTROL_RESPONSE_LIMIT + 1];
-        let serialized = bincode::serialize(&payload).expect("encode build response");
-        let (url, handler) = mock_response(200, serialized, None);
-        let client = wreq::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .build()
-            .expect("test client");
-        let result: Vec<u8> = send_async(client.get(url.as_str()), RequestClass::BuildResult)
-            .await
-            .expect("large result must remain supported");
-        assert_eq!(result.len(), CONTROL_RESPONSE_LIMIT + 1);
-        assert_eq!(result[0], 123);
         handler.join().expect("response server");
     }
 
@@ -255,34 +195,15 @@ mod tests {
             .timeout(Duration::from_secs(5))
             .build()
             .expect("test client");
-        let result = send_async::<u8>(client.get(url.as_str()), RequestClass::BuildResult).await;
+        let result = send_async::<u8>(client.get(url.as_str())).await;
         assert!(result.unwrap_err().to_string().contains("exceeds"));
         handler.join().expect("response server");
     }
 
-    #[cfg(feature = "dist-client")]
     #[test]
-    fn control_plane_is_bounded_and_build_output_is_not() {
-        assert_eq!(
-            response_limit(true, RequestClass::Control),
-            Some(16 * 1024 * 1024)
-        );
-        assert_eq!(response_limit(true, RequestClass::BuildResult), None);
-        for class in [
-            RequestClass::Control,
-            RequestClass::WorkerName,
-            RequestClass::ToolchainUpload,
-            RequestClass::BuildResult,
-        ] {
-            assert_eq!(response_limit(false, class), Some(64 * 1024));
-        }
-        assert_eq!(RequestClass::Control.timeout(), Duration::from_secs(90));
-        assert_eq!(RequestClass::WorkerName.timeout(), Duration::from_secs(1));
-        assert_eq!(
-            RequestClass::ToolchainUpload.timeout(),
-            Duration::from_mins(20)
-        );
-        assert_eq!(RequestClass::BuildResult.timeout(), Duration::from_mins(20));
+    fn all_control_responses_are_bounded() {
+        assert_eq!(response_limit(true), CONTROL_RESPONSE_LIMIT);
+        assert_eq!(response_limit(false), ERROR_RESPONSE_LIMIT);
     }
 
     #[cfg(feature = "dist-server")]

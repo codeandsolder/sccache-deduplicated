@@ -10,29 +10,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cache::CacheMode;
 use crate::cache::cache::Storage;
-use crate::cache::cache_io::{Cache, CacheRead, CacheWrite};
 use crate::client::{ServerConnection, SharedConnection, connection_task};
-use crate::compiler::PreprocessorCacheEntry;
-use crate::config::PreprocessorCacheModeConfig;
-use crate::errors::{Context, Result, anyhow, bail};
+use crate::errors::{Result, bail};
 use crate::protocol::{
-    NAMESPACE_PROTOCOL_VERSION, Request, Response, StorageBlob, StorageHandshakeInfo,
-    TRANSFER_CHUNK_BYTES, TransferReply, TransferRequest,
+    NAMESPACE_PROTOCOL_VERSION, Request, Response, StorageHandshakeInfo, TRANSFER_CHUNK_BYTES,
 };
 use anyhow::ensure;
 use async_trait::async_trait;
-use bytes::Bytes;
-use std::io::Cursor;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-/// `Storage` implementation that forwards all cache operations to the sccache
-/// daemon over the existing IPC connection.  Used by CLI processes in
-/// client-side mode.
+/// Native session metadata and broker connection for namespace discovery.
 ///
 /// `ServerConnection` is synchronous and non-`Clone`, so it lives behind a
 /// `Mutex` and every RPC dispatches via `tokio::task::spawn_blocking`.  The
@@ -94,7 +84,7 @@ impl IpcStorage {
             crate::build_runtime::DescriptorDigestProvider,
         >,
     ) -> crate::server::DistClientContainer {
-        use crate::server::{DistClientContainer, DistClientState};
+        use crate::server::DistClientContainer;
         #[cfg(target_os = "linux")]
         if let Some(policy) = &self.handshake.native {
             return DistClientContainer::new_native(
@@ -102,70 +92,14 @@ impl IpcStorage {
                     self.conn(),
                     self.handshake.transfer_chunk_bytes,
                     policy.clone(),
-                    config.toolchains.clone(),
                     &config.native_installation_catalogs,
                     digest_provider,
                 ),
             );
         }
 
-        self.handshake.dist_rewrite_includes_only.map_or_else(
-            DistClientContainer::new_disabled,
-            |rewrite| {
-                DistClientContainer::new_with_state(DistClientState::Broker(Arc::new(
-                    crate::dist::broker::NamespaceClient::new(
-                        self.conn(),
-                        self.handshake.transfer_chunk_bytes,
-                        rewrite,
-                        config.toolchains.clone(),
-                    ),
-                )))
-            },
-        )
-    }
-
-    async fn read_blob(&self, kind: StorageBlob, key: &str) -> Result<Option<Bytes>> {
-        let key = key.to_owned();
-        let chunk_bytes = self.handshake.transfer_chunk_bytes;
-        connection_task(self.conn(), move |conn| {
-            let TransferReply::ReadStarted(len) =
-                conn.transfer(TransferRequest::Read { kind, key })?
-            else {
-                bail!("expected download length");
-            };
-            let Some(len) = len else {
-                return Ok(None);
-            };
-            let mut data = Vec::new();
-            conn.download(len, chunk_bytes, &mut data)?;
-            Ok(Some(data.into()))
-        })
-        .await
-    }
-
-    async fn write_blob(&self, kind: StorageBlob, key: &str, data: Bytes) -> Result<()> {
-        let key = key.to_owned();
-        let len = data.len() as u64;
-        let chunk_bytes = self.handshake.transfer_chunk_bytes;
-        connection_task(self.conn(), move |conn| {
-            ensure!(
-                matches!(
-                    conn.transfer(TransferRequest::BeginWrite { kind, key, len })?,
-                    TransferReply::WriteStarted
-                ),
-                "expected upload start"
-            );
-            conn.upload(len, chunk_bytes, data.as_ref())?;
-            ensure!(
-                matches!(
-                    conn.transfer(TransferRequest::FinishWrite)?,
-                    TransferReply::Ack
-                ),
-                "expected upload commit"
-            );
-            Ok(())
-        })
-        .await
+        let _ = config;
+        DistClientContainer::new_disabled()
     }
 }
 
@@ -178,36 +112,6 @@ impl Storage for IpcStorage {
         );
         Ok(())
     }
-    async fn get(&self, key: &str) -> Result<Cache> {
-        // A daemon path can be unavailable or name different bytes in this
-        // namespace. Only consume bytes returned by the storage authority.
-        self.get_raw(key).await?.map_or_else(
-            || Ok(Cache::Miss),
-            |bytes| {
-                CacheRead::from(Cursor::new(bytes))
-                    .with_context(|| format!("IpcStorage: decode archive for key {key}"))
-                    .map(Cache::Hit)
-            },
-        )
-    }
-
-    async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
-        self.put_raw(key, entry.finish()?.into()).await
-    }
-
-    async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
-        self.read_blob(StorageBlob::Cache, key).await
-    }
-
-    async fn put_raw(&self, key: &str, data: Bytes) -> Result<Duration> {
-        self.write_blob(StorageBlob::Cache, key, data).await?;
-        Ok(Duration::ZERO)
-    }
-
-    async fn check(&self) -> Result<CacheMode> {
-        Ok(self.handshake.cache_mode)
-    }
-
     fn location(&self) -> String {
         self.handshake.location.clone()
     }
@@ -224,32 +128,7 @@ impl Storage for IpcStorage {
         Ok(self.handshake.max_size)
     }
 
-    fn preprocessor_cache_mode_config(&self) -> PreprocessorCacheModeConfig {
-        self.handshake.preprocessor_cache_mode_config
-    }
-
     fn basedirs(&self) -> &[Vec<u8>] {
         &self.handshake.basedirs
-    }
-
-    async fn get_preprocessor_cache_entry(
-        &self,
-        key: &str,
-    ) -> Result<Option<Box<dyn crate::lru_disk_cache::ReadSeek>>> {
-        Ok(self
-            .read_blob(StorageBlob::Preprocessor, key)
-            .await?
-            .map(|bytes| Box::new(Cursor::new(bytes)) as Box<dyn crate::lru_disk_cache::ReadSeek>))
-    }
-
-    async fn put_preprocessor_cache_entry(
-        &self,
-        key: &str,
-        entry: PreprocessorCacheEntry,
-    ) -> Result<()> {
-        let mut buf = vec![];
-        entry.serialize_to(&mut buf).map_err(|e| anyhow!("{e}"))?;
-        self.write_blob(StorageBlob::Preprocessor, key, buf.into())
-            .await
     }
 }

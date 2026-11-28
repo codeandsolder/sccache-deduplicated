@@ -15,7 +15,7 @@ cd "$repo"
 source_sha="$(git rev-parse HEAD)"
 source contrib/codeandsolder/release-protocol.env
 host_fingerprint="$(contrib/codeandsolder/host-native-metadata fingerprint)"
-features=s3,gha,dist-client,dist-server,direct-metrics
+features=dist-client,dist-server,direct-metrics
 dashboard=0
 if [[ ${2:-} == --scheduler-dashboard ]]; then
     dashboard=1

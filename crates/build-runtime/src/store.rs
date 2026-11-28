@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::unix::fs::{FileExt, MetadataExt, PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{FileExt, MetadataExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, Weak,
@@ -25,6 +28,7 @@ use super::{
     ResultId, ResultManifest, blob_codec, identity::encoding,
 };
 
+const STORE_ROOT: TableDefinition<'static, u8, &[u8]> = TableDefinition::new("store_root_v1");
 const ACTIONS: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("actions_v1");
 const RESULTS: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("results_v1");
 const PACKAGES: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("packages_v1");
@@ -155,23 +159,24 @@ fn detach_orphan_fuse_mounts(_directory: &Path) -> Result<()> {
 // The Redb lock is already held by the caller, so no live store can own the
 // transient mounts being reclaimed. Never follow symlinks during cleanup.
 fn clean_orphan_mounts(directory: &Path) -> Result<()> {
-    fn remove(path: &Path) -> Result<()> {
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.is_dir() {
-            // Tree manifests can contain directories with restrictive modes.
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-            for child in fs::read_dir(path)? {
-                remove(&child?.path())?;
-            }
-            fs::remove_dir(path)?;
-        } else {
-            fs::remove_file(path)?;
-        }
-        Ok(())
-    }
     detach_orphan_fuse_mounts(directory)?;
     for entry in fs::read_dir(directory)? {
-        remove(&entry?.path())?;
+        remove_transient_tree(&entry?.path())?;
+    }
+    Ok(())
+}
+
+fn remove_transient_tree(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        // Tree manifests can contain directories with restrictive modes.
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        for child in fs::read_dir(path)? {
+            remove_transient_tree(&child?.path())?;
+        }
+        fs::remove_dir(path)?;
+    } else {
+        fs::remove_file(path)?;
     }
     Ok(())
 }
@@ -273,7 +278,7 @@ pub struct PhysicalStager {
     path: TempPath,
     written: u64,
     synced: bool,
-    budget: StageBudget,
+    reservation: space::StagingReservation,
     ingest: Option<blob_codec::BlobIngest>,
     encoded: Vec<u8>,
     expected: BlobRef,
@@ -477,7 +482,7 @@ impl PhysicalStager {
             reference: self.expected,
             encoding: self.store.physical_encoding,
             owner: Arc::clone(&self.store.inner),
-            _reservation: self.budget.finish(self.expected.size)?,
+            _reservation: self.reservation,
         })
     }
 }
@@ -652,6 +657,8 @@ mod results;
 struct Inner {
     root: PathBuf,
     db: Database,
+    // A second index must never open the same content root concurrently.
+    _root_lock: File,
     // Mutations serialize filesystem changes with durable metadata commits.
     // Readers only acquire the separate pin lock, not the publication lock.
     mutations: Mutex<()>,
@@ -666,6 +673,8 @@ struct Inner {
     publications: publications::PublicationWaits,
     space_policy: Option<SpacePolicy>,
     space: Mutex<space::SpaceState>,
+    space_maintenance: Mutex<()>,
+    space_wakeup: tokio::sync::Notify,
     // Releases never acquire the space admission lock, avoiding lock-order
     // inversion with transactional publication and eviction.
     space_released: AtomicU64,
@@ -1084,11 +1093,30 @@ pub struct NativeStore {
     resident: Arc<resident::ResidentRuntime>,
 }
 
+fn index_requires_restart(db: &Database) -> bool {
+    matches!(
+        db.try_begin_write(),
+        Err(redb::TransactionError::Storage(
+            redb::StorageError::PreviousIo
+        ))
+    )
+}
+
 impl NativeStore {
     /// Canonical directory owned by this store.
     #[must_use = "the root identifies the store directory"]
     pub fn root(&self) -> &Path {
         &self.inner.root
+    }
+
+    /// Whether redb has latched a previous I/O failure and requires reopening.
+    ///
+    /// The nonblocking write entry point checks the latched error even when
+    /// another writer owns the transaction slot. Ordinary contention is not
+    /// a failed index. Call after a maintenance error, not on the hot path.
+    #[must_use = "a latched I/O failure requires supervised reopening"]
+    pub fn index_requires_restart(&self) -> bool {
+        index_requires_restart(&self.inner.db)
     }
 
     /// The single admission and eviction policy for all clones.
@@ -1162,18 +1190,59 @@ impl NativeStore {
     /// Returns an error for filesystem, database or recovery failures, including
     /// when another live process owns this directory.
     pub fn open(root: &Path) -> Result<Self> {
-        Self::open_inner(root, None)
+        Self::open_inner(root, root, None)
     }
 
-    fn open_inner(root: &Path, space_policy: Option<SpacePolicy>) -> Result<Self> {
-        fs::create_dir_all(root)?;
-        let root = fs::canonicalize(root)?;
-        let metadata = fs::metadata(&root)?;
+    fn load_usage(db: &Database) -> Result<Pins> {
+        let mut pins = Pins::default();
+        let read = db.begin_read()?;
+        for entry in read.open_table(USAGE)?.iter()? {
+            let (key, value) = entry?;
+            let root = space::Root::from_key(*key.value())?;
+            let record: space::UsageRecord = encoding().deserialize(value.value())?;
+            pins.usage.insert(root, record);
+        }
+        Ok(pins)
+    }
+
+    fn open_inner(
+        root: &Path,
+        index_directory: &Path,
+        space_policy: Option<SpacePolicy>,
+    ) -> Result<Self> {
+        fn owned_directory(path: &Path) -> Result<PathBuf> {
+            fs::create_dir_all(path)?;
+            let path = fs::canonicalize(path)?;
+            let metadata = fs::metadata(&path)?;
+            ensure!(
+                metadata.is_dir()
+                    && metadata.uid() == rustix::process::geteuid().as_raw()
+                    && metadata.mode() & 0o022 == 0,
+                "native store directory must be owned by the service and not writable by others: {}",
+                path.display()
+            );
+            Ok(path)
+        }
+
+        let root = owned_directory(root)?;
+        let root_lock = File::open(&root)?;
+        rustix::fs::flock(
+            &root_lock,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .context("native content store already owned or cannot be locked")?;
+        let index_directory = owned_directory(index_directory)?;
         ensure!(
-            metadata.uid() == rustix::process::geteuid().as_raw() && metadata.mode() & 0o022 == 0,
-            "native store root must be owned by the service and not writable by others"
+            index_directory == root || !index_directory.starts_with(&root),
+            "native index directory must be the store root or outside the content store"
         );
-        let index = root.join("index.redb");
+        if index_directory != root {
+            ensure!(
+                !root.join("index.redb").try_exists()?,
+                "native index still exists in the content store; migrate it offline before opening"
+            );
+        }
+        let index = index_directory.join("index.redb");
         match fs::symlink_metadata(&index) {
             Ok(metadata) => ensure!(metadata.is_file(), "native index is not a regular file"),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1185,6 +1254,24 @@ impl NativeStore {
             Err(error) => return Err(error.into()),
         }
         let db = Database::create(index)?;
+        // Bind a relocated index to its actual content root before touching
+        // staging or mounts. An accidental association must not collect
+        // another store's blobs as orphans.
+        let write = db.begin_write()?;
+        {
+            let mut binding = write.open_table(STORE_ROOT)?;
+            let previous = binding.get(0)?.map(|value| value.value().to_vec());
+            let identity = root.as_os_str().as_bytes();
+            if let Some(previous) = previous {
+                ensure!(
+                    previous == identity,
+                    "native index belongs to a different content root"
+                );
+            } else {
+                binding.insert(0, identity)?;
+            }
+        }
+        write.commit()?;
         for name in ["staging", "blobs", "mounts"] {
             let path = root.join(name);
             fs::create_dir_all(&path)?;
@@ -1203,6 +1290,9 @@ impl NativeStore {
         clean_orphan_mounts(&root.join("mounts"))?;
         File::open(root.join("blobs"))?.sync_all()?;
         File::open(&root)?.sync_all()?;
+        if index_directory != root {
+            File::open(&index_directory)?.sync_all()?;
+        }
         let write = db.begin_write()?;
         write.open_table(ACTIONS)?;
         history::initialize(&write)?;
@@ -1216,6 +1306,7 @@ impl NativeStore {
         write.open_table(BLOB_LAYOUTS)?;
         write.open_multimap_table(RESULT_ACTIONS)?;
         write.open_multimap_table(BLOB_ROOTS)?;
+        duplicate_results::initialize(&write)?;
         write.open_table(PENDING_DELETIONS)?;
         {
             let mut accounting = write.open_table(ACCOUNTING)?;
@@ -1227,16 +1318,7 @@ impl NativeStore {
             }
         }
         write.commit()?;
-        let mut pins = Pins::default();
-        {
-            let read = db.begin_read()?;
-            for entry in read.open_table(USAGE)?.iter()? {
-                let (key, value) = entry?;
-                let root = space::Root::from_key(*key.value())?;
-                let record: space::UsageRecord = encoding().deserialize(value.value())?;
-                pins.usage.insert(root, record);
-            }
-        }
+        let pins = Self::load_usage(&db)?;
         let result_history_limit = history::configured_limit(&db)?;
         let physical_encoding = if is_native_zfs(&root.join("staging"))? {
             BlobEncoding::Raw
@@ -1246,6 +1328,7 @@ impl NativeStore {
         let inner = Arc::new(Inner {
             root,
             db,
+            _root_lock: root_lock,
             mutations: Mutex::new(()),
             dirty_blob_directory: AtomicBool::new(false),
             pins: Mutex::new(pins),
@@ -1256,6 +1339,8 @@ impl NativeStore {
             publications: publications::PublicationWaits::default(),
             space_policy,
             space: Mutex::default(),
+            space_maintenance: Mutex::default(),
+            space_wakeup: tokio::sync::Notify::new(),
             space_released: AtomicU64::new(0),
             result_history_limit: AtomicU64::new(result_history_limit),
         });
@@ -1281,11 +1366,44 @@ impl NativeStore {
         matches!(self.physical_encoding, BlobEncoding::Raw)
     }
 
+    /// Claim a dedicated worker scratch directory and remove abandoned private
+    /// views from the previous process. The returned descriptor holds the
+    /// directory lock for the entire worker lifetime.
+    ///
+    /// # Errors
+    /// Returns an error for an unsafe, occupied or invalid scratch directory.
     #[cfg(target_os = "linux")]
+    pub fn claim_execution_scratch(&self, scratch: &Path) -> Result<File> {
+        fs::create_dir_all(scratch)?;
+        let scratch = fs::canonicalize(scratch)?;
+        let metadata = fs::metadata(&scratch)?;
+        ensure!(
+            metadata.uid() == rustix::process::geteuid().as_raw()
+                && metadata.mode() & 0o022 == 0
+                && scratch != self.inner.root
+                && !self.inner.root.starts_with(&scratch)
+                && !scratch.starts_with(&self.inner.root),
+            "native execution scratch must be a dedicated owner-controlled directory outside the store"
+        );
+        let lock = File::open(&scratch)?;
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .context("native execution scratch already owned or cannot be locked")?;
+        self.can_clone_into(&scratch)?;
+        for entry in fs::read_dir(&scratch)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.as_bytes().starts_with(b"build-mutable-") {
+                remove_transient_tree(&entry.path())?;
+            }
+        }
+        Ok(lock)
+    }
+
     /// Check whether a build can use native block cloning on this store.
     ///
     /// # Errors
     /// Returns an error when native ZFS and scratch are on different datasets.
+    #[cfg(target_os = "linux")]
     pub fn can_clone_into(&self, scratch: &Path) -> Result<bool> {
         if !self.uses_native_zfs() {
             return Ok(false);
@@ -1359,9 +1477,11 @@ impl NativeStore {
                             .context("staging budget overflow")?;
                         // A small managed worker must be able to stage a
                         // small object even with a budget below one chunk.
-                        let reservation = self.inner.space_policy.map_or(reservation, |policy| {
-                            reservation.min(policy.max_resident_bytes)
-                        });
+                        let reservation = if let Some(policy) = self.inner.space_policy {
+                            reservation.min(self.staging_limit(policy)?)
+                        } else {
+                            reservation
+                        };
                         ensure!(
                             size <= reservation,
                             "native staged content exceeds resident budget"
@@ -1458,8 +1578,20 @@ impl NativeStore {
         expected: BlobRef,
         encoding: BlobEncoding,
     ) -> Result<PhysicalStager> {
-        let mut budget = space::StageBudget::new(self);
-        budget.grow_to(expected.size)?;
+        let reservation = self.reserve_transfer(expected.size)?;
+        self.prepare_physical_reserved(expected, encoding, reservation)
+    }
+
+    pub(crate) fn reserve_transfer(&self, bytes: u64) -> Result<space::StagingReservation> {
+        self.reserve_staging(bytes)?.finish(bytes)
+    }
+
+    pub(crate) fn prepare_physical_reserved(
+        &self,
+        expected: BlobRef,
+        encoding: BlobEncoding,
+        reservation: space::StagingReservation,
+    ) -> Result<PhysicalStager> {
         let (file, path) = NamedTempFile::new_in(self.inner.root.join("staging"))?.into_parts();
         let mut written = 0;
         let ingest = blob_codec::BlobIngest::new(
@@ -1477,7 +1609,7 @@ impl NativeStore {
             path,
             written,
             synced: false,
-            budget,
+            reservation,
             ingest: Some(ingest),
             encoded: Vec::new(),
             expected,
@@ -2014,6 +2146,8 @@ impl NativeStore {
                     .context("missing indexed result")?;
                 let manifest: ResultManifest = encoding().deserialize(manifest.value())?;
                 history::remember(&write, action, manifest, limit)?;
+            } else {
+                duplicate_results::forget(&write, action)?;
             }
             unreferenced_logical_bytes = Self::release_result_reference(
                 &write,
@@ -2433,10 +2567,15 @@ impl<L> Seek for LeasedReader<'_, L> {
     }
 }
 
+mod duplicate_results;
 mod history;
 mod space;
 use crate::SpacePolicy;
-pub use space::{CacheAnalyticsSampler, SpaceReport, SpaceStatus, StageBudget};
+pub use space::StagingReservation;
+pub use space::{
+    CacheAnalyticsSampler, SpaceReport, SpaceStatus, StageBudget, StageSpaceExhausted,
+    StageSpaceTooLarge,
+};
 mod audit;
 pub use audit::{ComponentAudit, NativeIndexAudit, SchemaInventory};
 mod packages;

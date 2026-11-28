@@ -7,10 +7,11 @@
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    fs,
-    os::unix::ffi::OsStrExt,
+    fs::{self, File},
+    io::Read,
+    os::{fd::AsRawFd, unix::ffi::OsStrExt},
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Command, ExitStatus},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -204,18 +205,27 @@ impl SandboxPlan {
     ///
     /// # Errors
     /// Returns an error if the Bubblewrap launcher is not an absolute path.
-    pub fn command(&self, bubblewrap: &Path, invocation: &SandboxInvocation) -> Result<Command> {
+    pub fn command(
+        &self,
+        bubblewrap: &Path,
+        invocation: &SandboxInvocation,
+        status: File,
+    ) -> Result<Command> {
         ensure!(
             bubblewrap.is_absolute(),
             "bubblewrap launcher must be absolute"
         );
         let mut command = Command::new(bubblewrap);
         let mask = rustix::fs::Mode::from_bits_truncate(invocation.umask);
+        let status_fd = status.as_raw_fd();
+        command.arg("--json-status-fd").arg(status_fd.to_string());
         // SAFETY: umask is an async-signal-safe syscall; the child alone
         // changes its creation mask before exec, never the worker process.
         unsafe {
             std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
                 rustix::process::umask(mask);
+                // Only the child inherits this private status descriptor.
+                rustix::io::fcntl_setfd(&status, rustix::io::FdFlags::empty())?;
                 Ok(())
             });
         }
@@ -260,6 +270,46 @@ impl SandboxPlan {
             .args(&invocation.arguments);
         Ok(command)
     }
+}
+
+/// Bubblewrap's exit status alone is not a compiler exit status. Its
+/// bootstrap failures and failed execve return ordinary nonzero codes
+/// without emitting the terminal JSON record. Require both records.
+pub(crate) fn verify_status(reader: impl Read, status: ExitStatus) -> Result<()> {
+    const LIMIT: u64 = 64 * 1024;
+    let mut bytes = Vec::new();
+    reader.take(LIMIT + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        u64::try_from(bytes.len())? <= LIMIT,
+        "oversized Bubblewrap status"
+    );
+    let mut records = serde_json::Deserializer::from_slice(&bytes).into_iter::<serde_json::Value>();
+    let started = records
+        .next()
+        .context("missing Bubblewrap start record")??;
+    ensure!(
+        started
+            .get("child-pid")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|pid| pid != 0),
+        "invalid Bubblewrap start record"
+    );
+    let ended = records
+        .next()
+        .context("missing Bubblewrap compiler exit record")??;
+    let exit_code = ended
+        .get("exit-code")
+        .and_then(serde_json::Value::as_i64)
+        .context("invalid Bubblewrap compiler exit record")?;
+    ensure!(
+        status.code().map(i64::from) == Some(exit_code),
+        "Bubblewrap exit status mismatch"
+    );
+    ensure!(
+        records.next().is_none(),
+        "unexpected extra Bubblewrap status records"
+    );
+    Ok(())
 }
 
 fn canonical_source(source: &Path) -> Result<PathBuf> {

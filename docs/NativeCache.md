@@ -1,4 +1,4 @@
-# Native scheduler cache (experimental)
+# Native scheduler cache
 
 The native runtime in `crates/build-runtime` is a separate explicit action
 protocol. It does not reinterpret the archive compiler protocol's keys and
@@ -217,6 +217,7 @@ Scheduler configuration example (illustrative resource limits):
 [native_cache]
 public_addr = "127.0.0.1:10502"
 directory = "/var/lib/sccache-native/scheduler"
+index_directory = "/var/lib/sccache-native-index/scheduler"
 idle_timeout_secs = 120
 max_sessions = 128
 max_result_bytes = 1073741824
@@ -231,8 +232,7 @@ max_metadata_bytes = 67108864
 [native_cache.space]
 min_available_bytes = 536870912
 target_available_bytes = 2147483648
-max_resident_bytes = 274877906944
-target_resident_bytes = 257698037760
+# On a dedicated quota-controlled filesystem, omit logical resident limits.
 max_evictions_per_pass = 32
 gc_batch = 1024
 ```
@@ -242,8 +242,11 @@ cache address, not necessarily the example loopback address). Select
 `builder.type = "native"` in the main worker configuration and omit archive
 `cache_dir` and archive sources. This worker never constructs the legacy
 overlay builder or archive cache, and cannot be scheduled for archive jobs.
-A worker with a legacy builder and a native worker section supports both
-protocols, sharing its advertised capacity.
+Legacy archive builders and their configuration fields have been removed.
+Workers require Bubblewrap with `--json-status-fd` support. A launch or
+namespace failure is a distinct infrastructure failure, with its bounded
+diagnostic delivered to the caller; compiler exit failures remain ordinary
+failed compilation results.
 
 ```toml
 [builder]
@@ -252,6 +255,7 @@ type = "native"
 [native_worker]
 cache_url = "https://127.0.0.1:10502"
 directory = "/var/lib/sccache-native/worker"
+index_directory = "/var/lib/sccache-native-index/worker"
 scratch = "/var/lib/sccache-native/scratch"
 bubblewrap = "/usr/bin/bwrap"
 platform_contract = "site-defined-linux-execution-contract-v1"
@@ -271,17 +275,32 @@ gc_batch = 1024
 ```
 
 The native store uses one transactional index, lease/GC implementation, and
-usage-aware eviction policy on scheduler, worker and local executor. The
-resident budget counts uncompressed live blobs and queued garbage conservatively;
-ZFS separately compresses them and the filesystem free-space watermarks still
-apply. For actual physical cache isolation, place each store on a quota-managed
-dataset. Worker replicas are persistent and reuse the same verified blobs and
+usage-aware eviction policy on scheduler and worker. The
+optional logical resident watermarks count uncompressed live blobs and queued
+garbage. For a quota-managed dataset, omit both logical watermarks and use the
+filesystem free-space watermarks to drive eviction against the actual allocated
+bytes, including compression, temporary files and scratch on that dataset.
+Keep logical limits only for a store sharing a filesystem without a dedicated quota.
+Reservations conservatively reserve worst-case incoming bytes. Worker replicas are persistent and reuse the same verified blobs and
 package trees, fetching missing inputs only. Access frequency and recency are
 buffered and checkpointed at most once per minute during maintenance,
 plus on orderly shutdown, without write I/O on cache hits. Staged files
 hold admission reservations through publication; their releases are applied
 atomically without taking the admission lock, preventing lock-order cycles
-with concurrent eviction and index publication.
+with concurrent eviction and index publication. Result and tree negotiation
+reserves the complete missing content closure before receiving any blobs;
+individual transfers share that charge even when a stream must be retried.
+A temporarily occupied budget returns retryable HTTP 503 rather than a
+terminal publication error. Impossible single reservations are rejected
+without eviction. Admission never performs eviction or GC. Background maintenance replenishes
+headroom proactively to the retention target (4 GiB below the hard limit
+in the fleet), and observes larger rejected reservations as demand for
+additional headroom. New reservations and writable execution pressure wake an
+idle maintenance pass. While bounded passes are making progress, their delay
+falls continuously from one second to 50 ms as the soft-to-hard buffer fills;
+if all reclaimable roots are pinned or reclamation is stalled, the regular
+one-second observation avoids repeated scans. Admission remains separate from
+reclamation, and compiler input leases are released before output publication.
 
 Under cache pressure, eviction ranks roots by the expected reuse cost per
 byte that deleting them could actually reclaim. It follows the transactional
@@ -357,8 +376,18 @@ counterfactual results do not include ZFS block compression, original-package
 decode CPU, cache admission stalls, concurrent pinning or external snapshots.
 
 The worker advertises the BLAKE3 digest of the exact platform contract.
-Clients use the same digest in `ExecutionSpec.platform`. The renewal
-interval must be shorter than the scheduler idle timeout.
+Clients use the same digest in `ExecutionSpec.platform`. The configured renewal interval is a maximum cadence. Every successful
+renewal returns the scheduler's actual idle lease lifetime; the client
+renews no later than one third of that lifetime. Each guard owns one lease.
+A delayed request or missed cadence is not a lease expiry: temporary
+transport failures and service overload are retried with bounded request
+timeouts and backoff. Only a definitive scheduler rejection (lost/expired
+lease or invalid ownership) terminates the lease. Other authenticated
+operations can extend a lease, so a client-side elapsed timer cannot prove
+expiration. If confirmed validity becomes uncertain, diagnostics report
+the transport failure while attempts continue; the ordinary build/action
+deadlines still apply. A restarted scheduler rejects old in-memory leases
+with HTTP 410, requiring a new build session.
 
 On ZFS workers, the native CAS directory and execution scratch **must be
 on the same ZFS dataset** for block cloning. The worker verifies this at
@@ -385,8 +414,33 @@ Recency is in-memory and unknown roots after restart rank oldest.
 The external dataset quota remains the hard limit; snapshots, open files,
 clone extents, delayed accounting and other writers can prevent reclaim.
 A separate scratch *filesystem* is not appropriate for native ZFS cloning:
-scratch must share the CAS dataset. Per-job scratch limits and fleet-level
-capacity policy remain outstanding. The native store is not an additional
+scratch must share the CAS dataset. Compiler preparation, process polling and
+capture check the managed filesystem's physical low watermark, including
+executions that do not retain output locally. This is a pressure guard, not
+a hard per-job quota: bursts and unrelated writers can still exhaust the
+content dataset.
+
+**Keep the transactional index in its own capacity domain.** Set
+`index_directory` outside the content/scratch dataset (a separate ZFS dataset
+with reserved headroom is recommended). Provision it with the same service
+owner and verify that the CAS quota does not include that directory. The CAS
+directory and scratch remain on the same dataset for block cloning.
+A colocated worker inherits its scheduler's index; it must not specify another
+index directory. A failed redb transaction can latch `PreviousIo` even after
+the filesystem becomes writable. The scheduler and standalone worker exit
+with failure on this latched state so their supervisor reopens and repairs
+the index; restart-on-failure and control-group cleanup must be enabled.
+
+For an existing store, stop its service and any colocated worker, create the
+new owner-controlled index directory, and move only `index.redb` using the
+`contrib/codeandsolder/fleet/relocate-native-index` offline relocation helper. Keep the content root unchanged. Fleet activation refuses to install new binaries until this migration is complete. If rolling back to a release using the original in-store index, relocate the index back with both owners stopped before starting that release. Then set
+`index_directory` in the same service configuration and start the new
+binary. The content-root directory lock and persisted index binding prevent
+two indices from collecting the same CAS or an index from attaching to a
+different root. The opener rejects a missing external index for an existing
+content root and rejects a leftover old index, rather than starting an empty
+cache. On startup the worker also removes abandoned private scratch views.
+Per-job hard scratch quotas and fleet-level capacity policy remain outstanding. The native store is not an additional
 production sccache cache tier.
 
 ### Ordinary compiler client
@@ -449,44 +503,6 @@ precedes publication. No client or daemon archive staging is required.
 The stream has bounded queues, frame limits and an absolute deadline;
 disconnect releases or expires the native action pins.
 
-## Local exact-sandbox execution
-
-Opt in on the managed sccache daemon (or a directly configured compiler
-service) using the same native client configuration and platform contract:
-
-```toml
-[dist.native.local_execution]
-preference = "remote_first" # or "local"
-max_jobs = 4
-directory = "/path/to/native-local-input-store"
-scratch = "/path/to/native-local-scratch"
-bubblewrap = "/usr/bin/bwrap"
-
-[dist.native.local_execution.space]
-min_available_bytes = 2147483648
-target_available_bytes = 4294967296
-max_evictions_per_pass = 128
-gc_batch = 1024
-```
-
-The local executor owns an explicit quota-managed input CAS and private
-scratch directory. It uses the same execution specification, verified root
-composition, Bubblewrap runner, output capture, scheduler ticket and atomic
-publication as a remote worker. Ordinary hits bypass execution. With the
-local preference, missing input trees are first staged from the caller;
-only missing content goes to the scheduler from those exact verified files.
-With remote-first, local execution is selected only on an explicit unavailable
-allocation, never after an ambiguous or successful remote assignment.
-The local executor imports missing input bytes directly from caller-provided
-sources, including through the scoped networkless namespace stream. Local
-misses publish to the scheduler and deliver the captured descriptors directly
-to the caller; they do not download the just-published result or populate a
-second local action cache. A bounded local job pool renews the action lease
-while waiting. Both local and worker execution require an administrator-
-attested matching platform contract. Unconstrained local fallbacks remain
-uncached. Native control and result publication work even when no compatible
-remote worker is available, provided the scheduler cache service is reachable.
-
 ## Toolchain discovery and mapped trees
 
 The Linux C and Rust toolchain packagers share their existing dependency and
@@ -514,6 +530,24 @@ artifacts rather than generating another, metadata-only variant of each
 rlib. The archive emitter still supports per-file trimming and streams
 ordinary files instead of collecting them into a buffer. The native
 input and toolchain trees use the same explicit directory normalization.
+
+For ordinary preprocessed C and C++ actions, the package owns its executable
+search path. The client resolves helpers using the requested driver and its
+arguments, captures the selected ELF dependency closures, and verifies a
+reconstructed library search contract without the host's loader cache.
+Changing Cargo output directories or irrelevant PATH/LD_LIBRARY_PATH entries
+does not change that contract. Actual changes in selected helpers or shared
+libraries remain inputs. Opaque compiler extensions retain exact execution
+identity; arbitrary loader injection is not automatically distributed.
+
+The dashboard's Cache hits tab includes durable counters of successful new-key
+reuse-mode publications whose artifacts match another known action, and the
+subset whose complete results (including diagnostics) match. Existing live
+manifests and retained eviction receipts are comparison data, not retroactively
+counted misses. Same-key retries, recovery, and explicit refreshes do not count.
+The comparison index follows retention and does not pin payloads. Identical
+outputs alone are evidence of redundant work, not permission to alias
+semantically different compiler requests.
 
 ## Validation
 
@@ -556,9 +590,20 @@ intending to transform the input directory instead declare a complete tree.
 Both worker capture and client delivery account for logical file bytes
 independently of content deduplication. All staged directory contents are
 validated and materialized before publication at a previously absent
-destination. The caller can mount a generated-only result over its original
-live input directory for native linking, without replacing its dependencies
-with stale worker copies.
+destination. Rust linking is a dependent native action, not a local replay. Codegen's
+result is retained by the scheduler and used as a recipe layer in the
+link action. Its owned files can be consumed or replaced by the link
+stage; all external inputs are still immutable. The worker constructs
+the filesystem with Bubblewrap from verified CAS content. There is no
+requirement that the worker has the same installed linker or libraries.
+The final generated tree, rather than the intermediate codegen tree,
+is delivered to the caller. Each stage has its own action key and
+cache/worker statistics.
+
+The compiler client requires a native scheduler; an unavailable worker,
+unsupported compile or failed remote command returns an error. Only
+explicit compiler information queries and input discovery are executed
+in the caller namespace.
 
 ### Inspecting key relevance
 
@@ -1415,10 +1460,13 @@ private staging inode only after the result is committed and retained.
 The compiler's input manifest uses the same content ID as a materialized input,
 so a resident artifact does not need to pass through the launcher or compiler
 client. Locally executed build scripts, linkers, proc macros, and other readers
-receive verified bytes on demand. Mutable operations detach from the immutable
-content, preserving hardlinks and ordinary file metadata; truncation need not
-read the old bytes. Multiple local reads share one verified private spool per
-content identity. Spools and namespace data are temporary, not another cache.
+receive verified bytes on data open, before a compiler can fault a remote
+read through an mmap. Identity-only descriptor probes do not open file data.
+Mutable operations detach from the immutable content, preserving hardlinks
+and ordinary file metadata; truncation need not read the old bytes. Multiple
+local reads share one verified private anonymous spool per content identity,
+held until the build mount exits. Spools and namespace data are temporary,
+not another cache.
 
 An expired or unavailable lease fails the affected operation rather than
 exposing an empty placeholder or inventing a new content identity. Scratch

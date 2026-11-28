@@ -197,6 +197,31 @@ impl RustEnvironmentPath {
     }
 }
 
+pub(super) fn compiler_build_path_variable(name: &OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(
+            "OUT_DIR"
+                | "CARGO_MANIFEST_DIR"
+                | "CARGO_MANIFEST_PATH"
+                | "CARGO_TARGET_DIR"
+                | "CARGO_BUILD_BUILD_DIR"
+                | "CARGO_HOME"
+                | "CARGO_TARGET_TMPDIR"
+                | "CARGO"
+                | "RUSTC"
+                | "RUSTDOC"
+                | "CLIPPY_CONF_DIR"
+                | "HOME"
+                | "TMPDIR"
+                | "TMP"
+                | "TEMP"
+                | "TEMPDIR"
+                | "PWD"
+        )
+    )
+}
+
 fn embedded_path_match_is_token(text: &str, start: usize, end: usize) -> bool {
     let prefix = &text[..start];
     let token_start = prefix
@@ -264,6 +289,25 @@ fn replace_embedded_path(text: &str, physical: &str, canonical: &str) -> String 
 
     output.push_str(&text[copied_until..]);
     output
+}
+
+/// Normalize an absolute path in the constructed logical namespace.
+/// Unlike a physical operand, this is never resolved against host files.
+pub(super) fn logical_absolute_path(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                result.pop();
+            }
+            Component::CurDir => {}
+            other => result.push(other),
+        }
+    }
+    Some(result)
 }
 
 /// Resolve an operand against the invocation's physical cwd before applying
@@ -398,6 +442,20 @@ impl CanonicalRustPaths {
         })
     }
 
+    /// The caller's build-script output directory is a logical input root,
+    /// not the Cargo unit/lease pathname. Its selected file contents are
+    /// hashed by the frontend.
+    pub(super) fn normalize_generated_root(&mut self, env: &[(OsString, OsString)]) {
+        if let Some(out) = env_value(env, "OUT_DIR")
+            && out.is_absolute()
+            && out.is_dir()
+            && out != self.target_root
+            && self.root_is_known(&out)
+        {
+            self.roots.insert(0, RootMapping::new(&out, "/generated"));
+        }
+    }
+
     pub(crate) fn to_canonical(&self, path: &Path) -> PathBuf {
         self.roots
             .iter()
@@ -486,8 +544,9 @@ impl CanonicalRustPaths {
         let mut canonical: Vec<_> = env
             .iter()
             .filter(|(k, _)| {
-                k != "SCCACHE_EXPERIMENTAL_CANONICAL_RUST"
-                    && !k.to_string_lossy().starts_with("SCCACHE_CANONICAL_")
+                preserve.contains(k)
+                    || (k != "SCCACHE_EXPERIMENTAL_CANONICAL_RUST"
+                        && !k.to_string_lossy().starts_with("SCCACHE_CANONICAL_"))
             })
             .map(|(k, v)| {
                 let value = if preserve.contains(k) {
@@ -711,6 +770,35 @@ impl CanonicalRustPaths {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn native_generated_directory_has_one_logical_identity() -> crate::errors::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='test'\nversion='0.0.0'\n",
+        )?;
+        let target = root.join("target");
+        std::fs::create_dir_all(&target)?;
+        std::fs::write(target.join("CACHEDIR.TAG"), "cache")?;
+        let build = |suffix: &str| -> crate::errors::Result<OsString> {
+            let out = target.join("debug/build").join(suffix).join("out");
+            std::fs::create_dir_all(&out)?;
+            let env = vec![
+                ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+                ("CARGO_TARGET_DIR".into(), target.as_os_str().to_owned()),
+                ("OUT_DIR".into(), out.as_os_str().to_owned()),
+            ];
+            let mut paths = CanonicalRustPaths::from_env(&env, root, Path::new("/rust-toolchain"))
+                .ok_or_else(|| anyhow::anyhow!("missing canonical roots"))?;
+            paths.normalize_generated_root(&env);
+            Ok(paths.env_value_to_canonical(OsStr::new("OUT_DIR"), out.as_os_str()))
+        };
+        assert_eq!(build("package-first")?, OsString::from("/generated"));
+        assert_eq!(build("package-second")?, OsString::from("/generated"));
+        Ok(())
+    }
 
     #[test]
     fn rust_environment_classification_preserves_disclosure_policy() {

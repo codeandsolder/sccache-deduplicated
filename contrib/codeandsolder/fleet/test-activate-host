@@ -113,7 +113,7 @@ bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-net --die-with-pare
  --bind "$tmp/usr-local" /usr/local \
  --bind "$tmp/etc" /etc \
  --bind "$tmp/var-lib" /var/lib \
- --bind "$tmp/var-cache" /var/cache \
+ --tmpfs /var/cache \
  --bind "$tmp/var-tmp" /var/tmp \
  --ro-bind "$tmp/bin" /run/test-bin \
  --setenv PATH /run/test-bin:/usr/bin:/bin \
@@ -154,7 +154,19 @@ chmod 755 /usr/local/libexec/host-native-metadata
 [[ -f /dev/shm/sccache-maintenance-drain ]]
 [[ $(cat /usr/local/bin/sccache) == "new router" ]]
 ./activate-host stop-dist "$sha"
+# A preexisting CAS must never be attached to a new empty index.
+mkdir -p /var/cache/sccache-native/worker /var/lib/sccache-native-index/worker
+printf 'existing index\n' > /var/cache/sccache-native/worker/index.redb
+if ./activate-host install "$sha"; then
+    echo "activation accepted an unmigrated index" >&2
+    exit 1
+fi
+[[ $(cat /usr/local/libexec/sccache-bin/sccache) == "old client" ]]
+printf 'existing blob\n' > /var/cache/sccache-native/worker/blob
+mv /var/cache/sccache-native/worker/index.redb /var/lib/sccache-native-index/worker/index.redb
 ./activate-host install "$sha"
+[[ $(cat /var/lib/sccache-native-index/worker/index.redb) == "existing index" ]]
+[[ $(cat /var/cache/sccache-native/worker/blob) == "existing blob" ]]
 [[ $(cat /etc/sccache/client-shared.toml) == "new shared config" ]]
 [[ $(cat /etc/sccache/cluster-ca.pem) == "fixture CA" ]]
 [[ $(cat /etc/sccache-dist/server.conf) == "new worker config" ]]

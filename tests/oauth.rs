@@ -4,7 +4,6 @@
 use fs_err as fs;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use thirtyfour::prelude::*;
@@ -44,20 +43,12 @@ fn generate_implicit_auth_config() -> sccache::config::DistAuth {
     }
 }
 
-fn config_with_dist_auth(
-    tmpdir: &Path,
-    auth_config: sccache::config::DistAuth,
-) -> sccache::config::FileConfig {
+fn config_with_dist_auth(auth_config: sccache::config::DistAuth) -> sccache::config::FileConfig {
     sccache::config::FileConfig {
-        cache: Default::default(),
         dist: sccache::config::DistConfig {
             auth: auth_config,
             cluster: None,
             scheduler_url: None,
-            cache_dir: tmpdir.join("unused-cache"),
-            toolchains: vec![],
-            toolchain_cache_size: 0,
-            rewrite_includes_only: true,
             native: None,
             native_installation_catalogs: Vec::new(),
         },
@@ -237,7 +228,7 @@ async fn test_auth_with_config(dist_auth: sccache::config::DistAuth) {
         .prefix("sccache-test-conf")
         .tempdir()
         .unwrap();
-    let sccache_config = config_with_dist_auth(conf_dir.path(), dist_auth);
+    let sccache_config = config_with_dist_auth(dist_auth);
     assert_eq!(sccache_config.basedirs, [] as [std::string::String; 0]);
     let sccache_config_path = conf_dir.path().join("sccache-config.json");
     fs::File::create(&sccache_config_path)

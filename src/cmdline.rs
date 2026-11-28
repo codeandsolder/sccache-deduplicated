@@ -72,8 +72,6 @@ pub enum Command {
     DistStatus,
     /// Perform a login to authenticate for distributed compilation.
     DistAuth,
-    /// Package a toolchain for distributed compilation (executable, out)
-    PackageToolchain(PathBuf, PathBuf),
     /// Run a compiler command.
     Compile {
         /// The binary to execute.
@@ -85,7 +83,6 @@ pub enum Command {
         /// The environment variables to use for execution.
         env_vars: Vec<(OsString, OsString)>,
     },
-    DebugPreprocessorCacheEntries,
 }
 
 fn flag_long_and_short(name: &'static str, short: char) -> Arg {
@@ -99,34 +96,7 @@ fn flag_infer_long(name: &'static str) -> Arg {
 const ENABLED_FEATURES_HELP: &str = concat!(
     "Linux Cargo launcher: --cargo-final -- [Cargo arguments] (temporary intermediates)\n",
     "                      --cargo-all -- [Cargo arguments] (normal Cargo retention)\n\n",
-    "Enabled features:\n",
-    "    S3:        ",
-    cfg!(feature = "s3"),
-    "\n",
-    "    Redis:     ",
-    cfg!(feature = "redis"),
-    "\n",
-    "    Memcached: ",
-    cfg!(feature = "memcached"),
-    "\n",
-    "    GCS:       ",
-    cfg!(feature = "gcs"),
-    "\n",
-    "    GHA:       ",
-    cfg!(feature = "gha"),
-    "\n",
-    "    Azure:     ",
-    cfg!(feature = "azure"),
-    "\n",
-    "    WebDAV:    ",
-    cfg!(feature = "webdav"),
-    "\n",
-    "    OSS:       ",
-    cfg!(feature = "oss"),
-    "\n",
-    "    COS:       ",
-    cfg!(feature = "cos"),
-    "\n"
+    "Execution storage: native scheduler CAS only"
 );
 /// Get the [`clap::Command`] used for argument parsing.
 fn get_clap_command() -> clap::Command {
@@ -155,9 +125,6 @@ fn get_clap_command() -> clap::Command {
             flag_infer_long("start-server")
                 .help("start background server")
                 .action(ArgAction::SetTrue),
-            flag_infer_long("debug-preprocessor-cache")
-                .help("show all preprocessor cache entries")
-                .action(ArgAction::SetTrue),
             flag_infer_long("stop-server")
                 .help("stop background server")
                 .action(ArgAction::SetTrue),
@@ -170,11 +137,6 @@ fn get_clap_command() -> clap::Command {
             flag_infer_long("dist-status")
                 .help("show status of the distributed client")
                 .action(ArgAction::SetTrue),
-            flag_infer_long("package-toolchain")
-                .help("package toolchain for distributed compilation")
-                .value_parser(clap::value_parser!(PathBuf))
-                .num_args(2)
-                .value_names(["EXE", "OUT"]),
             flag_infer_long("stats-format")
                 .help("set output format of statistics")
                 .value_name("FMT")
@@ -190,7 +152,6 @@ fn get_clap_command() -> clap::Command {
                 .args([
                     "capabilities",
                     "dist-auth",
-                    "debug-preprocessor-cache",
                     "dist-status",
                     "show-stats",
                     "active-compiles",
@@ -199,7 +160,6 @@ fn get_clap_command() -> clap::Command {
                     "start-server",
                     "stop-server",
                     "zero-stats",
-                    "package-toolchain",
                     "CMD",
                 ])
                 .required(true),
@@ -213,42 +173,24 @@ fn stats_format(matches: &clap::ArgMatches) -> Result<StatsFormat> {
         .ok_or_else(|| anyhow!("stats format missing despite clap default"))
 }
 
-fn package_toolchain_command(matches: &clap::ArgMatches) -> Result<Command> {
-    let mut values = matches
-        .get_many::<PathBuf>("package-toolchain")
-        .ok_or_else(|| anyhow!("package-toolchain requires executable and output paths"))?
-        .cloned();
-
-    let exe = values
-        .next()
-        .ok_or_else(|| anyhow!("package-toolchain executable is missing"))?;
-    let out = values
-        .next()
-        .ok_or_else(|| anyhow!("package-toolchain output path is missing"))?;
-    if values.next().is_some() {
-        bail!("package-toolchain received more than two values");
-    }
-
-    Ok(Command::PackageToolchain(exe, out))
+/// Preserve ordinary compiler inputs for discovery. Only process-local
+/// instrumentation and jobserver transport state are not transferable.
+fn compiler_request_environment(
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    environment
+        .into_iter()
+        .filter(|(key, _)| {
+            !matches!(
+                key.to_str(),
+                Some("LD_PRELOAD" | "RUNNING_UNDER_RR" | "CARGO_MAKEFLAGS")
+            )
+        })
+        .collect()
 }
 
 fn compile_command(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Command> {
-    let mut env_vars = env::vars_os().collect::<Vec<_>>();
-
-    env_vars.retain(|(key, _)| {
-        key != "LD_PRELOAD"
-            && key != "RUNNING_UNDER_RR"
-            && key != "HOSTNAME"
-            && key != "PWD"
-            && key != "HOST"
-            && key != "RPM_BUILD_ROOT"
-            && key != "SOURCE_DATE_EPOCH"
-            && key != "RPM_PACKAGE_RELEASE"
-            && key != "MINICOM"
-            && key != "DESTDIR"
-            && key != "RPM_PACKAGE_VERSION"
-            && key != "CARGO_MAKEFLAGS"
-    });
+    let env_vars = compiler_request_environment(env::vars_os());
 
     let mut values = matches
         .get_many::<OsString>("CMD")
@@ -280,8 +222,6 @@ fn command_from_matches(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Comm
         Ok(Command::ShowStats(stats_format(matches)?, true))
     } else if matches.get_flag("start-server") {
         Ok(Command::StartServer)
-    } else if matches.get_flag("debug-preprocessor-cache") {
-        Ok(Command::DebugPreprocessorCacheEntries)
     } else if matches.get_flag("stop-server") {
         Ok(Command::StopServer)
     } else if matches.get_flag("zero-stats") {
@@ -290,8 +230,6 @@ fn command_from_matches(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Comm
         Ok(Command::DistAuth)
     } else if matches.get_flag("dist-status") {
         Ok(Command::DistStatus)
-    } else if matches.contains_id("package-toolchain") {
-        package_toolchain_command(matches)
     } else if matches.contains_id("CMD") {
         compile_command(matches, cwd)
     } else {
@@ -382,6 +320,22 @@ pub fn try_parse() -> Result<Command> {
 mod tests {
     use super::{Command, command_from_matches, get_clap_command};
     use std::path::PathBuf;
+
+    #[test]
+    fn compiler_request_preserves_build_inputs_for_discovery() {
+        let values = [
+            "SOURCE_DATE_EPOCH",
+            "HOSTNAME",
+            "PWD",
+            "RPM_BUILD_ROOT",
+            "DESTDIR",
+            "CARGO_MAKEFLAGS",
+            "LD_PRELOAD",
+        ]
+        .map(|name| (std::ffi::OsString::from(name), "value".into()));
+        let actual = super::compiler_request_environment(values.clone());
+        assert_eq!(actual, values[..5]);
+    }
 
     #[test]
     fn capabilities_is_a_control_command() {

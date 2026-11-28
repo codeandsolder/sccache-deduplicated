@@ -86,13 +86,8 @@ impl CCompilerImpl for Gcc {
             env_vars,
             may_dist,
             rewrite_includes_only,
-            preprocessor_cache_mode,
         } = context;
-        let ignorable_whitespace_flags = if preprocessor_cache_mode {
-            vec![]
-        } else {
-            vec!["-P".to_string()]
-        };
+        let ignorable_whitespace_flags = vec!["-P".to_string()];
         preprocess(
             creator,
             executable,
@@ -386,8 +381,6 @@ where
     // and interpreting it as a list of more arguments.
     let it = ExpandIncludeFile::new(cwd, arguments);
 
-    let mut too_hard_for_preprocessor_cache_mode = None;
-
     let mut args_iter = ArgsIter::new(it, arg_info);
     if kind == CCompilerKind::Clang {
         args_iter = args_iter.with_double_dashes();
@@ -588,13 +581,7 @@ where
                 extra_hash_files.push(clang_module_file_path(cwd, val));
                 &mut common_args
             }
-            Some(PreprocessorArgument(_)) => {
-                too_hard_for_preprocessor_cache_mode = match arg.flag_str() {
-                    Some(s) if s == "-Xpreprocessor" || s == "-Wp" => Some(arg.to_os_string()),
-                    _ => None,
-                };
-                &mut preprocessor_args
-            }
+            Some(PreprocessorArgument(_)) => &mut preprocessor_args,
             Some(PreprocessorArgumentFlag | PreprocessorArgumentPath(_)) => &mut preprocessor_args,
             Some(DepArgumentPath(_) | NeedDepTarget) => &mut dependency_args,
             Some(
@@ -844,7 +831,6 @@ where
         profile_generate,
         color_mode,
         suppress_rewrite_includes_only,
-        too_hard_for_preprocessor_cache_mode,
     })
 }
 
@@ -3144,7 +3130,7 @@ mod test {
             dist_command.is_some(),
             cfg!(feature = "dist-client") && verbose.is_none()
         );
-        assert_compile_command_executes(&command)?;
+        assert_compile_command_declared(&command)?;
         assert_eq!(Cacheable::Yes, cacheable);
         Ok(())
     }
@@ -3365,35 +3351,5 @@ mod test {
             },
         );
         assert!(!cmd.args.contains(&"-x".into()));
-    }
-
-    #[test]
-    fn test_too_hard_for_preprocessor_cache_mode() {
-        let args = stringvec!["-c", "foo.c", "-o", "foo.o"];
-        let parsed_args = match parse_arguments_(args, false) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {o:?}"),
-        };
-        assert!(parsed_args.too_hard_for_preprocessor_cache_mode.is_none());
-
-        let args = stringvec!["-c", "foo.c", "-o", "foo.o", "-Xpreprocessor", "-M"];
-        let parsed_args = match parse_arguments_(args, false) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {o:?}"),
-        };
-        assert_eq!(
-            parsed_args.too_hard_for_preprocessor_cache_mode,
-            Some("-Xpreprocessor".into())
-        );
-
-        let args = stringvec!["-c", "foo.c", "-o", "foo.o", r#"-Wp,-DFOO="something""#];
-        let parsed_args = match parse_arguments_(args, false) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {o:?}"),
-        };
-        assert_eq!(
-            parsed_args.too_hard_for_preprocessor_cache_mode,
-            Some("-Wp".into())
-        );
     }
 }

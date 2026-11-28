@@ -203,27 +203,79 @@ impl NativeCargoPaths {
         result.map_or(Cow::Borrowed(bytes), Cow::Owned)
     }
 
+    /// Compiler line-marker directory spelling is diagnostic/debug metadata;
+    /// actual string literals (including expanded __FILE__) are untouched.
+    pub(super) fn native_line_marker_identity(bytes: &[u8]) -> Cow<'_, [u8]> {
+        let mut lexer = LineContext::Code;
+        let mut continued = false;
+        let mut result = None::<Vec<u8>>;
+        let mut offset = 0;
+        for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+            let marker = if lexer == LineContext::Code && !continued {
+                linemarker_filename(line)
+            } else {
+                None
+            };
+            let replacement = marker.and_then(|(start, end)| {
+                let name = &line[start..end];
+                name.iter()
+                    .rposition(|&b| b == b'/')
+                    .map(|slash| (start, end, &name[slash + 1..]))
+            });
+            if let Some((start, end, name)) = replacement {
+                let output = result.get_or_insert_with(|| {
+                    let mut output = Vec::with_capacity(bytes.len());
+                    output.extend_from_slice(&bytes[..offset]);
+                    output
+                });
+                output.extend_from_slice(&line[..start]);
+                output.extend_from_slice(name);
+                output.extend_from_slice(&line[end..]);
+            } else {
+                if marker.is_none() {
+                    lexer.scan(line);
+                }
+                if let Some(output) = result.as_mut() {
+                    output.extend_from_slice(line);
+                }
+            }
+            continued = line.strip_suffix(b"\n").unwrap_or(line).ends_with(b"\\");
+            offset += line.len();
+        }
+        result.map_or(Cow::Borrowed(bytes), Cow::Owned)
+    }
+
     pub(super) fn context_digest(
         &self,
         args: &ParsedArguments,
         cwd: &Path,
         preprocessed: &[u8],
+        relocatable_output: bool,
     ) -> String {
-        let mut digest = Digest::new();
+        let mut digest = Digest::audited("c-path-context");
+        digest.audit_field("sccache.key.schema");
         digest.update(b"sccache-cargo-native-paths-v1\0");
+        digest.audit_field("sccache.key.output_paths");
+        if relocatable_output {
+            digest.update(b"relocatable-single-artifact-v2\0");
+            return digest.finish();
+        }
         let input = cwd.join(&args.input);
+        digest.audit_field("sccache.key.cwd");
         self.hash_path(&mut digest, cwd);
+        digest.audit_field("sccache.key.input_path");
         self.hash_path(&mut digest, &input);
-        // Split DWARF and similar compiler outputs can refer to one another.
-        // Preserve their relative identity while dropping the transient root.
-        let mut outputs: Vec<_> = args.outputs.iter().collect();
+        digest.audit_field("sccache.key.output_paths");
+        let mut outputs: Vec<_> = args
+            .outputs
+            .iter()
+            .filter(|(name, _)| **name != "d")
+            .collect();
         outputs.sort_unstable_by_key(|(name, _)| *name);
         for (name, output) in outputs {
-            if *name != "d" {
-                digest.update(name.as_bytes());
-                digest.update(b"\0");
-                self.hash_path(&mut digest, &cwd.join(&output.path));
-            }
+            digest.update(name.as_bytes());
+            digest.update(b"\0");
+            self.hash_path(&mut digest, &cwd.join(&output.path));
         }
 
         // Arbitrary strings, assembler .file directives, and explicit
@@ -232,6 +284,7 @@ impl NativeCargoPaths {
         // mapping's physical identity; never mistake a literal for a filename.
         // Explicit assembler file directives may also encode a path with
         // escapes, and command-line recording can record the map flags.
+        digest.audit_field("sccache.key.physical_maps");
         let physical_options_observable = match args.language {
             Language::Assembler | Language::AssemblerToPreprocess => {
                 assembler_may_observe_map(preprocessed)
@@ -265,6 +318,44 @@ impl NativeCargoPaths {
         digest.update(&self.map_bytes(path.as_os_str().as_encoded_bytes()));
         digest.update(b"\0");
     }
+}
+
+/// A regular, independent object may be produced at the sandbox's stable
+/// destination. Preserve physical names for linked outputs, output-derived
+/// profiling, recorded invocations and arbitrary compiler extensions.
+pub(super) fn relocatable_object(args: &ParsedArguments) -> bool {
+    args.outputs
+        .get("obj")
+        .is_some_and(|object| !object.optional)
+        && args.outputs.keys().all(|name| matches!(*name, "obj" | "d"))
+        && !args.profile_generate
+        && !args.language.is_c_like_header()
+        && !args
+            .extra_hash_files
+            .iter()
+            .chain(&args.extra_dist_files)
+            .any(|path| path.extension().is_some_and(|ext| ext == "so"))
+        && !args.common_args.iter().any(|arg| {
+            let bytes = arg.as_encoded_bytes();
+            [
+                b"-frecord-gcc-switches".as_slice(),
+                b"-grecord-command-line",
+                b"-frecord-command-line",
+                b"-fplugin",
+                b"-fpass-plugin",
+                b"-load",
+                b"-add-plugin",
+                b"-plugin",
+                b"-wrapper",
+                b"-specs",
+                b"--specs",
+                b"-fprofile",
+                b"-fauto-profile",
+                b"-aux-info",
+            ]
+            .iter()
+            .any(|prefix| bytes.starts_with(prefix))
+        })
 }
 
 fn assembler_may_observe_map(bytes: &[u8]) -> bool {
@@ -484,6 +575,60 @@ const char *other = u8R"(
     }
 
     #[test]
+    fn native_line_marker_identity_ignores_only_directory_spelling() {
+        let first = b"# 1 \"/first/tree/src.c\"\nconst char *name = \"/actual/program/data\";\n";
+        let second = b"# 1 \"/other/tree/src.c\"\nconst char *name = \"/actual/program/data\";\n";
+        let changed = b"# 1 \"/other/tree/src.c\"\nconst char *name = \"/changed/program/data\";\n";
+        assert_eq!(
+            NativeCargoPaths::native_line_marker_identity(first),
+            NativeCargoPaths::native_line_marker_identity(second)
+        );
+        assert_ne!(
+            NativeCargoPaths::native_line_marker_identity(first),
+            NativeCargoPaths::native_line_marker_identity(changed)
+        );
+    }
+
+    #[test]
+    fn single_object_delivery_path_does_not_partition_result() {
+        let paths = NativeCargoPaths {
+            preserve_preprocessed_identity: false,
+            maps: vec![PrefixMap {
+                physical: "/tmp/lease".into(),
+                canonical: "/stable",
+            }],
+        };
+        let cwd = Path::new("/tmp/lease");
+        let input = b"# 1 \"/stable/file.S\"\n";
+        let a = ParsedArguments::test_compile("file.S", "a.o", Language::AssemblerToPreprocess);
+        let mut b = a.clone();
+        b.outputs.get_mut("obj").unwrap().path = "another/destination.o".into();
+        assert_eq!(
+            paths.context_digest(&a, cwd, input, relocatable_object(&a)),
+            paths.context_digest(&b, cwd, input, relocatable_object(&b))
+        );
+        let mut a = a;
+        a.outputs.insert(
+            "dwo",
+            super::super::c::ArtifactDescriptor {
+                path: "a.dwo".into(),
+                optional: true,
+            },
+        );
+        b.outputs.insert(
+            "dwo",
+            super::super::c::ArtifactDescriptor {
+                path: "another/destination.dwo".into(),
+                optional: true,
+            },
+        );
+        assert_ne!(
+            paths.context_digest(&a, cwd, input, relocatable_object(&a)),
+            paths.context_digest(&b, cwd, input, relocatable_object(&b))
+        );
+    }
+
+    #[test]
     fn cargo_output_mapping_does_not_depend_on_package_build_hash() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let compiler = Gcc {
@@ -526,7 +671,7 @@ const char *other = u8R"(
                 content.as_ref(),
                 b"# 1 \"/__sccache/cargo/out/src/file.cc\"\n"
             );
-            identities.push(paths.context_digest(&args, &cwd, &content));
+            identities.push(paths.context_digest(&args, &cwd, &content, relocatable_object(&args)));
         }
         assert_eq!(identities[0], identities[1]);
         Ok(())

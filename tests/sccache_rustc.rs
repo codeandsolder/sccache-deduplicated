@@ -15,65 +15,23 @@ use std::{
     path::{Path, PathBuf},
 };
 
-struct StopServer;
-impl Drop for StopServer {
-    fn drop(&mut self) {
-        let _ = Command::from_std({
-            let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_sccache"));
-            cmd.env_remove("SCCACHE_SERVER_PORT")
-                .env_remove("SCCACHE_SERVER_UDS");
-            cmd
-        })
-        .arg("--stop-server")
-        .ok();
-    }
-}
-
-// (temp dir)
-// ├── rust // symlinks to rust1 on the first run and rust2 on the second
-// ├── rust1/
-// │  ├── bin
-// │  │  └── rustc
-// │  ├── lib
-// │  │  └── driver.so -> ../driver.so
-// │  └── driver.so
-// ├── rust2/
-// │  ├── bin
-// │  │  └── rustc
-// │  ├── lib
-// │  │  └── driver.so -> ../driver.so
-// │  └── driver.so
-// ├── sccache/
-// ├── counter // increases by 1 for every compilation that is not cached
-// ├── RUST_FILE // compile output copied from counter, same content means it was cached
-// └── RUST_FILE.rs
+// A compiler discovered through a symlink must not execute locally just
+// because native configuration is absent.
 #[test]
-fn test_symlinks() {
+fn test_symlinked_compiler_cannot_fallback() {
     let root = tempdir().unwrap();
     let root = root.path();
-
     fs::write(root.join("counter"), b"0").unwrap();
     fs::write(root.join("RUST_FILE.rs"), []).unwrap();
-
-    create_mock_rustc(root.join("rust1"));
-    create_mock_rustc(root.join("rust2"));
-
-    let rust = root.join("rust");
-    let bin = rust.join("bin");
-    let out_file = root.join("RUST_FILE");
-
-    symlink(root.join("rust1"), &rust).unwrap();
-    drop(StopServer);
-    let _stop_server = StopServer;
-    run_sccache(root, &bin);
-    let output1 = fs::read(&out_file).unwrap();
-
-    remove_file(&rust).unwrap();
-    symlink(root.join("rust2"), &rust).unwrap();
-    run_sccache(root, &bin);
-    let output2 = fs::read(out_file).unwrap();
-
-    assert_ne!(output1, output2);
+    for target in ["rust1", "rust2"] {
+        create_mock_rustc(root.join(target));
+        let rust = root.join("rust");
+        symlink(root.join(target), &rust).unwrap();
+        run_sccache(root, &rust.join("bin"));
+        assert_eq!(fs::read(root.join("counter")).unwrap(), b"0");
+        assert!(!root.join("RUST_FILE").exists());
+        remove_file(&rust).unwrap();
+    }
 }
 
 fn create_mock_rustc(dir: PathBuf) {
@@ -147,13 +105,14 @@ fn run_sccache(root: &Path, path: &Path) {
     paths.push(":");
     paths.push(var_os("PATH").unwrap());
 
+    fs::write(root.join("native-missing.toml"), "").unwrap();
     Command::cargo_bin("sccache")
         .unwrap()
         .current_dir(root)
         .env("PATH", paths)
-        .env("SCCACHE_DIR", root.join("sccache"))
+        .env("SCCACHE_CONF", root.join("native-missing.toml"))
+        .env("SCCACHE_SERVER_UDS", root.join("client.sock"))
         .env_remove("SCCACHE_SERVER_PORT")
-        .env_remove("SCCACHE_SERVER_UDS")
         .arg("rustc")
         .arg("RUST_FILE.rs")
         .arg("--crate-name=sccache_rustc_tests")
@@ -161,5 +120,6 @@ fn run_sccache(root: &Path, path: &Path) {
         .arg("--emit=link")
         .arg("--out-dir")
         .arg(root)
-        .unwrap();
+        .assert()
+        .failure();
 }

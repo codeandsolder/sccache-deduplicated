@@ -16,7 +16,7 @@ In parallel, we also take into account in the hash:
 * Host triple for this rustc
 * Path to the rustc sysroot
 * digests of all the shared libraries in rustc's $sysroot/lib
-* A shared, caching reader for rlib dependencies (for dist-client)
+* Verified compiler-reported dependency closure
 * Parsed arguments from the rustc invocation
   
 See https://github.com/mozilla/sccache/blob/8567bbe2ba493153e76177c1f9a6f98cc7ba419f/src/compiler/rust.rs#L122 for the full list
@@ -51,14 +51,6 @@ We also take into account in the hash:
 
 See https://github.com/mozilla/sccache/blob/8567bbe2ba493153e76177c1f9a6f98cc7ba419f/src/compiler/c.rs#L84
 
-### C/C++ preprocessor
-
-In "preprocessor cache mode", [explained in the local doc](Local.md), an
-extra key is computed to cache the preprocessor output itself. It is very close
-to the C/C++ compiler one, but with additional elements:
-
-* The path of the input file
-* The hash of the input file
-
-Note that some compiler options can disable preprocessor cache mode. As of this
-writing, only `-Xpreprocessor` and `-Wp,*` do.
+C/C++ preprocessing runs as input discovery; there is no separate
+preprocessor cache. The resulting action and verified input tree are the
+native cache identity. See [native CAS](NativeCache.md).

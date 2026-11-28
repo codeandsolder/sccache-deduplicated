@@ -36,14 +36,12 @@ mod compiler;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub use compiler::rust_link;
-pub mod compression;
 pub mod config;
 pub mod dist;
 #[cfg(feature = "http-client")]
 pub mod http_client;
 mod jobserver;
 pub mod latency_trace;
-pub mod lru_disk_cache;
 mod mock_command;
 mod net;
 mod protocol;
@@ -61,9 +59,6 @@ pub static BUILD_CAPABILITIES: &[&str] = &[
     #[cfg(feature = "direct-metrics")]
     telemetry::CAPABILITY,
 ];
-// For benches/preprocessor_cache_bench.rs.
-#[doc(hidden)]
-pub use compiler::PreprocessorCacheEntry;
 
 use std::env;
 
@@ -95,17 +90,6 @@ pub fn main() {
             }
         });
     }
-    #[cfg(target_os = "linux")]
-    if let Some(result) = rust_link::capture_if_relay() {
-        std::process::exit(match result {
-            Ok(()) => 0,
-            Err(error) => {
-                eprintln!("sccache link capture: {error:#}");
-                1
-            }
-        });
-    }
-
     init_logging();
 
     #[cfg(target_os = "linux")]
