@@ -168,6 +168,18 @@ impl NativeCompilerClient {
         Ok(Some((reference.blob, provider)))
     }
 
+    fn input_blob(&self, path: &Path) -> Result<crate::build_runtime::BlobRef> {
+        let file = crate::build_runtime::open_input_descriptor(path, true)?;
+        match self.reference(&file)? {
+            Some((blob, _)) => Ok(blob),
+            // Check the opened descriptor for mutation while hashing;
+            // do not memoize mutable build inputs by timestamps.
+            None => crate::build_runtime::hash_descriptor(&crate::build_runtime::open_input_data(
+                &file,
+            )?),
+        }
+    }
+
     pub(crate) async fn hash_files(
         self: &Arc<Self>,
         files: &[PathBuf],
@@ -178,15 +190,7 @@ impl NativeCompilerClient {
             if path.is_dir() {
                 return crate::util::Digest::path_sync(path);
             }
-            let file = std::fs::File::open(path)?;
-            if let Some((blob, _)) = client.reference(&file)? {
-                Ok(crate::util::hex(&blob.id.0))
-            } else {
-                // Check the opened descriptor for mutation while hashing;
-                // do not memoize mutable build inputs by timestamps.
-                let blob = crate::build_runtime::hash_descriptor(&file)?;
-                Ok(crate::util::hex(&blob.id.0))
-            }
+            Ok(crate::util::hex(&client.input_blob(path)?.id.0))
         })
         .await
     }
@@ -211,12 +215,7 @@ impl NativeCompilerClient {
                     &client.toolchain_digests.file_digest(path)?.id.0,
                 ));
             }
-            let file = std::fs::File::open(path)?;
-            let blob = match client.reference(&file)? {
-                Some((blob, _)) => blob,
-                None => crate::build_runtime::hash_descriptor(&file)?,
-            };
-            Ok(crate::util::hex(&blob.id.0))
+            Ok(crate::util::hex(&client.input_blob(path)?.id.0))
         })
         .await
     }

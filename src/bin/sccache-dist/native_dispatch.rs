@@ -468,21 +468,27 @@ impl NativeDispatcher {
         let maintenance_task = shared.worker.maintains_local_store().then(|| {
             let shared = Arc::downgrade(&shared);
             runtime.spawn(async move {
+                let mut previous = None;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
                     let Some(shared) = shared.upgrade() else {
                         break;
                     };
-                    match tokio::task::spawn_blocking(move || shared.worker.maintain_local_store())
-                        .await
+                    shared.worker.wait_for_local_maintenance(previous).await;
+                    previous = match tokio::task::spawn_blocking(move || {
+                        shared.worker.maintain_local_store()
+                    })
+                    .await
                     {
-                        Ok(Ok(())) => (),
-                        Ok(Err(error)) => warn!("native worker maintenance failed: {error:#}"),
+                        Ok(Ok(report)) => report,
+                        Ok(Err(error)) => {
+                            warn!("native worker maintenance failed: {error:#}");
+                            None
+                        }
                         Err(error) => {
                             error!("native worker maintenance task failed: {error:#}");
                             break;
                         }
-                    }
+                    };
                 }
             })
         });

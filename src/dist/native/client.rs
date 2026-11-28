@@ -5,10 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Read, Seek, Take, Write},
-    os::unix::{
-        fs::{OpenOptionsExt, PermissionsExt},
-        process::ExitStatusExt,
-    },
+    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{ExitStatus, Output},
     sync::{Arc, Mutex},
@@ -892,11 +889,7 @@ impl<D: FnMut(BlobRef, &mut BlobSink<'_>) -> Result<()>> ResultBlobs<'_, D> {
         // Never consume a local candidate directly into the destination: it
         // may have changed since discovery. Verify into private staging first.
         let existing = existing.and_then(|path| {
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(path)
-                .ok()?;
+            let file = crate::build_runtime::open_input_descriptor(path, false).ok()?;
             let metadata = file.metadata().ok()?;
             if crate::build_runtime::intermediate_fs::intermediate_reference(&file)
                 .ok()
@@ -905,8 +898,11 @@ impl<D: FnMut(BlobRef, &mut BlobSink<'_>) -> Result<()>> ResultBlobs<'_, D> {
             {
                 return None;
             }
-            (metadata.is_file() && metadata.len() == blob.size)
-                .then(|| Box::new(file) as Box<dyn Read + Send>)
+            if metadata.len() != blob.size {
+                return None;
+            }
+            let file = crate::build_runtime::open_input_data(&file).ok()?;
+            Some(Box::new(file) as Box<dyn Read + Send>)
         });
         let inputs = self.inputs;
         let repeated = self.repeated.contains(&blob.id);

@@ -674,6 +674,7 @@ struct Inner {
     space_policy: Option<SpacePolicy>,
     space: Mutex<space::SpaceState>,
     space_maintenance: Mutex<()>,
+    space_wakeup: tokio::sync::Notify,
     // Releases never acquire the space admission lock, avoiding lock-order
     // inversion with transactional publication and eviction.
     space_released: AtomicU64,
@@ -1339,6 +1340,7 @@ impl NativeStore {
             space_policy,
             space: Mutex::default(),
             space_maintenance: Mutex::default(),
+            space_wakeup: tokio::sync::Notify::new(),
             space_released: AtomicU64::new(0),
             result_history_limit: AtomicU64::new(result_history_limit),
         });
