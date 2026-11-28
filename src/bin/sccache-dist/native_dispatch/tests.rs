@@ -464,7 +464,9 @@ fn native_dispatcher_reaps_only_expired_terminal_reservations() {
         (
             JobId(2),
             State::Terminal {
-                result: Arc::new(Terminal::Unavailable),
+                result: Arc::new(Terminal::InfrastructureFailure(
+                    "synthetic execution failure".into(),
+                )),
                 completed_at: now,
             },
         ),

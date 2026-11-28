@@ -324,6 +324,7 @@ fn run(command: Command) -> Result<i32> {
         }
         Command::NativeImportRust {
             store,
+            archive,
             source,
             max_entries,
             max_expanded_bytes,
@@ -331,6 +332,7 @@ fn run(command: Command) -> Result<i32> {
             manifest_output,
         } => import_rust_package(
             &store,
+            archive,
             source,
             max_entries,
             max_expanded_bytes,
