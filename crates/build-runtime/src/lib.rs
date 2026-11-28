@@ -95,6 +95,8 @@ mod tree_fs;
 pub use tree_fs::{MaterializationStats, MaterializedTree, materialize_tree};
 
 #[cfg(all(target_os = "linux", feature = "mapping"))]
+pub mod discovery;
+#[cfg(all(target_os = "linux", feature = "mapping"))]
 mod mapped;
 #[cfg(all(target_os = "linux", feature = "mapping"))]
 mod source;
