@@ -50,6 +50,13 @@ semantic arguments (effective codegen fields, emission sets and deduplicated
 cfg predicates and effective check-cfg expectation sets), selected source and binary dependencies (including selected
 standard libraries), extern name-to-content bindings, auxiliary inputs,
 static libraries, custom target contents and explicitly observed environment.
+Dependency files are generated in the receiving checkout from the discovery
+records. The compiler action does not emit them. `--emit=dep-info`, the
+`-Zdep-info-omit-d-target` delivery policy and the `artifacts` JSON notification
+flag do not contribute to native result identity. Generate artifact notifications
+for the actual receiving paths on hits and misses; preserve other diagnostic
+controls. Parse rustc's unambiguous per-file prerequisite rules and validate
+the combined target rule rather than splitting on ambiguous escaped spaces.
 Native nightly dep-info reports binary dependencies; stable compilers and
 proc-macro compilations discover successful file reads in the dependency probe,
 rather than treating a package tree as a dependency. The trace tool is part of

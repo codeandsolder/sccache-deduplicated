@@ -3216,6 +3216,96 @@ fn run_packed_archive_audit(
     Ok(())
 }
 
+fn run_rust_delivery_audit(
+    service: &LocalService,
+    source: &Path,
+    rustc: &Path,
+    config: &Path,
+) -> Result<()> {
+    fs::write(
+        source.join("delivery.rs"),
+        br#"pub const DATA: &[u8] = include_bytes!("ending\\");"#,
+    )?;
+    fs::write(source.join("ending\\"), b"initial")?;
+    let compile = |out: &str, extra: &[&str]| -> Result<(std::process::Output, Vec<u8>)> {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .arg(rustc)
+            .args([
+                "--crate-name",
+                "delivery_audit",
+                "--crate-type",
+                "rlib",
+                "--edition=2024",
+                "--error-format=json",
+                "--out-dir",
+                out,
+                "delivery.rs",
+            ])
+            .args(extra)
+            .current_dir(source)
+            .env("SCCACHE_CONF", config)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
+            .output()?;
+        action_report(&output)?;
+        Ok((
+            output,
+            fs::read(source.join(out).join("libdelivery_audit.rlib"))?,
+        ))
+    };
+    let artifacts = |output: &std::process::Output| -> Vec<serde_json::Value> {
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|message| message["$message_type"] == "artifact")
+            .collect()
+    };
+    let (first, original) = compile("delivery-first", &["--emit=metadata,link"])?;
+    let (key, kind) = action_report(&first)?;
+    assert_eq!(kind, "worker");
+    assert!(artifacts(&first).is_empty());
+    let (second, restored) = compile(
+        "delivery-second",
+        &[
+            "--emit=metadata,link,dep-info",
+            "--json=artifacts",
+            "-Zdep-info-omit-d-target",
+        ],
+    )?;
+    assert_eq!(action_report(&second)?, (key.clone(), "hit".into()));
+    assert_eq!(original, restored);
+    assert_eq!(
+        fs::read(source.join("delivery-first/libdelivery_audit.rmeta"))?,
+        fs::read(source.join("delivery-second/libdelivery_audit.rmeta"))?
+    );
+    assert_eq!(
+        artifacts(&second),
+        [
+            serde_json::json!({"$message_type":"artifact","artifact":"delivery-second/delivery_audit.d","emit":"dep-info"}),
+            serde_json::json!({"$message_type":"artifact","artifact":"delivery-second/libdelivery_audit.rmeta","emit":"metadata"}),
+            serde_json::json!({"$message_type":"artifact","artifact":"delivery-second/libdelivery_audit.rlib","emit":"link"}),
+        ]
+    );
+    let dep_info = fs::read_to_string(source.join("delivery-second/delivery_audit.d"))?;
+    assert!(!dep_info.contains("delivery-second/delivery_audit.d: "));
+    assert!(dep_info.contains("ending\\:\n"));
+    let (third, restored) = compile("delivery-third", &["--emit=metadata,link,dep-info"])?;
+    assert_eq!(action_report(&third)?, (key.clone(), "hit".into()));
+    assert_eq!(original, restored);
+    assert!(artifacts(&third).is_empty());
+    assert!(
+        fs::read_to_string(source.join("delivery-third/delivery_audit.d"))?
+            .starts_with("delivery-third/delivery_audit.d: ")
+    );
+    fs::write(source.join("ending\\"), b"changed")?;
+    let (changed, bytes) = compile("delivery-fourth", &["--emit=metadata,link"])?;
+    let (changed_key, kind) = action_report(&changed)?;
+    assert_ne!(changed_key, key);
+    assert_eq!(kind, "worker");
+    assert_ne!(bytes, original);
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires Linux Bubblewrap, GCC, Rust toolchain and ldd"]
 fn native_rust_bundled_archive_identity_follows_search_precedence() -> Result<()> {
@@ -3361,6 +3451,7 @@ fn native_rust_bundled_archive_identity_follows_search_precedence() -> Result<()
     assert_eq!((same, source_kind), (changed, "hit".into()));
     assert_eq!(second, third);
     run_packed_archive_audit(&service, &source, &rustc, &config)?;
+    run_rust_delivery_audit(&service, &source, &rustc, &config)?;
     service.stop()?;
     fleet.finish()?;
     Ok(())

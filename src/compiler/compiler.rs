@@ -1375,6 +1375,14 @@ where
         false
     }
 
+    /// Per-request delivery diagnostics. These are never stored in the shared
+    /// result. The first buffer follows successful discovery; the second is
+    /// emitted only once the requested artifacts have been delivered.
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    fn native_delivery_messages(&self) -> (Vec<u8>, Vec<u8>) {
+        (Vec::new(), Vec::new())
+    }
+
     /// The original Rust native link stage's local namespace, if this
     /// compilation uses an independently cacheable codegen action.
     #[cfg(all(feature = "dist-client", target_os = "linux"))]

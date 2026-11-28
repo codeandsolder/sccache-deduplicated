@@ -952,6 +952,20 @@ async fn finish_link<T: CommandCreatorSync>(
     }
 }
 
+fn deliver_compiler_messages(
+    mut output: process::Output,
+    (mut discovery, success): (Vec<u8>, Vec<u8>),
+) -> process::Output {
+    if !discovery.is_empty() {
+        discovery.append(&mut output.stderr);
+        output.stderr = discovery;
+    }
+    if output.status.success() {
+        output.stderr.extend(success);
+    }
+    output
+}
+
 pub(super) async fn compile<T: CommandCreatorSync>(
     client: Arc<NativeCompilerClient>,
     service: &SccacheService<T>,
@@ -963,6 +977,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
 ) -> Result<(CompileResult, process::Output)> {
     let start = Instant::now();
     let result_policy = compilation.native_packaging_policy();
+    let delivery = compilation.native_delivery_messages();
     let (control, key) = identity;
     let key = key.to_owned();
     crate::server::activity::phase(crate::server::activity::Phase::PlanCompile);
@@ -1034,7 +1049,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                 };
                 return Ok((
                     CompileResult::Native(report, start.elapsed()),
-                    result.output,
+                    deliver_compiler_messages(result.output, delivery),
                 ));
             }
             Ok((result, _)) => {
@@ -1063,7 +1078,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
     } else {
         CompileResult::CompileFailed(fallback, start.elapsed())
     };
-    Ok((result, output))
+    Ok((result, deliver_compiler_messages(output, delivery)))
 }
 
 #[cfg(all(test, feature = "native-store"))]

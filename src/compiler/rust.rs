@@ -253,6 +253,13 @@ pub struct ParsedArguments {
     target_json: Option<PathBuf>,
 }
 
+#[cfg(all(feature = "dist-client", target_os = "linux"))]
+#[derive(Debug, Clone, Default)]
+struct RustDelivery {
+    discovery: Vec<u8>,
+    success: Vec<u8>,
+}
+
 /// A struct on which to hang a `Compilation` impl.
 #[derive(Debug, Clone)]
 pub struct RustCompilation {
@@ -274,6 +281,8 @@ pub struct RustCompilation {
     inputs: Vec<PathBuf>,
     #[cfg(feature = "dist-client")]
     generated_archives: BTreeMap<PathBuf, Vec<u8>>,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    delivery: RustDelivery,
     /// The compiler outputs.
     outputs: HashMap<String, ArtifactDescriptor>,
     /// The directories searched for rlibs
@@ -360,7 +369,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"22";
+const CACHE_VERSION: &[u8] = b"23";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -561,65 +570,46 @@ where
     let mut f = fs::File::open(file.as_ref())?;
     let mut deps = String::new();
     f.read_to_string(&mut deps)?;
-    Ok((parse_dep_info(&deps, cwd), parse_env_dep_info(&deps), deps))
+    Ok((parse_dep_info(&deps, cwd)?, parse_env_dep_info(&deps), deps))
 }
 
-/// Return make-style prerequisite spellings from rustc dep-info.
-///
-/// Normal dep-info starts with `<target>: <prerequisites>`. With
-/// `-Zdep-info-omit-d-target`, rustc emits only leading phony prerequisite rules.
+/// Rustc escapes spaces, but not backslashes, in Make prerequisite names.
+/// A combined target rule is consequently ambiguous when a filename ends
+/// in a literal backslash. The one-filename phony rules are authoritative.
+/// Verify the combined rule against those records rather than splitting it.
 fn dep_info_prerequisites(dep_info: &str) -> Result<Vec<String>> {
-    const MAX_LEN: usize = 200;
-
-    if dep_info.trim().is_empty() {
-        bail!("dep-info written by rustc is empty");
-    }
-    let first = dep_info.lines().next().unwrap_or_default();
-    if let Some((_, prerequisites)) = first.split_once(": ") {
-        return Ok(split_make_prerequisite_spellings(prerequisites));
-    }
-    if first.ends_with(':') {
-        return Ok(dep_info
-            .lines()
-            .map_while(|line| line.strip_suffix(':'))
-            .map(str::to_owned)
-            .collect());
-    }
-
-    let first_line = match first.char_indices().nth(MAX_LEN) {
-        Some((i, _)) => format!("{}...", &first[..i]),
-        None => first.to_owned(),
+    let first = dep_info
+        .lines()
+        .next()
+        .context("dep-info written by rustc is empty")?;
+    let combined = first.contains(": ");
+    let records = if combined {
+        dep_info.split_once('\n').map_or("", |(_, rest)| rest)
+    } else {
+        dep_info
     };
-    bail!(
-        "dep-info does not start with a `<target>: <prerequisites>` rule or phony prerequisite rules; its first line is {first_line:?}"
-    )
-}
-
-/// Split make-style prerequisites without losing their escaping.
-fn split_make_prerequisite_spellings(prerequisites: &str) -> Vec<String> {
-    let mut deps = Vec::new();
-    let mut current = String::new();
-    let mut iter = prerequisites.chars();
-    loop {
-        match iter.next() {
-            Some('\\') => {
-                current.push('\\');
-                if let Some(next) = iter.next() {
-                    current.push(next);
-                }
-            }
-            Some(' ') if !current.is_empty() => deps.push(std::mem::take(&mut current)),
-            Some(' ') => {}
-            Some(c) => current.push(c),
-            None => {
-                if !current.is_empty() {
-                    deps.push(current);
-                }
-                break;
-            }
+    let mut prerequisites = Vec::new();
+    for line in records.lines().filter(|line| !line.is_empty()) {
+        if line.starts_with("# env-dep:") || line.starts_with("# checksum:") {
+            break;
         }
+        let name = line
+            .strip_suffix(':')
+            .context("invalid rustc dep-info prerequisite rule")?;
+        anyhow::ensure!(!name.is_empty(), "empty rustc dep-info prerequisite");
+        prerequisites.push(name.to_owned());
     }
-    deps
+    anyhow::ensure!(
+        !prerequisites.is_empty(),
+        "rustc dep-info contains no prerequisite rules"
+    );
+    if combined {
+        anyhow::ensure!(
+            first.ends_with(&format!(": {}", prerequisites.join(" "))),
+            "rustc dep-info target and prerequisite rules disagree"
+        );
+    }
+    Ok(prerequisites)
 }
 
 fn decode_make_prerequisite(spelling: &str) -> String {
@@ -636,20 +626,19 @@ fn decode_make_prerequisite(spelling: &str) -> String {
     path
 }
 
-fn parse_dep_info<T>(dep_info: &str, cwd: T) -> Vec<PathBuf>
+fn parse_dep_info<T>(dep_info: &str, cwd: T) -> Result<Vec<PathBuf>>
 where
     T: AsRef<Path>,
 {
     let cwd = cwd.as_ref();
-    let Ok(deps) = dep_info_prerequisites(dep_info) else {
-        return vec![];
-    };
+    let deps = dep_info_prerequisites(dep_info)?;
     let mut deps = deps
         .into_iter()
         .map(|s| cwd.join(decode_make_prerequisite(&s)))
         .collect::<Vec<_>>();
     deps.sort();
-    deps
+    deps.dedup();
+    Ok(deps)
 }
 
 fn parse_env_dep_info(dep_info: &str) -> EnvDependencies {
@@ -1832,6 +1821,115 @@ fn remove_dep_info_emit(arguments: &mut Vec<Argument<ArgData>>) {
     });
 }
 
+/// Artifact notifications and dependency files belong to the receiving
+/// invocation, never to a cached compiler result from another checkout.
+/// Return whether the caller requested JSON artifact messages.
+fn normalize_native_delivery_arguments(arguments: &mut Vec<Argument<ArgData>>) -> bool {
+    remove_dep_info_emit(arguments);
+    let mut artifacts = false;
+    arguments.retain_mut(|argument| match argument {
+        Argument::WithValue(_, Json(value), _) => {
+            let flags = value
+                .split(',')
+                .filter(|flag| {
+                    if *flag == "artifacts" {
+                        artifacts = true;
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect::<Vec<_>>();
+            *value = flags.join(",");
+            !value.is_empty()
+        }
+        Argument::WithValue(_, Unstable(ArgUnstable { opt, .. }), _) => {
+            !option_is(opt, "dep-info-omit-d-target")
+        }
+        _ => true,
+    });
+    artifacts
+}
+
+fn omit_dep_info_target(arguments: &[Argument<ArgData>]) -> bool {
+    arguments
+        .iter()
+        .rev()
+        .find_map(|argument| match argument.get_data() {
+            Some(Unstable(ArgUnstable { opt, value }))
+                if option_is(opt, "dep-info-omit-d-target") =>
+            {
+                Some(!matches!(
+                    value.as_deref(),
+                    Some("n" | "no" | "off" | "false")
+                ))
+            }
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(all(feature = "dist-client", target_os = "linux"))]
+impl RustDelivery {
+    fn new(parsed: &ParsedArguments, outputs: &[String], artifacts: bool) -> Result<Self> {
+        let mut delivery = Self::default();
+        if !artifacts {
+            return Ok(delivery);
+        }
+        let pretty = parsed
+            .arguments
+            .iter()
+            .rev()
+            .find_map(|arg| match arg {
+                Argument::WithValue("--error-format", PassThrough(value), _) => {
+                    Some(value == "pretty-json")
+                }
+                _ => None,
+            })
+            .unwrap_or(false);
+        let append = |buffer: &mut Vec<u8>, path: &Path, emit: &str| -> Result<()> {
+            #[derive(Serialize)]
+            struct ArtifactMessage<'a> {
+                #[serde(rename = "$message_type")]
+                message_type: &'static str,
+                artifact: std::borrow::Cow<'a, str>,
+                emit: &'a str,
+            }
+            let message = ArtifactMessage {
+                message_type: "artifact",
+                artifact: path.to_string_lossy(),
+                emit,
+            };
+            if pretty {
+                serde_json::to_writer_pretty(&mut *buffer, &message)?;
+            } else {
+                serde_json::to_writer(&mut *buffer, &message)?;
+            }
+            buffer.push(b'\n');
+            Ok(())
+        };
+        if let Some(dep_info) = &parsed.dep_info {
+            append(
+                &mut delivery.discovery,
+                &parsed.output_dir.join(dep_info),
+                "dep-info",
+            )?;
+        }
+        for emit in ["metadata", "link"] {
+            if !parsed.emit.contains(emit) {
+                continue;
+            }
+            for name in outputs {
+                if name.ends_with(".rmeta") != (emit == "metadata") {
+                    continue;
+                }
+                append(&mut delivery.success, &parsed.output_dir.join(name), emit)?;
+            }
+        }
+        Ok(delivery)
+    }
+}
+
 fn parse_native_profile(llvm_ir: &str) -> Result<String> {
     let marker = "\"target-cpu\"=\"";
     let start = llvm_ir
@@ -2913,7 +3011,13 @@ fn parse_arguments(
             Some(Json(_)) => {
                 has_json = true;
             }
-            Some(PassThrough(_)) => (),
+            Some(PassThrough(value)) => {
+                if arg.flag_str() == Some("--error-format")
+                    && matches!(value.to_str(), Some("json" | "pretty-json"))
+                {
+                    has_json = true;
+                }
+            }
             Some(Target(target)) => match target {
                 ArgTarget::Path(json_path) => {
                     target_json = Some(json_path.to_owned());
@@ -3632,10 +3736,9 @@ where
             }
         }
 
-        // Keep the original argument set until canonical path eligibility has been
-        // validated against the inputs discovered by rustc's dep-info pre-pass.
-        // Canonical mode suppresses dep-info from the real compile, while an
-        // ordinary fallback must preserve the caller's original --emit request.
+        // Validate the original argument set during discovery before removing
+        // caller-specific dependency emission and artifact notifications from
+        // the actual native compiler action.
         let prepass_os_string_arguments: Vec<(OsString, Option<OsString>)> = effective_arguments
             .iter()
             .map(|arg| {
@@ -4045,7 +4148,9 @@ where
         if let Some(canonical) = canonical_paths.as_ref() {
             let mut relocated = effective_arguments.clone();
             if relocate_rust_operands(&mut relocated, canonical, &cwd).is_some() {
-                remove_dep_info_emit(&mut relocated);
+                if !native_discovery {
+                    remove_dep_info_emit(&mut relocated);
+                }
                 effective_arguments = relocated;
             } else {
                 debug!(
@@ -4054,6 +4159,11 @@ where
                 canonical_paths = None;
             }
         }
+
+        let artifacts =
+            native_discovery && normalize_native_delivery_arguments(&mut effective_arguments);
+        #[cfg(not(all(feature = "dist-client", target_os = "linux")))]
+        let _ = artifacts;
 
         // TODO: this doesn't produce correct arguments if they should be concatenated - should use iter_os_strings
         let os_string_arguments: Vec<(OsString, Option<OsString>)> = effective_arguments
@@ -4396,7 +4506,9 @@ where
         // from another checkout or machine and is not a portable compiler artifact.
         if let Some(dep_info_name) = &self.parsed_args.dep_info {
             let dep_info = self.parsed_args.output_dir.join(dep_info_name);
-            let targets = std::iter::once(dep_info.clone())
+            let targets = (!omit_dep_info_target(&self.parsed_args.arguments))
+                .then_some(dep_info.clone())
+                .into_iter()
                 .chain(outputs.iter().map(|o| self.parsed_args.output_dir.join(o)))
                 .collect::<Vec<_>>();
             let text = dep_info_with_targets(
@@ -4417,6 +4529,9 @@ where
             fs::write(&path, text)
                 .with_context(|| format!("Failed to write dep-info to {}", path.display()))?;
         }
+
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        let delivery = RustDelivery::new(&self.parsed_args, &outputs, artifacts)?;
 
         // Convert output files into a map of basename -> full
         // path, and remove some unneeded / non-existing ones,
@@ -4621,6 +4736,8 @@ where
                 inputs,
                 #[cfg(feature = "dist-client")]
                 generated_archives,
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                delivery,
                 outputs,
                 crate_link_paths: self.parsed_args.crate_link_paths.clone(),
                 #[cfg(feature = "dist-client")]
@@ -4814,11 +4931,9 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                 };
             }
 
-            // Dependency files are derived from the local source-discovery
-            // pass. Archive workers omit this emission because their output
-            // directory need not exist. Native workers preserve the original
-            // emission flags (which affect rlib metadata), but never publish
-            // the private dependency file.
+            // Dependency files are generated on the receiving client. Native
+            // hashing has already normalized the complete delivery contract;
+            // archive workers also omit the private dependency file.
             let mut worker_arguments = arguments.clone();
             if transport != CompileTransport::Native {
                 remove_dep_info_emit(&mut worker_arguments);
@@ -4963,6 +5078,14 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         })();
 
         Ok((command, dist_command, Cacheable::Yes))
+    }
+
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    fn native_delivery_messages(&self) -> (Vec<u8>, Vec<u8>) {
+        (
+            self.delivery.discovery.clone(),
+            self.delivery.success.clone(),
+        )
     }
 
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
@@ -7963,8 +8086,21 @@ bar.rs:
 ";
         assert_eq!(
             pathvec!["abc.rs", "bar.rs", "baz.rs"],
-            parse_dep_info(deps, "")
+            parse_dep_info(deps, "").unwrap()
         );
+    }
+
+    #[test]
+    fn rust_dep_info_uses_unambiguous_phony_records() -> Result<()> {
+        let records = "probe.rs:\nending\\:\nspace\\ \\\\ name:\ncolon:\\ file:\n";
+        let combined =
+            format!("probe.d: probe.rs ending\\ space\\ \\\\ name colon:\\ file\n\n{records}");
+        let expected = pathvec!["colon: file", "ending\\", "probe.rs", "space \\ name"];
+        assert_eq!(parse_dep_info(records, "")?, expected);
+        assert_eq!(parse_dep_info(&combined, "")?, expected);
+        assert!(parse_dep_info("probe.d: probe.rs\n", "").is_err());
+        assert!(parse_dep_info("probe.d: probe.rs extra.rs\n\nprobe.rs:\n", "").is_err());
+        Ok(())
     }
 
     #[test]
@@ -8019,7 +8155,7 @@ bar.rs:
         let deps = "src/lib.rs:\nsrc/a\\ b.rs:\n\n# env-dep:FOO=bar\n";
         assert_eq!(
             pathvec!["src/a b.rs", "src/lib.rs"],
-            parse_dep_info(deps, "")
+            parse_dep_info(deps, "").unwrap()
         );
     }
 
@@ -8065,7 +8201,7 @@ bar.rs:
     fn test_dep_info_with_targets_reports_bad_input() {
         assert!(dep_info_with_targets("", [Path::new("foo.d")], []).is_err());
         let err = dep_info_with_targets("# env-dep:FOO\n", [Path::new("foo.d")], []).unwrap_err();
-        assert!(err.to_string().contains("first line"), "{err:#}");
+        assert!(err.to_string().contains("prerequisite"), "{err:#}");
     }
 
     #[test]
@@ -8074,9 +8210,12 @@ bar.rs:
 
 baz.rs:
 
-abc def.rs:
+abc\ def.rs:
 ";
-        assert_eq!(pathvec!["abc def.rs", "baz.rs"], parse_dep_info(deps, ""));
+        assert_eq!(
+            pathvec!["abc def.rs", "baz.rs"],
+            parse_dep_info(deps, "").unwrap()
+        );
     }
 
     #[cfg(not(windows))]
@@ -8092,12 +8231,12 @@ bar.rs:
 ";
         assert_eq!(
             pathvec!["foo/abc.rs", "foo/bar.rs", "foo/baz.rs"],
-            parse_dep_info(deps, "foo/")
+            parse_dep_info(deps, "foo/").unwrap()
         );
 
         assert_eq!(
             pathvec!["/foo/bar/abc.rs", "/foo/bar/bar.rs", "/foo/bar/baz.rs"],
-            parse_dep_info(deps, "/foo/bar/")
+            parse_dep_info(deps, "/foo/bar/").unwrap()
         );
     }
 
@@ -8114,7 +8253,7 @@ bar.rs:
 ";
         assert_eq!(
             pathvec!["/foo/abc.rs", "/foo/bar.rs", "/foo/baz.rs"],
-            parse_dep_info(deps, "/bar/")
+            parse_dep_info(deps, "/bar/").unwrap()
         );
     }
 
@@ -8131,7 +8270,7 @@ bar.rs:
 ";
         assert_eq!(
             pathvec!["foo/abc.rs", "foo/bar.rs", "foo/baz.rs"],
-            parse_dep_info(deps, "foo/")
+            parse_dep_info(deps, "foo/").unwrap()
         );
 
         assert_eq!(
@@ -8140,7 +8279,7 @@ bar.rs:
                 "c:/foo/bar/bar.rs",
                 "c:/foo/bar/baz.rs"
             ],
-            parse_dep_info(deps, "c:/foo/bar/")
+            parse_dep_info(deps, "c:/foo/bar/").unwrap()
         );
     }
 
@@ -8149,13 +8288,13 @@ bar.rs:
     fn test_parse_dep_info_abs_paths() {
         let deps = "c:/foo/foo: c:/foo/baz.rs c:/foo/abc.rs c:/foo/bar.rs
 
-c:/foo/baz.rs: c:/foo/bar.rs
+c:/foo/baz.rs:
 c:/foo/abc.rs:
 c:/foo/bar.rs:
 ";
         assert_eq!(
             pathvec!["c:/foo/abc.rs", "c:/foo/bar.rs", "c:/foo/baz.rs"],
-            parse_dep_info(deps, "c:/bar/")
+            parse_dep_info(deps, "c:/bar/").unwrap()
         );
     }
 
@@ -9246,6 +9385,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             let compilation = RustCompilation {
                 #[cfg(feature = "dist-client")]
                 generated_archives: BTreeMap::new(),
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                delivery: RustDelivery::default(),
                 executable: clippy.clone(),
                 host: "x86_64-unknown-linux-gnu".into(),
                 #[cfg(feature = "dist-client")]
@@ -9368,6 +9509,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let compilation = RustCompilation {
             #[cfg(feature = "dist-client")]
             generated_archives: BTreeMap::new(),
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            delivery: RustDelivery::default(),
             executable: clippy,
             host: "x86_64-unknown-linux-gnu".into(),
             #[cfg(feature = "dist-client")]
@@ -9688,6 +9831,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let compilation = RustCompilation {
             #[cfg(feature = "dist-client")]
             generated_archives: BTreeMap::new(),
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            delivery: RustDelivery::default(),
             executable: sysroot.join(BINS_DIR).join("rustc"),
             host: "x86_64-unknown-linux-gnu".to_owned(),
             #[cfg(feature = "dist-client")]
@@ -9770,6 +9915,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let compilation = RustCompilation {
             #[cfg(feature = "dist-client")]
             generated_archives: BTreeMap::new(),
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            delivery: RustDelivery::default(),
             executable: sysroot.join(BINS_DIR).join("rustc"),
             host: "x86_64-unknown-linux-gnu".to_owned(),
             #[cfg(feature = "dist-client")]
