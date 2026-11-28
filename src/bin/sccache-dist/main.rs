@@ -289,14 +289,17 @@ fn package_report(
     }))
 }
 
+#[cfg(feature = "scheduler-dashboard")]
+fn verify_dashboard(assets: &Path, source: Option<&Path>) -> Result<i32> {
+    sccache_dashboard::server::verify_assets(assets, source)?;
+    println!("{}", sccache_dashboard::GENERATION);
+    Ok(0)
+}
+
 fn run(command: Command) -> Result<i32> {
     match command {
         #[cfg(feature = "scheduler-dashboard")]
-        Command::VerifyDashboard { assets, source } => {
-            sccache_dashboard::server::verify_assets(&assets, source.as_deref())?;
-            println!("{}", sccache_dashboard::GENERATION);
-            Ok(0)
-        }
+        Command::VerifyDashboard { assets, source } => verify_dashboard(&assets, source.as_deref()),
         Command::NativeDecodePackage {
             compression,
             max_tar_bytes,
@@ -1337,6 +1340,51 @@ struct NoCapacity {
     saturated_native: bool,
 }
 
+/// Native admission distinguishes incompatible platforms from a compatible
+/// fleet with no free queue headroom. Called while holding the servers lock.
+fn native_capacity_failure(
+    servers: &HashMap<ServerId, ServerDetails>,
+    platform: sccache::build_runtime::ContentId,
+) -> Option<NoCapacity> {
+    let mut compatible = false;
+    for details in servers.values() {
+        if details.capabilities.native_platform == Some(platform) {
+            compatible = true;
+            if details.native_headroom() != 0 {
+                return None;
+            }
+        }
+    }
+    Some(NoCapacity {
+        servers: servers.len(),
+        saturated_native: compatible,
+    })
+}
+
+fn native_transfer_plan<'a>(
+    native: &'a NativeAssignment,
+    network: &'a NetworkSnapshot,
+    servers: &HashMap<ServerId, ServerDetails>,
+    packages: &'a sccache::build_runtime::PackageCatalog,
+    cost_book: &placement::CostBook,
+    assigned_at: Instant,
+) -> NativeTransferPlan<'a> {
+    let receiver = native.receiver.as_ref();
+    let remote_fraction = receiver
+        .zip(native.delivery_profile)
+        .map_or(1_000_000, |((requester, _), profile)| {
+            cost_book.delivery_fraction(*requester, profile, assigned_at)
+        });
+    NativeTransferPlan::new(
+        network,
+        servers,
+        Some(packages),
+        Some(&native.input_blobs),
+        receiver,
+    )
+    .with_remote_fraction(remote_fraction)
+}
+
 struct CandidateSet {
     saturated_native: bool,
     healthy: Vec<(ServerId, f64)>,
@@ -1505,43 +1553,24 @@ impl Scheduler {
             .lock()
             .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
-        if let Some(platform) = native_platform {
-            let mut compatible = false;
-            let mut ready = false;
-            for details in servers.values() {
-                if details.capabilities.native_platform == Some(platform) {
-                    compatible = true;
-                    ready |= details.native_headroom() != 0;
-                }
-            }
-            if !ready {
-                return Ok(Err(NoCapacity {
-                    servers: servers.len(),
-                    saturated_native: compatible,
-                }));
-            }
+        if let Some(failure) =
+            native_platform.and_then(|platform| native_capacity_failure(&servers, platform))
+        {
+            return Ok(Err(failure));
         }
 
         let cost_book = self
             .cost_book
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transfer_plan = native_inputs.map(|inputs| {
-            NativeTransferPlan::new(
+        let transfer_plan = native.map(|assignment| {
+            native_transfer_plan(
+                assignment,
                 network,
                 &servers,
-                Some(packages),
-                Some(inputs),
-                native.and_then(|assignment| assignment.receiver.as_ref()),
-            )
-            .with_remote_fraction(
-                native
-                    .and_then(|assignment| {
-                        let (requester, _) = assignment.receiver.as_ref()?;
-                        let profile = assignment.delivery_profile?;
-                        Some(cost_book.delivery_fraction(*requester, profile, assigned_at))
-                    })
-                    .unwrap_or(1_000_000),
+                packages,
+                &cost_book,
+                assigned_at,
             )
         });
         let now = Instant::now();
