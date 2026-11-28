@@ -27,7 +27,9 @@ operation, not a distinct result identity.
 
 Do not hash native debug compilation directories, directory spellings in line
 markers, debug/file/macro prefix-map operands, or independent output destinations.
-Actual expanded string literals remain inputs. Ordinary single-object outputs
+Actual expanded string literals remain inputs, including date/time macro
+expansions from `SOURCE_DATE_EPOCH`. That setting is not a separate result
+fingerprint for ordinary preprocessed C and is not passed to its worker. Ordinary single-object outputs
 use the same execution destination. Multi-artifact output relationships and
 runtime profiling destinations remain meaningful inputs.
 
@@ -74,10 +76,20 @@ group. Dep-info preserves unset versus empty values as a typed observation;
 key only the observed value, not a second copy of the caller environment.
 Managed build-path observations use the realized canonical environment,
 including synthesized Cargo build-directory defaults.
+Normalize unobserved Rust bootstrap permissions to the effective scope of the
+current crate; unrelated crate names do not affect either execution or identity.
+Global bootstrap and crate-specific permission remain distinct. The obsolete
+`RUSTC_FORCE_UNSTABLE` setting is not an implicit compiler input. Preserve
+`SOURCE_DATE_EPOCH` when explicitly observed, consumed by opaque macros, or
+needed by an unsplit native linker; ordinary Rust codegen does not key it.
 Keep Rust metadata/output-name salts: changing `-C extra-filename` was verified
 to change both rlib and rmeta contents even with identical metadata salt.
 
 ## Execution
+
+Forward ordinary caller build variables to compiler discovery rather than
+stripping them before they can be observed. Process-local instrumentation and
+jobserver state remain transport concerns.
 
 Use the resident shared compiler runtime. Allowlist compiler execution variables,
 preserve explicit observations, normalize locale and scratch, and set native

@@ -2729,11 +2729,11 @@ fn run_environment_audit(
 ) -> Result<()> {
     fs::write(
         directory.join("audit.rs"),
-        b"pub const OBSERVED: &str = env!(\"NATIVE_AUDIT_OBSERVED\");\n",
+        b"pub const OBSERVED: Option<&str> = option_env!(\"SOURCE_DATE_EPOCH\");\n",
     )?;
-    let compile = |unused: &str, observed: &str| -> Result<((String, String), Vec<u8>)> {
-        let output = service
-            .command(env!("CARGO_BIN_EXE_sccache"))
+    let compile = |unused: &str, observed: Option<&str>| -> Result<((String, String), Vec<u8>)> {
+        let mut command = service.command(env!("CARGO_BIN_EXE_sccache"));
+        command
             .arg(rustc)
             .args([
                 "--crate-name",
@@ -2748,23 +2748,67 @@ fn run_environment_audit(
             ])
             .current_dir(directory)
             .env("SCCACHE_CONF", config)
-            .env("NATIVE_AUDIT_UNUSED", unused)
-            .env("SCCACHE_LOG", "sccache::native_action=info")
-            .env("NATIVE_AUDIT_OBSERVED", observed)
-            .output()?;
+            .env("HOSTNAME", unused)
+            .env("RUSTC_BOOTSTRAP", unused)
+            .env("SCCACHE_LOG", "sccache::native_action=info");
+        if let Some(value) = observed {
+            command.env("SOURCE_DATE_EPOCH", value);
+        } else {
+            command.env_remove("SOURCE_DATE_EPOCH");
+        }
+        let output = command.output()?;
         let report = action_report(&output)?;
         Ok((report, fs::read(directory.join("build/libaudit.rlib"))?))
     };
-    let ((key, source), first) = compile("first", "first")?;
+    let ((key, source), first) = compile("first", Some("0"))?;
     assert_eq!(source, "worker");
-    let ((same, source), second) = compile("second", "first")?;
+    let ((same, source), second) = compile("second", Some("0"))?;
     assert_eq!(source, "hit");
     assert_eq!(key, same);
     assert_eq!(first, second);
-    let ((changed, source), third) = compile("first", "second")?;
+    let ((changed, source), third) = compile("first", Some("86400"))?;
     assert_eq!(source, "worker");
     assert_ne!(key, changed);
     assert_ne!(first, third);
+    let ((absent, source), missing) = compile("first", None)?;
+    assert_eq!(source, "worker");
+    let ((empty, source), present) = compile("first", Some(""))?;
+    assert_eq!(source, "worker");
+    assert_ne!(absent, empty);
+    assert_ne!(missing, present);
+    let ((same, source), bytes) = compile("second", None)?;
+    assert_eq!((same, source), (absent, "hit".into()));
+    assert_eq!(missing, bytes);
+    Ok(())
+}
+
+/// The epoch affects C only through the expansion that the compiler consumes.
+/// Equal expanded dates must share a result even when the epochs differ.
+fn run_c_epoch_audit(service: &LocalService, root: &Path, config: &Path) -> Result<()> {
+    let directory = root.join("epoch");
+    fs::create_dir(&directory)?;
+    fs::write(directory.join("date.c"), b"const char *date = __DATE__;\n")?;
+    let compile = |epoch: &str| -> Result<((String, String), Vec<u8>)> {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .args(["/usr/bin/gcc", "-c", "date.c", "-o", "date.o"])
+            .current_dir(&directory)
+            .env("SCCACHE_CONF", config)
+            .env("SOURCE_DATE_EPOCH", epoch)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
+            .output()?;
+        Ok((action_report(&output)?, fs::read(directory.join("date.o"))?))
+    };
+    let ((key, source), first) = compile("0")?;
+    assert_eq!(source, "worker");
+    assert!(first.windows(11).any(|bytes| bytes == b"Jan  1 1970"));
+    let ((same, source), second) = compile("1")?;
+    assert_eq!((same, source), (key.clone(), "hit".into()));
+    assert_eq!(first, second);
+    let ((different, source), third) = compile("86400")?;
+    assert_eq!(source, "worker");
+    assert_ne!(key, different);
+    assert!(third.windows(11).any(|bytes| bytes == b"Jan  2 1970"));
     Ok(())
 }
 
@@ -2819,6 +2863,7 @@ fn native_compiler_semantic_reuse_across_ephemeral_inputs() -> Result<()> {
         assert_ne!(key, changed);
         assert_ne!(artifact, bytes);
     }
+    run_c_epoch_audit(&service, &root, &config)?;
     service.stop()?;
     fleet.finish()?;
     Ok(())

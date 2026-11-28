@@ -1020,6 +1020,7 @@ pub const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 pub const PAYLOAD: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/payload.txt"));
 pub const EMPTY: Option<&str> = option_env!("SCCACHE_OBSERVED_EMPTY");
 pub const MISSING: Option<&str> = option_env!("SCCACHE_OBSERVED_MISSING");
+pub const EPOCH: Option<&str> = option_env!("SOURCE_DATE_EPOCH");
 "#,
     );
     write_source(
@@ -1031,6 +1032,7 @@ fn main() {
     assert_eq!(observed_env::PAYLOAD, "physical input");
     assert_eq!(observed_env::EMPTY, Some(""));
     assert_eq!(observed_env::MISSING, None);
+    assert_eq!(observed_env::EPOCH, Some("86400"));
 }
 "#,
     );
@@ -1044,6 +1046,7 @@ fn main() {
         .env("SCCACHE_CANONICAL_BUILD_ROOT", &project)
         .env("CARGO_TARGET_DIR", project.join("target"))
         .env("SCCACHE_OBSERVED_EMPTY", "")
+        .env("SOURCE_DATE_EPOCH", "86400")
         .env_remove("SCCACHE_OBSERVED_MISSING")
         .assert()
         .success();

@@ -232,23 +232,24 @@ fn package_toolchain_command(matches: &clap::ArgMatches) -> Result<Command> {
     Ok(Command::PackageToolchain(exe, out))
 }
 
-fn compile_command(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Command> {
-    let mut env_vars = env::vars_os().collect::<Vec<_>>();
+/// Preserve ordinary compiler inputs for discovery. Only process-local
+/// instrumentation and jobserver transport state are not transferable.
+fn compiler_request_environment(
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    environment
+        .into_iter()
+        .filter(|(key, _)| {
+            !matches!(
+                key.to_str(),
+                Some("LD_PRELOAD" | "RUNNING_UNDER_RR" | "CARGO_MAKEFLAGS")
+            )
+        })
+        .collect()
+}
 
-    env_vars.retain(|(key, _)| {
-        key != "LD_PRELOAD"
-            && key != "RUNNING_UNDER_RR"
-            && key != "HOSTNAME"
-            && key != "PWD"
-            && key != "HOST"
-            && key != "RPM_BUILD_ROOT"
-            && key != "SOURCE_DATE_EPOCH"
-            && key != "RPM_PACKAGE_RELEASE"
-            && key != "MINICOM"
-            && key != "DESTDIR"
-            && key != "RPM_PACKAGE_VERSION"
-            && key != "CARGO_MAKEFLAGS"
-    });
+fn compile_command(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Command> {
+    let env_vars = compiler_request_environment(env::vars_os());
 
     let mut values = matches
         .get_many::<OsString>("CMD")
@@ -382,6 +383,22 @@ pub fn try_parse() -> Result<Command> {
 mod tests {
     use super::{Command, command_from_matches, get_clap_command};
     use std::path::PathBuf;
+
+    #[test]
+    fn compiler_request_preserves_build_inputs_for_discovery() {
+        let values = [
+            "SOURCE_DATE_EPOCH",
+            "HOSTNAME",
+            "PWD",
+            "RPM_BUILD_ROOT",
+            "DESTDIR",
+            "CARGO_MAKEFLAGS",
+            "LD_PRELOAD",
+        ]
+        .map(|name| (std::ffi::OsString::from(name), "value".into()));
+        let actual = super::compiler_request_environment(values.clone());
+        assert_eq!(actual, values[..5]);
+    }
 
     #[test]
     fn capabilities_is_a_control_command() {

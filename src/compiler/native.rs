@@ -584,7 +584,6 @@ fn prepare_toolchain(
                 b"PATH".as_slice(),
                 b"LD_LIBRARY_PATH",
                 b"CCC_OVERRIDE_OPTIONS",
-                b"SOURCE_DATE_EPOCH",
                 b"SDKROOT",
                 b"MACOSX_DEPLOYMENT_TARGET",
                 b"IPHONEOS_DEPLOYMENT_TARGET",
@@ -594,7 +593,8 @@ fn prepare_toolchain(
             .contains(&name)
                 || (scope != pkg::ToolchainScope::PreprocessedC
                     && [
-                        b"GCC_EXEC_PREFIX".as_slice(),
+                        b"SOURCE_DATE_EPOCH".as_slice(),
+                        b"GCC_EXEC_PREFIX",
                         b"COMPILER_PATH",
                         b"LIBRARY_PATH",
                         b"CUDA_PATH",

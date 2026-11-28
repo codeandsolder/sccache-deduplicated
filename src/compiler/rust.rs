@@ -353,7 +353,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"15";
+const CACHE_VERSION: &[u8] = b"16";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -1188,8 +1188,6 @@ fn rust_execution_variable(name: &OsStr, clippy: bool) -> bool {
         Some(
             "PATH"
                 | "LD_LIBRARY_PATH"
-                | "RUSTC_BOOTSTRAP"
-                | "RUSTC_FORCE_UNSTABLE"
                 | "SOURCE_DATE_EPOCH"
                 | "CARGO"
                 | "CARGO_MANIFEST_DIR"
@@ -1217,15 +1215,37 @@ fn effective_environment(
         .collect()
 }
 
+/// rustc checks global bootstrap permission before parsing the crate name,
+/// and crate-specific permission after it is known. Keep those distinct;
+/// names of other crates cannot affect this compilation.
+fn effective_bootstrap(value: &OsStr, crate_name: &str) -> Option<OsString> {
+    let value = value.to_str()?;
+    if matches!(value, "1" | "-1") || value.starts_with("-allow-unstable-compiler-flags=") {
+        Some(value.into())
+    } else if value.split(',').any(|name| name == crate_name) {
+        Some(crate_name.into())
+    } else {
+        None
+    }
+}
+
 fn compiler_execution_environment(
     env: &[(OsString, OsString)],
     observed: &HashSet<OsString>,
+    crate_name: &str,
     clippy: bool,
 ) -> Vec<(OsString, OsString)> {
     let mut result = env
         .iter()
-        .filter(|(name, _)| observed.contains(name) || rust_execution_variable(name, clippy))
-        .cloned()
+        .filter_map(|(name, value)| {
+            if observed.contains(name) {
+                Some((name.clone(), value.clone()))
+            } else if name == "RUSTC_BOOTSTRAP" {
+                effective_bootstrap(value, crate_name).map(|value| (name.clone(), value))
+            } else {
+                rust_execution_variable(name, clippy).then(|| (name.clone(), value.clone()))
+            }
+        })
         .collect::<Vec<_>>();
     for (name, value) in [
         ("LANG", "C"),
@@ -3158,6 +3178,7 @@ where
             let environment = compiler_execution_environment(
                 &env_vars,
                 &HashSet::new(),
+                &self.parsed_args.crate_name,
                 is_clippy_driver(&executable),
             );
             let files = pool
@@ -3504,6 +3525,7 @@ where
                     let execution = compiler_execution_environment(
                         &env_vars,
                         &observed,
+                        &self.parsed_args.crate_name,
                         is_clippy_driver(&self.executable),
                     );
                     if previous.as_ref() == Some(&execution) {
@@ -3957,16 +3979,19 @@ where
         m.audit_field("sccache.key.observed_environment");
         env_deps.sort();
         env_deps.dedup();
+        let native_execution = native_discovery.then(|| {
+            compiler_execution_environment(
+                &env_vars,
+                &env_dep_names,
+                &self.parsed_args.crate_name,
+                is_clippy_driver(&self.executable),
+            )
+        });
         let canonical_execution =
             canonical_paths
                 .as_ref()
-                .filter(|_| native_discovery)
-                .map(|paths| {
-                    let execution = compiler_execution_environment(
-                        &env_vars,
-                        &env_dep_names,
-                        is_clippy_driver(&self.executable),
-                    );
+                .zip(native_execution.as_ref())
+                .map(|(paths, execution)| {
                     // Preserve explicit observations other than managed build paths,
                     // exactly as the eventual native worker invocation does.
                     let preserve = env_dep_names
@@ -3974,7 +3999,7 @@ where
                         .filter(|name| !super::canonical_paths::compiler_build_path_variable(name))
                         .cloned()
                         .collect();
-                    paths.env_to_canonical_preserving(&execution, &preserve)
+                    paths.env_to_canonical_preserving(execution, &preserve)
                 });
         // Empty sets add no identity. rustc reports unset and empty distinctly;
         // neither the caller environment nor an old-layout salt is necessary.
@@ -4002,25 +4027,28 @@ where
                 val.hash(&mut HashToDigest { digest: &mut m });
             }
         }
-        if native_discovery {
-            m.delimiter(b"native-compiler-environment-contract-v2");
-            for (name, value) in &env_vars {
+        if let Some(execution) = &native_execution {
+            m.delimiter(b"native-compiler-environment-contract-v3");
+            // The pinned rustc/LLVM compiler does not consume an epoch
+            // for ordinary Rust codegen. Keep it when opaque macros or
+            // unsplit native linking can actually consume it.
+            let epoch_needed = opaque || (!metadata_inputs_only && !self.parsed_args.split_link);
+            for (name, value) in execution {
                 if env_deps.iter().any(|(observed, _)| observed == name) {
                     continue;
                 }
-                if matches!(
-                    name.to_str(),
-                    Some("RUSTC_BOOTSTRAP" | "RUSTC_FORCE_UNSTABLE" | "SOURCE_DATE_EPOCH")
-                ) || (opaque
-                    && matches!(
-                        name.to_str(),
-                        Some(
-                            "CARGO_PKG_NAME"
-                                | "CARGO_PKG_VERSION"
-                                | "CARGO_CRATE_NAME"
-                                | "CARGO_BIN_NAME"
-                        )
-                    ))
+                if name == "RUSTC_BOOTSTRAP"
+                    || (epoch_needed && name == "SOURCE_DATE_EPOCH")
+                    || (opaque
+                        && matches!(
+                            name.to_str(),
+                            Some(
+                                "CARGO_PKG_NAME"
+                                    | "CARGO_PKG_VERSION"
+                                    | "CARGO_CRATE_NAME"
+                                    | "CARGO_BIN_NAME"
+                            )
+                        ))
                 {
                     name.hash(&mut HashToDigest { digest: &mut m });
                     value.hash(&mut HashToDigest { digest: &mut m });
@@ -4420,6 +4448,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             local_execution_environment = compiler_execution_environment(
                 env_vars,
                 env_dep_names,
+                crate_name,
                 is_clippy_driver(executable),
             );
             &local_execution_environment
@@ -10072,8 +10101,42 @@ version='2.0.0'
         ];
         assert_eq!(effective_environment(env.clone()), expected);
         assert_eq!(
-            compiler_execution_environment(&env, &HashSet::new(), false),
-            compiler_execution_environment(&expected, &HashSet::new(), false),
+            compiler_execution_environment(&env, &HashSet::new(), "foo", false),
+            compiler_execution_environment(&expected, &HashSet::new(), "foo", false),
+        );
+    }
+
+    #[test]
+    fn bootstrap_permission_is_scoped_to_the_current_crate() {
+        let env = |value: &str| [(OsString::from("RUSTC_BOOTSTRAP"), OsString::from(value))];
+        let execution = |value: &str| {
+            compiler_execution_environment(&env(value), &HashSet::new(), "foo", false)
+        };
+        assert_eq!(
+            execution("bar,baz"),
+            compiler_execution_environment(&[], &HashSet::new(), "foo", false)
+        );
+        assert_eq!(execution("bar,foo,baz"), execution("foo"));
+        assert_ne!(execution("foo"), execution("1"));
+        assert_ne!(execution("foo"), execution("-1"));
+        let observed = HashSet::from([OsString::from("RUSTC_BOOTSTRAP")]);
+        assert_ne!(
+            compiler_execution_environment(&env("foo,bar"), &observed, "foo", false),
+            compiler_execution_environment(&env("foo"), &observed, "foo", false)
+        );
+        let obsolete = [(OsString::from("RUSTC_FORCE_UNSTABLE"), OsString::from("1"))];
+        assert_eq!(
+            compiler_execution_environment(&obsolete, &HashSet::new(), "foo", false),
+            compiler_execution_environment(&[], &HashSet::new(), "foo", false)
+        );
+        assert!(
+            compiler_execution_environment(
+                &obsolete,
+                &HashSet::from([obsolete[0].0.clone()]),
+                "foo",
+                false
+            )
+            .contains(&obsolete[0])
         );
     }
 
@@ -10094,28 +10157,28 @@ version='2.0.0'
         changed.push(("RUST_SKILLS2_WORKING_DIRECTORY".into(), "/tmp/lease".into()));
         let no_observations = HashSet::new();
         assert_eq!(
-            compiler_execution_environment(&base, &no_observations, false),
-            compiler_execution_environment(&changed, &no_observations, false)
+            compiler_execution_environment(&base, &no_observations, "foo", false),
+            compiler_execution_environment(&changed, &no_observations, "foo", false)
         );
         let observed = HashSet::from(["GITHUB_RUN_ID".into()]);
         assert_ne!(
-            compiler_execution_environment(&base, &observed, false),
-            compiler_execution_environment(&changed, &observed, false)
+            compiler_execution_environment(&base, &observed, "foo", false),
+            compiler_execution_environment(&changed, &observed, "foo", false)
         );
         assert!(
-            compiler_execution_environment(&base, &no_observations, true)
+            compiler_execution_environment(&base, &no_observations, "foo", true)
                 .iter()
                 .any(|(name, _)| name == "CLIPPY_ARGS")
         );
         changed[3].1 = "b".into();
         assert_eq!(
-            compiler_execution_environment(&base, &no_observations, false),
-            compiler_execution_environment(&changed, &no_observations, false)
+            compiler_execution_environment(&base, &no_observations, "foo", false),
+            compiler_execution_environment(&changed, &no_observations, "foo", false)
         );
         let observed = HashSet::from(["CUSTOM_BUILD_INPUT".into()]);
         assert_ne!(
-            compiler_execution_environment(&base, &observed, false),
-            compiler_execution_environment(&changed, &observed, false)
+            compiler_execution_environment(&base, &observed, "foo", false),
+            compiler_execution_environment(&changed, &observed, "foo", false)
         );
     }
 
