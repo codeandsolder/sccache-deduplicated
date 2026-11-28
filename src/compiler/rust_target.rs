@@ -177,7 +177,8 @@ impl NamedTargetSpec {
         } else {
             paths.to_canonical(&physical_dir)
         };
-        super::c::normalize_path(&logical_dir.join(relative)) == paths.to_canonical(&physical_file)
+        super::canonical_paths::logical_absolute_path(&logical_dir.join(relative)).as_ref()
+            == Some(&paths.to_canonical(&physical_file))
     }
 }
 

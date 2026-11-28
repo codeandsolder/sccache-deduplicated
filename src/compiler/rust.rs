@@ -1683,7 +1683,8 @@ fn thin_archive_members_visible(
             return false;
         }
         let logical = logical_parent.join(&member.name);
-        super::c::normalize_path(&logical) == canonical.to_canonical(&physical)
+        super::canonical_paths::logical_absolute_path(&logical).as_ref()
+            == Some(&canonical.to_canonical(&physical))
     })
 }
 
@@ -5626,19 +5627,19 @@ fn rust_selected_binary_companions(
     let mut companions = BTreeSet::new();
     for input in inputs {
         match input.extension().and_then(OsStr::to_str) {
-            Some(RLIB_EXTENSION) => {
+            Some("rlib") => {
                 if let Cow::Owned(path) = dependency_probe_input(input, search_paths)? {
                     companions.insert(path);
                 }
             }
-            Some(RMETA_EXTENSION) if include_linkable_companions => {
+            Some("rmeta") if include_linkable_companions => {
                 let mut header = [0; 40];
                 let mut file = fs::File::open(input)?;
                 if file.read_exact(&mut header).is_err() {
                     continue;
                 }
                 if let Some((false, hash)) = metadata_v12_header(&header) {
-                    let sibling = input.with_extension(RLIB_EXTENSION);
+                    let sibling = input.with_extension("rlib");
                     let name = sibling.file_name().context("missing library basename")?;
                     for candidate in iter::once(sibling.clone())
                         .chain(search_paths.iter().map(|dir| dir.join(name)))
@@ -5665,13 +5666,13 @@ fn rust_selected_binary_companions(
 /// companion, checking the embedded SVH rather than trusting its filename.
 #[cfg(feature = "dist-client")]
 fn dependency_probe_input<'a>(input: &'a Path, search_paths: &[PathBuf]) -> Result<Cow<'a, Path>> {
-    if input.extension() != Some(OsStr::new(RLIB_EXTENSION)) {
+    if input.extension() != Some(OsStr::new("rlib")) {
         return Ok(Cow::Borrowed(input));
     }
     let Some(hash) = rlib_stub_hash(input)? else {
         return Ok(Cow::Borrowed(input));
     };
-    let sibling = input.with_extension(RMETA_EXTENSION);
+    let sibling = input.with_extension("rmeta");
     let name = sibling
         .file_name()
         .context("Rust metadata companion has no filename")?;
@@ -5680,7 +5681,7 @@ fn dependency_probe_input<'a>(input: &'a Path, search_paths: &[PathBuf]) -> Resu
     {
         let mut file = match fs::File::open(&candidate) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
         let mut header = [0; 40];
@@ -5689,7 +5690,7 @@ fn dependency_probe_input<'a>(input: &'a Path, search_paths: &[PathBuf]) -> Resu
                 return Ok(Cow::Owned(candidate));
             }
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
             Err(error) => return Err(error.into()),
         }
     }

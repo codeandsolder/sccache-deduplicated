@@ -291,6 +291,25 @@ fn replace_embedded_path(text: &str, physical: &str, canonical: &str) -> String 
     output
 }
 
+/// Normalize an absolute path in the constructed logical namespace.
+/// Unlike a physical operand, this is never resolved against host files.
+pub(super) fn logical_absolute_path(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                result.pop();
+            }
+            Component::CurDir => {}
+            other => result.push(other),
+        }
+    }
+    Some(result)
+}
+
 /// Resolve an operand against the invocation's physical cwd before applying
 /// an independent sandbox root mapping. Never erase a symlink traversal.
 pub(super) fn physical_operand(cwd: &Path, operand: &Path) -> Option<PathBuf> {
