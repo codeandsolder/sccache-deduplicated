@@ -14,18 +14,7 @@ fn execute_test(
     progress: impl FnMut() -> Result<()>,
 ) -> Result<CapturedExecution> {
     let inputs = acquire_execution_inputs(spec, store)?;
-    execute(
-        spec,
-        store,
-        policy,
-        ExecutionInputs {
-            trees: &inputs,
-            discovery: None,
-        },
-        budget,
-        progress,
-        |_| {},
-    )
+    execute(spec, store, policy, &inputs, budget, progress, |_| {})
 }
 
 fn metadata(mode: u32) -> TreeMetadata {
@@ -175,7 +164,6 @@ fn shell_output_fixture(
     script: &[u8],
 ) -> Result<(ExecutionSpec, ExecutionPolicy)> {
     let spec = ExecutionSpec {
-        discovery: None,
         compiler_result: None,
         working_inputs: Default::default(),
         scratch: Default::default(),
@@ -206,7 +194,6 @@ fn shell_output_fixture(
         bubblewrap: "/usr/bin/bwrap".into(),
         scratch: parent.to_owned(),
         timeout: Duration::from_secs(20),
-        max_discovery_metadata_bytes: 64 * 1024 * 1024,
         max_result_bytes: 1024,
     };
     Ok((spec, policy))
@@ -368,7 +355,6 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
     let src = store.publish_tree(&original_manifest, vec![input])?;
     let platform = ContentId::of(b"test platform");
     let mut spec = ExecutionSpec {
-        discovery: None,
         compiler_result: None,
         working_inputs: Default::default(),
         scratch: Default::default(),
@@ -391,7 +377,6 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
         bubblewrap: "/usr/bin/bwrap".into(),
         scratch: dir.path().into(),
         timeout: Duration::from_secs(10),
-        max_discovery_metadata_bytes: 64 * 1024 * 1024,
         max_result_bytes: 1024,
     };
     let result = execute_test(&spec, &store, &policy, None, || Ok(()))?;
@@ -587,7 +572,6 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
         encoding: crate::BlobEncoding::ZstdChunks,
     };
     let spec = ExecutionSpec {
-        discovery: None,
         compiler_result: None,
         working_inputs: Default::default(),
         scratch: Default::default(),
@@ -676,7 +660,6 @@ async fn captured_output_publication_reuses_original_inode() -> Result<()> {
         files: capture.files,
         staged: capture.staged,
         encoding: capture.encoding,
-        discovery_bundle: None,
     };
     drop(capture.budget);
     assert_eq!(store.space_status()?.reserved_bytes, Some(blob.size));
@@ -733,7 +716,7 @@ fn resident_execution_isolates_concurrent_writable_state() -> Result<()> {
                     spec.command.arguments[1] = script.into_bytes();
                     barrier.wait();
                     let mut phases = Vec::new();
-                    let captured = execute(&spec, store, policy, ExecutionInputs { trees: inputs, discovery: None }, None, || Ok(()), |phase| phases.push(phase))?;
+                    let captured = execute(&spec, store, policy, inputs, None, || Ok(()), |phase| phases.push(phase))?;
                     assert_eq!(phases, [ExecutionPhase::Preparation, ExecutionPhase::Process, ExecutionPhase::Capture]);
                     let result = captured.successful_result().context("isolated job failed")?;
                     let mut output = Vec::new();
@@ -899,131 +882,5 @@ fn dependent_action_consumes_owned_inputs_and_preserves_immutable_inputs() -> Re
     assert_eq!(blob.id, ContentId::of(b"object-external"));
     link.command.arguments[1] = b"printf invalid > /out/library".to_vec();
     assert!(execute_test(&link, &store, &policy, None, || Ok(())).is_err());
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires host Bubblewrap and FUSE"]
-fn sealed_discovery_is_an_ordinary_action_input() -> Result<()> {
-    use crate::{
-        DiscoverySpec,
-        discovery::{DiscoveryLimits, DiscoveryOrigin, DiscoverySession},
-    };
-    let dir = tempfile::tempdir()?;
-    let store = NativeStore::open(&dir.path().join("store"))?;
-    let root = shell_root(&store)?;
-    let source = dir.path().join("origin");
-    fs::create_dir(&source)?;
-    fs::write(source.join("input"), b"observed bytes\n")?;
-    fs::write(source.join("unrelated"), b"not observed")?;
-    let scope = BuildPath::new(b"/src".to_vec())?;
-    let mut origin = DiscoveryOrigin::new(DiscoveryLimits {
-        max_queries: 32,
-        max_dirents: 32,
-        max_content_bytes: 4096,
-    })?;
-    origin.add_root(scope.clone(), &source)?;
-    let session = DiscoverySession::new(store.clone(), Box::new(origin), None)?;
-    let mount = session.mount(scope.clone(), dir.path())?;
-    assert_eq!(fs::read(mount.root().join("input"))?, b"observed bytes\n");
-    mount.unmount()?;
-    let discovered = session.finish()?;
-    let package = discovered.publish(&store)?;
-    let (mut spec, policy) = shell_output_fixture(
-        dir.path(),
-        root,
-        ContentId::of(b"discovery-replay-test"),
-        b"IFS= read -r word < /src/input; printf '%s' \"$word\" > /out/nested/object",
-    )?;
-    let original = spec.action_request()?.action_fingerprint()?.key()?;
-    spec.discovery = Some(DiscoverySpec {
-        source: crate::DiscoverySource::Sealed(package.id()),
-        mounts: BTreeSet::from([scope]),
-    });
-    let request = spec.action_request()?;
-    assert!(request.input_trees.contains(&package.id()));
-    assert_ne!(original, request.action_fingerprint()?.key()?);
-    // Replay cannot access the live origin, even if it is now different.
-    fs::write(source.join("input"), b"modified origin\n")?;
-    assert_eq!(
-        read_shell_output(&spec, &store, &policy)?,
-        b"observed bytes"
-    );
-    spec.command.arguments[1] = b"if test -e /src/unrelated; then :; fi; IFS= read -r word < /src/input; printf '%s' \"$word\" > /out/nested/object".to_vec();
-    assert!(execute_test(&spec, &store, &policy, None, || Ok(())).is_err());
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires host Bubblewrap and FUSE"]
-fn live_discovery_action_publishes_only_observed_inputs() -> Result<()> {
-    use crate::{
-        DISCOVERY_RESULT, DiscoverySource, DiscoverySpec,
-        discovery::{DiscoveryBundle, DiscoveryLimits, DiscoveryOrigin},
-    };
-    let temp = tempfile::tempdir()?;
-    let store = NativeStore::open(&temp.path().join("store"))?;
-    let root = shell_root(&store)?;
-    let source = temp.path().join("origin");
-    fs::create_dir(&source)?;
-    fs::write(source.join("input"), b"observed bytes\n")?;
-    fs::write(source.join("unrelated"), b"not observed")?;
-    let scope = BuildPath::new(b"/src".to_vec())?;
-    let mut origin = DiscoveryOrigin::new(DiscoveryLimits {
-        max_queries: 32,
-        max_dirents: 32,
-        max_content_bytes: 4096,
-    })?;
-    origin.add_root(scope.clone(), &source)?;
-    let (mut spec, policy) = shell_output_fixture(
-        temp.path(),
-        root,
-        ContentId::of(b"live-discovery-test"),
-        b"IFS= read -r word < /src/input; printf '%s' \"$word\"",
-    )?;
-    spec.outputs.clear();
-    spec.discovery = Some(DiscoverySpec {
-        source: DiscoverySource::Live {
-            nonce: ContentId::of(b"test unique live task"),
-        },
-        mounts: BTreeSet::from([scope]),
-    });
-    let inputs = acquire_execution_inputs(&spec, &store)?;
-    let result = execute(
-        &spec,
-        &store,
-        &policy,
-        ExecutionInputs {
-            trees: &inputs,
-            discovery: Some(Box::new(origin)),
-        },
-        None,
-        || Ok(()),
-        |_| {},
-    )?;
-    let manifest = result
-        .successful_result()
-        .context("live discovery failed")?;
-    spec.action_request()?.validate_result(manifest)?;
-    let Artifact::Tree(tree) = &manifest.outputs[DISCOVERY_RESULT] else {
-        anyhow::bail!("missing discovery package");
-    };
-    let lease = store
-        .lookup_tree(tree.id()?)?
-        .context("missing pinned discovery tree")?;
-    let bundle = DiscoveryBundle::load(&lease, 1024 * 1024)?;
-    assert!(
-        bundle
-            .transcript()
-            .observations()
-            .keys()
-            .all(|query| !query.path().as_bytes().ends_with(b"unrelated"))
-    );
-    assert_eq!(tree.blobs()?.len(), 2);
-    let mut stdout = Vec::new();
-    result
-        .open_blob(manifest.stdout.context("missing diagnostic")?.id)?
-        .read_to_end(&mut stdout)?;
-    assert_eq!(stdout, b"observed bytes");
     Ok(())
 }

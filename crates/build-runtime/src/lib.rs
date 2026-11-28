@@ -30,8 +30,7 @@ pub use space_policy::SpacePolicy;
 mod spec;
 pub use recipe::{TreeLayer, TreeRecipe};
 pub use spec::{
-    BuildPath, CommandSpec, CompilerResultIdentity, DISCOVERY_RESULT, DiscoverySource,
-    DiscoverySpec, ExecutionRoot, ExecutionSpec, OutputSpec,
+    BuildPath, CommandSpec, CompilerResultIdentity, ExecutionRoot, ExecutionSpec, OutputSpec,
 };
 mod tree;
 pub mod wire;
@@ -84,8 +83,8 @@ mod execution;
 pub mod sandbox;
 #[cfg(all(target_os = "linux", feature = "store"))]
 pub use execution::{
-    CapturedExecution, ExecutionInputs, ExecutionPhase, ExecutionPolicy, ExecutionTimings,
-    acquire_execution_inputs, execute,
+    CapturedExecution, ExecutionPhase, ExecutionPolicy, ExecutionTimings, acquire_execution_inputs,
+    execute,
 };
 
 #[cfg(all(target_os = "linux", feature = "store"))]
@@ -95,7 +94,6 @@ mod tree_fs;
 #[cfg(all(target_os = "linux", feature = "mapping"))]
 pub use tree_fs::{MaterializationStats, MaterializedTree, materialize_tree};
 
-pub mod discovery;
 #[cfg(all(target_os = "linux", feature = "mapping"))]
 mod mapped;
 #[cfg(all(target_os = "linux", feature = "mapping"))]

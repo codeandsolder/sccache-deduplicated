@@ -108,7 +108,6 @@ pub enum Publisher {
 /// The output contract is a mandatory component of either result identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionRequest {
-    pub(crate) live_discovery: Option<crate::DiscoverySpec>,
     pub(crate) result_fingerprint: Option<ActionFingerprint>,
     pub(crate) fingerprint: ActionFingerprint,
     pub(crate) root: ExecutionRoot,
@@ -247,35 +246,6 @@ pub struct InputDemand {
 pub enum InputPoll {
     Waiting,
     Demand(InputDemand),
-    Complete,
-}
-
-/// Live filesystem requests run only under a delegated action ticket.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DiscoveryOperation {
-    Observe(crate::discovery::DiscoveryQuery),
-    Fetch(BlobRef),
-    Seal(ContentId),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiscoveryRequest {
-    pub sequence: u64,
-    pub operation: DiscoveryOperation,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DiscoveryAnswer {
-    Observed(crate::discovery::DiscoveryReply),
-    Available,
-    Sealed,
-    Rejected(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DiscoveryPoll {
-    Waiting,
-    Demand(DiscoveryRequest),
     Complete,
 }
 
@@ -606,7 +576,7 @@ impl DeliverySelection {
     /// Returns an error for undeclared output names or encoding failure.
     pub fn new(spec: &crate::ExecutionSpec, outputs: BTreeSet<String>) -> Result<Self> {
         ensure!(
-            outputs.iter().all(|name| spec.output_kind(name).is_some()),
+            outputs.iter().all(|name| spec.outputs.contains_key(name)),
             "undeclared selected output"
         );
         let profile = ContentId(typed_digest(

@@ -530,9 +530,6 @@ fn native_admission_class((_, operation): &(String, String)) -> AdmissionClass {
         | "package_lookup"
         | "rust_package_lookup"
         | "trace_live"
-        | "discovery_request"
-        | "discovery_poll"
-        | "discovery_answer"
         | "begin" => AdmissionClass::Metadata,
         _ => AdmissionClass::Bulk,
     }
@@ -1105,22 +1102,6 @@ fn dispatch(
                 limit,
             )
         }
-        "discovery_request" if matches!(publisher, Publisher::Worker { .. }) => {
-            let (ticket, demand) = metadata(request, limit)?;
-            encode(
-                &sessions.discovery_request(ticket, publisher, demand)?,
-                limit,
-            )
-        }
-        "discovery_poll" if publisher == Publisher::Client => encode(
-            &sessions.discovery_poll(metadata(request, limit)?, request.id())?,
-            limit,
-        ),
-        "discovery_answer" if publisher == Publisher::Client => {
-            let (ticket, sequence, answer) = metadata(request, limit)?;
-            sessions.discovery_answer(ticket, request.id(), sequence, answer)?;
-            encode(&(), limit)
-        }
         "input_prefetch" if matches!(publisher, Publisher::Worker { .. }) => {
             let InputPrefetchRequest { ticket, missing } = metadata(request, limit)?;
             sessions.request_inputs(ticket, publisher, missing)?;
@@ -1226,14 +1207,11 @@ fn dispatch(
                 .collect::<Result<Vec<_>>>()?;
             encode(&plans, limit)
         }
-        "download" | "retain_download" | "discovery_download" => {
+        "download" | "retain_download" => {
             let download = if operation == "retain_download" {
                 ensure!(publisher == Publisher::Client, "retention is client-owned");
                 let RetainedDownloadRequest { group, blob } = metadata(request, limit)?;
                 sessions.download_retained(group, request.id(), blob)?
-            } else if operation == "discovery_download" {
-                let (ticket, blob) = metadata(request, limit)?;
-                sessions.discovery_download(ticket, publisher, blob)?
             } else {
                 let DownloadRequest { ticket, id } = metadata(request, limit)?;
                 sessions.download(ticket, publisher, id)?

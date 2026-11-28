@@ -22,7 +22,6 @@ use crate::{
 fn action(root: &TreeManifest) -> Result<ExecutionSpec> {
     let id = root.id()?;
     Ok(ExecutionSpec {
-        discovery: None,
         compiler_result: None,
         working_inputs: Default::default(),
         scratch: Default::default(),
@@ -1091,7 +1090,6 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
             bubblewrap: "/usr/bin/bwrap".into(),
             scratch: directory.path().into(),
             timeout: Duration::from_secs(10),
-            max_discovery_metadata_bytes: 64 * 1024 * 1024,
             max_result_bytes: 1024,
         };
         let transport = crate::dist::native::PackageTransportTracker::new(

@@ -680,24 +680,6 @@ impl NativeCacheClient {
         self.control("poll_input", &ticket)
     }
 
-    #[cfg(all(target_os = "linux", feature = "dist-client"))]
-    pub(super) fn discovery_poll(
-        &self,
-        ticket: Ticket,
-    ) -> Result<crate::build_runtime::wire::DiscoveryPoll> {
-        self.control("discovery_poll", &ticket)
-    }
-
-    #[cfg(all(target_os = "linux", feature = "dist-client"))]
-    pub(super) fn discovery_answer(
-        &self,
-        ticket: Ticket,
-        sequence: u64,
-        answer: &crate::build_runtime::wire::DiscoveryAnswer,
-    ) -> Result<()> {
-        self.control("discovery_answer", &(ticket, sequence, answer))
-    }
-
     #[cfg(test)]
     pub(super) fn inputs_staged(&self, ticket: Ticket) -> Result<()> {
         self.control("inputs_staged", &ticket)
@@ -739,13 +721,7 @@ impl NativeCacheClient {
     /// # Errors
     /// Returns an error for an invalid or expired action.
     pub fn schedule(&self, ticket: Ticket, spec: ExecutionSpec) -> Result<ScheduleReply> {
-        let request = spec.action_request()?;
-        let selected = request
-            .required_outputs
-            .keys()
-            .chain(request.optional_outputs.keys())
-            .cloned()
-            .collect();
+        let selected = spec.outputs.keys().cloned().collect();
         self.schedule_selected(
             crate::server::activity::trace_context(),
             ticket,
@@ -2005,8 +1981,6 @@ pub(super) fn codec() -> impl Options {
         .reject_trailing_bytes()
 }
 
-#[cfg(all(target_os = "linux", feature = "native-store"))]
-pub(super) mod discovery;
 #[cfg(all(target_os = "linux", feature = "native-store"))]
 mod grace;
 mod renewal;

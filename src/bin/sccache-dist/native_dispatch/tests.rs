@@ -53,7 +53,6 @@ fn assignment(marker: u8) -> Result<NativeAssignment> {
         ticket: Ticket([marker; 32]),
         input_blobs: BTreeMap::new(),
         spec: ExecutionSpec {
-            discovery: None,
             compiler_result: None,
             working_inputs: Default::default(),
             scratch: Default::default(),

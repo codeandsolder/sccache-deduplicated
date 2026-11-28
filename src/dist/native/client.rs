@@ -24,8 +24,8 @@ use crate::build_runtime::{
     ActionMode, Artifact, BlobRef, ContentId, ExecutionSpec, MaterializedTree, PreparedTree,
     ResultManifest, TreeId, TreeManifest, materialize_tree,
     wire::{
-        ClientDeliveryObservation, DiscoveryPoll, DiscoveryRequest, InputDemand, InputPoll,
-        NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket, WorkerAllocation,
+        ClientDeliveryObservation, InputDemand, InputPoll, NativeAdmission, NativeRunResult,
+        NativeStatus, ScheduleReply, Ticket, WorkerAllocation,
     },
 };
 
@@ -118,24 +118,11 @@ pub(super) trait InputProvider {
         progress.apply();
         Ok(())
     }
-    fn discovery(
-        &mut self,
-        _client: &NativeCacheClient,
-        _ticket: Ticket,
-        _demand: DiscoveryRequest,
-        _deadline: Instant,
-        _renewal: Duration,
-    ) -> Result<()> {
-        bail!("input provider has no live discovery authority")
-    }
     fn manifest(&mut self, tree: TreeId) -> Result<TreeManifest>;
     fn open_blob(&mut self, tree: TreeId, blob: BlobRef) -> Result<Option<InputBlob>>;
 }
 
-pub(super) struct LocalInputs<'a> {
-    trees: BTreeMap<TreeId, &'a PreparedTree>,
-    discovery: Option<crate::build_runtime::discovery::DiscoveryOrigin>,
-}
+pub(super) struct LocalInputs<'a>(BTreeMap<TreeId, &'a PreparedTree>);
 
 impl<'a> LocalInputs<'a> {
     pub(super) fn new(spec: &ExecutionSpec, inputs: &'a [PreparedTree]) -> Result<Self> {
@@ -147,20 +134,17 @@ impl<'a> LocalInputs<'a> {
             inputs.keys().copied().collect::<BTreeSet<_>>() == spec.action_request()?.input_trees,
             "prepared native inputs differ from the action declaration"
         );
-        Ok(Self {
-            trees: inputs,
-            discovery: None,
-        })
+        Ok(Self(inputs))
     }
 
     fn matching_sources(&self, id: ContentId) -> impl Iterator<Item = Box<dyn Read + Send>> + '_ {
-        self.trees
+        self.0
             .values()
             .filter_map(move |tree| tree.open_local_blob(id).ok())
     }
 
     pub(super) fn tree(&self, id: TreeId) -> Result<&PreparedTree> {
-        self.trees
+        self.0
             .get(&id)
             .copied()
             .context("scheduler requested undeclared input tree")
@@ -182,26 +166,6 @@ impl<'a> LocalInputs<'a> {
 }
 
 impl InputProvider for LocalInputs<'_> {
-    fn discovery(
-        &mut self,
-        client: &NativeCacheClient,
-        ticket: Ticket,
-        demand: DiscoveryRequest,
-        deadline: Instant,
-        renewal: Duration,
-    ) -> Result<()> {
-        super::discovery::serve_origin(
-            self.discovery
-                .as_mut()
-                .context("live discovery origin not configured")?,
-            client,
-            ticket,
-            demand,
-            deadline,
-            renewal,
-        )
-    }
-
     fn manifest(&mut self, tree: TreeId) -> Result<TreeManifest> {
         Ok(self.tree(tree)?.manifest().clone())
     }
@@ -419,37 +383,6 @@ impl NativeCacheClient {
         destinations: &BTreeMap<String, PathBuf>,
         policy: &NativeBuildPolicy,
     ) -> Result<NativeBuildResult> {
-        self.run_action_inner(
-            spec,
-            LocalInputs::new(spec, inputs)?,
-            destinations,
-            policy,
-            None,
-            BTreeSet::new(),
-        )
-    }
-
-    /// Execute a unique live discovery task through the ordinary scheduler,
-    /// servicing only this origin's explicitly authorized filesystem roots.
-    /// # Errors
-    /// Invalid declaration, origin observation, transfer or execution.
-    pub fn run_live_discovery(
-        &self,
-        spec: &ExecutionSpec,
-        inputs: &[PreparedTree],
-        origin: crate::build_runtime::discovery::DiscoveryOrigin,
-        destinations: &BTreeMap<String, PathBuf>,
-        policy: &NativeBuildPolicy,
-    ) -> Result<NativeBuildResult> {
-        ensure!(
-            spec.discovery.as_ref().is_some_and(|discovery| matches!(
-                discovery.source,
-                crate::build_runtime::DiscoverySource::Live { .. }
-            )),
-            "expected live discovery action"
-        );
-        let mut inputs = LocalInputs::new(spec, inputs)?;
-        inputs.discovery = Some(origin);
         self.run_action_inner(spec, inputs, destinations, policy, None, BTreeSet::new())
     }
 
@@ -464,7 +397,7 @@ impl NativeCacheClient {
     ) -> Result<NativeBuildResult> {
         self.run_action_inner(
             spec,
-            LocalInputs::new(spec, inputs)?,
+            inputs,
             destinations,
             policy,
             Some(retention),
@@ -475,20 +408,13 @@ impl NativeCacheClient {
     fn run_action_inner(
         &self,
         spec: &ExecutionSpec,
-        mut inputs: LocalInputs<'_>,
+        inputs: &[PreparedTree],
         destinations: &BTreeMap<String, PathBuf>,
         policy: &NativeBuildPolicy,
         retention: Option<(&super::result_session::Registry, u32)>,
         mut retained: BTreeSet<Ticket>,
     ) -> Result<NativeBuildResult> {
-        ensure!(
-            inputs.discovery.is_some()
-                == spec.discovery.as_ref().is_some_and(|discovery| matches!(
-                    discovery.source,
-                    crate::build_runtime::DiscoverySource::Live { .. }
-                )),
-            "live discovery declaration and origin authority differ"
-        );
+        let mut inputs = LocalInputs::new(spec, inputs)?;
         let destinations = verify_destinations(spec, destinations)?;
         let destinations = super::intermediate::Destinations::new(destinations)?;
         retained.extend(destinations.sessions());
@@ -702,20 +628,6 @@ impl NativeCacheClient {
                 policy,
                 || worker.is_finished(),
             );
-            let supply = supply.and_then(|()| {
-                if spec.discovery.as_ref().is_some_and(|discovery| {
-                    matches!(
-                        discovery.source,
-                        crate::build_runtime::DiscoverySource::Live { .. }
-                    )
-                }) && !worker.is_finished()
-                {
-                    self.serve_discovery(pin.ticket, inputs, start, policy, || {
-                        worker.is_finished()
-                    })?;
-                }
-                Ok(())
-            });
             // A worker may become ready through a concurrent provider while
             // its previous origin request is still in transit. Preserve an
             // already terminal result instead of cancelling it.
@@ -844,42 +756,6 @@ impl NativeCacheClient {
                     self.supply_demand(ticket, demand, inputs, start, policy)?;
                 }
             }
-        }
-        Ok(())
-    }
-
-    fn serve_discovery(
-        &self,
-        ticket: Ticket,
-        inputs: &mut impl InputProvider,
-        start: Instant,
-        policy: &NativeBuildPolicy,
-        worker_finished: impl Fn() -> bool,
-    ) -> Result<()> {
-        let deadline = start
-            .checked_add(policy.timeout)
-            .context("discovery deadline overflow")?;
-        let mut idle = Duration::from_millis(5);
-        while !worker_finished() {
-            ensure!(
-                Instant::now() < deadline,
-                "live discovery deadline exceeded"
-            );
-            match self.discovery_poll(ticket) {
-                Ok(DiscoveryPoll::Complete) => break,
-                Ok(DiscoveryPoll::Demand(demand)) => {
-                    inputs.discovery(self, ticket, demand, deadline, policy.renewal_interval)?;
-                    idle = Duration::from_millis(5);
-                    continue;
-                }
-                Ok(DiscoveryPoll::Waiting) => {}
-                Err(error) if retryable_transport_error(&error) => {
-                    debug!("retrying live discovery poll: {error:#}")
-                }
-                Err(error) => return Err(error),
-            }
-            thread::sleep(idle);
-            idle = (idle * 2).min(Duration::from_millis(50));
         }
         Ok(())
     }
@@ -1212,7 +1088,7 @@ pub(super) fn verify_destinations(
     ensure!(
         destinations
             .keys()
-            .all(|name| spec.output_kind(name).is_some()),
+            .all(|name| spec.outputs.contains_key(name)),
         "native output destination is not declared"
     );
     let mut seen = BTreeSet::new();
@@ -1233,11 +1109,7 @@ pub(super) fn verify_destinations(
                 .all(|other: &PathBuf| !path.starts_with(other) && !other.starts_with(&path)),
             "native output destination paths overlap"
         );
-        if spec
-            .output_kind(name)
-            .context("undeclared output destination")?
-            .is_tree()
-        {
+        if spec.outputs[name].kind.is_tree() {
             match fs::symlink_metadata(&path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Ok(_) => bail!("native tree output destination must not exist"),
@@ -1319,7 +1191,6 @@ mod result_tests {
         }
         let intermediate = intermediate.prepare()?;
         let spec = ExecutionSpec {
-            discovery: None,
             compiler_result: None,
             working_inputs: Default::default(),
             scratch: Default::default(),

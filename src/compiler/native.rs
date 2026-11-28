@@ -912,7 +912,6 @@ impl CompilerPlan {
         let compiler_result =
             result_policy.identity(key, &command, inputs[0].id(), inputs[1].manifest())?;
         let spec = ExecutionSpec {
-            discovery: None,
             compiler_result,
             working_inputs: Default::default(),
             scratch: Default::default(),
@@ -1526,13 +1525,9 @@ mod tests {
                 bubblewrap: "/usr/bin/bwrap".into(),
                 scratch: cwd.clone(),
                 timeout: Duration::from_secs(60),
-                max_discovery_metadata_bytes: 64 * 1024 * 1024,
                 max_result_bytes: 64 * 1024 * 1024,
             },
-            crate::build_runtime::ExecutionInputs {
-                trees: &leases,
-                discovery: None,
-            },
+            &leases,
             None,
             || Ok(()),
             |_| {},
@@ -1557,14 +1552,15 @@ mod tests {
             let readers = manifest
                 .blobs()?
                 .into_iter()
-                .map(|(id, _)| Ok((id, (result.open_file(id)?, result.physical_encoding(id)?))))
+                .map(|(id, _)| Ok((id, result.open_file(id)?)))
                 .collect::<Result<BTreeMap<_, _>>>()?;
+            let encoding = result.physical_encoding();
             let provider = ReferenceBlobProvider::new(move |blob| {
                 use std::os::fd::AsRawFd;
-                let (pinned, encoding) = readers.get(&blob.id).context("missing captured blob")?;
+                let pinned = readers.get(&blob.id).context("missing captured blob")?;
                 let file = std::fs::File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))?;
                 Ok(Box::new(crate::build_runtime::BlobReader::open(
-                    file, *encoding,
+                    file, encoding,
                 )?))
             });
             let cache = SourceDigestCache::default();
@@ -1592,13 +1588,9 @@ mod tests {
                         bubblewrap: "/usr/bin/bwrap".into(),
                         scratch: cwd.clone(),
                         timeout: Duration::from_secs(60),
-                        max_discovery_metadata_bytes: 64 * 1024 * 1024,
                         max_result_bytes: 64 * 1024 * 1024,
                     },
-                    crate::build_runtime::ExecutionInputs {
-                        trees: &leases,
-                        discovery: None,
-                    },
+                    &leases,
                     None,
                     || Ok(()),
                     |_| {},
@@ -1657,13 +1649,9 @@ mod tests {
                     bubblewrap: "/usr/bin/bwrap".into(),
                     scratch: cwd.clone(),
                     timeout: Duration::from_secs(60),
-                    max_discovery_metadata_bytes: 64 * 1024 * 1024,
                     max_result_bytes: 64 * 1024 * 1024,
                 },
-                crate::build_runtime::ExecutionInputs {
-                    trees: &leases,
-                    discovery: None,
-                },
+                &leases,
                 None,
                 || Ok(()),
                 |_| {},

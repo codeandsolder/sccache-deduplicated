@@ -480,42 +480,6 @@ rlib. The archive emitter still supports per-file trimming and streams
 ordinary files instead of collecting them into a buffer. The native
 input and toolchain trees use the same explicit directory normalization.
 
-### Sealed filesystem discovery replay
-
-The runtime supports read-only discovery filesystems with separate metadata,
-directory enumeration and content operations. Live discovery fetches content
-only on the first read, through ordinary CAS verification and retention.
-Directory listings record names, types and inode equivalence without hashing
-the files they enumerate. The origin seals the complete observation set,
-including negative results. Host device and inode numbers are canonicalized
-to observable equivalence classes.
-
-A sealed discovery bundle is an ordinary CAS tree containing the canonical
-transcript and references to its unique read content blobs. An
-`ExecutionSpec.discovery` declaration identifies this tree and its logical
-mountpoints, contributes to the exact action fingerprint, and uses the
-standard input admission and delivery protocol. Workers mount the admitted
-bundle through FUSE inside Bubblewrap. Replay cannot query the origin.
-An unobserved operation or incomplete replay prevents result publication,
-even if the compiler ignored the filesystem error and exited successfully.
-
-Live observation is a unique, refresh-only action. Its discovery declaration
-contains logical roots and a nonce; it returns the reserved discovery tree
-artifact, not a reusable compiler result. The assigned worker uses a
-sequenced scheduler mailbox to request logical observations. Only the
-originating authenticated client can respond. Content delivery is authorized
-by a recorded file observation and uses the ordinary verified CAS tree
-transfer. The scheduler verifies the origin seal and the resulting bundle
-manifest before accepting publication. No origin credentials or physical
-paths enter the compiler namespace.
-
-Discovery mounts currently require disjoint, empty mountpoints in the
-immutable root. Writable output and scratch regions remain separate.
-The direct native client can service live discovery; namespace IPC, compiler
-planner integration, and indexing previously sealed transcripts for refresh
-are still under development. The ordinary compiler planner does not yet
-request live bundles.
-
 ## Validation
 
 The runtime crate has focused tests for identity, import, tree capture,

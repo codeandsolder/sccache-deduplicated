@@ -28,12 +28,9 @@ use rustix::{
 };
 
 use crate::{
-    Artifact, BlobEncoding, BlobRef, BuildPath, ContentId, DISCOVERY_RESULT, DiscoverySource,
-    ExecutionSpec, MountedTree, NativeStore, OutputKind, ResultManifest, StageBudget, StagedBlob,
-    TreeEntry, TreeId, TreeLease, TreeManifest, TreePath,
-    discovery::{
-        DiscoveredInputs, DiscoveryBundle, DiscoveryMount, DiscoverySession, DiscoveryTransport,
-    },
+    Artifact, BlobEncoding, BlobRef, BuildPath, ContentId, ExecutionSpec, MountedTree, NativeStore,
+    OutputKind, ResultManifest, StageBudget, StagedBlob, TreeEntry, TreeId, TreeLease,
+    TreeManifest, TreePath,
     sandbox::{MountAccess, SandboxInvocation, SandboxPath, SandboxPlan},
     store::CapturedStage,
 };
@@ -49,7 +46,6 @@ pub struct ExecutionPolicy {
     pub scratch: PathBuf,
     pub timeout: Duration,
     pub max_result_bytes: u64,
-    pub max_discovery_metadata_bytes: u64,
 }
 
 /// Actual execution boundaries, including failures before output capture.
@@ -72,7 +68,6 @@ pub struct CapturedExecution {
     files: BTreeMap<ContentId, Arc<File>>,
     staged: BTreeMap<ContentId, CapturedStage>,
     encoding: BlobEncoding,
-    discovery_bundle: Option<TreeLease>,
 }
 
 /// Wall-clock phase durations of a native action. Process time includes
@@ -135,20 +130,12 @@ impl CapturedExecution {
     /// # Errors
     /// Returns an error for an undeclared blob or descriptor failure.
     pub fn open_blob(&self, id: ContentId) -> Result<impl Read + Send + 'static> {
-        crate::BlobReader::open(self.open_file(id)?, self.physical_encoding(id)?)
+        crate::BlobReader::open(self.open_file(id)?, self.encoding)
     }
 
     #[must_use = "result transport must advertise the physical encoding actually captured"]
-    /// # Errors
-    /// Returns an error for an undeclared output blob.
-    pub fn physical_encoding(&self, id: ContentId) -> Result<BlobEncoding> {
-        if self.files.contains_key(&id) {
-            return Ok(self.encoding);
-        }
-        self.discovery_bundle
-            .as_ref()
-            .context("uncaptured result blob")?
-            .physical_encoding(id)
+    pub const fn physical_encoding(&self) -> BlobEncoding {
+        self.encoding
     }
 
     /// Open the immutable physical CAS representation without decoding it,
@@ -157,13 +144,7 @@ impl CapturedExecution {
     /// # Errors
     /// Returns an error for undeclared content or descriptor failure.
     pub fn open_file(&self, id: ContentId) -> Result<File> {
-        let Some(file) = self.files.get(&id) else {
-            return self
-                .discovery_bundle
-                .as_ref()
-                .context("uncaptured result blob")?
-                .open_file(id);
-        };
+        let file = self.files.get(&id).context("uncaptured result blob")?;
         // A dup shares the original open-file description and seek cursor.
         // Reopening the pinned descriptor provides an independent cursor even
         // after the captured file was unlinked from its temporary directory.
@@ -381,7 +362,6 @@ struct PreparedBuild {
     plan: SandboxPlan,
     outputs: BTreeMap<String, OutputLocation>,
     _views: BTreeMap<BuildPath, MountedTree>,
-    discovery: Option<(DiscoverySession, Vec<DiscoveryMount>)>,
 }
 
 fn host_path(bytes: &[u8]) -> &Path {
@@ -594,13 +574,10 @@ impl PreparedBuild {
     fn prepare(
         spec: &ExecutionSpec,
         store: &NativeStore,
-        policy: &ExecutionPolicy,
-        inputs: ExecutionInputs<'_>,
+        scratch: &Path,
+        inputs: &[Arc<TreeLease>],
     ) -> Result<Self> {
-        let scratch = &policy.scratch;
-        let admitted = admitted_inputs(spec, store, inputs.trees)?;
-        let live_transport = inputs.discovery;
-        let inputs = admitted;
+        let inputs = admitted_inputs(spec, store, inputs)?;
         let root_point = BuildPath::new(b"/".to_vec())?;
         let mut leases: BTreeMap<BuildPath, Arc<TreeLease>> = spec
             .mounts
@@ -625,21 +602,6 @@ impl PreparedBuild {
             b"/dev",
         ]) {
             require_directory(root, host_path(&path[1..]))?;
-        }
-        // A replay mount must not hide declared immutable files. The root
-        // supplies only its mountpoint; all visible entries are observed.
-        if let Some(discovery) = &spec.discovery {
-            for path in &discovery.mounts {
-                let relative = &path.as_bytes()[1..];
-                require_directory(root, host_path(relative))?;
-                ensure!(
-                    !root.manifest().entries.keys().any(|entry| entry
-                        .as_bytes()
-                        .strip_prefix(relative)
-                        .is_some_and(|suffix| suffix.starts_with(b"/"))),
-                    "discovery mount hides immutable root inputs"
-                );
-            }
         }
         let writable = writable_locations(spec, &leases)?;
         // Reuse immutable native-ZFS CoW tree views (or compressed FUSE
@@ -702,45 +664,6 @@ impl PreparedBuild {
             )?;
         }
         bind_file_overlays(&mut plan, &views)?;
-        let discovery = if let Some(discovery) = &spec.discovery {
-            let session = match discovery.source {
-                DiscoverySource::Sealed(tree) => {
-                    ensure!(
-                        live_transport.is_none(),
-                        "sealed replay cannot have a live origin"
-                    );
-                    let lease = inputs
-                        .get(&tree)
-                        .context("missing admitted discovery package")?;
-                    let bundle = DiscoveryBundle::load(lease, policy.max_discovery_metadata_bytes)?;
-                    ensure!(
-                        bundle.roots() == &discovery.mounts,
-                        "discovery package mount set differs from action"
-                    );
-                    DiscoverySession::replay(store.clone(), bundle)?
-                }
-                DiscoverySource::Live { .. } => DiscoverySession::new(
-                    store.clone(),
-                    live_transport
-                        .context("live discovery requires an authorized origin transport")?,
-                    None,
-                )?,
-            };
-            let mut mounts = Vec::new();
-            for point in &discovery.mounts {
-                let mount = session.mount(point.clone(), scratch)?;
-                plan.bind(
-                    mount.root(),
-                    SandboxPath::new(host_path(point.as_bytes()))?,
-                    MountAccess::ReadOnly,
-                )?;
-                mounts.push(mount);
-            }
-            Some((session, mounts))
-        } else {
-            None
-        };
-
         let immutable_root = if spec.working_inputs.is_empty() {
             None
         } else {
@@ -762,17 +685,7 @@ impl PreparedBuild {
             plan,
             outputs,
             _views: views,
-            discovery,
         })
-    }
-    fn finish_discovery(&mut self) -> Result<Option<DiscoveredInputs>> {
-        if let Some((session, mounts)) = self.discovery.take() {
-            for mount in mounts {
-                mount.unmount()?;
-            }
-            return Ok(Some(session.finish()?));
-        }
-        Ok(None)
     }
 }
 
@@ -822,7 +735,14 @@ fn admitted_inputs(
     store: &NativeStore,
     inputs: &[Arc<TreeLease>],
 ) -> Result<BTreeMap<TreeId, Arc<TreeLease>>> {
-    let required = spec.action_request()?.input_trees;
+    let required: BTreeSet<_> = spec
+        .root
+        .recipe
+        .layers
+        .iter()
+        .map(|layer| layer.tree)
+        .chain(spec.mounts.values().copied())
+        .collect();
     let mut admitted = BTreeMap::new();
     for lease in inputs {
         ensure!(
@@ -863,13 +783,6 @@ pub fn acquire_execution_inputs(
         .collect()
 }
 
-/// Admitted static input leases and, only for a live observation task,
-/// the scheduler-authorized discovery channel.
-pub struct ExecutionInputs<'a> {
-    pub trees: &'a [Arc<TreeLease>],
-    pub discovery: Option<Box<dyn DiscoveryTransport>>,
-}
-
 /// Execute one immutable declared build on a worker.
 ///
 /// The progress callback is invoked while the process runs and may renew its
@@ -885,7 +798,7 @@ pub fn execute(
     spec: &ExecutionSpec,
     store: &NativeStore,
     policy: &ExecutionPolicy,
-    inputs: ExecutionInputs<'_>,
+    inputs: &[Arc<TreeLease>],
     budget: Option<StageBudget>,
     mut progress: impl FnMut() -> Result<()>,
     mut phase: impl FnMut(ExecutionPhase),
@@ -908,7 +821,7 @@ pub fn execute(
     );
     let started = Instant::now();
     progress()?;
-    let mut build = PreparedBuild::prepare(spec, store, policy, inputs)?;
+    let build = PreparedBuild::prepare(spec, store, &policy.scratch, inputs)?;
     let invocation = SandboxInvocation::from_spec(&spec.command)?;
     let stdout = tempfile::tempfile_in(&policy.scratch)?;
     let mut stderr = tempfile::tempfile_in(&policy.scratch)?;
@@ -944,7 +857,6 @@ pub fn execute(
             String::from_utf8_lossy(&diagnostic)
         )));
     }
-    let discovered = build.finish_discovery()?;
     let process = running.elapsed();
     phase(ExecutionPhase::Capture);
     progress()?;
@@ -958,33 +870,8 @@ pub fn execute(
     };
     let stdout = capture.diagnostic(stdout)?;
     let stderr = capture.diagnostic(stderr)?;
-    let mut discovery_bundle = None;
     let outputs = if status.success() {
-        if spec
-            .discovery
-            .as_ref()
-            .is_some_and(|discovery| matches!(discovery.source, DiscoverySource::Live { .. }))
-        {
-            let package = discovered
-                .context("live discovery did not return observations")?
-                .publish(store)?;
-            let bytes = package.blobs().values().try_fold(0_u64, |sum, &size| {
-                sum.checked_add(size)
-                    .context("discovery package size overflow")
-            })?;
-            ensure!(
-                bytes <= capture.remaining,
-                "native discovery result exceeds byte limit"
-            );
-            let outputs = BTreeMap::from([(
-                DISCOVERY_RESULT.into(),
-                Artifact::Tree(package.manifest().clone()),
-            )]);
-            discovery_bundle = Some(package);
-            outputs
-        } else {
-            capture.outputs(&build.outputs, spec)?
-        }
+        capture.outputs(&build.outputs, spec)?
     } else {
         BTreeMap::new()
     };
@@ -1010,7 +897,6 @@ pub fn execute(
         files: capture.files,
         staged: capture.staged,
         encoding: store.physical_encoding(),
-        discovery_bundle,
     })
 }
 

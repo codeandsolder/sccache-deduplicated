@@ -201,7 +201,6 @@ impl ManifestCatalog {
 }
 
 struct PendingAction {
-    discovery: Option<discovery::Mailbox>,
     request: ActionRequest,
     permit: CompilePermit,
     inputs: BTreeMap<TreeId, Arc<InputManifest>>,
@@ -504,9 +503,6 @@ impl Session {
                     }))
                 } else {
                     action.request.validate_output_contract(manifest)?;
-                    if let Some(discovery) = &action.discovery {
-                        discovery.verify_result(manifest)?;
-                    }
                     Ok(ResultNegotiation::Unnegotiated(action))
                 }
             }
@@ -1104,13 +1100,6 @@ impl NativeSessions {
         mode: ActionMode,
         declared: BTreeMap<TreeId, TreeManifest>,
     ) -> Result<NativeAdmission> {
-        // A live observation is not a cacheable compiler result: even a
-        // repeated nonce must not return stale origin observations.
-        let mode = if request.live_discovery.is_some() {
-            ActionMode::Refresh
-        } else {
-            mode
-        };
         let result = self.admit_inner(trace, request, publisher, mode, declared);
         self.admission_counters.record(mode, &result);
         result
@@ -1185,11 +1174,6 @@ impl NativeSessions {
                 request.root.verify(composed.id()?)?;
                 self.limits.check_blobs(Kind::Tree, &composed.blobs()?)?;
                 let pending = Pending::Action(Box::new(PendingAction {
-                    discovery: request
-                        .live_discovery
-                        .as_ref()
-                        .map(discovery::Mailbox::new)
-                        .transpose()?,
                     request,
                     permit,
                     inputs,
@@ -2684,7 +2668,6 @@ impl Drop for UploadSlot {
     }
 }
 
-mod discovery;
 mod live;
 mod recovery;
 mod retention;

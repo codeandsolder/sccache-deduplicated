@@ -184,7 +184,6 @@ mod linux {
         platform: ContentId,
     ) -> Result<ExecutionSpec> {
         Ok(ExecutionSpec {
-            discovery: None,
             compiler_result: None,
             working_inputs: Default::default(),
             scratch: Default::default(),
@@ -267,7 +266,6 @@ mod linux {
             bubblewrap: compiler_sandbox.to_owned(),
             scratch: temp_root.to_owned(),
             timeout: Duration::from_secs(90),
-            max_discovery_metadata_bytes: 64 * 1024 * 1024,
             max_result_bytes: 64 * 1024 * 1024,
         };
         for index in 0..REPETITIONS {
@@ -501,18 +499,7 @@ mod linux {
         let started = Instant::now();
         let inputs = acquire_execution_inputs(spec, store)?;
         let admission = started.elapsed();
-        let execution = execute(
-            spec,
-            store,
-            policy,
-            sccache_build::ExecutionInputs {
-                trees: &inputs,
-                discovery: None,
-            },
-            None,
-            || Ok(()),
-            |_| {},
-        )?;
+        let execution = execute(spec, store, policy, &inputs, None, || Ok(()), |_| {})?;
         let elapsed = started.elapsed();
         let timing = execution.timings();
         println!(
