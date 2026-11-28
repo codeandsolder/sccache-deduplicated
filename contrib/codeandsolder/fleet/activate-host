@@ -190,6 +190,7 @@ case "$phase" in
     [[ ! -f scheduler.conf ]] || files+=(/etc/sccache-dist/scheduler.conf "$dashboard_link")
     [[ ! -f 90-real-binary.conf ]] || files+=(/etc/systemd/system/sccache-strict-local.service.d/90-real-binary.conf)
     [[ ! -f cargo-wrapper ]] || files+=(/usr/local/bin/cargo)
+    [[ ! -f runtime-run ]] || files+=(/usr/local/bin/sccache-runtime)
     [[ ! -f sccache-cmake-launcher ]] || files+=(/usr/local/libexec/sccache-cmake-launcher)
     [[ ! -f sccache-dist-client-preflight ]] || files+=(/usr/local/libexec/sccache-dist-client-preflight)
     for f in "${state_files[@]}"; do files+=("$state/$f"); done
@@ -235,6 +236,7 @@ case "$phase" in
     install_atomic sccache-client /usr/local/libexec/sccache-client 0755
     install_atomic sccache-release-update /usr/local/libexec/sccache-release-update 0755
     install_atomic host-native-metadata /usr/local/libexec/host-native-metadata 0755
+    if [[ -f runtime-run ]]; then install_atomic runtime-run /usr/local/bin/sccache-runtime 0755; fi
     if [[ -f cargo-wrapper ]]; then install_atomic cargo-wrapper /usr/local/bin/cargo 0755; fi
     if [[ -f sccache-cmake-launcher ]]; then install_atomic sccache-cmake-launcher /usr/local/libexec/sccache-cmake-launcher 0755; fi
     if [[ -f sccache-dist-client-preflight ]]; then install_atomic sccache-dist-client-preflight /usr/local/libexec/sccache-dist-client-preflight 0755; fi

@@ -44,11 +44,17 @@ bind_dir() {
     [[ $path != /tmp ]] || { echo 'Cannot replace private runtime /tmp' >&2; exit 64; }
     local existing
     for existing in "${seen[@]}"; do
-        [[ $path == "$existing" ]] && return 0
+        [[ $path == "$existing" || $path == "$existing/"* ]] && return 0
     done
     seen+=("$path")
     mounts+=(--mount "type=bind,src=$path,dst=$path")
 }
+# Site build data must be visible at its original path. This includes
+# linked Git worktrees and Cargo targets outside the current checkout.
+bind_dir "$home"
+if [[ -d /srv/ci && -x /srv/ci ]]; then
+    bind_dir /srv/ci
+fi
 bind_dir "$workspace"
 bind_dir "$cargo_home"
 network=()
@@ -87,10 +93,10 @@ while (($#)); do
 done
 if [[ $separator != true ]] || (($# == 0)); then usage; fi
 
-# An opted-in workspace retains the exact installed host Rustup selection,
+# Managed Cargo retains the exact installed host Rustup selection,
 # but compiler processes see the common immutable system runtime. The host
 # installation is read-only and its actual bytes still enter native identity.
-# Only this separately selected mode inherits ordinary build environment.
+# The host-toolchain mode inherits ordinary build environment.
 build_env=()
 if [[ $host_toolchain == true ]]; then
     rust_home=$(realpath -e -- "${RUSTUP_HOME:-$home/.rustup}")
@@ -109,6 +115,20 @@ if [[ $host_toolchain == true ]]; then
         build_env+=(--env "$name")
     done < <(compgen -e)
     build_env+=(--env "RUSTUP_HOME=$rust_home")
+    # Keep the image's compiler and site wrappers first. Project and CI
+    # helper executables remain accessible without importing host /usr.
+    runtime_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    IFS=: read -r -a path_entries <<< "$PATH"
+    for entry in "${path_entries[@]}"; do
+        [[ $entry == /* ]] || continue
+        for directory in "${seen[@]}"; do
+            if [[ $entry == "$directory" || $entry == "$directory/"* ]]; then
+                runtime_path+=":$entry"
+                break
+            fi
+        done
+    done
+    build_env+=(--env "PATH=$runtime_path")
 fi
 
 # Refuse mutable tags, remote pulls and incompatible images. A rootless

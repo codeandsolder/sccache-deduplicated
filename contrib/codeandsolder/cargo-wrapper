@@ -1,40 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# The binary owns Cargo scratch leases and invokes the selected upstream
-# toolchain. Only the leading Rustup +toolchain selector is interpreted
-# for workspace profiles; all Cargo command arguments remain opaque.
-runtime_profile() {
-    local cwd="$1" file="$2" root
-    [[ -r $file ]] || return 1
-    while IFS= read -r root || [[ -n $root ]]; do
-        [[ $root == /* && $root != / && $root != */ ]] || continue
-        if [[ $cwd == "$root" || $cwd == "$root/"* ]]; then
-            return 0
-        fi
-    done < "$file"
-    return 1
-}
+# The managed site always builds within one common immutable runtime.
+# Nested Cargo invocations already share that runtime. Cargo's remaining
+# command line is opaque to this launcher.
 cargo_wrapper_main() {
-    local binary="$1"
-    shift
-    if [[ ! -e /run/sccache-runtime-session && -x /usr/local/bin/sccache-runtime ]] &&
-        runtime_profile "$(pwd -P)" /etc/sccache/runtime-workspaces; then
-        local selection
-        if [[ ${1:-} == +* ]]; then
-            selection="${1:1}"
-            shift
-        else
-            selection=$(rustup show active-toolchain)
-            selection="${selection%% *}"
-        fi
-        # Resolve the selected compiler without installing or updating it.
-        rustup which --toolchain "$selection" rustc >/dev/null
-        exec /usr/local/bin/sccache-runtime --host-toolchain --leased-intermediates -- cargo "+$selection" "$@"
+    local binary="$1" runtime="$2" marker="$3"
+    shift 3
+    if [[ -e $marker ]]; then
+        exec "$binary" --cargo-final -- "$@"
     fi
-    exec "$binary" --cargo-final -- "$@"
+    if [[ ! -x $runtime ]]; then
+        printf 'Managed compiler runtime is unavailable: %s\n' "$runtime" >&2
+        return 69
+    fi
+    local selection
+    if [[ ${1:-} == +* ]]; then
+        selection="${1:1}"
+        shift
+    else
+        selection=$(rustup show active-toolchain)
+        selection="${selection%% *}"
+    fi
+    # Resolve exactly the toolchain the caller selected, without replacing
+    # it with the image's bundled toolchain.
+    rustup which --toolchain "$selection" rustc >/dev/null
+    exec "$runtime" --host-toolchain --leased-intermediates -- cargo "+$selection" "$@"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    cargo_wrapper_main /usr/local/bin/sccache "$@"
+    cargo_wrapper_main /usr/local/bin/sccache /usr/local/bin/sccache-runtime /run/sccache-runtime-session "$@"
 fi

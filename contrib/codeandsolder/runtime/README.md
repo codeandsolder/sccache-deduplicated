@@ -86,12 +86,12 @@ The rootful build runtime is intended for trusted build work, not as a
 security boundary for untrusted code. It does not expose the Docker socket
 inside the container.
 
-The runtime provides the pinned Rustup toolchain; a project that requires
-another Rust version or additional native system packages needs a separate
-explicitly built, pinned image. CUDA, unusual cross-compilers and arbitrary
-host-only toolchains are not silently injected. The site host-native
-launcher remains independent until the relevant projects have passed
-runtime acceptance.
+The managed Cargo launcher uses the common runtime by default, mounting
+the original installed Rustup toolchain read-only. Native system packages
+and the compiler execution environment are supplied by the immutable
+image. CUDA, unusual cross-compilers and arbitrary host-only toolchains
+are not silently injected; additional system packages belong in the
+shared image.
 
 ## Acceptance
 
@@ -109,23 +109,18 @@ plain compiler actions, and matching artifact hashes. Build outputs are
 removed after the test; sources, reports and logs are retained. The CLI
 regression `test-run` does not require Docker or managed services.
 
-## Site workspace profiles
+## Default managed Cargo execution
 
-A verified workspace can use the installed common runtime automatically
-through the managed Cargo launcher. Add the absolute workspace directory
-(or a deliberately selected parent containing its worktrees) as one line
-in the administrator-maintained `/etc/sccache/runtime-workspaces`. Match
-is on directory boundaries, not arbitrary string prefixes. Install the
-matching `cargo-wrapper` and runtime runner. Nested Cargo runs inside the
-runtime do not start a second container.
+Install the runtime runner, its immutable image ID and the managed
+`cargo-wrapper` on each build-submitting host. Every top-level managed
+Cargo invocation uses this runtime, with the original Rustup selection.
+Nested Cargo invocations recognize the mounted runtime marker and use
+the existing lease launcher directly. A missing runtime is a provisioning
+error, not a reason to fall back to host-native compilation.
 
-This mode mounts the caller's existing Rustup home read-only and retains
-the caller-selected installed toolchain, including an explicit
-`+toolchain` or workspace override. It inherits the ordinary build
-environment except for host runtime paths and managed transport settings.
-The image controls the system runtime and native toolchain. Verify all
-required native packages, path dependencies and externally configured
-output locations before enabling a workspace profile. Workspaces not
-listed continue to run host-native. An opted-in workspace fails normally
-if its configured runtime is unavailable; it does not silently change
-execution identity by falling back to the host.
+The build data mounts cover the caller's home and the managed CI tree
+`/srv/ci`, preserving campaign Rustup aliases, sibling worktrees, path
+dependencies and external Cargo targets in those trees. Additional
+data roots can be explicitly bound when using the runtime runner.
+The selected Rustup home is read-only. The image's system PATH precedes
+project and CI helper directories; host system libraries are not imported.
