@@ -66,7 +66,7 @@ jsonwebtoken-btls = { git = "https://github.com/codeandsolder/btls-fast.git", re
 libc = "0.2.153"
 lru = "0.19"
 log = "0.4"
-lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "a97f149e673c45c795a8176667f379c1bf215327", optional = true }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "3cdf30cf748beffd2cec9078a8821d78f4912bef", optional = true }
 memchr = "2"
 mime = "0.3"
 opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"], optional = true }
@@ -139,7 +139,7 @@ thirtyfour = "0.38"
 # Cargo unifies this feature with all Wreq/TLS users in the same graph.
 [target.'cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))'.dependencies]
 wreq = { workspace = true, optional = true, features = ["static-cxx-runtime"] }
-lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "a97f149e673c45c795a8176667f379c1bf215327", optional = true, features = ["static-cxx-runtime"] }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "3cdf30cf748beffd2cec9078a8821d78f4912bef", optional = true, features = ["static-cxx-runtime"] }
 jsonwebtoken-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "53c46285a85742dc8c3ab48fbb66613da6b4a297", optional = true, features = ["static-cxx-runtime"] }
 
 [target.'cfg(unix)'.dependencies]
