@@ -3675,7 +3675,7 @@ mod scheduler_tests {
         let platform = ContentId::of(b"native-test");
         scheduler.handle_heartbeat_server(
             a,
-            nonce_a,
+            nonce_a.clone(),
             0.0,
             &[],
             Box::new(TestJobAuthorizer),
@@ -3796,6 +3796,28 @@ mod scheduler_tests {
             AllocJobResult::Fail { .. }
         ));
         scheduler.handle_update_job_state(job_alloc.job_id, a, JobState::Complete)?;
+        // The terminal result occupies a reservation until the worker acknowledges it.
+        scheduler.handle_heartbeat_server(
+            a,
+            nonce_a,
+            0.0,
+            &[second.job_id],
+            Box::new(TestJobAuthorizer),
+            dist::WorkerCapabilities {
+                archive: false,
+                native_platform: Some(platform),
+                native_placement: Some(dist::NativePlacement {
+                    queue: dist::NativeQueueSnapshot {
+                        capacity: 2,
+                        compiler_slots: 1,
+                        staging_slots: 2,
+                        publication_slots: 2,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            },
+        )?;
         let AllocJobResult::Success { job_alloc, .. } =
             tokio::time::timeout(Duration::from_secs(5), waiting).await??
         else {
