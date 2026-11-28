@@ -72,7 +72,16 @@ check-cfg declarations by name and value; any-value dominates finite sets,
 and any-name disables exhaustive names without disabling value checking.
 Use the parsed sets, not their CLI order, grouping, or literal spelling.
 Retain distinct enabled/disabled checking, empty value sets and bare cfg
-predicates. The original options still go to rustc for validation/diagnostics.
+predicates. The original options still go to rustc for validation/diagnostics. An
+omitted target and explicit host target identify the same compiler result.
+Explicit JSON targets use the canonical file stem and selected file contents,
+not the path spelling. Named targets use the compiler-reported built-in list,
+then the first matching `RUST_TARGET_PATH` file or installed target spec;
+only the selected specification participates. Preserve observed search-path
+environment values, otherwise retain only the selected directory for execution.
+Physical input layout preserves JSON aliases whose resolved names lack the
+`.json` suffix. Target specifications discovered again by tracing are not
+hashed a second time.
 Native nightly metadata-only and rlib-only results key the binary operands
 selected by rustc, not all explicit extern candidate files. A separate rlib
 supplied alongside selected rmeta contributes no digest; an entirely unused

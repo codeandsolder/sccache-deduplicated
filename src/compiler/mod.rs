@@ -52,6 +52,7 @@ mod rust_key_cfg;
 #[cfg(target_os = "linux")]
 pub mod rust_link;
 mod rust_response;
+mod rust_target;
 mod tasking_vx;
 #[macro_use]
 mod counted_array;

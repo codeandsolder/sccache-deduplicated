@@ -2867,6 +2867,97 @@ fn run_rust_argument_audit(
     Ok(())
 }
 
+/// Rustc keys explicit JSON targets by resolved stem and contents, and
+/// searches named custom targets in order without reporting them in dep-info.
+fn run_rust_target_audit(
+    service: &LocalService,
+    root: &Path,
+    rustc: &Path,
+    config: &Path,
+) -> Result<()> {
+    let directory = root.join("target-audit");
+    fs::create_dir_all(directory.join("one"))?;
+    fs::create_dir_all(directory.join("two"))?;
+    fs::create_dir_all(directory.join("build"))?;
+    fs::write(
+        directory.join("probe.rs"),
+        b"#![feature(no_core)]\n#![no_core]\n",
+    )?;
+    let specification = Command::new(rustc)
+        .args(["-Zunstable-options", "--print", "target-spec-json"])
+        .output()?;
+    ensure!(
+        specification.status.success(),
+        "cannot obtain host target spec"
+    );
+    for path in [
+        "one/alpha.json",
+        "two/alpha.json",
+        "two/beta.json",
+        "one/alpha.spec",
+    ] {
+        fs::write(directory.join(path), &specification.stdout)?;
+    }
+    std::os::unix::fs::symlink("alpha.spec", directory.join("one/alias.json"))?;
+    let compile = |target: &str, search: &str| -> Result<((String, String), Vec<u8>)> {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .arg(rustc)
+            .args([
+                "--crate-name",
+                "target_audit",
+                "--crate-type",
+                "rlib",
+                "--edition=2024",
+                "--emit=metadata",
+                "--out-dir",
+                "build",
+                "-Zunstable-options",
+                "--target",
+                target,
+                "probe.rs",
+            ])
+            .current_dir(&directory)
+            .env("SCCACHE_CONF", config)
+            .env("RUST_TARGET_PATH", search)
+            .env("SCCACHE_LOG", "sccache::native_action=info")
+            .output()?;
+        Ok((
+            action_report(&output)?,
+            fs::read(directory.join("build/libtarget_audit.rmeta"))?,
+        ))
+    };
+    let ((explicit, source), first) = compile("one/alias.json", "one:two")?;
+    assert_eq!(source, "worker");
+    let ((same, source), second) = compile("two/alpha.json", "two:one")?;
+    assert_eq!((same, source), (explicit.clone(), "hit".into()));
+    assert_eq!(first, second);
+    let ((alias, source), alias_bytes) = compile("one/alpha.json", "two:one")?;
+    assert_eq!((alias, source), (explicit.clone(), "hit".into()));
+    assert_eq!(first, alias_bytes);
+    let ((beta, source), _) = compile("two/beta.json", "one:two")?;
+    assert_eq!(source, "worker");
+    assert_ne!(explicit, beta);
+    let ((named, source), first_named) = compile("alpha", "one:two")?;
+    assert_eq!(source, "worker");
+    assert_ne!(explicit, named);
+    let ((same, source), second_named) = compile("alpha", "two:one")?;
+    assert_eq!((same, source), (named.clone(), "hit".into()));
+    assert_eq!(first_named, second_named);
+    let mut changed: serde_json::Value = serde_json::from_slice(&specification.stdout)?;
+    changed["max-atomic-width"] = serde_json::json!(32);
+    fs::write(
+        directory.join("two/alpha.json"),
+        serde_json::to_vec(&changed)?,
+    )?;
+    let ((same, source), _) = compile("alpha", "one:two")?;
+    assert_eq!((same, source), (named.clone(), "hit".into()));
+    let ((different, source), _) = compile("alpha", "two:one")?;
+    assert_eq!(source, "worker");
+    assert_ne!(different, named);
+    Ok(())
+}
+
 /// The epoch affects C only through the expansion that the compiler consumes.
 /// Equal expanded dates must share a result even when the epochs differ.
 fn run_c_epoch_audit(service: &LocalService, root: &Path, config: &Path) -> Result<()> {
@@ -3335,6 +3426,7 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     );
     run_environment_audit(&service, &direct, &rustc, &direct_config)?;
     run_rust_argument_audit(&service, &direct, &rustc, &direct_config)?;
+    run_rust_target_audit(&service, &direct, &rustc, &direct_config)?;
     assert_eq!(service.stats()?.dist_errors, 0);
     service.stop()?;
     let (scheduler, worker) = fleet.finish()?;

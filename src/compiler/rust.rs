@@ -258,6 +258,9 @@ pub struct RustCompilation {
     executable: PathBuf,
     /// The host triple for this rustc.
     host: String,
+    /// Effective target tuple, resolved before canonical path relocation.
+    #[cfg(feature = "dist-client")]
+    target: String,
     /// The sysroot for this rustc
     sysroot: PathBuf,
     /// A shared, caching reader for rlib dependencies
@@ -353,7 +356,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"20";
+const CACHE_VERSION: &[u8] = b"21";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -904,14 +907,14 @@ fn hashes_in_canonical_path_order(
 /// Its name-to-content binding already identifies it; only independently
 /// discovered inputs belong in the source group. Keep the original file
 /// list for the execution manifest.
-fn rust_source_key_hashes(
+fn rust_source_key_hashes<'a>(
     paths: &[PathBuf],
     hashes: Vec<String>,
-    externs: &[PathBuf],
+    explicit_inputs: impl IntoIterator<Item = &'a PathBuf>,
     canonical: Option<&CanonicalRustPaths>,
 ) -> Vec<String> {
-    let explicit = externs
-        .iter()
+    let explicit = explicit_inputs
+        .into_iter()
         .flat_map(|path| iter::once(path.clone()).chain(path.canonicalize().ok()))
         .collect::<HashSet<_>>();
     let (paths, hashes): (Vec<_>, Vec<_>) = paths
@@ -1189,6 +1192,7 @@ fn rust_execution_variable(name: &OsStr, clippy: bool) -> bool {
             "PATH"
                 | "LD_LIBRARY_PATH"
                 | "SOURCE_DATE_EPOCH"
+                | "RUST_TARGET_PATH"
                 | "CARGO"
                 | "CARGO_MANIFEST_DIR"
                 | "CARGO_MANIFEST_PATH"
@@ -1628,24 +1632,24 @@ fn thin_archive_members_visible(
     })
 }
 
-fn compilation_target(arguments: &[Argument<ArgData>], host: &str) -> String {
+fn compilation_target(arguments: &[Argument<ArgData>], host: &str, cwd: &Path) -> Result<String> {
     for arg in arguments.iter().rev() {
         match arg.get_data() {
-            Some(Target(ArgTarget::Name(target))) => return target.clone(),
-            Some(Target(ArgTarget::Path(_) | ArgTarget::Unsure(_))) => {
-                return "custom-target".to_owned();
+            Some(Target(ArgTarget::Name(target))) => return Ok(target.clone()),
+            Some(Target(ArgTarget::Path(path))) => {
+                return super::rust_target::tuple_from_path(&cwd.join(path).canonicalize()?);
             }
             _ => {}
         }
     }
-    host.to_owned()
+    Ok(host.to_owned())
 }
 
 // Bump this whenever RustToolchainPackager changes which files it archives or
 // where they appear. The weak map persists across sccache upgrades, so the
 // package format must participate in the weak key independently of compile
 // cache versioning.
-const RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA: &[u8] = b"rust-dist-toolchain-package-v3";
+const RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA: &[u8] = b"rust-dist-toolchain-package-v4";
 
 fn dist_toolchain_weak_key_with_schema(
     compiler_shlibs_digests: &[String],
@@ -2597,25 +2601,15 @@ impl IntoArg for ArgExtern {
 enum ArgTarget {
     Name(String),
     Path(PathBuf),
-    Unsure(OsString),
 }
 impl FromArg for ArgTarget {
     fn process(arg: OsString) -> ArgParseResult<Self> {
         // Is it obviously a json file path?
-        if Path::new(&arg).extension().is_some_and(|ext| ext == "json") {
+        if arg.to_str().is_some_and(|value| value.ends_with(".json")) {
             return Ok(Self::Path(arg.into()));
         }
-        // Time for clever detection - if we append .json (even if it's clearly
-        // a directory, i.e. resulting in /my/dir/.json), does the path exist?
-        let mut path = arg.clone();
-        path.push(".json");
-        if Path::new(&path).is_file() {
-            // Unfortunately, we're now not sure what will happen without having
-            // a list of all the built-in targets handy, as they don't get .json
-            // auto-added for target json discovery
-            return Ok(Self::Unsure(arg));
-        }
-        // The file doesn't exist so it can't be a path, safe to assume it's a name
+        // rustc interprets only a .json suffix as an explicit path. Other
+        // names use its built-in-first target search, including custom names.
         Ok(Self::Name(
             arg.into_string().map_err(ArgParseError::InvalidUnicode)?,
         ))
@@ -2626,14 +2620,12 @@ impl IntoArg for ArgTarget {
         match self {
             Self::Name(s) => s.into(),
             Self::Path(p) => p.into(),
-            Self::Unsure(s) => s,
         }
     }
     fn into_arg_string(self, transformer: PathTransformerFn<'_>) -> ArgToStringResult {
         Ok(match self {
             Self::Name(s) => s,
             Self::Path(p) => p.into_arg_string(transformer)?,
-            Self::Unsure(s) => s.into_arg_string(transformer)?,
         })
     }
 }
@@ -2865,9 +2857,14 @@ fn parse_arguments(
             }
             Some(PassThrough(_)) => (),
             Some(Target(target)) => match target {
-                ArgTarget::Path(json_path) => target_json = Some(json_path.to_owned()),
-                ArgTarget::Unsure(_) => cannot_cache!("target unsure"),
-                ArgTarget::Name(name) => target_name = Some(name.clone()),
+                ArgTarget::Path(json_path) => {
+                    target_json = Some(json_path.to_owned());
+                    target_name = None;
+                }
+                ArgTarget::Name(name) => {
+                    target_json = None;
+                    target_name = Some(name.clone());
+                }
             },
             None => {
                 match arg {
@@ -3295,6 +3292,32 @@ where
         )))]
         let compiler_shlibs_digests = Cow::Borrowed(self.compiler_shlibs_digests.as_slice());
         let mut effective_arguments = self.parsed_args.arguments.clone();
+        // rustc canonicalizes explicit JSON paths before deriving the target
+        // tuple from the file stem. Package that same resolved file, not a
+        // symlink alias whose filename would change the worker's crate hash.
+        let explicit_target = self
+            .parsed_args
+            .target_json
+            .as_ref()
+            .map(|path| cwd.join(path).canonicalize())
+            .transpose()?;
+        // A JSON-suffixed alias can resolve to a file without that suffix.
+        // Keep its original spelling and physical symlink topology in that
+        // case: rustc must first recognize the argument as a JSON path.
+        let explicit_alias = explicit_target
+            .as_ref()
+            .is_some_and(|path| !path.to_str().is_some_and(|value| value.ends_with(".json")));
+        if let Some(path) = &explicit_target {
+            for argument in &mut effective_arguments {
+                if let Argument::WithValue(_, Target(ArgTarget::Path(operand)), _) = argument {
+                    *operand = if explicit_alias {
+                        cwd.join(&*operand)
+                    } else {
+                        path.clone()
+                    };
+                }
+            }
+        }
         let needs_literal_argfile = effective_arguments
             .iter()
             .flat_map(|arg| arg.iter_os_strings())
@@ -3302,7 +3325,35 @@ where
         let native_target = native_target_requested(&effective_arguments);
         let native_tune = native_tune_requested(&effective_arguments);
         let native_requested = native_target || native_tune;
-        let target = compilation_target(&effective_arguments, &self.host);
+        let target = compilation_target(&effective_arguments, &self.host, &cwd)?;
+        let named_target = if explicit_target.is_none() && target != self.host {
+            let unstable_options = effective_arguments.iter().any(|arg| {
+                matches!(arg.get_data(), Some(Unstable(ArgUnstable { opt, .. })) if opt == "unstable-options")
+            });
+            super::rust_target::TargetQuery {
+                creator,
+                executable: &self.executable,
+                target: &target,
+                compiler_digests: &compiler_shlibs_digests,
+                cwd: &cwd,
+                environment: &env_vars,
+                unstable_options,
+            }
+            .discover()
+            .await?
+        } else {
+            None
+        };
+        let target_spec = explicit_target
+            .as_ref()
+            .or_else(|| named_target.as_ref().map(|spec| &spec.path));
+        let target_key = if explicit_target.is_some() {
+            Some(OsString::from(format!("{target}.json")))
+        } else if target != self.host {
+            Some(OsString::from(&target))
+        } else {
+            None
+        };
         // Worker and bubblewrap argv are currently raw. Keep literal @
         // operands in the local response-file-aware path.
         let mut allow_dist = !needs_literal_argfile;
@@ -3320,14 +3371,9 @@ where
                         }
                         _ => None,
                     });
-            let target_json = self
-                .parsed_args
-                .target_json
-                .as_ref()
-                .map(|path| cwd.join(path));
             super::rust_dlltool::discover(
                 &target,
-                target_json.as_deref(),
+                target_spec.map(PathBuf::as_path),
                 explicit,
                 &env_vars,
                 &cwd,
@@ -3377,7 +3423,7 @@ where
         };
 
         if native_requested && may_dist && allow_dist {
-            if target != self.host {
+            if target != self.host || target_spec.is_some() {
                 allow_dist = false;
                 warn!(
                     "distributed Rust native CPU request targets {target}; compiling locally because native resolution is only proven for host target {}",
@@ -3477,20 +3523,18 @@ where
         let output_dir = cwd.join(&self.parsed_args.output_dir);
         let canonical_output_dir =
             super::canonical_paths::physical_operand(&cwd, &self.parsed_args.output_dir);
-        let cargo_target = self
-            .parsed_args
-            .arguments
-            .iter()
-            .rev()
-            .find_map(|argument| match argument.get_data() {
-                Some(Target(ArgTarget::Name(name))) => Some(OsStr::new(name)),
-                Some(Target(ArgTarget::Path(path))) => Some(path.as_os_str()),
-                Some(Target(ArgTarget::Unsure(name))) => Some(name.as_os_str()),
-                _ => None,
-            });
+        let cargo_target =
+            effective_arguments
+                .iter()
+                .rev()
+                .find_map(|argument| match argument.get_data() {
+                    Some(Target(ArgTarget::Name(name))) => Some(OsStr::new(name)),
+                    Some(Target(ArgTarget::Path(_))) => Some(OsStr::new(&target)),
+                    _ => None,
+                });
         let mut canonical_paths = canonical_output_dir
             .as_ref()
-            .filter(|_| !needs_literal_argfile)
+            .filter(|_| !needs_literal_argfile && !explicit_alias)
             .and_then(|output_dir| {
                 CanonicalRustPaths::from_env_with_output_dir(
                     &env_vars,
@@ -3616,11 +3660,16 @@ where
             if native_discovery && (opaque || !binary_dependencies) {
                 let mut previous = None;
                 loop {
-                    let execution = compiler_execution_environment(
+                    let mut execution = compiler_execution_environment(
                         &env_vars,
                         &observed,
                         &self.parsed_args.crate_name,
                         is_clippy_driver(&self.executable),
+                    );
+                    super::rust_target::normalize_search_environment(
+                        &mut execution,
+                        &observed,
+                        named_target.as_ref(),
                     );
                     if previous.as_ref() == Some(&execution) {
                         break;
@@ -3730,24 +3779,23 @@ where
             .cloned()
             .collect::<Vec<_>>();
         let archive_target = if !abs_staticlibs.is_empty() && !self.parsed_args.crate_types.cdylib {
-            macho_archive_target(&target, self.parsed_args.target_json.as_deref(), &cwd)
+            macho_archive_target(&target, target_spec.map(PathBuf::as_path), &cwd)
         } else {
             None
         };
         let staticlib_hashes = hash_all_archives(&abs_staticlibs, pool, archive_target);
 
-        // Hash the content of the specified target json file, if any.
-        let mut target_json_files = Vec::new();
-        if let Some(path) = &self.parsed_args.target_json {
-            trace!(
-                "[{}]: hashing target json file {}",
-                self.parsed_args.crate_name,
-                path.display()
-            );
-            let abs_target_json = cwd.join(path);
-            target_json_files.push(abs_target_json);
-        }
-
+        // The selected target specification is a real compiler input;
+        // rustc binary dep-info does not report it.
+        let target_json_files = if explicit_alias {
+            self.parsed_args
+                .target_json
+                .iter()
+                .map(|path| cwd.join(path))
+                .collect::<Vec<_>>()
+        } else {
+            target_spec.into_iter().cloned().collect::<Vec<_>>()
+        };
         let target_json_hash = hash_all(&target_json_files, pool);
 
         // Output filenames depend on crate type, target and naming flags, not
@@ -3829,6 +3877,22 @@ where
             canonical_paths = None;
         }
 
+        let mut env_vars = env_vars;
+        if native_discovery {
+            super::rust_target::normalize_search_environment(
+                &mut env_vars,
+                &env_dep_names,
+                named_target.as_ref(),
+            );
+            if canonical_paths.as_ref().is_some_and(|paths| {
+                named_target
+                    .as_ref()
+                    .is_some_and(|spec| !spec.canonical_visible(paths, &cwd, &env_dep_names))
+            }) {
+                debug!("Named Rust target search requires physical input layout");
+                canonical_paths = None;
+            }
+        }
         let observes_relocated_environment = canonical_paths.as_ref().is_some_and(|canonical| {
             let mapped = canonical.env_to_canonical(&env_vars);
             env_dep_names.iter().any(|name| {
@@ -3911,7 +3975,7 @@ where
             rust_source_key_hashes(
                 &source_files,
                 source_hashes,
-                &abs_externs,
+                abs_externs.iter().chain(target_json_files.iter()),
                 canonical_paths.as_ref(),
             )
         } else {
@@ -4030,10 +4094,8 @@ where
         };
         // rustc parses independent codegen fields and output/cfg sets. Key
         // their effective representation rather than their raw spelling.
-        let key_arguments = super::rust_key_arguments::normalize(
-            &hash_os_string_arguments,
-            self.parsed_args.target_json.is_some(),
-        );
+        let key_arguments =
+            super::rust_key_arguments::normalize(&hash_os_string_arguments, target_key.as_deref());
         m.audit_field("sccache.key.arguments");
         hash_rust_argument_pairs(&mut m, key_arguments.len(), key_arguments.iter());
         let hashed_argument_pairs = shadow_log_path.is_some().then(|| {
@@ -4432,6 +4494,8 @@ where
             compilation: Box::new(RustCompilation {
                 executable: self.executable.clone(),
                 host: self.host.clone(),
+                #[cfg(feature = "dist-client")]
+                target,
                 sysroot: self.sysroot.clone(),
                 arguments,
                 inputs,
@@ -4852,7 +4916,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             canonical_paths,
             dlltool_files,
             host,
-            arguments,
+            target,
             executable,
             cwd,
             ..
@@ -4922,7 +4986,6 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             rlib_dep_reader,
         });
         let canonical = canonical_paths.is_some();
-        let target = compilation_target(&arguments, &host);
         let toolchain_packager = Box::new(RustToolchainPackager {
             #[cfg(all(
                 target_os = "linux",
@@ -6161,9 +6224,7 @@ impl pkg::DiscoverToolchain for RustToolchainPackager {
             let libs_path = sysroot.join(LIBS_DIR);
             let rustlib = libs_path.join("rustlib");
             if let (Some(host), Some(target)) = (host.as_deref(), target.as_deref())
-                && target != "custom-target"
                 && rustlib.join(host).is_dir()
-                && rustlib.join(target).is_dir()
             {
                 for entry in fs::read_dir(&libs_path)? {
                     let entry = entry?;
@@ -6188,7 +6249,7 @@ impl pkg::DiscoverToolchain for RustToolchainPackager {
                     }
                 }
             } else {
-                // Unknown/custom target, incomplete sysroot, or compiler-wide
+                // Incomplete sysroot or compiler-wide
                 // packaging: preserve all potentially required runtimes.
                 package_builder.add_dir_contents(&libs_path)?;
             }
@@ -9029,6 +9090,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             let compilation = RustCompilation {
                 executable: clippy.clone(),
                 host: "x86_64-unknown-linux-gnu".into(),
+                #[cfg(feature = "dist-client")]
+                target: "x86_64-unknown-linux-gnu".into(),
                 sysroot: sysroot.clone(),
                 rlib_dep_reader: None,
                 arguments: parsed.arguments,
@@ -9147,6 +9210,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let compilation = RustCompilation {
             executable: clippy,
             host: "x86_64-unknown-linux-gnu".into(),
+            #[cfg(feature = "dist-client")]
+            target: "x86_64-unknown-linux-gnu".into(),
             sysroot,
             #[cfg(feature = "dist-client")]
             rlib_dep_reader: None,
@@ -9463,6 +9528,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let compilation = RustCompilation {
             executable: sysroot.join(BINS_DIR).join("rustc"),
             host: "x86_64-unknown-linux-gnu".to_owned(),
+            #[cfg(feature = "dist-client")]
+            target: "x86_64-unknown-linux-gnu".to_owned(),
             sysroot: sysroot.clone(),
             rlib_dep_reader: None,
             arguments: parsed.arguments,
@@ -9541,6 +9608,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let compilation = RustCompilation {
             executable: sysroot.join(BINS_DIR).join("rustc"),
             host: "x86_64-unknown-linux-gnu".to_owned(),
+            #[cfg(feature = "dist-client")]
+            target: "x86_64-unknown-linux-gnu".to_owned(),
             sysroot,
             rlib_dep_reader: None,
             arguments: parsed.arguments,

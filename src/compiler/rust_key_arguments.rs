@@ -3,7 +3,7 @@
 //! still see the original options. These reductions follow rustc's parsed
 //! `CodegenOptions` fields, not the surface syntax of its CLI.
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 
 pub(super) type ArgumentPair = (OsString, Option<OsString>);
 
@@ -258,7 +258,7 @@ impl CodegenFields {
 /// ordered options, independently parsed codegen fields, and set-valued
 /// emission/cfg requests separate. -O/-g are *not* aliases for -C values:
 /// rustc tracks both the raw codegen field and the final top-level setting.
-pub(super) fn normalize(arguments: &[ArgumentPair], custom_target: bool) -> Vec<ArgumentPair> {
+pub(super) fn normalize(arguments: &[ArgumentPair], target: Option<&OsStr>) -> Vec<ArgumentPair> {
     let mut short_opt = false;
     let mut short_debug = false;
     let mut ordered = Vec::new();
@@ -268,8 +268,7 @@ pub(super) fn normalize(arguments: &[ArgumentPair], custom_target: bool) -> Vec<
     let mut fields = CodegenFields::default();
     for (flag, value) in arguments {
         match flag.to_str() {
-            Some("--extern" | "-L" | "--out-dir") => continue,
-            Some("--target") if custom_target => continue,
+            Some("--extern" | "-L" | "--out-dir" | "--target") => continue,
             Some("-O") => {
                 short_opt = true;
                 continue;
@@ -318,6 +317,9 @@ pub(super) fn normalize(arguments: &[ArgumentPair], custom_target: bool) -> Vec<
         }
         ordered.push((flag.clone(), value.clone()));
     }
+    if let Some(target) = target {
+        ordered.push(("--target".into(), Some(target.to_owned())));
+    }
     if !emit.is_empty() {
         ordered.push((
             "--emit".into(),
@@ -362,8 +364,18 @@ mod tests {
                 .iter()
                 .map(|(name, value)| ((*name).into(), value.map(OsString::from)))
                 .collect::<Vec<_>>(),
-            false,
+            None,
         )
+    }
+
+    #[test]
+    fn target_key_uses_resolved_identity() {
+        let explicit = vec![("--target".into(), Some("/checkout/alpha.json".into()))];
+        assert_eq!(normalize(&explicit, None), normalize(&[], None));
+        let alpha = normalize(&explicit, Some(OsStr::new("alpha.json")));
+        assert_eq!(alpha, normalize(&[], Some(OsStr::new("alpha.json"))));
+        assert_ne!(alpha, normalize(&explicit, Some(OsStr::new("beta.json"))));
+        assert_ne!(alpha, normalize(&explicit, Some(OsStr::new("alpha"))));
     }
 
     #[test]
