@@ -54,6 +54,7 @@ impl LocalExecutor {
         std::fs::create_dir_all(&self.config.scratch)?;
         let store = Arc::new(NativeStore::open_managed(
             &self.config.directory,
+            &self.config.index_directory,
             self.config.space,
         )?);
         *guard = Some(Arc::clone(&store));
@@ -194,6 +195,7 @@ mod tests {
                 preference: NativeExecutionPreference::Local,
                 max_jobs: 1,
                 directory: directory.path().join("input"),
+                index_directory: directory.path().join("input"),
                 scratch: directory.path().join("scratch"),
                 bubblewrap: "/usr/bin/bwrap".into(),
                 space: SpacePolicy {

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Offline migration of a closed redb index to a separate filesystem.
+set -euo pipefail
+umask 077
+[[ $EUID == 0 ]] || { echo "run as root" >&2; exit 1; }
+unit=${1:?stopped systemd unit}
+store=$(realpath -e -- "${2:?existing content store}")
+index=$(realpath -e -- "${3:?pre-provisioned index directory}")
+[[ $(systemctl show -p ActiveState --value "$unit") == inactive ]] || {
+    echo "stop $unit and all other store owners before relocation" >&2; exit 1;
+}
+[[ "$store" != "$index" && "$index" != "$store/"* && "$store" != "$index/"* ]]
+[[ $(stat -c %d "$store") != $(stat -c %d "$index") ]] || {
+    echo "index must be on a different capacity domain" >&2; exit 1;
+}
+[[ $(stat -c %u:%g "$store") == $(stat -c %u:%g "$index") ]]
+exec 9<"$store"
+flock -n -x 9
+old="$store/index.redb"
+new="$index/index.redb"
+[[ -f "$old" && ! -L "$old" ]] || { echo "missing source index" >&2; exit 1; }
+if [[ -e "$new" ]]; then
+    [[ -f "$new" && ! -L "$new" ]]
+    cmp -- "$old" "$new"
+else
+    tmp=$(mktemp "$index/.index-relocation.XXXXXXXX")
+    trap 'rm -f -- "$tmp"' EXIT
+    cp --reflink=never --preserve=mode,ownership,timestamps -- "$old" "$tmp"
+    cmp -- "$old" "$tmp"
+    sync -f "$tmp"
+    mv -T -- "$tmp" "$new"
+    sync -f "$index"
+    trap - EXIT
+fi
+# The new copy is verified and synced. Remove only the old index, not CAS data.
+sync -f "$new"
+rm -- "$old"
+sync -f "$store"
+printf 'Relocated index to %s; configure index_directory = "%s" before starting %s\n' "$new" "$index" "$unit"

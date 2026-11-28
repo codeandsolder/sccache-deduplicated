@@ -252,13 +252,14 @@ case "$phase" in
       install_atomic server.conf /etc/sccache-dist/server.conf 0600
       install -d -m 0755 /var/cache/sccache-native
       install -d -m 0700 /var/cache/sccache-native/worker /var/cache/sccache-native/scratch
+      install -d -m 0700 /var/lib/sccache-native-index/worker
       [[ $(stat -c %d /var/cache/sccache-native/worker) == $(stat -c %d /var/cache/sccache-native/scratch) ]]
     fi
     if [[ -f scheduler.conf ]]; then
       install_atomic scheduler.conf /etc/sccache-dist/scheduler.conf 0640 root sccache-scheduler
       /usr/local/libexec/host-native-metadata dashboard-select "$bundle" "$dashboard_link"
       runuser -u sccache-scheduler -- test -r "$dashboard_link/sccache-dashboard_bg.wasm"
-      install -d -o sccache-scheduler -g sccache-scheduler -m 0700 /var/cache/sccache-native/scheduler
+      install -d -o sccache-scheduler -g sccache-scheduler -m 0700 /var/cache/sccache-native/scheduler /var/lib/sccache-native-index/scheduler
     fi
     systemctl daemon-reload
     [[ $(systemctl show sccache-local.service -p User --value) == root ]]

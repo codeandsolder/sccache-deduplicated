@@ -65,6 +65,7 @@ fn local_config(root: &Path, preference: NativeExecutionPreference) -> NativeLoc
         preference,
         max_jobs: 2,
         directory: root.join("local-input-store"),
+        index_directory: root.join("local-input-store"),
         scratch: root.join("local-scratch"),
         bubblewrap: "/usr/bin/bwrap".into(),
         space: space(),
@@ -185,6 +186,7 @@ fn native_worker_config(
         native_worker: Some(server::NativeWorkerConfig {
             cache_url: HTTPUrl::from_url(cache_url),
             directory: Some(root.join("worker-store")),
+            index_directory: Some(root.join("worker-store")),
             space: Some(space()),
             scratch: root.join("scratch"),
             bubblewrap: "/usr/bin/bwrap".into(),
@@ -300,6 +302,7 @@ impl Fleet {
                 .as_mut()
                 .context("native config missing")?;
             native.directory = None;
+            native.index_directory = None;
             native.space = None;
             (Some(Box::new(worker_config)), None)
         } else {
@@ -329,6 +332,7 @@ impl Fleet {
                     public_addr: cache_address,
                     bind_address: Some(cache_address),
                     directory: scheduler_directory.clone(),
+                    index_directory: scheduler_directory.clone(),
                     space: space(),
                     idle_timeout_secs: 120,
                     max_sessions: 64,

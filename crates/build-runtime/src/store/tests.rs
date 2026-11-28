@@ -1565,3 +1565,167 @@ fn result_receipt_budget_evicts_oldest_metadata_only() -> Result<()> {
     assert_eq!(store.stats()?.blobs, 0);
     Ok(())
 }
+
+#[test]
+fn separate_index_survives_reopen_and_rejects_wrong_content_root() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("content");
+    let index = dir.path().join("metadata");
+    let other_index = dir.path().join("other-index");
+    let store = NativeStore::open_inner(&root, &index, None)?;
+    let blob = store.stage(&b"quota-isolated index"[..])?;
+    let manifest = result(blob.reference());
+    let key = store
+        .publish(
+            &action("split-index"),
+            &manifest,
+            vec![blob],
+            ActionMode::Reuse,
+        )?
+        .action;
+    assert!(index.join("index.redb").is_file());
+    assert!(!root.join("index.redb").exists());
+    assert!(NativeStore::open_inner(&root, &other_index, None).is_err());
+    drop(store);
+    assert!(NativeStore::open_inner(&dir.path().join("wrong-root"), &index, None).is_err());
+    assert!(NativeStore::open(&root).is_err());
+    let store = NativeStore::open_inner(&root, &index, None)?;
+    assert_eq!(
+        store.lookup(key)?.context("missing result")?.manifest(),
+        &manifest
+    );
+    Ok(())
+}
+
+#[test]
+fn external_index_requires_explicit_offline_migration() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("content");
+    let index = dir.path().join("metadata");
+    let store = NativeStore::open(&root)?;
+    let staged = store.stage(&b"retained through migration"[..])?;
+    let manifest = result(staged.reference());
+    let key = store
+        .publish(
+            &action("relocated"),
+            &manifest,
+            vec![staged],
+            ActionMode::Reuse,
+        )?
+        .action;
+    drop(store);
+    assert!(NativeStore::open_inner(&root, &index, None).is_err());
+    fs::rename(root.join("index.redb"), index.join("index.redb"))?;
+    let store = NativeStore::open_inner(&root, &index, None)?;
+    assert_eq!(
+        store
+            .lookup(key)?
+            .context("missing relocated result")?
+            .manifest(),
+        &manifest
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn execution_scratch_reclaims_only_abandoned_private_views() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(&dir.path().join("store"))?;
+    let scratch = dir.path().join("scratch");
+    fs::create_dir(&scratch)?;
+    fs::create_dir(scratch.join("build-mutable-orphan"))?;
+    fs::write(
+        scratch.join("build-mutable-orphan").join("output"),
+        b"abandoned",
+    )?;
+    fs::write(scratch.join("unrelated"), b"retain")?;
+    let lock = store.claim_execution_scratch(&scratch)?;
+    assert!(!scratch.join("build-mutable-orphan").exists());
+    assert!(scratch.join("unrelated").is_file());
+    assert!(store.claim_execution_scratch(&scratch).is_err());
+    drop(lock);
+    assert!(store.claim_execution_scratch(&scratch).is_ok());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+mod quota_failure {
+    use super::*;
+    use redb::{BackendError, StorageBackend, backends::FileBackend};
+
+    #[derive(Debug)]
+    struct QuotaFault {
+        backend: FileBackend,
+        full: Arc<AtomicBool>,
+    }
+
+    impl StorageBackend for QuotaFault {
+        fn len(&self) -> std::result::Result<u64, BackendError> {
+            self.backend.len()
+        }
+        fn read(&self, offset: u64, out: &mut [u8]) -> std::result::Result<(), BackendError> {
+            self.backend.read(offset, out)
+        }
+        fn set_len(&self, len: u64) -> std::result::Result<(), BackendError> {
+            self.backend.set_len(len)
+        }
+        fn sync_data(&self) -> std::result::Result<(), BackendError> {
+            if self.full.load(Ordering::Acquire) {
+                return Err(io::Error::from_raw_os_error(libc::EDQUOT).into());
+            }
+            self.backend.sync_data()
+        }
+        fn write(&self, offset: u64, bytes: &[u8]) -> std::result::Result<(), BackendError> {
+            if self.full.load(Ordering::Acquire) {
+                return Err(io::Error::from_raw_os_error(libc::EDQUOT).into());
+            }
+            self.backend.write(offset, bytes)
+        }
+    }
+
+    #[test]
+    fn quota_io_failure_latches_until_index_reopen() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let full = Arc::new(AtomicBool::new(false));
+        let db = Database::builder()
+            .set_cache_size(0)
+            .create_with_backend(QuotaFault {
+                backend: FileBackend::new(file.reopen()?),
+                full: Arc::clone(&full),
+            })?;
+        let table = TableDefinition::<u64, u64>::new("test");
+        let write = db.begin_write()?;
+        write.open_table(table)?.insert(1, 42)?;
+        assert!(
+            !index_requires_restart(&db),
+            "ordinary writer contention is not poison"
+        );
+        write.commit()?;
+        let write = db.begin_write()?;
+        write.open_table(table)?.insert(2, 43)?;
+        full.store(true, Ordering::Release);
+        assert!(write.commit().is_err());
+        full.store(false, Ordering::Release);
+        assert!(
+            index_requires_restart(&db),
+            "free space alone cannot clear redb's latch"
+        );
+        drop(db);
+        let reopened = Database::open(file.path())?;
+        assert!(!index_requires_restart(&reopened));
+        let read = reopened.begin_read()?;
+        assert_eq!(
+            read.open_table(table)?
+                .get(1)?
+                .context("missing committed data")?
+                .value(),
+            42
+        );
+        drop(read);
+        let write = reopened.begin_write()?;
+        write.open_table(table)?.insert(3, 44)?;
+        write.commit()?;
+        Ok(())
+    }
+}

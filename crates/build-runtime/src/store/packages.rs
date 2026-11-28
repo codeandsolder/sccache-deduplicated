@@ -908,6 +908,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let store = NativeStore::open_managed(
             directory.path(),
+            directory.path(),
             crate::SpacePolicy {
                 min_available_bytes: 4096,
                 target_available_bytes: 8192,
