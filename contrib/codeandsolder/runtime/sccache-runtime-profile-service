@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# The socket and SSH entrypoints accept only a base digest plus canonical
+# manifest data, never caller-selected paths, Docker commands or shell argv.
+set -euo pipefail
+
+fail() { printf '%s\n' "$*" >&2; exit 65; }
+
+# Only the deployment unit / forced SSH command selects the mode.
+# Optional explicit site paths support independent hermetic tests.
+[[ $# == 1 || $# == 4 ]] || exit 64
+mode=$1
+site=${2:-/etc/sccache}
+profile=${3:-/usr/local/bin/sccache-runtime-profile}
+catalog=${4:-$site/runtime-profiles}
+[[ $mode == socket || $mode == ssh ]] || exit 64
+scratch=$(mktemp -d)
+finish() {
+    local status=$?
+    if [[ $mode == socket ]]; then
+        cat "$scratch/error" >&3
+        if ((status != 0)); then
+            printf 'ERROR: profile resolution failed\n'
+            tail -n 12 "$scratch/error"
+        fi
+    fi
+    rm -rf -- "$scratch"
+}
+if [[ $mode == socket ]]; then
+    exec 3>&2 2>"$scratch/error"
+fi
+trap finish EXIT
+read -r authority < "$site/runtime-profile-authority"
+[[ $authority == local || $authority == ssh ]] || fail 'Invalid runtime profile authority configuration'
+read -r configured_base < "$site/runtime-image"
+[[ $configured_base =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'Invalid configured runtime base'
+if [[ $mode == socket ]]; then
+    IFS= read -r -n 72 base || fail 'Missing runtime base'
+    operation=resolve
+else
+    [[ $authority == local ]] || fail 'Only the authoritative host serves SSH profile requests'
+    [[ ${SSH_ORIGINAL_COMMAND:-} =~ ^(resolve|export)\ (sha256:[0-9a-f]{64})$ ]] || fail 'Invalid profile authority request'
+    operation=${BASH_REMATCH[1]}
+    base=${BASH_REMATCH[2]}
+fi
+[[ $base == "$configured_base" ]] || fail 'Requested runtime base does not match configured fleet base'
+head -c 65537 > "$scratch/manifest"
+[[ $(wc -c < "$scratch/manifest") -le 65536 ]] || fail 'Runtime package manifest exceeds 64 KiB'
+"$profile" canonical "$scratch/manifest" > "$scratch/request"
+key=$("$profile" key "$scratch/request")
+[[ $key =~ ^[0-9a-f]{64}$ ]] || fail 'Expected a nonempty profile request'
+request=$scratch/request
+
+resolve() {
+    if [[ $authority == local ]]; then
+        local result image
+        result=$("$profile" provision "$base" "$catalog" "$request")
+        [[ ${result%%$'\t'*} == "$key" ]] || fail 'Unexpected authoritative profile result'
+        image=${result#*$'\t'}
+        [[ $image =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'Invalid authoritative image'
+        printf '%s\n' "$image"
+        return
+    fi
+    # Serialize each local import, rechecking after the lock is held.
+    local directory record image local_image lockfd
+    directory=$catalog/${base#sha256:}
+    mkdir -p -- "$directory/.locks"
+    exec {lockfd}>"$directory/.locks/$key"
+    flock -x "$lockfd"
+    record=$directory/$key
+    local_image=
+    if [[ -e $record || -L $record ]]; then
+        [[ -f $record && ! -L $record && -r $record ]] || fail 'Invalid local catalog record'
+        local_image=$(cat -- "$record")
+        [[ $local_image =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'Invalid local catalog image'
+        if docker image inspect "$local_image" >/dev/null 2>&1; then
+            "$profile" select "$base" "$request" "$catalog"
+            return
+        fi
+    fi
+    local -a remote=(ssh -F "$site/runtime-profile-ssh.conf" -T sccache-runtime-authority)
+    image=$("${remote[@]}" resolve "$base" < "$request")
+    [[ $image =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'Invalid remote authoritative image'
+    [[ -z $local_image || $local_image == "$image" ]] || fail 'Authority disagrees with existing local profile mapping'
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        "${remote[@]}" export "$base" < "$request" | zstd -d -q | docker image load >&2
+    fi
+    # Retain imported images as tagged images, not anonymous GC candidates.
+    docker image tag "$image" "local/sccache-runtime-profile:${base:7:32}-$key"
+    "$profile" register "$base" "$request" "$image" "$catalog"
+}
+
+if [[ $operation == export ]]; then
+    image=$("$profile" select "$base" "$request" "$catalog")
+    docker image save "$image" | zstd -q -T2 -3
+else
+    resolve
+fi

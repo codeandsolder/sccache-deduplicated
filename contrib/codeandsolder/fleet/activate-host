@@ -37,7 +37,8 @@ fi
 guard="$stage/updaters-paused"
 client_guard=/etc/systemd/system/sccache-fleet-rollout-drain
 guard_name=zz-sccache-fleet-rollout-guard.conf
-units=("${clients[@]}" "${workers[@]}" "${scheduler[@]}" "${timers[@]}" "$watchdog_timer")
+profile_socket=sccache-runtime-profile.socket
+units=("${clients[@]}" "${workers[@]}" "${scheduler[@]}" "${timers[@]}" "$watchdog_timer" "$profile_socket")
 exec 9>"$stage/activation.lock"
 flock -x 9
 active_before() { rg -xq -- "$1" "$rollback/active-units"; }
@@ -190,6 +191,11 @@ case "$phase" in
     [[ ! -f scheduler.conf ]] || files+=(/etc/sccache-dist/scheduler.conf "$dashboard_link")
     [[ ! -f 90-real-binary.conf ]] || files+=(/etc/systemd/system/sccache-strict-local.service.d/90-real-binary.conf)
     [[ ! -f cargo-wrapper ]] || files+=(/usr/local/bin/cargo)
+    [[ ! -f runtime-run ]] || files+=(/usr/local/bin/sccache-runtime)
+    [[ ! -f runtime-profile ]] || files+=(/usr/local/bin/sccache-runtime-profile)
+    if [[ -f runtime-profile-service ]]; then
+      files+=(/usr/local/libexec/sccache-runtime-profile-service /usr/local/share/sccache-runtime/Dockerfile.profile "/etc/systemd/system/$profile_socket" /etc/systemd/system/sccache-runtime-profile@.service)
+    fi
     [[ ! -f sccache-cmake-launcher ]] || files+=(/usr/local/libexec/sccache-cmake-launcher)
     for f in "${state_files[@]}"; do files+=("$state/$f"); done
     files+=("$state/release.json")
@@ -234,6 +240,14 @@ case "$phase" in
     install_atomic sccache-client /usr/local/libexec/sccache-client 0755
     install_atomic sccache-release-update /usr/local/libexec/sccache-release-update 0755
     install_atomic host-native-metadata /usr/local/libexec/host-native-metadata 0755
+    if [[ -f runtime-run ]]; then install_atomic runtime-run /usr/local/bin/sccache-runtime 0755; fi
+    if [[ -f runtime-profile-service ]]; then
+      install_atomic runtime-profile-service /usr/local/libexec/sccache-runtime-profile-service 0755
+      install_atomic runtime-profile-dockerfile /usr/local/share/sccache-runtime/Dockerfile.profile 0644
+      install_atomic runtime-profile.socket "/etc/systemd/system/$profile_socket" 0644
+      install_atomic runtime-profile@.service /etc/systemd/system/sccache-runtime-profile@.service 0644
+    fi
+    if [[ -f runtime-profile ]]; then install_atomic runtime-profile /usr/local/bin/sccache-runtime-profile 0755; fi
     if [[ -f cargo-wrapper ]]; then install_atomic cargo-wrapper /usr/local/bin/cargo 0755; fi
     if [[ -f sccache-cmake-launcher ]]; then install_atomic sccache-cmake-launcher /usr/local/libexec/sccache-cmake-launcher 0755; fi
     install_atomic client-shared.toml /etc/sccache/client-shared.toml 0600
@@ -260,6 +274,11 @@ case "$phase" in
     fi
     systemctl daemon-reload
     [[ $(systemctl show sccache-local.service -p User --value) == root ]]
+    if [[ -f runtime-profile-service ]]; then
+      systemctl enable "$profile_socket"
+      systemctl start "$profile_socket"
+      systemctl is-active --quiet "$profile_socket"
+    fi
     echo "installed $role $sha"
     ;;
   start-scheduler)
@@ -383,6 +402,10 @@ case "$phase" in
     ;;
   rollback-restore)
     assert_stopped
+    if [[ -f runtime-profile-service ]]; then
+      stop_if_active "$profile_socket"
+      if ! rg -xq "$profile_socket" "$rollback/enabled-units"; then systemctl disable "$profile_socket"; fi
+    fi
     while IFS= read -r f; do
       if [[ -e "$rollback/files$f" || -L "$rollback/files$f" ]]; then
         [[ -d "$(dirname -- "$f")" ]] || install -d -m 0755 "$(dirname -- "$f")"
@@ -393,6 +416,7 @@ case "$phase" in
     done < "$rollback/paths"
     systemctl daemon-reload
     if rg -xq sccache-local-root.service "$rollback/enabled-units"; then systemctl enable sccache-local-root.service; fi
+    if [[ -f runtime-profile-service ]]; then start_if_previous "$profile_socket"; fi
     ;;
   rollback-start-scheduler)
     start_if_previous sccache-dist-scheduler.service

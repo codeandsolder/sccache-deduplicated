@@ -172,7 +172,18 @@ install -m 0700 "$repo/host-native-metadata" "$stage/host-native-metadata"
 install -m 0700 "$repo/fleet/activate-host" "$stage/activate-host"
 install -m 0600 "$repo/native-action-report.awk" "$stage/native-action-report.awk"
 if [[ -x /usr/bin/rustup && -f /usr/local/bin/cargo ]]; then
+  [[ -r /etc/sccache/runtime-image ]] || { echo "Managed Cargo requires a provisioned common runtime image" >&2; exit 69; }
+  read -r runtime_image < /etc/sccache/runtime-image
+  [[ "$runtime_image" =~ ^sha256:[0-9a-f]{64}$ ]]
+  [[ "$(docker image inspect --format '{{.Id}}' "$runtime_image")" == "$runtime_image" ]]
   install -m 0700 "$repo/cargo-wrapper" "$stage/cargo-wrapper"
+  install -m 0700 "$repo/runtime/run" "$stage/runtime-run"
+  install -m 0700 "$repo/runtime/sccache-runtime-profile" "$stage/runtime-profile"
+  install -m 0700 "$repo/runtime/sccache-runtime-profile-service" "$stage/runtime-profile-service"
+  install -m 0600 "$repo/runtime/Dockerfile.profile" "$stage/runtime-profile-dockerfile"
+  install -m 0600 "$repo/runtime/sccache-runtime-profile.socket" "$stage/runtime-profile.socket"
+  install -m 0600 "$repo/runtime/sccache-runtime-profile@.service" "$stage/runtime-profile@.service"
+  [[ -r /etc/sccache/runtime-profile-authority ]] || { echo "Configure the fleet runtime profile authority before activation" >&2; exit 69; }
 fi
 if [[ -f /usr/local/libexec/sccache-cmake-launcher ]]; then
   install -m 0700 "$repo/sccache-cmake-launcher" "$stage/sccache-cmake-launcher"
